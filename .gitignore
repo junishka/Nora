@@ -1,0 +1,42 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Virtualenvs
+.venv/
+venv/
+
+# uv
+uv.lock
+
+# Build artifacts
+build/
+dist/
+*.dmg
+*.app
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+
+# Local dev scratch
+scratch/
+*.local.*
+
+# Claude Code local state (settings.local.json has personal permission
+# allowlist and machine-specific paths; worktrees/ is session scratch).
+.claude/
+
+# Builder per-run state inside researcher project dirs.
+.builder/
+
+# Hypothesis example database.
+.hypothesis/
