@@ -5,28 +5,27 @@
 # Pipeline:
 #   1. `uv run pyinstaller packaging/builder.spec --clean --noconfirm`
 #      produces `dist/builder/` (one-dir bundle).
-#   2. `osacompile` compiles the launcher AppleScript into a .app
-#      skeleton at `dist/Builder.app/`.
-#   3. We copy the PyInstaller bundle into
-#      `dist/Builder.app/Contents/Resources/builder/` — the launcher
-#      points there at runtime.
-#   4. We overwrite the generated Info.plist with our own (sets the
-#      bundle identifier, version, and LSUIElement=false so the app
-#      shows up in Dock / Launchpad).
+#   2. Assemble Builder.app manually — no osacompile — so we control
+#      the launcher mechanism. Contents/MacOS/Builder is our own
+#      shell script from packaging/launcher.sh; see that file for
+#      why we avoid AppleScript.
+#   3. Copy the PyInstaller bundle into
+#      Builder.app/Contents/Resources/builder/.
+#   4. Write an Info.plist that points at our launcher and sets the
+#      usual bundle metadata.
 #
-# Gatekeeper note: the resulting .app is unsigned. On first open,
-# macOS will block it with "cannot be opened because the developer
-# cannot be verified." Researcher workaround is in docs/install.md —
-# right-click the .app → Open, or `xattr -cr Builder.app` to clear
-# the quarantine flag. Proper code-signing needs an Apple Developer
-# Program membership, deferred until wider distribution.
+# Gatekeeper note: the resulting .app is unsigned. First-run workaround
+# (right-click → Open, or `xattr -cr Builder.app`) is documented in
+# docs/install.md. Proper code-signing is deferred until wider
+# distribution justifies paying for the Apple Developer Program.
 #
 # Usage (from repo root):
 #   bash packaging/build_app.sh
 #
 # Produces:
 #   dist/Builder.app      — the macOS application bundle
-#   dist/builder/         — the raw PyInstaller output (used by the .app)
+#   dist/builder/         — the raw PyInstaller output (kept for
+#                            direct CLI invocation and debugging)
 
 set -euo pipefail
 
@@ -45,15 +44,17 @@ if [[ ! -x "$PYINSTALLER_OUT/builder" ]]; then
     exit 1
 fi
 
-echo "==> Compiling launcher AppleScript into Builder.app"
+echo "==> Assembling Builder.app"
 rm -rf "$APP_BUNDLE"
-/usr/bin/osacompile -o "$APP_BUNDLE" "$REPO_ROOT/packaging/launcher.applescript"
-
-echo "==> Staging PyInstaller bundle inside Builder.app/Contents/Resources"
+mkdir -p "$APP_BUNDLE/Contents/MacOS"
 mkdir -p "$APP_BUNDLE/Contents/Resources/builder"
-# `cp -R` preserves symlinks and the _internal/ layout PyInstaller
-# generates. Copying (rather than moving) leaves the raw
-# `dist/builder/` around for direct CLI invocation and debugging.
+
+# Launcher script — the .app's executable per Info.plist.
+cp "$REPO_ROOT/packaging/launcher.sh" "$APP_BUNDLE/Contents/MacOS/Builder"
+chmod +x "$APP_BUNDLE/Contents/MacOS/Builder"
+
+# PyInstaller bundle — lives under Resources/builder/.
+# `cp -R` preserves the _internal/ layout PyInstaller generates.
 cp -R "$PYINSTALLER_OUT/." "$APP_BUNDLE/Contents/Resources/builder/"
 
 echo "==> Writing Info.plist"
@@ -73,19 +74,21 @@ cat > "$APP_BUNDLE/Contents/Info.plist" <<'PLIST'
     <key>CFBundleShortVersionString</key>
     <string>0.0.1</string>
     <key>CFBundleExecutable</key>
-    <string>applet</string>
+    <string>Builder</string>
     <key>CFBundlePackageType</key>
     <string>APPL</string>
     <key>CFBundleSignature</key>
     <string>????</string>
     <key>LSMinimumSystemVersion</key>
     <string>11.0</string>
+    <!-- LSUIElement=false means Builder shows up in Launchpad / Dock -->
+    <!-- during the brief moment the launcher runs before spawning    -->
+    <!-- Terminal. Set to true to hide (feels cleaner but then        -->
+    <!-- Cmd-Q-on-Builder doesn't work; keep visible).                -->
     <key>LSUIElement</key>
     <false/>
     <key>NSHighResolutionCapable</key>
     <true/>
-    <key>NSPrincipalClass</key>
-    <string>NSApplication</string>
 </dict>
 </plist>
 PLIST
