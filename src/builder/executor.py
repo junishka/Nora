@@ -29,6 +29,7 @@ What this executor deliberately does NOT do:
 from __future__ import annotations
 
 import os
+import secrets
 import shutil
 import subprocess
 import time
@@ -37,7 +38,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from importlib import resources
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal
 
 from builder.env_detect import Environment, detect_environment
 
@@ -48,6 +49,70 @@ DEFAULT_TIMEOUT_SECONDS = 120
 
 # Where per-run scratch dirs live, relative to cwd.
 RUNS_SUBDIR = ".builder/runs"
+
+# Name of the payload field the runtime library embeds to prove the
+# payload came from the library (rather than being hand-crafted by
+# Claude's script). Starts with underscore so it doesn't collide with
+# a future analysis-schema field name.
+RESULT_TOKEN_FIELD = "_token"
+
+# Environment variable name the runtime library reads the token from.
+# The R library reads this at source time and then unsets it; Stata
+# `.ado` files read it on each invocation (Stata doesn't cleanly
+# support env-unset from within the running process).
+RUN_TOKEN_ENV_VAR = "BUILDER_RUN_TOKEN"
+
+
+def _generate_run_token() -> str:
+    """Return a random per-run token embedded in every valid payload.
+
+    256 bits via `secrets.token_hex(32)`. The runtime library copies it
+    into every emitted payload under `_token`; the executor validates
+    and strips it before passing the payload on. A malicious script
+    that bypasses the runtime library (writing hand-crafted JSON
+    straight to `BUILDER_RESULT_PATH`) has to either guess a fresh
+    256-bit token or introspect the interpreter's loaded environment
+    to recover it — the former is infeasible, the latter raises
+    attacker cost meaningfully without being an absolute guarantee.
+    See ``docs/direction.md`` "runtime-library contract" for the full
+    threat-model discussion.
+    """
+    return secrets.token_hex(32)
+
+
+def _validate_and_strip_token(
+    payload: dict[str, Any], expected_token: str
+) -> tuple[dict[str, Any] | None, str | None]:
+    """Check ``payload[RESULT_TOKEN_FIELD]`` matches ``expected_token``.
+
+    Returns ``(cleaned_payload, None)`` on success or ``(None, error)``
+    on mismatch / missing. The cleaned payload has the token field
+    removed so downstream consumers (sanitizer, Claude) never see it.
+    """
+    if not isinstance(payload, dict):
+        return None, (
+            f"runtime-library payload must be a JSON object, got "
+            f"{type(payload).__name__}"
+        )
+    got = payload.get(RESULT_TOKEN_FIELD)
+    if got is None:
+        return None, (
+            f"runtime-library payload missing {RESULT_TOKEN_FIELD!r} "
+            f"authenticity field — either the script bypassed the "
+            f"Builder runtime library (writing JSON directly) or is "
+            f"using a library version older than this executor. The "
+            f"payload is rejected."
+        )
+    if not isinstance(got, str) or not secrets.compare_digest(
+        got, expected_token
+    ):
+        return None, (
+            f"runtime-library payload {RESULT_TOKEN_FIELD!r} did not "
+            f"match the per-run token — the payload may have been "
+            f"hand-crafted to bypass the runtime library. Rejected."
+        )
+    cleaned = {k: v for k, v in payload.items() if k != RESULT_TOKEN_FIELD}
+    return cleaned, None
 
 
 # ---------------------------------------------------------------------------
@@ -173,11 +238,17 @@ def run_script(
     #     `cd`s to the researcher's cwd before running the user's code,
     #     so relative paths in the user script still work.
     subprocess_cwd = cwd if language == "R" else run_dir
+    # Generate a fresh per-run token. The runtime library reads it from
+    # BUILDER_RUN_TOKEN, embeds it in every emitted payload, and (in R)
+    # unsets the env var so user code loaded afterward can't read it
+    # directly. See ``_validate_and_strip_token`` below.
+    run_token = _generate_run_token()
     subprocess_env = {
         **os.environ,
         "BUILDER_RESULT_PATH": str(result_path),
         "BUILDER_LIB_DIR": str(lib_dir),
         "BUILDER_CWD": str(cwd),
+        RUN_TOKEN_ENV_VAR: run_token,
     }
 
     start = time.monotonic()
@@ -236,7 +307,7 @@ def run_script(
     else:
         import json
         try:
-            payload = json.loads(result_path.read_text(encoding="utf-8"))
+            raw_payload = json.loads(result_path.read_text(encoding="utf-8"))
         except json.JSONDecodeError as je:
             error = (
                 f"script emitted a result file that is not valid JSON: "
@@ -244,6 +315,20 @@ def run_script(
             )
         except OSError as oe:
             error = f"could not read result file: {oe}"
+        else:
+            # Authenticity check: payload must carry the per-run token
+            # the runtime library embeds. A script that wrote JSON
+            # directly to BUILDER_RESULT_PATH (bypassing the library)
+            # has no token and gets rejected here. The token is
+            # stripped from the payload before it flows on to the
+            # sanitizer, so downstream consumers don't see it.
+            cleaned, auth_err = _validate_and_strip_token(
+                raw_payload, run_token
+            )
+            if auth_err is not None:
+                error = auth_err
+            else:
+                payload = cleaned
 
     exit_code = proc.returncode
     ok = (exit_code == 0) and (payload is not None) and (error is None)

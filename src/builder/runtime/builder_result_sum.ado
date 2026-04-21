@@ -42,6 +42,14 @@ program define builder_result_sum
         exit 198
     }
 
+    * Per-run authenticity token. See builder_result_regress.ado for the
+    * full explanation.
+    local _builder_token : env BUILDER_RUN_TOKEN
+    if "`_builder_token'" == "" {
+        display as error "BUILDER_RUN_TOKEN not set. Run through Builder."
+        exit 198
+    }
+
     * Variable name from the positional argument. `syntax varname` is a
     * real-variable-in-data reference; the name lands in the `varlist`
     * macro (Stata's naming quirk).
@@ -71,6 +79,7 @@ program define builder_result_sum
     file open `fh' using `"`path'"', write text replace
 
     file write `fh' `"{"type":"descriptive""'
+    file write `fh' `","_token":"`_builder_token'""'
     if `"`label'"' != "" {
         file write `fh' `","label":"`label'""'
     }

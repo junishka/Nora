@@ -45,6 +45,19 @@ program define builder_result_regress
         exit 198
     }
 
+    * Per-run authenticity token — the executor validates this before
+    * the payload reaches the sanitizer. Stata cannot cleanly unset
+    * environment variables from within the running process, so a user
+    * script CAN also read BUILDER_RUN_TOKEN. The protection this
+    * provides is that naive "write hand-crafted JSON" bypasses fail,
+    * and any sophisticated bypass must include token-extraction logic
+    * that is visible in the executed script the researcher reviews.
+    local _builder_token : env BUILDER_RUN_TOKEN
+    if "`_builder_token'" == "" {
+        display as error "BUILDER_RUN_TOKEN not set. Run through Builder."
+        exit 198
+    }
+
     * Integer-position indexing into e(b) / e(V) — name indexing fails
     * in scalar context on Stata 13/15. Column names come from colnames.
     tempname bmat Vmat
@@ -57,6 +70,7 @@ program define builder_result_regress
     file open `fh' using `"`path'"', write text replace
 
     file write `fh' `"{"type":"linear_regression""'
+    file write `fh' `","_token":"`_builder_token'""'
     if `"`label'"' != "" {
         file write `fh' `","label":"`label'""'
     }

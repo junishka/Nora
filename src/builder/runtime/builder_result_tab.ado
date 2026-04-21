@@ -52,6 +52,14 @@ program define _builder_tab_1way
     local vname "`varlist'"
     local path : env BUILDER_RESULT_PATH
 
+    * Per-run authenticity token. See builder_result_regress.ado for the
+    * full explanation.
+    local _builder_token : env BUILDER_RUN_TOKEN
+    if "`_builder_token'" == "" {
+        display as error "BUILDER_RUN_TOKEN not set. Run through Builder."
+        exit 198
+    }
+
     * Totals and missing count BEFORE contract (which drops missings).
     quietly count
     local total = r(N)
@@ -70,6 +78,7 @@ program define _builder_tab_1way
     file open `fh' using `"`path'"', write text replace
 
     file write `fh' `"{"type":"frequency_table""'
+    file write `fh' `","_token":"`_builder_token'""'
     if `"`label'"' != "" {
         file write `fh' `","label":"`label'""'
     }
@@ -119,6 +128,15 @@ program define _builder_tab_2way
     local label : subinstr local label "`=char(9)'" " ", all
 
     local path : env BUILDER_RESULT_PATH
+
+    * Per-run authenticity token. See builder_result_regress.ado for the
+    * full explanation.
+    local _builder_token : env BUILDER_RUN_TOKEN
+    if "`_builder_token'" == "" {
+        display as error "BUILDER_RUN_TOKEN not set. Run through Builder."
+        exit 198
+    }
+
     tokenize `varlist'
     local row_var "`1'"
     local col_var "`2'"
@@ -141,6 +159,7 @@ program define _builder_tab_2way
     file open `fh' using `"`path'"', write text replace
 
     file write `fh' `"{"type":"crosstab""'
+    file write `fh' `","_token":"`_builder_token'""'
     if `"`label'"' != "" {
         file write `fh' `","label":"`label'""'
     }

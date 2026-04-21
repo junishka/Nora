@@ -27,6 +27,30 @@ builder <- new.env(parent = emptyenv())
 
 
 # ---------------------------------------------------------------------------
+# Per-run authenticity token
+# ---------------------------------------------------------------------------
+# Read the token once at source-time, stash it in the library's private
+# env, and clear the env var so user code loaded after this file can't
+# read it via Sys.getenv. Claude's script still CAN find it via
+# environment introspection (`ls(builder)`, `get("token", ..., envir =
+# builder)`) — R closures are open — but doing so requires code that
+# clearly shows up in the executed script the researcher reviews. That
+# raises attacker cost without pretending to be a structural
+# guarantee. See `docs/direction.md` "runtime-library contract" for
+# the deliberate limits of this measure.
+
+builder$.run_token <- Sys.getenv("BUILDER_RUN_TOKEN")
+if (!nzchar(builder$.run_token)) {
+  stop(
+    "BUILDER_RUN_TOKEN not set. This script must be run through the ",
+    "Builder executor; direct `Rscript` invocation of user code that ",
+    "emits result payloads isn't supported."
+  )
+}
+Sys.unsetenv("BUILDER_RUN_TOKEN")
+
+
+# ---------------------------------------------------------------------------
 # Pure-R JSON serializer
 # ---------------------------------------------------------------------------
 
@@ -98,6 +122,9 @@ builder$.write_result <- function(payload) {
       "Builder — direct `Rscript` invocation isn't supported."
     )
   }
+  # Embed the per-run authenticity token. The executor validates this
+  # and strips it before the payload reaches the sanitizer.
+  payload[["_token"]] <- builder$.run_token
   con <- file(result_path, open = "w", encoding = "UTF-8")
   on.exit(close(con), add = TRUE)
   writeLines(builder$.to_json(payload), con)

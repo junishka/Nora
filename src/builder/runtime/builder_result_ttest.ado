@@ -35,6 +35,14 @@ program define builder_result_ttest
         exit 198
     }
 
+    * Per-run authenticity token. See builder_result_regress.ado for the
+    * full explanation.
+    local _builder_token : env BUILDER_RUN_TOKEN
+    if "`_builder_token'" == "" {
+        display as error "BUILDER_RUN_TOKEN not set. Run through Builder."
+        exit 198
+    }
+
     * Stata's ttest sets different r() scalars for one-sample vs two-sample
     * vs paired. We detect which variant populated r() and map to
     * Builder's test_type taxonomy.
@@ -64,6 +72,7 @@ program define builder_result_ttest
     file open `fh' using `"`path'"', write text replace
 
     file write `fh' `"{"type":"t_test""'
+    file write `fh' `","_token":"`_builder_token'""'
     if `"`label'"' != "" {
         file write `fh' `","label":"`label'""'
     }
