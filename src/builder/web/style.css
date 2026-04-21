@@ -231,13 +231,18 @@ body {
   word-wrap: break-word;
 }
 
+/* User messages: right-aligned bubble, like most chat UIs. The
+ * bubble width is capped at 75% of the column so a long message
+ * still reads naturally; `justify-content: flex-end` pushes it
+ * to the right edge of the centered column. */
+.message.user {
+  display: flex;
+  justify-content: flex-end;
+}
+
 .message.user .message-body {
   background: var(--bg-user);
-  /* Left-aligned, flush with the conversation column. Right margin
-   * gives a small asymmetric gutter so the speaker is visually
-   * distinct from the assistant messages which have an accent
-   * border and no right margin. */
-  margin-right: 40px;
+  max-width: 75%;
 }
 
 .message.assistant .message-body {
