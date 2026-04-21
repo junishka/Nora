@@ -1,0 +1,42 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Builder</title>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <header class="topbar">
+    <div class="topbar-title">Builder</div>
+    <div class="topbar-meta" id="topbar-meta">
+      <span id="cwd-display"></span>
+    </div>
+  </header>
+
+  <main id="messages" class="messages">
+    <div class="message system">
+      <div class="message-body" id="welcome">
+        Welcome. Starting up…
+      </div>
+    </div>
+  </main>
+
+  <footer class="composer">
+    <form id="compose-form">
+      <textarea
+        id="compose-input"
+        placeholder="Ask Claude about your data. Shift-Enter for a new line."
+        rows="1"
+        autofocus
+      ></textarea>
+      <button type="submit" id="send-btn">Send</button>
+    </form>
+    <div class="composer-hint">
+      Schema policy: <span id="policy-summary">loading…</span>
+    </div>
+  </footer>
+
+  <script src="app.js"></script>
+</body>
+</html>

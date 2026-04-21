@@ -31,10 +31,17 @@ dependencies = [
     "pyreadstat>=1.2",
     "pyreadr>=0.5",
     "pandas>=2.0",
+    # Web UI shell (`builder-ui` entry point). pywebview wraps a native
+    # WKWebView window on macOS — no Chromium bundled, ~25 MB added to
+    # the .app rather than ~120 MB for Electron. Terminal UI (`builder`)
+    # keeps working without it; pywebview is imported lazily by the UI
+    # entry point.
+    "pywebview>=5.0",
 ]
 
 [project.scripts]
 builder = "builder.app:main"
+builder-ui = "builder.ui:main"
 
 [dependency-groups]
 dev = [
