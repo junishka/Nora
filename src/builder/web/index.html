@@ -26,7 +26,7 @@
             <polyline points="17 8 12 3 7 8"/>
             <line x1="12" y1="3" x2="12" y2="15"/>
           </svg>
-          <p class="drop-zone-hint">Drop .csv, .dta, or .rds files here</p>
+          <p class="drop-zone-hint">Drop one or more .csv, .dta, or .rds files here</p>
         </div>
       </div>
 
@@ -38,10 +38,11 @@
       <div id="landing-status" class="landing-status"></div>
 
       <p class="landing-fineprint">
-        Drag-drop holds files in memory (capped at 500 MB/file); very
-        large datasets — use <strong>Choose files…</strong>, which
-        reads from disk. <strong>Choose folder…</strong> uses an
-        existing directory as the sandbox scope.
+        Drag-drop loads files through memory (capped at 2 GB per file).
+        For larger datasets use <strong>Choose files…</strong> — it
+        copies directly from disk with no size limit.
+        <strong>Choose folder…</strong> uses an existing directory as
+        the sandbox scope without copying anything.
       </p>
     </div>
   </div>

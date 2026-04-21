@@ -208,17 +208,21 @@ class BuilderBridge:
     ) -> dict[str, Any]:
         """Receive files from JS drag-and-drop. Each ``files[i]`` is
         ``{name: str, content: str (base64)}``. We decode and stage
-        into a fresh session dir.
+        into a fresh session dir. Multiple files are supported —
+        they all land in the same session.
 
-        Size capped per-file at 500 MB (plenty for typical research
-        data; the real issue is memory while transferring through
-        the bridge). Callers enforcing larger files should use the
-        file-picker path which reads directly from disk.
+        Size capped per-file at 2 GB. The real constraint is peak
+        memory while transferring through the bridge: a file of N
+        bytes needs roughly 3N during upload (JS ArrayBuffer + JS
+        base64 string + Python-side decode), so 2 GB is already
+        ~6 GB of peak heap. Larger datasets should use the file
+        picker (`choose_files`) which copies directly from disk
+        with no memory overhead.
         """
         if not files:
             return {"ok": False, "reason": "no files"}
         import base64
-        max_bytes = 500 * 1024 * 1024
+        max_bytes = 2 * 1024 * 1024 * 1024
         decoded: list[tuple[str, bytes]] = []
         for item in files:
             name = item.get("name", "")
@@ -233,12 +237,14 @@ class BuilderBridge:
             except Exception:  # noqa: BLE001
                 return {"ok": False, "reason": f"could not decode {name!r}"}
             if len(blob) > max_bytes:
+                mb = len(blob) // (1024 * 1024)
                 return {
                     "ok": False,
                     "reason": (
-                        f"{name!r} is {len(blob) // (1024*1024)} MB — "
-                        f"above the 500 MB drag-drop cap. Use Choose "
-                        f"Files instead; it reads directly from disk."
+                        f"{name!r} is {mb} MB — above the 2 GB "
+                        f"drag-drop cap. Use Choose Files… instead; "
+                        f"it copies straight from disk with no "
+                        f"memory overhead, so there's no size limit."
                     ),
                 }
             decoded.append((Path(name).name, blob))

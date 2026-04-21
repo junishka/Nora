@@ -138,16 +138,39 @@ landingEl.addEventListener('drop', async (e) => {
   // so researchers see the reason in the UI rather than a confused
   // session with non-data files in it.
   const accepted = files.filter((f) => /\.(csv|dta|rds)$/i.test(f.name));
+  const rejected = files.length - accepted.length;
   if (accepted.length === 0) {
     setLandingError(
       'Drop .csv, .dta, or .rds files. Other types are ignored.'
     );
     return;
   }
-  setLandingBusy(true, `Uploading ${accepted.length} file${accepted.length === 1 ? '' : 's'}…`);
   try {
-    const payload = await Promise.all(accepted.map(readFileAsBase64));
+    // Read serially with a progress message so large drops don't
+    // look frozen. readAsDataURL loads the whole file into memory —
+    // fine up to the 2 GB per-file cap, above which "Choose files…"
+    // is the right path (see the landing fineprint).
+    const payload = [];
+    for (let i = 0; i < accepted.length; i++) {
+      const file = accepted[i];
+      const sizeMb = Math.round(file.size / (1024 * 1024));
+      setLandingBusy(
+        true,
+        `Reading (${i + 1}/${accepted.length}) ${file.name}` +
+          (sizeMb > 0 ? ` (${sizeMb} MB)…` : '…')
+      );
+      payload.push(await readFileAsBase64(file));
+    }
+    setLandingBusy(
+      true,
+      `Staging ${accepted.length} file${accepted.length === 1 ? '' : 's'}…`
+    );
     const result = await window.pywebview.api.upload_files(payload);
+    if (result && result.ok && rejected > 0) {
+      // Will switch views — the note on rejected-types is just
+      // a courtesy; no need to block.
+      console.info(`${rejected} non-data file(s) ignored.`);
+    }
     await handleSessionResult(result);
   } catch (err) {
     setLandingError('upload failed: ' + err);
