@@ -146,7 +146,14 @@ builder$result <- function(type, ...) {
 #' The helper covers the fields the Builder linear_regression schema
 #' accepts. Any extra kwargs passed via `...` are included too (dropped
 #' by the sanitizer if not whitelisted).
+#'
+#' Also prints R's native `summary(model)` table to stdout so the
+#' researcher sees the familiar regression output in the TUI's raw
+#' log panel. Stdout never reaches Claude (executor strips it before
+#' anything returns to the sanitizer), so printing here is only for
+#' the researcher's benefit.
 builder$from_lm <- function(model, ...) {
+  print(summary(model))
   s <- summary(model)
   ce <- as.data.frame(s$coefficients)
   coefs <- as.list(ce[, "Estimate"])
@@ -192,7 +199,12 @@ builder$from_lm <- function(model, ...) {
 
 
 #' From a `t.test` result, emit a t_test payload.
+#'
+#' Also prints the native t.test output — R formats this nicely
+#' (test name, CI, p-value, sample means) so the researcher sees
+#' the conventional view in the raw log panel.
 builder$from_t_test <- function(res, ...) {
+  print(res)
   # t.test returns different shapes depending on one-sample vs two-sample.
   is_two_sample <- grepl("two sample", res$method, ignore.case = TRUE)
   is_welch      <- grepl("welch",       res$method, ignore.case = TRUE)
@@ -244,8 +256,20 @@ builder$from_t_test <- function(res, ...) {
 
 
 #' Emit a descriptive payload for a single variable.
+#'
+#' Prints a compact one-variable summary to stdout so the researcher
+#' sees "variable: n=X, mean=Y, sd=Z, missing=M" in the raw log
+#' panel. The caller provides the numbers; we don't recompute.
 builder$from_summarize <- function(variable, n, mean, sd, missing_count,
                                    distinct_count = NULL, ...) {
+  cat(sprintf(
+    "%s: n=%d, mean=%.6g, sd=%.6g, missing=%d",
+    variable, as.integer(n), mean, sd, as.integer(missing_count)
+  ))
+  if (!is.null(distinct_count)) {
+    cat(sprintf(", distinct=%d", as.integer(distinct_count)))
+  }
+  cat("\n")
   builder$result(
     type = "descriptive",
     variable = variable,
@@ -273,6 +297,27 @@ builder$from_summarize <- function(variable, n, mean, sd, missing_count,
 #' values so mixed signs don't produce meaningless shares.
 builder$from_magnitude_table <- function(df, group_var, value_var,
                                           aggregation = "sum", ...) {
+  # Native-R preview for the researcher's raw log panel. Use the same
+  # aggregation the payload will report so the printed table matches
+  # what the sanitized result says.
+  tryCatch({
+    na_mask <- !is.na(df[[group_var]]) & !is.na(df[[value_var]])
+    if (any(na_mask)) {
+      agg_fn <- if (aggregation == "sum") sum else mean
+      agg_df <- aggregate(
+        df[[value_var]][na_mask],
+        by = list(df[[group_var]][na_mask]),
+        FUN = agg_fn
+      )
+      names(agg_df) <- c(group_var, paste0(aggregation, "_", value_var))
+      cat(sprintf("Magnitude table: %s of %s by %s\n",
+                  aggregation, value_var, group_var))
+      print(agg_df)
+    }
+  }, error = function(e) {
+    cat(sprintf("(native preview skipped: %s)\n", conditionMessage(e)))
+  })
+
   if (!(aggregation %in% c("sum", "mean"))) {
     stop('builder$from_magnitude_table: aggregation must be "sum" or "mean", ',
          'got ', aggregation)
@@ -343,6 +388,8 @@ builder$from_crosstab <- function(tbl, row_variable = NULL, col_variable = NULL,
     stop("builder$from_crosstab: expected a 2D table or matrix, got ",
          class(tbl)[1])
   }
+  # Native preview for the raw log panel.
+  print(tbl)
   if (length(dim(tbl)) != 2) {
     stop("builder$from_crosstab: expected a 2D structure, got ",
          length(dim(tbl)), " dimension(s). Use builder$from_table for 1D.")
@@ -387,9 +434,17 @@ builder$from_table <- function(variable, counts, n = NULL, missing_count = 0L, .
   # `counts` should be a named integer vector / list. Normalize to a
   # named list of ints.
   if (is.table(counts)) {
+    # Native preview — R formats a 1D table nicely as a two-row block.
+    cat(sprintf("Frequency table: %s\n", variable))
+    print(counts)
     d <- as.list(as.integer(counts))
     names(d) <- names(counts)
     counts <- d
+  } else if (is.list(counts) || !is.null(names(counts))) {
+    cat(sprintf("Frequency table: %s\n", variable))
+    for (lvl in names(counts)) {
+      cat(sprintf("  %s: %s\n", lvl, counts[[lvl]]))
+    }
   }
   if (is.null(n)) {
     n <- sum(unlist(counts)) + missing_count

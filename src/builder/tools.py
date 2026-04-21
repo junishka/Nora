@@ -660,7 +660,7 @@ async def expand_result(args: dict[str, Any]) -> dict[str, Any]:
             "status": "not_found",
             "reason": f"no stored result with id {result_id!r}",
         })
-    return _as_mcp_text({
+    response: dict[str, Any] = {
         "status": "ok",
         "result_id": row.id,
         "label": row.label,
@@ -669,7 +669,16 @@ async def expand_result(args: dict[str, Any]) -> dict[str, Any]:
         "payload": row.sanitized_payload,
         "transformations": row.transformations,
         "created_at": row.created_at,
-    })
+    }
+    # Surface the run_dir so the TUI can re-render the raw R/Stata
+    # output alongside the (possibly dense) sanitized payload. Without
+    # this, re-expanding a stored regression gives the researcher
+    # nothing but rows of coefficients / SEs / t-stats / p-values,
+    # with no trace of the conventional R or Stata output they'd
+    # recognize.
+    if row.raw_log_path:
+        response["_run_dir"] = row.raw_log_path
+    return _as_mcp_text(response)
 
 
 # ---------------------------------------------------------------------------

@@ -260,8 +260,13 @@ def _event_to_dict(evt: Any) -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 def _resolve_cwd(raw: str | None) -> Path:
-    """Match the terminal app's cwd-handling: validate, resolve,
-    fall back to ~/Documents if not provided."""
+    """Validate the data directory argument; fall back to ~/Documents.
+
+    Includes a friendlier error message for the most common misformat
+    — typing ``~/Users/<name>/...`` (which expands to
+    ``/Users/<name>/Users/<name>/...``) when the researcher means
+    ``~/...`` or ``/Users/<name>/...``.
+    """
     if raw:
         path = Path(raw).expanduser()
     else:
@@ -272,7 +277,35 @@ def _resolve_cwd(raw: str | None) -> Path:
         print(f"builder-ui: {e}", file=sys.stderr)
         sys.exit(2)
     if not path.is_dir():
-        print(f"builder-ui: not a directory: {path}", file=sys.stderr)
+        msg = [f"builder-ui: not a directory: {path}"]
+        # Common path-expansion gotcha: `~/Users/<name>/...` expands
+        # to `/Users/<name>/Users/<name>/...` because `~` already
+        # means `/Users/<name>`. Detect and suggest the fix.
+        if raw and raw.startswith("~/Users/"):
+            suggested = raw.replace("~/Users/", "/Users/", 1)
+            msg.append(
+                f"  Hint: `~` already expands to /Users/<you>. You "
+                f"may have meant: {suggested}"
+            )
+        elif raw and raw.startswith("~/"):
+            home = Path.home()
+            parent = path.parent
+            if parent.is_dir():
+                siblings = sorted(
+                    p.name for p in parent.iterdir() if p.is_dir()
+                )[:10]
+                if siblings:
+                    msg.append(
+                        f"  Hint: in {parent}, I see: "
+                        f"{', '.join(siblings)}"
+                    )
+            _ = home
+        else:
+            msg.append(
+                "  Hint: pass an absolute path (like "
+                "/Users/bb/Downloads) or a tilde path (~/Downloads)."
+            )
+        print("\n".join(msg), file=sys.stderr)
         sys.exit(2)
     return path
 
