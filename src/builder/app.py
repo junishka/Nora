@@ -680,9 +680,70 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
+def _prompt_for_cwd() -> Path:
+    """Ask the researcher where their data lives.
+
+    Launched via `builder` with no argv (e.g., double-clicked from a
+    .app launcher) there's no shell cwd that makes sense as the data
+    dir — the process inherits whatever Terminal was last looking at,
+    often the user's HOME. Prompt for an explicit directory instead of
+    silently picking the wrong one.
+
+    Loops until the researcher enters a valid, existing directory or
+    hits Ctrl-D.
+    """
+    console.print(
+        Panel.fit(
+            Text.from_markup(
+                "[bold]Welcome to Builder.[/bold]\n\n"
+                "Builder reads data only from one directory you choose. "
+                "That directory is the sandbox — Claude's scripts can't "
+                "reach anything outside it.\n\n"
+                "[dim]Where do your data files live?[/dim]"
+            ),
+            border_style="cyan",
+        )
+    )
+    default = str(Path.home() / "Documents")
+    while True:
+        try:
+            raw = Prompt.ask(
+                "[bold green]data directory[/bold green]",
+                default=default,
+            )
+        except (EOFError, KeyboardInterrupt):
+            console.print("\n[dim]bye.[/dim]")
+            sys.exit(0)
+        path = Path(raw).expanduser()
+        try:
+            path = path.resolve()
+        except OSError as e:
+            console.print(f"[red]{e}[/red]. Try again.")
+            continue
+        if not path.exists():
+            console.print(
+                f"[red]Not found:[/red] {path}. Try again or Ctrl-D to quit."
+            )
+            continue
+        if not path.is_dir():
+            console.print(
+                f"[red]Not a directory:[/red] {path}. Try again."
+            )
+            continue
+        return path
+
+
 def main() -> NoReturn:  # type: ignore[misc]
     args = _parse_args()
-    cwd = Path(args.cwd).expanduser() if args.cwd else Path.cwd()
+    if args.cwd:
+        cwd = Path(args.cwd).expanduser()
+    elif sys.stdin.isatty():
+        # No argv, interactive terminal — prompt. This is the
+        # double-clicked-.app flow where no cwd can be inferred.
+        cwd = _prompt_for_cwd()
+    else:
+        # No argv and no TTY (piped / CI) — fall back to shell cwd.
+        cwd = Path.cwd()
     try:
         cwd = cwd.resolve()
         if not cwd.is_dir():

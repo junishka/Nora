@@ -43,9 +43,16 @@ Also needs:
 - A Claude subscription or `ANTHROPIC_API_KEY` — auth is inherited
   from the `claude` CLI or environment.
 
-## Running from source (developer workflow)
+## Installing
 
-Double-click install (`.dmg`) is planned but not yet done. Today:
+If you have a `Builder.dmg` handed to you, see
+[`docs/install.md`](docs/install.md) for double-click install
+instructions and first-run Gatekeeper workaround.
+
+If you want to build the `.dmg` yourself from the repo, or just run
+from the development checkout, see "Running from source" below.
+
+## Running from source (developer workflow)
 
 ```bash
 git clone https://github.com/junishka/builder.git
@@ -56,8 +63,21 @@ uv run python -m builder /path/to/your/data
 ```
 
 The first argument is the directory containing the data files
-Builder is allowed to read. Leaving it off uses the current shell
-directory.
+Builder is allowed to read. Leaving it off launches the interactive
+prompt (the same one `.app` users see).
+
+To rebuild the distributable `.app` and `.dmg`:
+
+```bash
+bash packaging/build_app.sh   # → dist/Builder.app  (unsigned)
+bash packaging/build_dmg.sh   # → dist/Builder.dmg  (~34 MB)
+```
+
+The resulting `.app` bundles Python, all dependencies, and the
+runtime libraries — researchers running it don't need Python,
+`uv`, or any build tooling installed. R and (optionally) Stata are
+still required separately since Builder invokes them as
+subprocesses.
 
 ## Project layout
 

@@ -42,6 +42,9 @@ dev = [
     # proof: generate adversarial payloads, assert post-sanitize invariants.
     "pytest>=8",
     "hypothesis>=6",
+    # Packaging: PyInstaller produces a self-contained macOS binary the
+    # .app launcher wraps. See packaging/ for the build pipeline.
+    "pyinstaller>=6.0",
 ]
 
 [build-system]
