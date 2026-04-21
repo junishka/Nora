@@ -219,6 +219,9 @@ function scrollToBottom() {
 }
 
 function updatePolicySummary(policy) {
+  // Reset whatever was here — this function is called on initial load
+  // and whenever the policy changes.
+  policyEl.innerHTML = '';
   if (!policy) {
     policyEl.textContent = '(no datasets)';
     return;
@@ -228,10 +231,46 @@ function updatePolicySummary(policy) {
     policyEl.textContent = 'no datasets in cwd';
     return;
   }
-  const parts = datasets.map((d) =>
-    d.name + ' → ' + d.ceiling + (d.explicit ? '' : ' (default)')
-  );
-  policyEl.textContent = parts.join('  ·  ');
+
+  const n = datasets.length;
+  const customized = datasets.filter((d) => d.explicit).length;
+  const defaultDepth = policy.default_max_depth;
+  const plural = n === 1 ? '' : 's';
+
+  let summary;
+  if (customized === 0) {
+    summary = `${n} dataset${plural} · all at ${defaultDepth} (default)`;
+  } else if (customized === n) {
+    summary = `${n} datasets · all have custom ceilings`;
+  } else {
+    summary = `${n} datasets · ${customized} customized, rest at ${defaultDepth}`;
+  }
+
+  const summarySpan = document.createElement('span');
+  summarySpan.textContent = `Schema policy: ${summary}`;
+  policyEl.appendChild(summarySpan);
+
+  const toggle = document.createElement('a');
+  toggle.href = '#';
+  toggle.className = 'policy-toggle';
+  toggle.textContent = 'show all';
+  policyEl.appendChild(toggle);
+
+  const details = document.createElement('div');
+  details.className = 'policy-details hidden';
+  datasets.forEach((d) => {
+    const row = document.createElement('div');
+    row.textContent =
+      `${d.name} → ${d.ceiling}${d.explicit ? '' : ' (default)'}`;
+    details.appendChild(row);
+  });
+  policyEl.appendChild(details);
+
+  toggle.addEventListener('click', (e) => {
+    e.preventDefault();
+    details.classList.toggle('hidden');
+    toggle.textContent = details.classList.contains('hidden') ? 'show all' : 'hide';
+  });
 }
 
 // Signal to the Python side that we're ready to receive events. pywebview

@@ -173,6 +173,40 @@ surface UX issues in a single afternoon. A colleague or two as #2
 and #3 validates whether the tool works for someone who *didn't*
 build it.
 
+### 5. Web UI polish — follow-ons from the first test run
+
+The pywebview shell ships. Still to do, ordered by how often the
+current friction bites:
+
+- **Drag-and-drop / file upload instead of picking a directory
+  path.** First researcher feedback: *"in the future we should be
+  just able to upload the data instead of choosing path."*
+  Implementation sketch: launch the app into a "no data yet" state
+  with a drop zone; on drop, copy the files into a managed dir
+  (e.g. `~/Library/Application Support/Builder/sessions/<id>/`)
+  and use that as cwd. Avoids the `~/Users/bb/…` path-expansion
+  class of mistake entirely, and doesn't expose a whole project
+  directory to the sandbox just to give Claude two files.
+- **Markdown + syntax-highlighted code in assistant text.** Drop
+  in `marked.js` + `highlight.js` via CDN (or bundled). Currently
+  assistant messages render as plain text.
+- **Inline raw R/Stata output panel in the web UI.** The terminal
+  reads `run_dir/stdout.log` on every `submit_script` result and
+  shows the native R/Stata output before the sanitized payload.
+  The web UI currently only notes the path — should read and
+  render the log directly, matching the terminal's split.
+- **Policy editing in the UI.** Web version of the `/policy`
+  wizard — a settings panel with per-dataset ceiling dropdowns.
+  Complementary to hiding the policy footer by default.
+- **Dataset picker sidebar / session list.** List datasets the
+  researcher has opened, recent plans, something like Claude.ai's
+  left rail.
+- **Bundling web assets into the PyInstaller `.app`.** Today the
+  `builder-ui` entry runs from source only; the `.dmg` only
+  distributes the terminal `builder`. Fold `src/builder/web/` into
+  the spec as data files and update the launcher to support both
+  entry points.
+
 ## Known-real, design-pending
 
 ### Cumulative-inference / cross-query composition
