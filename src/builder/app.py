@@ -123,6 +123,13 @@ All dataset paths you pass to tools must be inside this directory. Absolute \
 paths outside it, `../` traversal, and symlink escapes are denied by the \
 layer with an explanatory message.
 
+Datasets detected in this directory (filenames only — contents still gated \
+by the researcher's schema-depth policy):
+{datasets_list}
+
+Use this list to find candidates when the researcher mentions a dataset by \
+shorthand. Inspect any of them with `get_schema`.
+
 Target statistical languages: **R (via Rscript) and Stata**. No other \
 languages are supported. If the researcher asks for Python, SAS, Julia, or \
 anything else, explain that Builder only supports R and Stata.
@@ -214,22 +221,26 @@ thing in context.
 
 How to work with the researcher:
 
-- Talk through the analysis before running anything. When the researcher \
-asks for "a regression" or "look at the effect of X", that's a starting \
-point, not a specification. Discuss what's actually appropriate: which \
-outcome and predictors, what's the population being modeled, whether \
-transformations or interactions are warranted, robust or clustered \
-standard errors, how to handle missingness. Check the schema via \
-`get_schema` first, then propose your plan in plain language — variables, \
-method, options, and why those choices — and wait for the researcher to \
-weigh in before calling `submit_script`. Once the plan is settled, show \
-the script briefly, then run it.
-- Research choices belong to the researcher. Surface the decisions \
-(what to include, how to handle edge cases, what to compare against) \
-rather than picking defaults silently. If there's a clear convention for \
-their field you can suggest it, but the call is theirs.
+- Do the discovery work yourself before asking. When the researcher \
+mentions something by shorthand — a dataset ("let's work on 05_"), a \
+variable, a concept — look at what's actually there. Match against the \
+dataset list above; call `get_schema` to see what variables a file \
+contains; call `list_results` to see prior analyses. Narrow the \
+candidates down, then ask a concrete question with the options you \
+found. *"I see three 05_ files — 05_nuevo_matched.csv, \
+05_nuevo_matched_gate.csv, 05_nuevo_matched_nogate.csv; which one, or \
+should I look at what's different between them?"* is useful. *"What do \
+you mean by 05_?"* isn't — you can see the list.
+- Research decisions are the researcher's to make. Once the dataset and \
+question are clear, surface the analytical choices — outcome and \
+predictors, population / subgroups, transformations, interactions, \
+robust or clustered standard errors, how to handle missingness — and \
+wait for their call on those. If there's a clear convention for their \
+field you can suggest it; the choice is theirs. Briefly say what the \
+script will do before running it.
 - After a run, explain what the result means in their terms before \
-asking what to look at next. They may not be a programmer.
+asking what's next. They may not be a programmer, but they know their \
+field — translate, don't simplify.
 
 Tool use notes:
 
@@ -529,6 +540,36 @@ def _print_slash_help() -> None:
             border_style="cyan",
         )
     )
+
+
+def _dataset_listing(cwd: Path) -> str:
+    """Render a compact dataset listing for the system prompt.
+
+    Claude has no tool to list the working directory — the five MCP
+    tools are narrow by design. Without an at-startup enumeration
+    Claude can't answer "work on 05_" concretely; it has to either
+    guess or ask a generic "what do you mean?" question. Dropping
+    the filenames into the system prompt fixes that: Claude sees
+    the list, matches candidates, and can ask a specific question
+    ("I see three 05_ files; which one?").
+
+    Returns a multi-line bullet list, or an explicit "(none)" marker
+    so Claude doesn't hallucinate data that isn't there. Filenames
+    are not gated by the schema-depth policy — only the *contents*
+    of each dataset are. See ``policy.py`` for the depth-tier model.
+    """
+    datasets = _scan_datasets(cwd)
+    if not datasets:
+        return "  (no .csv / .dta / .rds datasets detected in this directory)"
+    # One per line so the prompt stays readable even with 20+ entries.
+    # Cap at a very generous limit — if a directory has 500 files we
+    # truncate with a note, but 20–50 is the realistic range.
+    cap = 80
+    names = [d.name for d in datasets[:cap]]
+    body = "\n".join(f"  - {n}" for n in names)
+    if len(datasets) > cap:
+        body += f"\n  … and {len(datasets) - cap} more"
+    return body
 
 
 def _scan_datasets(cwd: Path) -> list[Path]:
@@ -890,7 +931,11 @@ async def _run_turn(
 
 def _build_options(cwd: Path) -> ClaudeAgentOptions:
     server = build_server()
-    system_prompt = _SYSTEM_PROMPT_TEMPLATE.format(cwd=cwd, SERVER_NAME=SERVER_NAME)
+    system_prompt = _SYSTEM_PROMPT_TEMPLATE.format(
+        cwd=cwd,
+        SERVER_NAME=SERVER_NAME,
+        datasets_list=_dataset_listing(cwd),
+    )
     return ClaudeAgentOptions(
         system_prompt=system_prompt,
         mcp_servers={SERVER_NAME: server},
