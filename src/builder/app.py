@@ -56,11 +56,15 @@ from rich.text import Text
 from builder.config import get_cwd, set_cwd
 from builder.env_detect import Environment, detect_environment
 from builder.policy import (
+    DEFAULT_MAX_DEPTH,
     POLICY_FILE,
+    VALID_DEPTHS,
     BuilderPolicy,
+    DatasetPolicy,
     get_max_depth,
     has_explicit_policy,
     load_policy,
+    save_policy,
 )
 from builder.tools import ALLOWED_TOOL_NAMES, SERVER_NAME, build_server
 
@@ -208,17 +212,36 @@ thing in context.
 
 5. `list_results()` — list session results (id + one-line label).
 
-Constraints:
+How to work with the researcher:
 
-- **You do NOT have Bash, Read, Write, Edit, Glob, Grep, or any other \
-general tool.** They are disabled by policy. If you think you need one, \
-the correct move is a custom tool call or asking the researcher.
-- Keep scripts small and focused. One question per script.
-- When you need to know something about the data, prefer `request_data` \
-over `submit_script` with a probe — it's pre-approved and faster.
-- After each run, briefly summarize what the result means before asking \
-what to do next. The researcher may not be a programmer.
-- Never suggest uploading data, using cloud services, or anything that \
+- Talk through the analysis before running anything. When the researcher \
+asks for "a regression" or "look at the effect of X", that's a starting \
+point, not a specification. Discuss what's actually appropriate: which \
+outcome and predictors, what's the population being modeled, whether \
+transformations or interactions are warranted, robust or clustered \
+standard errors, how to handle missingness. Check the schema via \
+`get_schema` first, then propose your plan in plain language — variables, \
+method, options, and why those choices — and wait for the researcher to \
+weigh in before calling `submit_script`. Once the plan is settled, show \
+the script briefly, then run it.
+- Research choices belong to the researcher. Surface the decisions \
+(what to include, how to handle edge cases, what to compare against) \
+rather than picking defaults silently. If there's a clear convention for \
+their field you can suggest it, but the call is theirs.
+- After a run, explain what the result means in their terms before \
+asking what to look at next. They may not be a programmer.
+
+Tool use notes:
+
+- You don't have Bash, Read, Write, Edit, Glob, Grep, or any other \
+general tool — only the five above. If you think you need one, the \
+right move is a custom tool call or asking the researcher.
+- Keep scripts small and focused. One question per script is usually \
+right.
+- When you need something specific about a variable (levels, rough scale, \
+missingness), `request_data` is faster and pre-approved — prefer it over \
+writing a probe script.
+- Don't suggest uploading data, using cloud services, or anything that \
 moves data off the machine.
 
 STAGE NOTE: step 4 is complete.\
@@ -298,6 +321,210 @@ def _print_banner(mode: AuthMode, cwd: Path, env: Environment) -> None:
                 f"{_runtimes_line(env)}\n"
                 f"[dim]working dir:[/dim] [cyan]{cwd}[/cyan]\n"
                 "[dim]Type a message. 'exit' / Ctrl-D to quit.[/dim]"
+            ),
+            border_style="cyan",
+        )
+    )
+
+
+# One-line descriptions of each depth tier, shown in the /policy wizard
+# so researchers don't have to remember what each one means.
+_DEPTH_DESCRIPTIONS: dict[str, str] = {
+    "names_only": "variable names only",
+    "names_types": "+ type per variable (conservative default)",
+    "names_types_labels": "+ variable labels and value labels",
+    "names_types_labels_summary": "+ NA counts and distinct-value counts",
+}
+
+
+def _run_policy_wizard(cwd: Path) -> None:
+    """Interactive TUI to view and edit the schema-depth policy.
+
+    Researchers invoke this by typing `/policy` in the chat. The
+    wizard:
+      1. Lists datasets in cwd with their current ceiling.
+      2. Lets the researcher pick one.
+      3. Lets them pick a new depth (or leave as-is).
+      4. Writes the update to ``<cwd>/.builder/policy.json``.
+
+    Nothing here touches Claude. The chat message is intercepted in
+    the loop before it would otherwise be sent to the model.
+    """
+    datasets = _scan_datasets(cwd)
+    if not datasets:
+        console.print(
+            Text.from_markup(
+                "[yellow]No datasets (.csv / .dta / .rds) found in "
+                f"[cyan]{cwd}[/cyan]. Add some and try again.[/yellow]"
+            )
+        )
+        return
+
+    while True:
+        policy = load_policy(cwd)
+        console.print()
+        console.print(
+            Panel.fit(
+                _render_policy_table(datasets, policy),
+                border_style="cyan",
+                title="[bold]Schema policy[/bold]",
+                title_align="left",
+            )
+        )
+        prompt_text = (
+            f"[green]pick a dataset by number (1-{len(datasets)}), "
+            f"or type [cyan]q[/cyan] to return to chat[/green]"
+        )
+        try:
+            raw = Prompt.ask(prompt_text, default="q")
+        except (EOFError, KeyboardInterrupt):
+            return
+        raw = raw.strip()
+        if raw.lower() in ("q", "quit", "exit", "done", ""):
+            return
+        try:
+            idx = int(raw)
+        except ValueError:
+            console.print(Text(f"  '{raw}' isn't a number or 'q'. Try again.", style="red"))
+            continue
+        if not 1 <= idx <= len(datasets):
+            console.print(Text("  out of range.", style="red"))
+            continue
+        chosen = datasets[idx - 1]
+        _edit_dataset_policy(cwd, chosen, policy)
+
+
+def _render_policy_table(datasets: list[Path], policy: BuilderPolicy) -> Any:
+    """Format the dataset×ceiling table as Rich markup."""
+    lines: list[str] = []
+    width = max(len(d.name) for d in datasets) + 2
+    for i, ds in enumerate(datasets, start=1):
+        ceiling = get_max_depth(policy, ds.name)
+        source = (
+            "[green]explicit[/green]"
+            if has_explicit_policy(policy, ds.name)
+            else "[yellow]default[/yellow]"
+        )
+        lines.append(
+            f"  [dim]{i:2d}.[/dim]  "
+            f"[cyan]{ds.name:<{width}}[/cyan]  "
+            f"{ceiling:<30}  {source}"
+        )
+    lines.append("")
+    lines.append(f"[dim]Default ceiling: [/dim]{policy.default_max_depth}")
+    return Text.from_markup("\n".join(lines))
+
+
+def _edit_dataset_policy(
+    cwd: Path, dataset: Path, policy: BuilderPolicy
+) -> None:
+    """Prompt the researcher for a new ceiling for one dataset, save it."""
+    current = get_max_depth(policy, dataset.name)
+    console.print()
+    console.print(
+        Text.from_markup(
+            f"[bold]{dataset.name}[/bold]  [dim]·[/dim]  "
+            f"current ceiling: [cyan]{current}[/cyan]"
+        )
+    )
+    console.print()
+    for i, depth in enumerate(VALID_DEPTHS, start=1):
+        marker = " [dim](current)[/dim]" if depth == current else ""
+        console.print(
+            Text.from_markup(
+                f"  [dim]{i}.[/dim]  [cyan]{depth:<30}[/cyan]  "
+                f"[dim]{_DEPTH_DESCRIPTIONS.get(depth, '')}[/dim]{marker}"
+            )
+        )
+    console.print()
+    try:
+        raw = Prompt.ask(
+            "[green]pick a depth by number, or [cyan]Enter[/cyan] to keep current[/green]",
+            default="",
+        )
+    except (EOFError, KeyboardInterrupt):
+        return
+    raw = raw.strip()
+    if not raw:
+        return
+    try:
+        idx = int(raw)
+    except ValueError:
+        console.print(Text(f"  '{raw}' isn't a number. Keeping current.", style="red"))
+        return
+    if not 1 <= idx <= len(VALID_DEPTHS):
+        console.print(Text("  out of range. Keeping current.", style="red"))
+        return
+    new_depth = VALID_DEPTHS[idx - 1]
+    if new_depth == current:
+        return
+
+    from datetime import datetime, timezone
+    updated = BuilderPolicy(
+        version=policy.version,
+        default_max_depth=policy.default_max_depth,
+        datasets={
+            **policy.datasets,
+            dataset.name: DatasetPolicy(
+                max_depth=new_depth,
+                set_at=datetime.now(timezone.utc).isoformat(),
+            ),
+        },
+    )
+    try:
+        save_policy(cwd, updated)
+    except OSError as e:
+        console.print(
+            Text.from_markup(
+                f"  [red]failed to write policy file: {e}[/red]"
+            )
+        )
+        return
+    console.print(
+        Text.from_markup(
+            f"  [green]✓[/green]  {dataset.name} → {new_depth}"
+        )
+    )
+
+
+def _handle_slash_command(user_text: str, cwd: Path) -> bool:
+    """Dispatch slash-commands typed in the chat. Returns True if the
+    command was recognized and handled (so the chat loop should skip
+    sending it to Claude), False if it should fall through to Claude
+    as a normal message (e.g. the researcher typed '/' as part of a
+    path or was quoting something).
+    """
+    parts = user_text[1:].split()
+    if not parts:
+        return False
+    cmd = parts[0].lower()
+    if cmd in ("policy", "policies"):
+        _run_policy_wizard(cwd)
+        return True
+    if cmd in ("help", "?"):
+        _print_slash_help()
+        return True
+    # Unknown slash-prefixed thing — warn but don't forward (could be a
+    # typo of a known command).
+    console.print(
+        Text.from_markup(
+            f"[yellow]unknown command[/yellow] [cyan]/{cmd}[/cyan]. "
+            f"[dim]/help for the list. To send this to Claude as a "
+            f"message, drop the leading '/'.[/dim]"
+        )
+    )
+    return True
+
+
+def _print_slash_help() -> None:
+    console.print(
+        Panel.fit(
+            Text.from_markup(
+                "[bold]Local commands[/bold] [dim](these never go to Claude)[/dim]\n\n"
+                "  [cyan]/policy[/cyan]   view or change the schema-depth "
+                "ceiling per dataset\n"
+                "  [cyan]/help[/cyan]     this message\n"
+                "  [cyan]exit[/cyan]      quit Builder"
             ),
             border_style="cyan",
         )
@@ -424,21 +651,113 @@ def _render_tool_use(block: ToolUseBlock) -> None:
 
 
 def _render_tool_result(block: ToolResultBlock) -> None:
-    """Render the tool's response so the researcher sees what went back to Claude."""
+    """Render the tool's response so the researcher sees what went back to Claude.
+
+    For ``submit_script`` responses, also surface the raw R/Stata
+    stdout (and non-empty stderr) from the run directory. Claude
+    never sees this text — it's strictly for the researcher — so
+    the conventional "Claude saw this, you see both" split is
+    visible here.
+    """
     text = _extract_tool_result_text(block.content)
     border = "red" if block.is_error else "green"
     if not text.strip():
         console.print(Text("  (empty tool result)", style="dim"))
         return
-    # If the payload is JSON (which our tools always emit), render it as JSON.
+
+    # If the payload is JSON (which our tools always emit), render
+    # it as JSON. Also peel off `_run_dir` so we can display the raw
+    # R/Stata log the researcher actually wants to see.
+    run_dir: Path | None = None
+    rendered: Any
     try:
         parsed = json.loads(text)
-        rendered: Any = Syntax(
-            json.dumps(parsed, indent=2), "json", theme="ansi_dark", line_numbers=False
+        if isinstance(parsed, dict) and "_run_dir" in parsed:
+            run_dir = Path(parsed["_run_dir"])
+            # Strip from the rendered JSON so the "what Claude saw"
+            # panel doesn't clutter with the path marker.
+            display_payload = {k: v for k, v in parsed.items() if k != "_run_dir"}
+        else:
+            display_payload = parsed
+        rendered = Syntax(
+            json.dumps(display_payload, indent=2),
+            "json",
+            theme="ansi_dark",
+            line_numbers=False,
         )
     except (json.JSONDecodeError, ValueError):
         rendered = Text(text)
-    console.print(Panel(rendered, border_style=border, padding=(0, 1)))
+
+    # First the raw R/Stata output — what the researcher actually
+    # wants to look at — then the sanitized payload that Claude saw.
+    if run_dir is not None:
+        _render_raw_script_output(run_dir)
+    console.print(
+        Panel(
+            rendered,
+            border_style=border,
+            padding=(0, 1),
+            title="[dim]what Claude saw (sanitized)[/dim]",
+            title_align="left",
+        )
+    )
+
+
+def _render_raw_script_output(run_dir: Path) -> None:
+    """Display the raw R / Stata stdout + stderr from a run directory.
+
+    These files are written by ``executor.run_script`` right after the
+    subprocess returns. Claude never sees them; this is purely for
+    the researcher.
+    """
+    stdout_path = run_dir / "stdout.log"
+    stderr_path = run_dir / "stderr.log"
+    stdout_text = _read_log(stdout_path)
+    stderr_text = _read_log(stderr_path)
+    if not stdout_text and not stderr_text:
+        return
+    # Guess the lexer from the log content: Stata batch output starts
+    # with lines like `. sysuse auto, clear`; R output doesn't have a
+    # consistent prefix. `stata` lexer handles both better than plain
+    # text but Rich may not have it — fall back to text if missing.
+    body: Any
+    if stdout_text:
+        body = Text(stdout_text)
+        # Cap very long outputs so the TUI stays readable. The full
+        # log still lives at stdout_path on disk for deep inspection.
+        if len(stdout_text) > 8000:
+            body = Text(
+                stdout_text[-8000:]
+                + f"\n\n[…truncated; full log: {stdout_path}]"
+            )
+    else:
+        body = Text("(no stdout)", style="dim")
+    console.print(
+        Panel(
+            body,
+            border_style="blue",
+            padding=(0, 1),
+            title="[bold blue]R / Stata output (what you see)[/bold blue]",
+            title_align="left",
+        )
+    )
+    if stderr_text.strip():
+        console.print(
+            Panel(
+                Text(stderr_text),
+                border_style="yellow",
+                padding=(0, 1),
+                title="[yellow]stderr[/yellow]",
+                title_align="left",
+            )
+        )
+
+
+def _read_log(path: Path) -> str:
+    try:
+        return path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return ""
 
 
 def _extract_tool_result_text(content: str | list[dict[str, Any]] | None) -> str:
@@ -649,6 +968,15 @@ async def _chat_loop() -> int:
                 if user_text.lower() in _EXIT_WORDS:
                     console.print("[dim]bye.[/dim]")
                     return 0
+                # Slash-commands are local to the TUI — they never reach
+                # Claude. Keeps policy management out of the chat history
+                # and out of the frontier's context.
+                if user_text.startswith("/"):
+                    handled = await asyncio.to_thread(
+                        _handle_slash_command, user_text, cwd
+                    )
+                    if handled:
+                        continue
                 console.print()
                 ok = await _run_turn(client, user_text, mode)
                 console.print()

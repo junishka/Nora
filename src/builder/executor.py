@@ -294,6 +294,20 @@ def run_script(
         if log_contents:
             raw_stdout = log_contents + (("\n" + raw_stdout) if raw_stdout else "")
 
+    # Persist the raw subprocess output to the run dir so the researcher
+    # TUI (and, if needed, later audit) can display what R / Stata
+    # actually said. These files are INTENTIONALLY outside the
+    # sanitization boundary — only the researcher ever sees them; they
+    # never flow back to the frontier model. See
+    # ``test_stderr_isolation.py`` for the regression that locks that in.
+    try:
+        (run_dir / "stdout.log").write_text(raw_stdout, encoding="utf-8")
+        (run_dir / "stderr.log").write_text(raw_stderr, encoding="utf-8")
+    except OSError:
+        # Persistence failure isn't fatal — raw output still lives in the
+        # ExecutionResult fields for in-process rendering.
+        pass
+
     # 6. Parse result file.
     payload: dict | None = None
     error: str | None = None

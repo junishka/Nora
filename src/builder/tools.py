@@ -548,6 +548,7 @@ async def submit_script(args: dict[str, Any]) -> dict[str, Any]:
                 "(see result via expand_result). Adjust the script and "
                 "resubmit."
             ),
+            "_run_dir": str(exec_result.run_dir),
         })
 
     # --- Sanitizer ---------------------------------------------------------
@@ -581,6 +582,7 @@ async def submit_script(args: dict[str, Any]) -> dict[str, Any]:
                 "field, type mismatch). Adjust the analysis (e.g., "
                 "larger sample) and resubmit."
             ),
+            "_run_dir": str(exec_result.run_dir),
         })
 
     # --- Row-count change check --------------------------------------------
@@ -617,6 +619,13 @@ async def submit_script(args: dict[str, Any]) -> dict[str, Any]:
         "summary": _summarize(sanitized.sanitized or {}),
         "transformations": transformations,
         "duration_seconds": round(exec_result.duration_seconds, 3),
+        # Path for the TUI to read raw R/Stata output from. Claude
+        # seeing the path is not a leak (directory names are
+        # structural, not data), but Claude should not try to read
+        # files from it — there are no tools for that. The researcher
+        # UI uses this to render the raw log alongside the sanitized
+        # result.
+        "_run_dir": str(exec_result.run_dir),
     })
 
 

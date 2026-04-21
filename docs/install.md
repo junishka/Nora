@@ -68,7 +68,13 @@ Then you type messages to Claude. The chat behaves like any terminal chat: you t
 
 ## Schema policy — controlling what Claude sees
 
-By default, Claude sees only **variable names and types** for each dataset. It does not see labels, value labels, or any actual values. You can raise this ceiling per-dataset by editing `<your-data-dir>/.builder/policy.json`:
+By default, Claude sees only **variable names and types** for each dataset. It does not see labels, value labels, or any actual values.
+
+**From inside Builder**, type `/policy` at the prompt to open an interactive wizard that lists your datasets and their current ceilings, and lets you raise or lower each one without editing any files. This is the recommended way.
+
+Type `/help` to see the full list of local commands (they don't go to Claude).
+
+**By hand**, you can also edit `<your-data-dir>/.builder/policy.json` directly:
 
 ```json
 {
