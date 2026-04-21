@@ -219,6 +219,36 @@ class BuilderBridge:
         }
 
 
+def _read_raw_logs(run_dir: str | None) -> tuple[str, str]:
+    """Read ``stdout.log`` and ``stderr.log`` from a run dir, if they
+    exist. Returns empty strings when the dir is missing or the files
+    haven't been written. Mirrors ``app.py:_read_log``.
+
+    Content is capped at 32 KB per stream — enough to show a full
+    regression table, short of letting a runaway log blow up the
+    browser. The full log is still on disk at ``run_dir`` for audit.
+    """
+    if not run_dir:
+        return "", ""
+    stdout_text = ""
+    stderr_text = ""
+    for name, bucket in (("stdout.log", "stdout"), ("stderr.log", "stderr")):
+        try:
+            content = Path(run_dir, name).read_text(
+                encoding="utf-8", errors="replace"
+            )
+        except OSError:
+            continue
+        cap = 32 * 1024
+        if len(content) > cap:
+            content = content[-cap:] + f"\n[… truncated; full log at {run_dir}/{name}]"
+        if bucket == "stdout":
+            stdout_text = content
+        else:
+            stderr_text = content
+    return stdout_text, stderr_text
+
+
 def _event_to_dict(evt: Any) -> dict[str, Any]:
     """Flatten a chat_service.Event dataclass into a JSON-serializable
     dict with a type tag the JS side switches on."""
@@ -234,12 +264,21 @@ def _event_to_dict(evt: Any) -> dict[str, Any]:
             "call_id": evt.call_id,
         }
     if isinstance(evt, chat_service.ToolCallResult):
+        # Read the raw stdout/stderr logs when the tool call was a
+        # submit_script or expand_result — those are the two paths
+        # that plant `_run_dir` in their response for this purpose.
+        # Raw logs are researcher-only: they reach the UI, never
+        # Claude (the executor's stderr-isolation regression locks
+        # that in; see test_stderr_isolation.py).
+        raw_stdout, raw_stderr = _read_raw_logs(evt.run_dir)
         return {
             "type": "tool_result",
             "call_id": evt.call_id,
             "text": evt.text,
             "is_error": evt.is_error,
             "run_dir": evt.run_dir,
+            "raw_stdout": raw_stdout,
+            "raw_stderr": raw_stderr,
         }
     if isinstance(evt, chat_service.TurnDone):
         return {

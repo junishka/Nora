@@ -107,7 +107,11 @@ function appendUser(text) {
 }
 
 function appendAssistant(text) {
-  append('assistant', text);
+  // Render markdown — Claude emits **bold**, `code`, lists, fenced
+  // code blocks, etc. BuilderMarkdown escapes HTML before injecting
+  // specific tags, so assistant-generated HTML / scripts never
+  // execute. See src/builder/web/markdown.js.
+  append('assistant', text, /*markdown=*/ true);
 }
 
 function appendThinking(text) {
@@ -122,12 +126,16 @@ function appendError(text) {
   append('error', text);
 }
 
-function append(kind, text) {
+function append(kind, text, markdown) {
   const wrapper = document.createElement('div');
   wrapper.className = 'message ' + kind;
   const body = document.createElement('div');
   body.className = 'message-body';
-  body.textContent = text;
+  if (markdown && window.BuilderMarkdown) {
+    body.innerHTML = window.BuilderMarkdown.render(text);
+  } else {
+    body.textContent = text;
+  }
   wrapper.appendChild(body);
   messagesEl.appendChild(wrapper);
   scrollToBottom();
@@ -165,39 +173,118 @@ function appendToolCall(evt) {
 }
 
 function appendToolResult(evt) {
-  // Find the matching tool-call card and append the result to it.
   const existingCard = [...messagesEl.querySelectorAll('.tool-card')]
     .find((c) => c.dataset.callId === evt.call_id);
+
+  // For submit_script / expand_result (anything with raw R/Stata
+  // output), render the native R / Stata output prominently BEFORE
+  // the sanitized JSON. The researcher recognizes the regression
+  // table; the JSON is secondary. Matches the terminal TUI's split.
+  const hasRawOutput = !!(evt.raw_stdout || evt.raw_stderr);
+
   if (existingCard) {
     if (evt.is_error) {
       existingCard.classList.add('error');
     }
     const statusEl = existingCard.querySelector('.tool-status');
     if (statusEl) statusEl.textContent = evt.is_error ? 'error' : 'done';
-
     const body = existingCard.querySelector('.tool-body');
-    const resultPre = document.createElement('pre');
-    resultPre.textContent = prettyJson(evt.text);
-    body.appendChild(resultPre);
 
-    if (evt.run_dir) {
-      const rawNote = document.createElement('div');
-      rawNote.style.fontSize = '11px';
-      rawNote.style.color = 'var(--text-dim)';
-      rawNote.textContent = 'Raw R/Stata output: ' + evt.run_dir + '/stdout.log';
-      body.appendChild(rawNote);
+    if (hasRawOutput) {
+      // Keep the tool-call card compact and put the output as its
+      // own panel right after. The call card expands on click for
+      // audit purposes; the primary visual is the output panel.
+      existingCard.classList.add('collapsed');
+      messagesEl.appendChild(buildResultPanel(evt));
+    } else {
+      // Non-script tool (get_schema, request_data, list_results) —
+      // the JSON IS the useful output. Keep it inline in the card.
+      const resultPre = document.createElement('pre');
+      resultPre.textContent = prettyJson(evt.text);
+      body.appendChild(resultPre);
     }
     scrollToBottom();
   } else {
-    // No matching card (shouldn't happen often) — render standalone.
-    const card = document.createElement('div');
-    card.className = 'tool-card' + (evt.is_error ? ' error' : '');
-    const pre = document.createElement('pre');
-    pre.textContent = prettyJson(evt.text);
-    card.appendChild(pre);
-    messagesEl.appendChild(card);
+    // No matching card — render a standalone panel.
+    if (hasRawOutput) {
+      messagesEl.appendChild(buildResultPanel(evt));
+    } else {
+      const card = document.createElement('div');
+      card.className = 'tool-card' + (evt.is_error ? ' error' : '');
+      const pre = document.createElement('pre');
+      pre.textContent = prettyJson(evt.text);
+      card.appendChild(pre);
+      messagesEl.appendChild(card);
+    }
     scrollToBottom();
   }
+}
+
+function buildResultPanel(evt) {
+  /* Result panel for submit_script / expand_result events — the ones
+   * that have raw R/Stata output. Layout:
+   *   ┌─ R / Stata output (always visible) ─────────┐
+   *   │  <pre>...native regression table...</pre>    │
+   *   ├─ stderr (if present, yellow-tinted) ────────┤
+   *   │  <pre>warnings...</pre>                      │
+   *   ├─ Sanitized output (collapsed, toggle) ──────┤
+   *   │  <pre>{ ... clamped JSON ... }</pre>         │
+   *   └──────────────────────────────────────────────┘ */
+  const panel = document.createElement('div');
+  panel.className = 'result-panel' + (evt.is_error ? ' error' : '');
+
+  const stdoutSection = document.createElement('section');
+  stdoutSection.className = 'result-stdout';
+  const stdoutHeader = document.createElement('div');
+  stdoutHeader.className = 'result-header';
+  stdoutHeader.textContent = 'R / Stata output';
+  stdoutSection.appendChild(stdoutHeader);
+  const stdoutPre = document.createElement('pre');
+  stdoutPre.textContent = (evt.raw_stdout || '').trimEnd() || '(no output)';
+  stdoutSection.appendChild(stdoutPre);
+  panel.appendChild(stdoutSection);
+
+  if (evt.raw_stderr && evt.raw_stderr.trim()) {
+    const stderrSection = document.createElement('section');
+    stderrSection.className = 'result-stderr';
+    const stderrHeader = document.createElement('div');
+    stderrHeader.className = 'result-header';
+    stderrHeader.textContent = 'stderr';
+    stderrSection.appendChild(stderrHeader);
+    const stderrPre = document.createElement('pre');
+    stderrPre.textContent = evt.raw_stderr.trimEnd();
+    stderrSection.appendChild(stderrPre);
+    panel.appendChild(stderrSection);
+  }
+
+  const sanitizedSection = document.createElement('section');
+  sanitizedSection.className = 'result-sanitized collapsed';
+  const sanitizedHeader = document.createElement('div');
+  sanitizedHeader.className = 'result-header result-toggle';
+  const arrow = document.createElement('span');
+  arrow.className = 'toggle-arrow';
+  arrow.textContent = '▼';
+  const label = document.createElement('span');
+  label.textContent = 'Sanitized output (what Claude saw)';
+  sanitizedHeader.appendChild(arrow);
+  sanitizedHeader.appendChild(label);
+  sanitizedSection.appendChild(sanitizedHeader);
+  const sanitizedPre = document.createElement('pre');
+  sanitizedPre.textContent = prettyJson(evt.text);
+  sanitizedSection.appendChild(sanitizedPre);
+  sanitizedHeader.addEventListener('click', () => {
+    sanitizedSection.classList.toggle('collapsed');
+  });
+  panel.appendChild(sanitizedSection);
+
+  if (evt.run_dir) {
+    const note = document.createElement('div');
+    note.className = 'result-note';
+    note.textContent = 'Full log: ' + evt.run_dir;
+    panel.appendChild(note);
+  }
+
+  return panel;
 }
 
 function shortenToolName(name) {
