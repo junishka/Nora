@@ -404,34 +404,38 @@ def _stage_runtime(run_dir: Path, language: Language) -> Path:
 def _write_script(run_dir: Path, language: Language, code: str) -> Path:
     """Persist Claude's code to disk.
 
-    For Stata, wraps the user code in a `.do` that first prepends the
-    Builder runtime library to the adopath so helpers like
-    `builder_result_regress` are findable without the researcher
-    needing to type the adopath line themselves. The actual Claude
-    code goes into `user.do` and is `do`-sourced from the wrapper.
+    For Stata, prepends a small preamble that adds the Builder runtime
+    library to the adopath and `cd`s into the researcher's working
+    directory (so `use "data.dta"` in the user's code resolves against
+    their project, not the scratch dir). The researcher's code and the
+    preamble live in a single `.do` file with a visible separator — we
+    used to split preamble and user code across two files with an
+    internal `do "<user_path>"`, but that path was absolute and broke
+    when the researcher's cwd contained spaces: Stata's own parser for
+    the `-b do <path>` command line tokenizes on spaces and the nested
+    `do` inherited the same risk. Concatenating avoids both issues and
+    keeps the scratch dir easy to audit.
     """
     if language == "R":
         path = run_dir / "script.R"
         path.write_text(code, encoding="utf-8")
         return path
-    # Stata: two files, a wrapper that sets adopath, `cd`s into the
-    # researcher's working directory so relative paths in the user's
-    # script resolve to the researcher's data (not the scratch dir —
-    # which is where we set Stata's subprocess cwd so its .log file
-    # lands in scratch rather than polluting the researcher's project).
-    # Then the wrapper runs the user's .do.
-    user_path = run_dir / "user.do"
-    user_path.write_text(code, encoding="utf-8")
-    wrapper = (
-        'local lib : env BUILDER_LIB_DIR\n'
-        'adopath + "`lib\'"\n'
-        'local builder_cwd : env BUILDER_CWD\n'
-        'cd "`builder_cwd\'"\n'
-        f'do "{user_path}"\n'
+    # Stata: single .do file. Preamble + separator + researcher code.
+    # Quoted paths in Stata's `adopath +` and `cd` handle spaces fine
+    # at the language level — only the command-line `-b do <path>`
+    # has the tokenization bug (see _stata_command).
+    preamble = (
+        "local lib : env BUILDER_LIB_DIR\n"
+        "adopath + \"`lib'\"\n"
+        "local builder_cwd : env BUILDER_CWD\n"
+        "cd \"`builder_cwd'\"\n"
+        "\n"
+        "*! ----- Builder preamble above; researcher code below -----\n"
+        "\n"
     )
-    wrapper_path = run_dir / "script.do"
-    wrapper_path.write_text(wrapper, encoding="utf-8")
-    return wrapper_path
+    script_path = run_dir / "script.do"
+    script_path.write_text(preamble + code + "\n", encoding="utf-8")
+    return script_path
 
 
 # ---------------------------------------------------------------------------
@@ -465,12 +469,19 @@ def _stata_command(stata: str, lib_dir: Path, script_path: Path) -> list[str]:
 
     Stata's batch mode writes output to a .log file next to the .do
     script (not stdout), so the executor reads that log after the
-    process exits. We pass the .do file as an absolute path so Stata
-    finds it regardless of the subprocess cwd (which is the researcher's
-    directory, not the scratch dir).
+    process exits.
+
+    Path handling: we pass the script as a **bare filename** and rely
+    on the subprocess cwd being the scratch dir. Absolute paths don't
+    work here — Stata's batch-mode argument parser tokenizes
+    ``-b do <path>`` on spaces, so a researcher whose project lives
+    under ``~/IESE Dropbox/...`` would hit ``file /Users/bb/IESE.do
+    not found`` even though the shell passed a perfectly-quoted
+    argument. See ``run_script`` for where subprocess_cwd is set to
+    run_dir for Stata.
     """
     del lib_dir  # the .do script itself prepends adopath with $BUILDER_LIB_DIR
-    return [stata, "-b", "-q", "do", str(script_path)]
+    return [stata, "-b", "-q", "do", script_path.name]
 
 
 def _read_stata_log(script_path: Path | None) -> str:
