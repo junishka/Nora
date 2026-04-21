@@ -377,45 +377,75 @@ body {
   cursor: not-allowed;
 }
 
-.composer-hint {
+/* --- policy card (pinned at top of chat) --- */
+
+.policy-card {
   max-width: var(--max-width);
-  margin: 8px auto 0;
-  font-size: 12px;
-  color: var(--text-dim);
-}
-
-.policy-toggle {
-  margin-left: 8px;
-  color: var(--accent);
-  text-decoration: none;
-  font-size: 11px;
-}
-
-.policy-toggle:hover {
-  text-decoration: underline;
-}
-
-.policy-details {
-  margin-top: 8px;
-  max-height: 200px;
-  overflow-y: auto;
-  font-family: ui-monospace, "SF Mono", Menlo, monospace;
-  font-size: 11px;
-  line-height: 1.6;
-  padding: 8px 10px;
-  background: var(--bg);
-  border-radius: 6px;
+  width: 100%;
+  margin: 0 auto;
+  background: var(--bg-surface);
   border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 14px 16px;
+  font-size: 13px;
 }
 
-.policy-details.hidden {
-  display: none;
+.policy-card-header {
+  margin-bottom: 10px;
+  color: var(--text);
 }
 
-.policy-details > div {
-  white-space: nowrap;
+.policy-card-sub {
+  color: var(--text-dim);
+  font-weight: 400;
+}
+
+.policy-card-list {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  row-gap: 8px;
+  column-gap: 12px;
+  align-items: center;
+}
+
+.policy-row {
+  display: contents;
+}
+
+.policy-row-name {
+  font-family: ui-monospace, "SF Mono", Menlo, monospace;
+  font-size: 12.5px;
+  color: var(--text);
   overflow: hidden;
   text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.policy-row-select {
+  font-family: inherit;
+  font-size: 12.5px;
+  padding: 4px 8px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--bg);
+  color: var(--text);
+  cursor: pointer;
+  min-width: 220px;
+}
+
+.policy-row-select:hover:not(:disabled) {
+  border-color: var(--accent);
+}
+
+.policy-row-select:disabled {
+  opacity: 0.6;
+  cursor: wait;
+}
+
+.policy-row-err {
+  grid-column: 1 / -1;
+  color: #c23;
+  font-size: 11px;
 }
 
 /* --- rendered markdown (assistant text) --- */

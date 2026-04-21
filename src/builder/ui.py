@@ -48,9 +48,13 @@ from builder import chat_service
 from builder.config import set_cwd
 from builder.env_detect import detect_environment
 from builder.policy import (
+    VALID_DEPTHS,
+    BuilderPolicy,
+    DatasetPolicy,
     get_max_depth,
     has_explicit_policy,
     load_policy,
+    save_policy,
 )
 
 
@@ -241,6 +245,42 @@ class BuilderBridge:
         if not decoded:
             return {"ok": False, "reason": "no valid files in drop"}
         return self._stage_session_from_blobs(decoded)
+
+    def set_dataset_policy(
+        self, name: str, depth: str
+    ) -> dict[str, Any]:
+        """Update the schema-depth ceiling for one dataset and persist
+        to ``.builder/policy.json``. Returns the refreshed policy
+        summary so the UI can re-render.
+
+        No-ops cleanly if ``cwd`` isn't set or the depth isn't one of
+        the valid tiers — a malformed JS caller shouldn't be able to
+        corrupt the policy file.
+        """
+        if self.cwd is None:
+            return {"ok": False, "reason": "session not started"}
+        if depth not in VALID_DEPTHS:
+            return {"ok": False, "reason": f"invalid depth: {depth!r}"}
+        if not isinstance(name, str) or not name:
+            return {"ok": False, "reason": "empty dataset name"}
+
+        current = load_policy(self.cwd)
+        updated = BuilderPolicy(
+            version=current.version,
+            default_max_depth=current.default_max_depth,
+            datasets={
+                **current.datasets,
+                name: DatasetPolicy(
+                    max_depth=depth,
+                    set_at=datetime.now(timezone.utc).isoformat(),
+                ),
+            },
+        )
+        try:
+            save_policy(self.cwd, updated)
+        except OSError as e:
+            return {"ok": False, "reason": f"save failed: {e}"}
+        return {"ok": True, "policy": self._policy_summary()}
 
     def send_message(self, text: str) -> None:
         """Called from the web form. Runs a single chat turn on the

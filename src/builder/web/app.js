@@ -22,7 +22,16 @@ const input = document.getElementById('compose-input');
 const sendBtn = document.getElementById('send-btn');
 const welcomeEl = document.getElementById('welcome');
 const cwdEl = document.getElementById('cwd-display');
-const policyEl = document.getElementById('policy-summary');
+
+// Depth tiers — kept in sync with builder/policy.py::VALID_DEPTHS and
+// with the get_schema tool help. Displayed labels are researcher-
+// facing — plain English, not internal identifiers.
+const DEPTH_TIERS = [
+  { value: 'names_only',                 label: 'Names only' },
+  { value: 'names_types',                label: 'Names + types (default)' },
+  { value: 'names_types_labels',         label: '+ labels / value labels' },
+  { value: 'names_types_labels_summary', label: '+ NA count / distinct count' },
+];
 
 // ----- view routing ------------------------------------------------------
 
@@ -36,7 +45,16 @@ function showChat(payload) {
   chatEl.classList.remove('hidden');
   welcomeEl.textContent = payload.greeting || 'Ready.';
   cwdEl.textContent = payload.cwd || '';
-  updatePolicySummary(payload.policy);
+  // Remove any prior policy card so a re-show doesn't duplicate it
+  // (e.g., if a future feature re-renders the chat view).
+  const prior = document.getElementById('policy-card');
+  if (prior) prior.remove();
+  const card = buildPolicyCard(payload.policy);
+  if (card) {
+    // Insert above the welcome so it's the first thing the
+    // researcher sees.
+    messagesEl.insertBefore(card, messagesEl.firstChild);
+  }
   input.focus();
 }
 
@@ -438,59 +456,84 @@ function scrollToBottom() {
   messagesEl.scrollTop = messagesEl.scrollHeight;
 }
 
-function updatePolicySummary(policy) {
-  // Reset whatever was here — this function is called on initial load
-  // and whenever the policy changes.
-  policyEl.innerHTML = '';
-  if (!policy) {
-    policyEl.textContent = '(no datasets)';
-    return;
-  }
+function buildPolicyCard(policy) {
+  /* A pinned card at the top of the chat showing each dataset with
+   * a depth-tier dropdown. Changing a dropdown persists immediately
+   * to `.builder/policy.json` via the bridge. The researcher never
+   * touches the JSON file or memorizes tier names — they pick from
+   * English labels in a native <select>. */
+  if (!policy) return null;
   const datasets = policy.datasets || [];
-  if (datasets.length === 0) {
-    policyEl.textContent = 'no datasets in cwd';
-    return;
-  }
+  if (datasets.length === 0) return null;
 
-  const n = datasets.length;
-  const customized = datasets.filter((d) => d.explicit).length;
-  const defaultDepth = policy.default_max_depth;
-  const plural = n === 1 ? '' : 's';
+  const card = document.createElement('div');
+  card.id = 'policy-card';
+  card.className = 'policy-card';
 
-  let summary;
-  if (customized === 0) {
-    summary = `${n} dataset${plural} · all at ${defaultDepth} (default)`;
-  } else if (customized === n) {
-    summary = `${n} datasets · all have custom ceilings`;
-  } else {
-    summary = `${n} datasets · ${customized} customized, rest at ${defaultDepth}`;
-  }
+  const header = document.createElement('div');
+  header.className = 'policy-card-header';
+  header.innerHTML =
+    '<strong>Schema policy</strong> <span class="policy-card-sub">— what Claude sees about each dataset. Default is conservative; widen per-dataset if labels or summary counts aren\'t sensitive.</span>';
+  card.appendChild(header);
 
-  const summarySpan = document.createElement('span');
-  summarySpan.textContent = `Schema policy: ${summary}`;
-  policyEl.appendChild(summarySpan);
+  const list = document.createElement('div');
+  list.className = 'policy-card-list';
 
-  const toggle = document.createElement('a');
-  toggle.href = '#';
-  toggle.className = 'policy-toggle';
-  toggle.textContent = 'show all';
-  policyEl.appendChild(toggle);
-
-  const details = document.createElement('div');
-  details.className = 'policy-details hidden';
   datasets.forEach((d) => {
     const row = document.createElement('div');
-    row.textContent =
-      `${d.name} → ${d.ceiling}${d.explicit ? '' : ' (default)'}`;
-    details.appendChild(row);
-  });
-  policyEl.appendChild(details);
+    row.className = 'policy-row';
 
-  toggle.addEventListener('click', (e) => {
-    e.preventDefault();
-    details.classList.toggle('hidden');
-    toggle.textContent = details.classList.contains('hidden') ? 'show all' : 'hide';
+    const name = document.createElement('span');
+    name.className = 'policy-row-name';
+    name.textContent = d.name;
+    row.appendChild(name);
+
+    const select = document.createElement('select');
+    select.className = 'policy-row-select';
+    select.dataset.dataset = d.name;
+    DEPTH_TIERS.forEach((tier) => {
+      const opt = document.createElement('option');
+      opt.value = tier.value;
+      opt.textContent = tier.label;
+      if (tier.value === d.ceiling) opt.selected = true;
+      select.appendChild(opt);
+    });
+    select.addEventListener('change', async () => {
+      const depth = select.value;
+      const prev = [...select.options].find((o) => o.defaultSelected);
+      select.disabled = true;
+      try {
+        const result = await window.pywebview.api.set_dataset_policy(
+          d.name, depth
+        );
+        if (!result || !result.ok) {
+          // Revert on failure.
+          if (prev) select.value = prev.value;
+          // Inline error hint.
+          const err = document.createElement('span');
+          err.className = 'policy-row-err';
+          err.textContent =
+            ' ' + (result && result.reason ? result.reason : 'update failed');
+          row.appendChild(err);
+          setTimeout(() => err.remove(), 4000);
+        } else {
+          // Mark the new value as the default-selected one so a
+          // future revert lands back here.
+          [...select.options].forEach((o) => { o.defaultSelected = false; });
+          select.options[select.selectedIndex].defaultSelected = true;
+        }
+      } catch (e) {
+        if (prev) select.value = prev.value;
+      } finally {
+        select.disabled = false;
+      }
+    });
+    row.appendChild(select);
+    list.appendChild(row);
   });
+
+  card.appendChild(list);
+  return card;
 }
 
 // Signal to the Python side that we're ready to receive events. pywebview
