@@ -429,13 +429,92 @@ function buildResultPanel(evt) {
   panel.appendChild(sanitizedSection);
 
   if (evt.run_dir) {
+    // Action buttons — opt-in "show me the raw result in my native
+    // app" affordances. None of these fire automatically; researcher
+    // clicks what they want.
+    const actions = document.createElement('div');
+    actions.className = 'result-actions';
+
+    const openOutputBtn = document.createElement('button');
+    openOutputBtn.type = 'button';
+    openOutputBtn.className = 'result-action';
+    openOutputBtn.textContent = 'Open output';
+    openOutputBtn.title =
+      'Open the full R/Stata stdout log in your default text editor.';
+    openOutputBtn.addEventListener('click', () =>
+      openInNativeApp(evt.run_dir + '/stdout.log', openOutputBtn)
+    );
+    actions.appendChild(openOutputBtn);
+
+    const openScriptBtn = document.createElement('button');
+    openScriptBtn.type = 'button';
+    openScriptBtn.className = 'result-action';
+    openScriptBtn.textContent = 'Open script';
+    openScriptBtn.title =
+      'Open the R or Stata script in its default app (RStudio / Stata). '
+      + 'You can re-run it there to see the native output yourself.';
+    openScriptBtn.addEventListener('click', () => {
+      // Try script.R first; if not present try script.do. The bridge
+      // reports "not found" and we fall through silently.
+      openInNativeApp(evt.run_dir + '/script.R', openScriptBtn, () =>
+        openInNativeApp(evt.run_dir + '/script.do', openScriptBtn)
+      );
+    });
+    actions.appendChild(openScriptBtn);
+
+    const openFolderBtn = document.createElement('button');
+    openFolderBtn.type = 'button';
+    openFolderBtn.className = 'result-action';
+    openFolderBtn.textContent = 'Show folder';
+    openFolderBtn.title = 'Reveal the run directory in Finder.';
+    openFolderBtn.addEventListener('click', () =>
+      openInNativeApp(evt.run_dir, openFolderBtn)
+    );
+    actions.appendChild(openFolderBtn);
+
+    panel.appendChild(actions);
+
     const note = document.createElement('div');
     note.className = 'result-note';
-    note.textContent = 'Full log: ' + evt.run_dir;
+    note.textContent = evt.run_dir;
     panel.appendChild(note);
   }
 
   return panel;
+}
+
+async function openInNativeApp(path, btn, fallback) {
+  /* Ask the Python bridge to hand the path to macOS `open`. The
+   * bridge refuses anything outside Builder-managed directories, so
+   * this can't be used to launch arbitrary files. */
+  if (!window.pywebview || !window.pywebview.api) return;
+  const originalText = btn && btn.textContent;
+  if (btn) { btn.disabled = true; btn.textContent = 'Opening…'; }
+  try {
+    const result = await window.pywebview.api.open_path(path);
+    if (!result || !result.ok) {
+      if (fallback) { await fallback(); return; }
+      // Transient inline error on the button itself.
+      if (btn) btn.textContent = result && result.reason
+        ? 'Error: ' + result.reason
+        : 'Failed';
+      setTimeout(() => {
+        if (btn) btn.textContent = originalText;
+      }, 3000);
+    } else {
+      // Don't reset the text immediately — the app is launching.
+      // Restore shortly so the button doesn't look stuck.
+      if (btn) {
+        btn.textContent = 'Opened';
+        setTimeout(() => { btn.textContent = originalText; }, 1500);
+      }
+    }
+  } catch (e) {
+    if (btn) btn.textContent = 'Failed';
+    setTimeout(() => { if (btn) btn.textContent = originalText; }, 2000);
+  } finally {
+    if (btn) btn.disabled = false;
+  }
 }
 
 function shortenToolName(name) {

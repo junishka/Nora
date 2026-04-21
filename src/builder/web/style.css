@@ -233,7 +233,11 @@ body {
 
 .message.user .message-body {
   background: var(--bg-user);
-  margin-left: 40px;
+  /* Left-aligned, flush with the conversation column. Right margin
+   * gives a small asymmetric gutter so the speaker is visually
+   * distinct from the assistant messages which have an accent
+   * border and no right margin. */
+  margin-right: 40px;
 }
 
 .message.assistant .message-body {
@@ -620,6 +624,43 @@ body {
   .result-note {
     background: rgba(255, 255, 255, 0.02);
   }
+}
+
+.result-actions {
+  display: flex;
+  gap: 8px;
+  padding: 10px 14px;
+  background: rgba(0, 0, 0, 0.02);
+  border-top: 1px solid var(--border);
+  flex-wrap: wrap;
+}
+
+@media (prefers-color-scheme: dark) {
+  .result-actions {
+    background: rgba(255, 255, 255, 0.02);
+  }
+}
+
+.result-action {
+  padding: 4px 10px;
+  font-size: 12px;
+  font-family: inherit;
+  background: var(--bg-surface);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  cursor: pointer;
+  transition: border-color 0.15s, background 0.15s;
+}
+
+.result-action:hover:not(:disabled) {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+.result-action:disabled {
+  opacity: 0.6;
+  cursor: wait;
 }
 
 /* --- scrollbar polish --- */

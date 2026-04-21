@@ -246,6 +246,54 @@ class BuilderBridge:
             return {"ok": False, "reason": "no valid files in drop"}
         return self._stage_session_from_blobs(decoded)
 
+    def open_path(self, path: str) -> dict[str, Any]:
+        """Open a file or folder in its macOS default handler (R scripts
+        → RStudio / R.app, .do files → Stata, text → TextEdit, folders
+        → Finder).
+
+        **Restricted to Builder-managed locations** — only paths
+        inside the current session's working directory or inside the
+        ``~/.builder-sessions/`` tree are allowed. Anywhere else is
+        refused. This keeps a misbehaving page (or a hypothetical
+        malicious tool result smuggling a path) from asking us to
+        ``open /etc/passwd`` or a path outside the researcher's
+        intended scope.
+
+        Returns ``{ok: True}`` or ``{ok: False, reason}``.
+        """
+        if not path:
+            return {"ok": False, "reason": "empty path"}
+        try:
+            p = Path(path).expanduser().resolve()
+        except OSError as e:
+            return {"ok": False, "reason": f"bad path: {e}"}
+        if not p.exists():
+            return {"ok": False, "reason": f"not found: {p}"}
+        # Allowlist: inside the current session's cwd tree, or inside
+        # ~/.builder-sessions. Nothing else.
+        allowed_roots: list[Path] = [SESSIONS_ROOT.resolve()]
+        if self.cwd is not None:
+            allowed_roots.append(self.cwd.resolve())
+        ok = any(_is_within(p, root) for root in allowed_roots)
+        if not ok:
+            return {
+                "ok": False,
+                "reason": (
+                    "path is outside Builder's managed directories — "
+                    "refused as a precaution"
+                ),
+            }
+        try:
+            # `open` returns immediately after handing off to Launch
+            # Services. No need to wait on the resulting app.
+            import subprocess
+            subprocess.run(
+                ["/usr/bin/open", str(p)], check=False, timeout=5
+            )
+        except (OSError, subprocess.TimeoutExpired) as e:
+            return {"ok": False, "reason": f"open failed: {e}"}
+        return {"ok": True}
+
     def set_dataset_policy(
         self, name: str, depth: str
     ) -> dict[str, Any]:
@@ -436,6 +484,17 @@ class BuilderBridge:
                 for p in _scan_datasets(self.cwd)
             ],
         }
+
+
+def _is_within(child: Path, parent: Path) -> bool:
+    """Path-safe "is this inside that" check. Uses resolved paths to
+    follow symlinks and normalize `..`, so a symlink escape can't
+    sneak an outside path past the allowlist."""
+    try:
+        child.resolve().relative_to(parent.resolve())
+        return True
+    except (ValueError, OSError):
+        return False
 
 
 def _new_session_dir() -> Path:
