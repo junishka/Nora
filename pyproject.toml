@@ -1,8 +1,25 @@
 [project]
 name = "builder"
 version = "0.0.1"
-description = "Local layer letting Claude drive statistical analysis on a researcher's own machine"
+description = "Local privacy layer letting Claude drive statistical analysis on a researcher's own machine (macOS-only at this stage)"
 requires-python = ">=3.10"
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: Console",
+    "Intended Audience :: Science/Research",
+    "License :: Other/Proprietary License",
+    # Platform scope: `submit_script` relies on macOS `sandbox-exec` for
+    # its privacy boundary. Non-macOS platforms can run the chat and
+    # schema tools but scripts refuse to execute. Do not promise what
+    # the code cannot enforce.
+    "Operating System :: MacOS :: MacOS X",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering",
+    "Topic :: Security",
+]
 dependencies = [
     "claude-agent-sdk>=0.1.61",
     "rich>=13.0",

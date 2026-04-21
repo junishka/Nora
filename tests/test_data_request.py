@@ -171,6 +171,40 @@ def test_supported_request_types_are_expected():
     }
 
 
+def test_tool_help_request_types_match_runtime_allowlist():
+    """The request_data tool's help text must list exactly the request
+    types the runtime actually supports.
+
+    Regression: the help used to advertise 'numeric_range' and
+    'missingness_pattern', neither of which `data_request.handle`
+    accepts. Claude would call those and get a `denied:
+    request_type not in the allowlist` response, wasting a round
+    trip on a phantom capability. The fix was to build the help
+    text from SUPPORTED_REQUEST_TYPES; this test locks in the
+    single-source-of-truth arrangement.
+    """
+    from builder import tools
+
+    # The rendered enumeration that the @tool decorator interpolated
+    # into the help string at import time.
+    rendered = tools._REQUEST_TYPE_LIST_STR
+
+    # Every supported type appears in the rendered string.
+    for req_type in SUPPORTED_REQUEST_TYPES:
+        assert f"'{req_type}'" in rendered, (
+            f"tool help missing supported request_type {req_type!r}; "
+            f"rendered={rendered!r}"
+        )
+
+    # No phantom types leak in. These are the specific ones the old
+    # help advertised that the runtime never supported.
+    for phantom in ("numeric_range", "missingness_pattern"):
+        assert f"'{phantom}'" not in rendered, (
+            f"tool help still advertises phantom request_type "
+            f"{phantom!r}; rendered={rendered!r}"
+        )
+
+
 # ---------------------------------------------------------------------------
 # Regression: denial and error messages must sanitize data-origin strings
 # before echoing them to Claude (Finding 3).

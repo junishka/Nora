@@ -60,12 +60,16 @@ def test_no_broad_private_read_subpath(example_profile: str):
 
 def test_narrow_private_subpaths_present(example_profile: str):
     """The specific /private subtrees R/Stata actually need must be
-    allowed — otherwise the interpreter can't read passwd/hosts,
-    resolve user/group IDs, load timezone data, or stage $TMPDIR
-    scratch files. Locking these in prevents accidental over-narrowing
-    that breaks R/Stata startup."""
+    allowed — otherwise the interpreter can't resolve user/group IDs,
+    load timezone data, or stage $TMPDIR scratch files.
+
+    NB: `/private/etc` is NOT a subpath here — specific config files
+    are allowed via `read_literals` instead (see
+    `test_narrow_private_etc_literals_present` below). Locking these
+    subpaths in prevents accidental over-narrowing that breaks
+    R/Stata startup.
+    """
     required = [
-        '(subpath "/private/etc")',
         '(subpath "/private/tmp")',
         '(subpath "/private/var/db/dslocal")',
         '(subpath "/private/var/db/timezone")',
@@ -73,6 +77,44 @@ def test_narrow_private_subpaths_present(example_profile: str):
     ]
     for entry in required:
         assert entry in example_profile, f"missing required allow: {entry}"
+
+
+def test_no_broad_private_etc_subpath(example_profile: str):
+    """`(subpath "/private/etc")` would re-open reads on /etc/passwd
+    (user GECOS + home + shell), /etc/group, /etc/sudoers.d, and
+    similar mildly-sensitive config files. Specific files R/Stata
+    need are allowed as literals below, not as a whole-subtree
+    subpath.
+    """
+    assert '(subpath "/private/etc")' not in example_profile
+
+
+def test_narrow_private_etc_literals_present(example_profile: str):
+    """The specific /private/etc config files R/Stata probe at startup
+    must be allowed as literals. Expand this list if a future version
+    of R/Stata needs another file; never widen back to the whole
+    /private/etc subpath.
+    """
+    required_literals = [
+        '(literal "/private/etc/hosts")',
+        '(literal "/private/etc/localtime")',
+        '(literal "/private/etc/resolv.conf")',
+        '(literal "/private/etc/protocols")',
+        '(literal "/private/etc/services")',
+        '(literal "/private/etc/nsswitch.conf")',
+    ]
+    for entry in required_literals:
+        assert entry in example_profile, f"missing required literal: {entry}"
+
+
+def test_private_etc_passwd_not_readable(example_profile: str):
+    """`/etc/passwd` contains user real names (GECOS), home dirs, and
+    shells. It must not be in the read allowlist — neither as a subpath
+    ancestor nor as an explicit literal. Letting a script read it lets
+    Claude exfil those strings through sanitizer-allowed label fields.
+    """
+    assert '(literal "/private/etc/passwd")' not in example_profile
+    assert '(literal "/etc/passwd")' not in example_profile
 
 
 def test_no_broad_private_var_db(example_profile: str):

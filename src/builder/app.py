@@ -528,6 +528,32 @@ async def _chat_loop() -> int:
     cwd = get_cwd()
     env = detect_environment()
     _print_banner(mode, cwd, env)
+    # Platform preflight — submit_script currently requires macOS's
+    # `sandbox-exec`. Warn up-front rather than failing at the first
+    # script submission; `get_schema` and `request_data` still work
+    # without it, so the session isn't useless.
+    if env.sandbox_exec is None:
+        if sys.platform == "darwin":
+            console.print(
+                Text.from_markup(
+                    "[red bold]/usr/bin/sandbox-exec not found on this "
+                    "macOS install.[/red bold] `submit_script` will "
+                    "refuse to run without it. `get_schema` and "
+                    "`request_data` still work.\n"
+                )
+            )
+        else:
+            console.print(
+                Text.from_markup(
+                    "[yellow bold]submit_script is macOS-only in this "
+                    f"version.[/yellow bold] You're on `{sys.platform}`; "
+                    "scripts will refuse to run (the sandbox that "
+                    "protects your data relies on macOS `sandbox-exec`). "
+                    "`get_schema` and `request_data` still work — you "
+                    "can inspect schema and get bounded summaries, but "
+                    "Claude can't execute R/Stata.\n"
+                )
+            )
     if not env.has_any_runtime():
         console.print(
             Text.from_markup(

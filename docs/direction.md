@@ -90,12 +90,27 @@ Full implementation status in
   result-payload exfil channel.
 - **Runtime-library contract.** Today a malicious script can write
   hand-crafted JSON directly to `BUILDER_RESULT_PATH`, bypassing
-  the runtime library. Fix options, easiest to hardest: (a)
-  stricter sanitizer structural checks that reject payloads
-  without a runtime-library-shaped signature; (b) per-run token
-  the runtime library embeds in every payload, executor validates;
-  (c) pre-opened fd the subprocess inherits but can't discover by
-  path. Pick (a) or (b) first.
+  the runtime library. Fix options, ordered by the strength of
+  guarantee they actually provide:
+  - **(a) Stricter sanitizer structural checks** that reject
+    payloads without a runtime-library-shaped signature. Weakest:
+    a determined attacker can replicate the shape.
+  - **(b) Per-run token** the runtime library embeds in every
+    payload; executor validates. **Raises attacker cost** — the
+    trivial write-to-BUILDER_RESULT_PATH bypass stops working. Does
+    **not** provide a strong guarantee: R closures are
+    introspectable, so a script that knows the architecture can
+    find the token in the library's loaded environment. Useful
+    interim measure.
+  - **(c) Pre-opened fd** the subprocess inherits but can't
+    discover by path. Structural fix — the path Claude's code
+    knows about simply isn't the fd the library writes through.
+    Significantly more work in R.
+
+  Plan: **ship (b) first** for the cost-raising benefit. Commit to
+  **(c) as the follow-on** if the runtime-authenticity concern
+  matters for researchers handling more sensitive data than
+  current pilots.
 
 ### 2. Researcher consent UI for schema depth (1–2 sessions)
 
@@ -136,6 +151,50 @@ real analytical questions, and they've built the thing so they can
 surface UX issues in a single afternoon. A colleague or two as #2
 and #3 validates whether the tool works for someone who *didn't*
 build it.
+
+## Known-real, design-pending
+
+### Cumulative-inference / cross-query composition
+
+Builder's SDC rules (precision clamping, cell suppression,
+dominance, text-safety) constrain what any **single** sanitized
+result reveals. They do not constrain the **joint distribution of
+answers across many queries**. A researcher — or an adaptive,
+adversarial Claude — who issues 200 individually-compliant queries
+can learn things about the dataset that no single query would
+release. This is the "20 questions" attack, and it is inherent to
+every interactive analysis system (not a Builder-specific bug).
+
+Session-level disclosure budgets are the first layer of defense,
+but naïve implementations ("count calls, stop at N") do not
+protect against adaptive adversaries and frustrate honest
+researchers whose work is iterative by nature. Worse than nothing
+if they give false confidence.
+
+The real answers live in established SDC / DP literature:
+
+- **Differential privacy with a per-session ε-budget.** Genuine
+  guarantee, but adds calibrated noise to every result, which
+  makes replication and debugging harder. Census Bureau went
+  through the ergonomics pain post-2020.
+- **Interactive query audit** — track every released quantity,
+  block queries whose composition with prior releases would
+  exceed a leakage threshold. Requires defining "composition"
+  rigorously.
+- **Release ledger as human-review queue** — every emission
+  logged; periodic review by a disclosure officer. Organizational
+  pattern, low tech cost, but requires a reviewer.
+
+**Status: backlog. Design-pending.** Commit to reading the
+literature (OpenDP, Google's DP library, the Census Bureau's
+post-2020 approach, τ-ARGUS's query-log mechanisms) before
+implementing. Do not ship a query counter that looks like
+protection but isn't.
+
+When does this become urgent? When Builder is used against data
+where repeated-query inference is a realistic attacker scenario —
+clinical trial data, HR data at the individual level, regulated
+datasets. Not urgent for pilot-scale public-ish research.
 
 ## Invariants (non-negotiable)
 

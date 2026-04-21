@@ -491,6 +491,22 @@ def _build_profile(run_dir: Path, cwd: Path, home: Path) -> str:
         _quote("/dev/tty"),
     ]
 
+    # Narrow /private/etc reads to the specific config files R/Stata
+    # actually need. The previous `(subpath "/private/etc")` re-opened
+    # reads on /etc/passwd (user GECOS, home dirs, shells), /etc/group,
+    # /etc/sudoers.d, etc. — all of which a malicious script could
+    # exfiltrate character-by-character through sanitizer-allowed label
+    # fields. This list is an empirical starting point; expand if a
+    # future R/Stata version probes another config file at startup.
+    read_literals = [
+        _quote("/private/etc/hosts"),
+        _quote("/private/etc/localtime"),
+        _quote("/private/etc/resolv.conf"),
+        _quote("/private/etc/protocols"),
+        _quote("/private/etc/services"),
+        _quote("/private/etc/nsswitch.conf"),
+    ]
+
     # Per-run read scope: system trees needed by R/Stata to bootstrap
     # themselves, plus the researcher's cwd (data) and the runtime
     # staging dir.
@@ -527,9 +543,9 @@ def _build_profile(run_dir: Path, cwd: Path, home: Path) -> str:
         _quote("/Applications"),
         # /private — only the subtrees needed for POSIX config,
         # user/group resolution, timezone data, and $TMPDIR scratch.
-        # Notably excludes /private/var/log, /private/var/backups,
-        # /private/var/db (other than dslocal + timezone), etc.
-        _quote("/private/etc"),
+        # Notably: /private/etc is NOT a subpath — specific config
+        # files are allowed via read_literals above. See the comment
+        # on that list for why.
         _quote("/private/tmp"),
         _quote("/private/var/db/dslocal"),
         _quote("/private/var/db/timezone"),
@@ -565,6 +581,7 @@ def _build_profile(run_dir: Path, cwd: Path, home: Path) -> str:
         "; of the home dir) is implicitly denied.\n"
         "(allow file-read*\n"
         "    (literal \"/\")\n"
+        + "".join(f"    (literal {p})\n" for p in read_literals)
         + "".join(f"    (subpath {p})\n" for p in read_subpaths)
         + ")\n"
         "\n"

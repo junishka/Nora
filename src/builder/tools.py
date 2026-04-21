@@ -30,8 +30,17 @@ from claude_agent_sdk import create_sdk_mcp_server, tool
 
 from builder import data_request, executor, schema
 from builder.config import PathEscapeError, get_cwd, resolve_in_cwd
+from builder.data_request import SUPPORTED_REQUEST_TYPES
 from builder.sanitizer import sanitize
 from builder.store import get_store
+
+
+# Build the request_type enumeration string from the canonical list in
+# data_request so the tool's help text cannot drift from the actual
+# implementation. Previously the help listed `numeric_range` and
+# `missingness_pattern` — neither supported by the runtime — so Claude
+# would call them and get "denied: request_type not in the allowlist".
+_REQUEST_TYPE_LIST_STR = ", ".join(f"'{t}'" for t in SUPPORTED_REQUEST_TYPES)
 
 
 def _effective_n(payload: dict[str, Any]) -> int | None:
@@ -348,8 +357,7 @@ async def get_schema(args: dict[str, Any]) -> dict[str, Any]:
         "writing an exploratory probe script.\n\n"
         "Arguments:\n"
         "  dataset: identifier for the dataset.\n"
-        "  request_type: one of 'categorical_levels', 'numeric_range', "
-        "'na_count', 'missingness_pattern'.\n"
+        f"  request_type: one of {_REQUEST_TYPE_LIST_STR}.\n"
         "  variable: name of the variable the request is about."
     ),
     {"dataset": str, "request_type": str, "variable": str},
