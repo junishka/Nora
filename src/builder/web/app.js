@@ -10,6 +10,12 @@
  * real framework later if we want components and state management.
  */
 
+const landingEl = document.getElementById('landing');
+const chatEl = document.getElementById('chat');
+const dropZone = document.getElementById('drop-zone');
+const chooseFilesBtn = document.getElementById('choose-files-btn');
+const chooseFolderBtn = document.getElementById('choose-folder-btn');
+const landingStatus = document.getElementById('landing-status');
 const messagesEl = document.getElementById('messages');
 const form = document.getElementById('compose-form');
 const input = document.getElementById('compose-input');
@@ -17,6 +23,135 @@ const sendBtn = document.getElementById('send-btn');
 const welcomeEl = document.getElementById('welcome');
 const cwdEl = document.getElementById('cwd-display');
 const policyEl = document.getElementById('policy-summary');
+
+// ----- view routing ------------------------------------------------------
+
+function showLanding() {
+  landingEl.classList.remove('hidden');
+  chatEl.classList.add('hidden');
+}
+
+function showChat(payload) {
+  landingEl.classList.add('hidden');
+  chatEl.classList.remove('hidden');
+  welcomeEl.textContent = payload.greeting || 'Ready.';
+  cwdEl.textContent = payload.cwd || '';
+  updatePolicySummary(payload.policy);
+  input.focus();
+}
+
+// ----- landing: file picker / folder picker / drag-drop -----------------
+
+function setLandingBusy(busy, msg) {
+  chooseFilesBtn.disabled = busy;
+  chooseFolderBtn.disabled = busy;
+  landingStatus.classList.remove('error');
+  landingStatus.textContent = msg || '';
+}
+
+function setLandingError(msg) {
+  chooseFilesBtn.disabled = false;
+  chooseFolderBtn.disabled = false;
+  landingStatus.classList.add('error');
+  landingStatus.textContent = msg;
+}
+
+async function handleSessionResult(result) {
+  if (!result) {
+    setLandingError('no response from the backend');
+    return;
+  }
+  if (!result.ok) {
+    const reason = result.reason || 'unknown';
+    if (reason === 'cancelled') {
+      // Researcher cancelled the dialog — no noise, just clear status.
+      setLandingBusy(false, '');
+    } else {
+      setLandingError(reason);
+    }
+    return;
+  }
+  showChat(result);
+}
+
+chooseFilesBtn.addEventListener('click', async () => {
+  if (!window.pywebview || !window.pywebview.api) return;
+  setLandingBusy(true, 'Opening file picker…');
+  try {
+    const result = await window.pywebview.api.choose_files();
+    await handleSessionResult(result);
+  } catch (err) {
+    setLandingError('failed: ' + err);
+  }
+});
+
+chooseFolderBtn.addEventListener('click', async () => {
+  if (!window.pywebview || !window.pywebview.api) return;
+  setLandingBusy(true, 'Opening folder picker…');
+  try {
+    const result = await window.pywebview.api.choose_folder();
+    await handleSessionResult(result);
+  } catch (err) {
+    setLandingError('failed: ' + err);
+  }
+});
+
+// Drag-drop. Visual state on the drop zone; actual handling on the whole
+// landing area so a near-miss still works.
+['dragenter', 'dragover'].forEach((name) => {
+  landingEl.addEventListener(name, (e) => {
+    e.preventDefault();
+    dropZone.classList.add('dragover');
+  });
+});
+['dragleave', 'drop'].forEach((name) => {
+  landingEl.addEventListener(name, (e) => {
+    e.preventDefault();
+    dropZone.classList.remove('dragover');
+  });
+});
+
+landingEl.addEventListener('drop', async (e) => {
+  e.preventDefault();
+  const dt = e.dataTransfer;
+  if (!dt || !dt.files || dt.files.length === 0) return;
+  const files = Array.from(dt.files);
+  // Only data files we recognize. Anything else gets rejected up-front
+  // so researchers see the reason in the UI rather than a confused
+  // session with non-data files in it.
+  const accepted = files.filter((f) => /\.(csv|dta|rds)$/i.test(f.name));
+  if (accepted.length === 0) {
+    setLandingError(
+      'Drop .csv, .dta, or .rds files. Other types are ignored.'
+    );
+    return;
+  }
+  setLandingBusy(true, `Uploading ${accepted.length} file${accepted.length === 1 ? '' : 's'}…`);
+  try {
+    const payload = await Promise.all(accepted.map(readFileAsBase64));
+    const result = await window.pywebview.api.upload_files(payload);
+    await handleSessionResult(result);
+  } catch (err) {
+    setLandingError('upload failed: ' + err);
+  }
+});
+
+function readFileAsBase64(file) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => {
+      // result is a data URL; base64 content is after the first comma.
+      const dataUrl = reader.result;
+      const comma = dataUrl.indexOf(',');
+      resolve({
+        name: file.name,
+        content: comma >= 0 ? dataUrl.substring(comma + 1) : dataUrl,
+      });
+    };
+    reader.onerror = () => reject(reader.error);
+    reader.readAsDataURL(file);
+  });
+}
 
 // ----- send / receive -----------------------------------------------------
 
@@ -67,9 +202,7 @@ window.builder_event = function (evt) {
   // evt is a plain object; {type} + type-specific fields.
   switch (evt.type) {
     case 'ready':
-      welcomeEl.textContent = evt.greeting || 'Ready. Ask a question about your data.';
-      cwdEl.textContent = evt.cwd || '';
-      updatePolicySummary(evt.policy);
+      showChat(evt);
       break;
     case 'assistant_text':
       appendAssistant(evt.text);
@@ -367,7 +500,19 @@ function whenReady(fn) {
   window.addEventListener('pywebviewready', fn, { once: true });
 }
 
-whenReady(() => {
-  // Ask the backend for initial state (cwd, policy, etc.).
-  window.pywebview.api.ui_ready();
+whenReady(async () => {
+  // On startup, check whether the backend already has a cwd (launched
+  // with an argv path) or needs one (land on the drop / choose-files
+  // screen). ui_ready returns a synchronous response — no event yet.
+  try {
+    const state = await window.pywebview.api.ui_ready();
+    if (state && state.state === 'ready') {
+      showChat(state);
+    } else {
+      showLanding();
+    }
+  } catch (err) {
+    console.error('ui_ready failed', err);
+    showLanding();
+  }
 });

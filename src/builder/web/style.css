@@ -53,6 +53,136 @@ body {
   flex-direction: column;
 }
 
+.hidden {
+  display: none !important;
+}
+
+/* --- landing --- */
+
+.landing {
+  flex: 1 1 auto;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 32px 24px;
+}
+
+.landing-card {
+  max-width: 560px;
+  width: 100%;
+  text-align: center;
+}
+
+.landing-logo {
+  font-size: 14px;
+  font-weight: 600;
+  letter-spacing: 0.6px;
+  color: var(--text-dim);
+  margin-bottom: 16px;
+  text-transform: uppercase;
+}
+
+.landing h1 {
+  margin: 0 0 12px;
+  font-size: 28px;
+  font-weight: 600;
+  color: var(--text);
+}
+
+.landing-lead {
+  margin: 0 0 24px;
+  font-size: 15px;
+  line-height: 1.55;
+  color: var(--text-dim);
+}
+
+.drop-zone {
+  margin: 0 0 18px;
+  border: 2px dashed var(--border);
+  border-radius: var(--radius);
+  padding: 40px 20px;
+  background: var(--bg-surface);
+  transition: border-color 0.15s, background 0.15s;
+  cursor: default;
+}
+
+.drop-zone.dragover {
+  border-color: var(--accent);
+  background: var(--bg-user);
+}
+
+.drop-zone-main {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 10px;
+  color: var(--text-dim);
+}
+
+.drop-zone-hint {
+  margin: 0;
+  font-size: 14px;
+}
+
+.landing-actions {
+  display: flex;
+  gap: 10px;
+  justify-content: center;
+  margin-bottom: 18px;
+}
+
+.landing-btn {
+  padding: 10px 18px;
+  font-size: 14px;
+  font-family: inherit;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--bg-surface);
+  color: var(--text);
+  cursor: pointer;
+  transition: border-color 0.15s, background 0.15s;
+}
+
+.landing-btn:hover {
+  border-color: var(--accent);
+}
+
+.landing-btn.primary {
+  background: var(--accent);
+  color: white;
+  border-color: var(--accent);
+}
+
+.landing-btn:disabled {
+  opacity: 0.5;
+  cursor: wait;
+}
+
+.landing-status {
+  min-height: 20px;
+  margin-bottom: 14px;
+  font-size: 13px;
+  color: var(--text-dim);
+}
+
+.landing-status.error {
+  color: #c23;
+}
+
+.landing-fineprint {
+  margin: 0;
+  font-size: 12px;
+  color: var(--text-dim);
+  line-height: 1.5;
+}
+
+.chat {
+  display: flex;
+  flex-direction: column;
+  flex: 1 1 auto;
+  min-height: 0;
+}
+
 /* --- topbar --- */
 
 .topbar {

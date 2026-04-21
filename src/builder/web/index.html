@@ -7,35 +7,77 @@
   <link rel="stylesheet" href="style.css" />
 </head>
 <body>
-  <header class="topbar">
-    <div class="topbar-title">Builder</div>
-    <div class="topbar-meta" id="topbar-meta">
-      <span id="cwd-display"></span>
-    </div>
-  </header>
+  <!-- Landing view: shown when no cwd is set (launched without argv).
+       The researcher drops files or clicks a button to pick them. -->
+  <div id="landing" class="landing hidden">
+    <div class="landing-card">
+      <div class="landing-logo">Builder</div>
+      <h1>Share data with Claude</h1>
+      <p class="landing-lead">
+        Choose the data files you want Claude to help you analyze.
+        They stay on this machine — Claude only sees schema and
+        disclosure-controlled summaries.
+      </p>
 
-  <main id="messages" class="messages">
-    <div class="message system">
-      <div class="message-body" id="welcome">
-        Welcome. Starting up…
+      <div id="drop-zone" class="drop-zone">
+        <div class="drop-zone-main">
+          <svg width="36" height="36" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
+            <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
+            <polyline points="17 8 12 3 7 8"/>
+            <line x1="12" y1="3" x2="12" y2="15"/>
+          </svg>
+          <p class="drop-zone-hint">Drop .csv, .dta, or .rds files here</p>
+        </div>
       </div>
-    </div>
-  </main>
 
-  <footer class="composer">
-    <form id="compose-form">
-      <textarea
-        id="compose-input"
-        placeholder="Ask Claude about your data. Shift-Enter for a new line."
-        rows="1"
-        autofocus
-      ></textarea>
-      <button type="submit" id="send-btn">Send</button>
-    </form>
-    <div class="composer-hint">
-      Schema policy: <span id="policy-summary">loading…</span>
+      <div class="landing-actions">
+        <button id="choose-files-btn" type="button" class="landing-btn primary">Choose files…</button>
+        <button id="choose-folder-btn" type="button" class="landing-btn">Choose folder…</button>
+      </div>
+
+      <div id="landing-status" class="landing-status"></div>
+
+      <p class="landing-fineprint">
+        Drag-drop holds files in memory (capped at 500 MB/file); very
+        large datasets — use <strong>Choose files…</strong>, which
+        reads from disk. <strong>Choose folder…</strong> uses an
+        existing directory as the sandbox scope.
+      </p>
     </div>
-  </footer>
+  </div>
+
+  <!-- Chat view: shown once the session's working directory is set. -->
+  <div id="chat" class="chat hidden">
+    <header class="topbar">
+      <div class="topbar-title">Builder</div>
+      <div class="topbar-meta" id="topbar-meta">
+        <span id="cwd-display"></span>
+      </div>
+    </header>
+
+    <main id="messages" class="messages">
+      <div class="message system">
+        <div class="message-body" id="welcome">
+          Ready.
+        </div>
+      </div>
+    </main>
+
+    <footer class="composer">
+      <form id="compose-form">
+        <textarea
+          id="compose-input"
+          placeholder="Ask Claude about your data. Shift-Enter for a new line."
+          rows="1"
+          autofocus
+        ></textarea>
+        <button type="submit" id="send-btn">Send</button>
+      </form>
+      <div class="composer-hint">
+        Schema policy: <span id="policy-summary">loading…</span>
+      </div>
+    </footer>
+  </div>
 
   <script src="markdown.js"></script>
   <script src="app.js"></script>
