@@ -1,221 +1,192 @@
 # Builder — architectural direction
 
-Working document, not a locked-down spec. Captures the decision to
-pivot from free-form script submission (current state) to a
-plan-based architecture with a local LLM translator. Settled after
-the 2026-04-20 reviewer pass revealed that the sandbox was carrying
-too much of the privacy guarantee alone.
+Working document. Last updated 2026-04-20 after reviewer feedback
+and the decision to stay with the current script-submission
+architecture ("Option A") rather than pivot to a plan-submission
+architecture with a local LLM translator.
 
-## Where we are today
+See [`docs/overview.md`](overview.md) for a plain-language
+description of what Builder is and why it exists. This document is
+about what the architecture is, what it isn't, and what's next.
 
-The current implementation (tag-of-the-initial-commit) is a strong
-privacy prototype:
+## The decision
 
-- Frontier (Claude) has a 5-tool MCP surface. All SDK built-ins
-  disabled. Four-layer lockdown on tool use.
-- Schema extractor, executor with `(deny default)` subpath-allowlist
-  sandbox, SQLite result store, SDC sanitizer across six analysis
-  families (linear_regression, t_test, descriptive, frequency_table,
-  crosstab, magnitude_table) with R + Stata parity.
-- 152 tests, including ~3,600 Hypothesis-generated adversarial cases
-  and 19 pure SBPL unit tests locking in the sandbox profile shape.
+**Keep the current architecture.** Remaining work is hardening, UX,
+and real-researcher contact — not restructuring.
 
-It works end-to-end against real R and Stata. Sensitive reads
-(`~/.zshrc`, `/Library/Keychains/System.keychain`,
-`/private/var/log/system.log`) are denied. Claude can submit R/Stata
-scripts and get sanitized results back.
+A recent external reviewer proposed replacing Claude's direct
+script authorship with a plan-submission architecture where Claude
+writes structured plans and a bundled local LLM compiles them into
+R/Stata. After working through the argument, that proposal was
+rejected as over-correction.
 
-It has one architectural weakness: **the sandbox is the primary
-privacy guarantee, not a defense-in-depth layer**. A malicious script
-can:
+The privacy guarantee in Builder comes from three independent
+layers:
 
-- Bypass the runtime library by writing hand-crafted JSON directly to
-  `BUILDER_RESULT_PATH`.
-- Encode contents of any readable file into sanitizer-allowed fields
-  (coefficient names, labels) and smuggle them out through the result
-  payload that Claude sees.
+1. **The tool interface** — Claude can only do five things
+   (`get_schema`, `request_data`, `submit_script`, `expand_result`,
+   `list_results`). No filesystem, no shell, no network.
+2. **The sandbox** — scripts run under macOS `sandbox-exec` with a
+   `(deny default)` profile and a narrow subpath-allowlist for
+   reads; network denied entirely.
+3. **The sanitizer** — every output payload passes through SDC +
+   text-safety checks before reaching Claude.
 
-Both are bounded (the sandbox narrows what's readable, the sanitizer
-caps string length and strips control chars), but the trust anchor is
-"the sandbox holds" rather than "Claude cannot author arbitrary
-instructions." That's the wrong anchor for a privacy product.
+None of those three layers depends on *who authored the code*.
+Claude writing R is fine as long as Claude cannot directly touch
+data — which the tool interface and sandbox together enforce. A
+local LLM would add *capability* (debugging help, text-data
+handling), not privacy. It stays an optional future enhancement,
+re-enters the critical path only when a specific researcher use
+case demands it.
 
-## Where we're going
+## What's built
 
-Claude stops writing code. Claude writes **detailed analysis plans**
-against safe variable identifiers. A **local translator** (existing
-open-weight LLM, routed through Ollama or similar) compiles the plan
-into R or Stata locally. The executor runs the compiled code under
-the existing sandbox. The sanitizer gates everything that returns.
+As of 2026-04-20, the implementation covers:
 
-The trust anchor moves from "sandbox holds" to a three-layer stack:
+- Spine + full SDK lockdown (5 MCP tools, every built-in disabled,
+  four defense layers).
+- Schema extractor for `.csv` / `.dta` / `.rds` with configurable
+  depth tiers.
+- Executor with `(deny default)` subpath-allowlist sandbox. Pure
+  unit tests lock in the SBPL profile shape; integration tests
+  verify real sandbox behavior (gated on `Rscript` + sandbox-apply
+  preflight).
+- Sanitizer across six analysis families (linear regression,
+  t-test, descriptive, frequency table, crosstab, magnitude table)
+  with full R + Stata parity.
+- Runtime libraries (R + five Stata `.ado` files) with
+  JSON-escaped labels and CR/LF/TAB handling.
+- SQLite result store.
+- 152 tests, ~3,600 Hypothesis-generated adversarial cases. Pushed
+  to [github.com/junishka/builder](https://github.com/junishka/builder).
 
-1. **Boundary** — Claude cannot emit executable code. The MCP
-   interface accepts plans, not scripts.
-2. **Sandbox** — defense in depth. Compiled code still runs under the
-   `(deny default)` subpath-allowlist profile.
-3. **Sanitizer** — unchanged. Every result payload still flows
-   through SDC + text-safety before reaching Claude.
+Full implementation status in
+`memory/project_builder_current_state.md`.
 
-Each layer is independent. No single failure kills the privacy story.
+## What's remaining (prioritized)
 
-## Architectural invariants (non-negotiable)
+### 1. Security hardening (1–2 sessions)
 
-- Frontier has no general-purpose tools. SDK built-ins stay disabled.
-- Frontier cannot author executable code that runs locally.
-- Frontier can only submit plans through the custom MCP interface.
-- Raw data, raw paths, raw variable names, raw stderr stay local.
-- Frontier sees **safe variable IDs** plus sanitized display names.
-  Raw column names resolve to IDs inside the local translator.
-- Every execution output passes through the sanitizer before
-  reaching the frontier.
-- Researcher sees raw logs, compiled script, diffs, sanitized result.
-  Frontier sees sanitized result only.
-- Sandbox is mandatory (unchanged), but defense in depth.
+- **Tighten `/private/etc` reads.** Current profile allows the
+  whole `/private/etc` subtree. R/Stata only actually need a small
+  set of config files (`hosts`, `localtime`, `resolv.conf`,
+  `protocols`). Replace the subpath with literals for those files.
+  Closes reads of `/etc/passwd` and similar through the
+  result-payload exfil channel.
+- **Runtime-library contract.** Today a malicious script can write
+  hand-crafted JSON directly to `BUILDER_RESULT_PATH`, bypassing
+  the runtime library. Fix options, easiest to hardest: (a)
+  stricter sanitizer structural checks that reject payloads
+  without a runtime-library-shaped signature; (b) per-run token
+  the runtime library embeds in every payload, executor validates;
+  (c) pre-opened fd the subprocess inherits but can't discover by
+  path. Pick (a) or (b) first.
 
-## System shape
+### 2. Researcher consent UI for schema depth (1–2 sessions)
 
-- **Frontier model (Claude).** Reads schema and bounded metadata;
-  produces rich, detailed analysis plans; does not write code.
-- **Schema layer.** Extracts schema locally; returns safe variable
-  IDs, sanitized display names, types, labels per policy.
-- **Plan interface (MCP tools).** `get_schema`, `request_data`,
-  `preview_plan`, `submit_plan`, `expand_result`, `list_results`. No
-  tool accepts arbitrary code.
-- **Local translator.** Existing open-weight LLM (candidates:
-  Qwen2.5-Coder-14B-Instruct via Ollama, DeepSeek-Coder-V2-Lite).
-  Resolves safe IDs to raw names. Generates R/Stata. May do bounded
-  local repair using local stderr.
-- **Executor.** Unchanged. `(deny default)` subpath-allowlist
-  sandbox. Refuses to run without sandbox-exec.
-- **Sanitizer.** Unchanged. SDC rules + text-safety, reject by
+Currently schema depth is a code default. Move to an explicit
+per-dataset policy file (`.builder/policy.json` or equivalent)
+with conservative defaults:
+
+- **Default:** variable names + types.
+- **Opt-in:** variable labels.
+- **Opt-in:** categorical level names.
+- **Opt-in:** 5th/95th numeric bounds.
+- **Never:** raw values, min, max, median, individual observations.
+
+Surface the policy in the TUI when a dataset is first opened so
+the researcher makes an explicit choice rather than inheriting a
+default silently.
+
+### 3. Packaging to `.dmg` (2–4 sessions)
+
+The "install must be double-click" rule has been owed since early
+in the project. Current path (`uv sync` + `uv run python -m
+builder`) is a developer workflow.
+
+Approach:
+- PyInstaller (or py2app / Briefcase — decision open) to a `.app`
+  bundle.
+- Notarize + sign; distribute as `.dmg`.
+- R must either be bundled or instructed-to-install (Homebrew cask
+  redirect). Stata stays user-installed — commercial license.
+- First-run UX: pick data dir, set schema policy, configure
+  Claude auth.
+
+### 4. One real researcher on real data
+
+The most important missing signal. The user (a quantitative
+researcher) is the cheapest researcher #1 — they have real data,
+real analytical questions, and they've built the thing so they can
+surface UX issues in a single afternoon. A colleague or two as #2
+and #3 validates whether the tool works for someone who *didn't*
+build it.
+
+## Invariants (non-negotiable)
+
+- Claude has no general-purpose tools. SDK built-ins stay
+  disabled.
+- Claude's only interface to the machine is the 5 MCP tools.
+- Every `submit_script` call runs under the sandbox.
+- Every executor output passes through the sanitizer before
+  reaching Claude.
+- Raw stderr / stdout never reach Claude.
+- Schema exposure is explicit researcher policy, conservative by
   default.
-- **Store.** Extended to persist submitted plan, compiled script,
-  repair diff (if any), sanitized result, raw log path.
+- Researcher sees raw logs and sanitized output; Claude sees
+  sanitized output only.
 
-## Plan envelope
+## What we're not doing (and why)
 
-Structured, not tiny. Real research is not a six-enum grammar.
-Envelope supports:
+- **Replacing `submit_script` with a constrained plan grammar.**
+  Privacy gain is zero — the boundary is already enforced by the
+  tool interface + sandbox + sanitizer stack. Capability cost is
+  real (narrow grammars can't express log-transforms, interaction
+  terms, clustering, fixed effects without bloating the grammar
+  into a mini-language). Timeline cost is weeks. Rejected as
+  over-correction.
 
-- `analysis_type`
-- `dataset_id`
-- `outcome_variables`, `predictor_variables`, `grouping_variables`
-- `filters`, `transformations`, `interactions`
-- `fixed_effects`, `variance_estimator`, `cluster_variables`
-- `reference_levels`, `missing_data_policy`
-- `table_options`, `output_requests`
-- `research_intent` (prose — see decisions below)
+- **Bundling a local LLM on the critical path.** 15–17 GB install
+  footprint, requires 16 GB+ RAM, produces worse R/Stata than
+  Claude — especially Stata, where the open training corpus is
+  thin. Adds zero privacy gain given the existing stack. Stays
+  available as a future optional helper for: error recovery using
+  raw stderr (which Claude can't see), text-data redaction so
+  free-text values can flow through the sanitizer, and quality
+  improvements in specific edge cases. Re-enters the discussion
+  when a real researcher's task actually needs one of these.
 
-The rule is: Claude expresses intent richly but submits no
-executable code.
+- **Mandatory safe variable IDs as the frontier-facing identity
+  surface.** Schema exposure is policy, not architecture. If a
+  researcher's dataset has non-sensitive variable names and they
+  opt in to sharing them with Claude, that's their call. Builder
+  enforces conservative defaults and makes the choice visible; it
+  doesn't enforce a ceiling.
 
-## Decisions (as of 2026-04-20)
+- **Language-specific hybrid (Claude writes Stata, local model
+  writes R/Python).** The premise — that local models are weak on
+  Stata — is true, but Option A has Claude writing all three
+  languages directly. The hybrid solves a problem we don't have.
 
-- **Local LLM on the core path**, not optional. The privacy gain
-  comes from moving code authorship local, not from crippling the
-  plan format.
-- **Use an existing model** via Ollama; do not build or bundle one.
-  First candidate: Qwen2.5-Coder-14B-Instruct. Researchers can swap.
-- **No plan validator at v1.** Sandbox + sanitizer are the two
-  structural layers. Add a validator later if the translator's
-  output surprises us in practice.
-- **Script preview visible by default**, not a mandatory
-  click-through. Researchers inspect plan → compiled diff as part of
-  the normal audit UX. Mandatory confirmation becomes dialog-
-  blindness within days.
-- **`research_intent` is prose the translator reads.** Claude can
-  give step-by-step instructions in natural language; the local
-  model compiles them. The privacy guarantee comes from the stacked
-  boundary (sandbox + sanitizer), not from restricting Claude's
-  language.
-- **Default schema depth: safe IDs + types.** Labels, level names,
-  value labels opt-in per dataset. Sensitive domains stay tight by
-  default; researchers widen explicitly.
-- **Stderr data-leakage risk in local repair: defer.** Revisit only
-  if the repair loop shows data values landing in stored scripts.
+## Open policy decisions
 
-## Retirement rule for `submit_script`
-
-Current free-form `submit_script` becomes a developer-only flag
-during migration. Retires from production when **all four** hold:
-
-1. `submit_plan` supports the six current analysis families in R.
-2. ≥95% of tasks in a curated research-task corpus compile and run
-   via `submit_plan` without researcher escape.
-3. Local repair is stable — execution recovery is not materially
-   worse than the free-form path today.
-4. Remaining unsupported workflows are explicitly documented.
-
-Name a specific threshold. Without one, the dev flag becomes
-permanent.
-
-## Build order
-
-1. **Pick the model.** Qwen2.5-Coder-14B-Instruct via Ollama is the
-   starting candidate. Decide this before writing any translator
-   code — the product's usability floor is the model's coding
-   quality.
-2. **Safe variable IDs in schema extraction.** Stop emitting raw
-   column names across the boundary. Schema returns `variable_id`,
-   sanitized display name, type, labels per policy.
-3. **`submit_plan` + `preview_plan` MCP tools.** Accept structured
-   plans; store them; surface the compiled preview back to the
-   researcher.
-4. **Local translator, first pass, R only.** Descriptive and
-   frequency_table only. Prove the shape small.
-5. **30–50 task corpus.** Real plans from real research questions.
-   Measure first-try success rate. Target >80% without repair. If
-   <70%, the model choice needs rework before scaling.
-6. **Bounded local repair** using local stderr. Bounded iteration
-   count; every attempt stored in provenance.
-7. **Expand to inference families.** t_test, linear_regression,
-   robust SE, one-way clustering.
-8. **Richer expressivity.** Transformations, interactions, filters,
-   fixed effects.
-9. **Stata translator.** After the R path stabilizes.
-10. **Retire `submit_script`.** When the four retirement conditions
-    hold.
-
-## Load-bearing UX details
-
-- **Script preview is critical.** With an intelligent translator,
-  its output can silently deviate from Claude's plan. Preview +
-  plan-to-script diff is how the researcher catches hallucinations
-  and wrong variable resolution.
-- **Usability floor = local model's coding quality.** Researchers
-  coming from a Claude-written-R product will feel the downgrade if
-  the local model generates brittle code. Repair has to absorb most
-  of the gap. This is the biggest risk in the plan and the thing to
-  validate first with the task corpus.
-
-## Open questions for the build
-
-- Which bounded-repair policy (max iterations, what counts as a
-  successful repair, when to surface the repair to the researcher)?
-- Where does the variable-ID ↔ raw-name mapping live in session
-  state? Per-plan, per-session, per-dataset?
-- How is the task corpus curated and versioned? It's the measuring
-  stick for "does this work" — needs ownership.
-- Which Ollama model version gets pinned at install? Model upgrades
-  change output; provenance should capture it.
+- **Default schema depth.** names+types (safest) vs names+types+
+  labels (more useful). Labels are sometimes disclosive (rare
+  diagnosis codes, specific named conditions). Leaning:
+  names+types default, with an opt-in prompt for labels during
+  first-dataset-open.
+- **Packaging framework.** PyInstaller vs py2app vs Briefcase.
+  Decided when the packaging work actually starts.
+- **When to revisit local LLM.** Rule of thumb: when a real
+  researcher asks for something only a local model can provide
+  (text-data analysis, stderr-based repair of a specific recurring
+  failure mode). Not before.
 
 ## What must not happen
 
-- Frontier regains free-form code submission in production.
-- Raw variable names become frontier-facing identifiers.
-- Local translator edits the compiled code without the diff being
-  visible to the researcher.
-- Raw stderr reaches the frontier.
-- Sandbox becomes the only privacy story again.
-- The plan envelope is made so small that useful research workflows
-  cannot be expressed.
-
-## What this delays
-
-Step 8 ("one real researcher on real data") pushes out by several
-weeks at minimum. The current prototype is runnable from source
-today; a researcher could use it this afternoon. But shipping v0 to a
-real researcher and later discovering a boundary breach is a worse
-outcome than delaying. The redesign is the right call. The timeline
-cost is real.
+- Claude gains general-purpose tools at any stage.
+- Sandbox or sanitizer becomes conditional on a flag.
+- Raw stderr / stdout reaches Claude.
+- Schema-exposure defaults widen silently.
+- Runtime-library bypass remains open indefinitely.
