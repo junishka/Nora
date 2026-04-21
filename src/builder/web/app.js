@@ -350,11 +350,14 @@ function appendToolResult(evt) {
   const existingCard = [...messagesEl.querySelectorAll('.tool-card')]
     .find((c) => c.dataset.callId === evt.call_id);
 
-  // For submit_script / expand_result (anything with raw R/Stata
-  // output), render the native R / Stata output prominently BEFORE
-  // the sanitized JSON. The researcher recognizes the regression
-  // table; the JSON is secondary. Matches the terminal TUI's split.
-  const hasRawOutput = !!(evt.raw_stdout || evt.raw_stderr);
+  // Results from submit_script / expand_result carry a run_dir. Those
+  // get a full result panel with the native R/Stata output and action
+  // buttons ("Open output", "Open script in R/Stata", "Show folder").
+  // The panel appears whether or not raw_stdout is populated — the
+  // action buttons are useful even for scripts that produced no
+  // console output, because the staged .R / .do file is still there
+  // to re-open in RStudio / Stata.
+  const hasRunDir = !!evt.run_dir;
 
   if (existingCard) {
     if (evt.is_error) {
@@ -364,10 +367,7 @@ function appendToolResult(evt) {
     if (statusEl) statusEl.textContent = evt.is_error ? 'error' : 'done';
     const body = existingCard.querySelector('.tool-body');
 
-    if (hasRawOutput) {
-      // Keep the tool-call card compact and put the output as its
-      // own panel right after. The call card expands on click for
-      // audit purposes; the primary visual is the output panel.
+    if (hasRunDir) {
       existingCard.classList.add('collapsed');
       messagesEl.appendChild(buildResultPanel(evt));
     } else {
@@ -379,8 +379,8 @@ function appendToolResult(evt) {
     }
     scrollToBottom();
   } else {
-    // No matching card — render a standalone panel.
-    if (hasRawOutput) {
+    // No matching call card (unusual) — render a standalone.
+    if (hasRunDir) {
       messagesEl.appendChild(buildResultPanel(evt));
     } else {
       const card = document.createElement('div');
@@ -395,28 +395,36 @@ function appendToolResult(evt) {
 }
 
 function buildResultPanel(evt) {
-  /* Result panel for submit_script / expand_result events — the ones
-   * that have raw R/Stata output. Layout:
-   *   ┌─ R / Stata output (always visible) ─────────┐
-   *   │  <pre>...native regression table...</pre>    │
-   *   ├─ stderr (if present, yellow-tinted) ────────┤
-   *   │  <pre>warnings...</pre>                      │
-   *   ├─ Sanitized output (collapsed, toggle) ──────┤
-   *   │  <pre>{ ... clamped JSON ... }</pre>         │
-   *   └──────────────────────────────────────────────┘ */
+  /* Result panel for submit_script / expand_result events. Layout:
+   *   ┌─ R / Stata output (always visible if non-empty) ─┐
+   *   │  <pre>...native regression table...</pre>         │
+   *   ├─ stderr (if present, yellow-tinted) ─────────────┤
+   *   │  <pre>warnings...</pre>                           │
+   *   ├─ Sanitized output (collapsed, toggle) ───────────┤
+   *   │  <pre>{ ... clamped JSON ... }</pre>              │
+   *   ├─ [Open output] [Open script] [Show folder] ─────┤
+   *   └───────────────────────────────────────────────────┘
+   * The stdout section is skipped entirely when raw output is
+   * empty — otherwise we'd show a useless "(no output)" panel.
+   * The sanitized section and action buttons are always present
+   * for run_dir results so the researcher can re-open the script
+   * even if it didn't print. */
   const panel = document.createElement('div');
   panel.className = 'result-panel' + (evt.is_error ? ' error' : '');
 
-  const stdoutSection = document.createElement('section');
-  stdoutSection.className = 'result-stdout';
-  const stdoutHeader = document.createElement('div');
-  stdoutHeader.className = 'result-header';
-  stdoutHeader.textContent = 'R / Stata output';
-  stdoutSection.appendChild(stdoutHeader);
-  const stdoutPre = document.createElement('pre');
-  stdoutPre.textContent = (evt.raw_stdout || '').trimEnd() || '(no output)';
-  stdoutSection.appendChild(stdoutPre);
-  panel.appendChild(stdoutSection);
+  const stdoutText = (evt.raw_stdout || '').trimEnd();
+  if (stdoutText) {
+    const stdoutSection = document.createElement('section');
+    stdoutSection.className = 'result-stdout';
+    const stdoutHeader = document.createElement('div');
+    stdoutHeader.className = 'result-header';
+    stdoutHeader.textContent = 'R / Stata output';
+    stdoutSection.appendChild(stdoutHeader);
+    const stdoutPre = document.createElement('pre');
+    stdoutPre.textContent = stdoutText;
+    stdoutSection.appendChild(stdoutPre);
+    panel.appendChild(stdoutSection);
+  }
 
   if (evt.raw_stderr && evt.raw_stderr.trim()) {
     const stderrSection = document.createElement('section');
