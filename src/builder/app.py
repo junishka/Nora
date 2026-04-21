@@ -55,6 +55,13 @@ from rich.text import Text
 
 from builder.config import get_cwd, set_cwd
 from builder.env_detect import Environment, detect_environment
+from builder.policy import (
+    POLICY_FILE,
+    BuilderPolicy,
+    get_max_depth,
+    has_explicit_policy,
+    load_policy,
+)
 from builder.tools import ALLOWED_TOOL_NAMES, SERVER_NAME, build_server
 
 
@@ -297,6 +304,67 @@ def _print_banner(mode: AuthMode, cwd: Path, env: Environment) -> None:
     )
 
 
+def _scan_datasets(cwd: Path) -> list[Path]:
+    """Return dataset files in ``cwd`` (top-level only), sorted.
+
+    Only the three formats Builder currently supports: ``.csv``,
+    ``.dta``, ``.rds``. We scan the top level only — datasets
+    nested inside subdirs don't participate in the researcher's
+    consent UI until they do.
+    """
+    results: list[Path] = []
+    try:
+        for child in cwd.iterdir():
+            if child.is_file() and child.suffix.lower() in (".csv", ".dta", ".rds"):
+                results.append(child)
+    except OSError:
+        return []
+    results.sort()
+    return results
+
+
+def _print_schema_policy(cwd: Path) -> None:
+    """Show the researcher which schema-depth ceiling applies to each
+    dataset in cwd. Silent if no datasets are present.
+
+    This is a non-interactive notification — the researcher edits
+    ``<cwd>/.builder/policy.json`` by hand to change what Claude can
+    see. A proper wizard UX is a follow-on.
+    """
+    datasets = _scan_datasets(cwd)
+    if not datasets:
+        return
+
+    policy = load_policy(cwd)
+    lines: list[str] = []
+    any_default = False
+    for ds in datasets:
+        ceiling = get_max_depth(policy, ds.name)
+        if has_explicit_policy(policy, ds.name):
+            source = "[green]explicit[/green]"
+        else:
+            source = "[yellow]default[/yellow]"
+            any_default = True
+        lines.append(f"  [cyan]{ds.name}[/cyan]  [dim]·[/dim]  {ceiling}  [dim]({source})[/dim]")
+
+    body_parts = [
+        "[bold]Schema policy[/bold] [dim](what Claude can see about each dataset)[/dim]",
+        *lines,
+    ]
+    if any_default:
+        body_parts.append(
+            f"[dim]Edit {POLICY_FILE} to raise any dataset's ceiling. "
+            f"Tiers: names_only < names_types < names_types_labels < "
+            f"names_types_labels_summary.[/dim]"
+        )
+    console.print(
+        Panel.fit(
+            Text.from_markup("\n".join(body_parts)),
+            border_style="yellow" if any_default else "green",
+        )
+    )
+
+
 def _print_auth_hint() -> None:
     console.print()
     console.print(
@@ -528,6 +596,7 @@ async def _chat_loop() -> int:
     cwd = get_cwd()
     env = detect_environment()
     _print_banner(mode, cwd, env)
+    _print_schema_policy(cwd)
     # Platform preflight — submit_script currently requires macOS's
     # `sandbox-exec`. Warn up-front rather than failing at the first
     # script submission; `get_schema` and `request_data` still work

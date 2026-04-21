@@ -18,7 +18,7 @@ working architectural direction.
 
 ## Status
 
-Alpha. Privacy invariants are implemented and tested (156 tests),
+Alpha. Privacy invariants are implemented and tested (194 tests),
 but this is not yet a product non-developers can install. See the
 [remaining work section in the direction doc](docs/direction.md#whats-remaining-prioritized).
 
@@ -51,7 +51,7 @@ Double-click install (`.dmg`) is planned but not yet done. Today:
 git clone https://github.com/junishka/builder.git
 cd builder
 uv sync --group dev
-uv run pytest              # expect: 156 passed (on macOS with R installed)
+uv run pytest              # expect: 194 passed (on macOS with R installed)
 uv run python -m builder /path/to/your/data
 ```
 

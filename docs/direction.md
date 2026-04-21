@@ -112,21 +112,42 @@ Full implementation status in
   matters for researchers handling more sensitive data than
   current pilots.
 
-### 2. Researcher consent UI for schema depth (1–2 sessions)
+### 2. Researcher consent UI for schema depth — *done (file-based v1)*
 
-Currently schema depth is a code default. Move to an explicit
-per-dataset policy file (`.builder/policy.json` or equivalent)
-with conservative defaults:
+Schema depth is now an explicit researcher policy in
+`<cwd>/.builder/policy.json` rather than a code default. Each
+dataset has a per-file `max_depth` ceiling (or inherits
+`default_max_depth`); `get_schema` denies requests above the
+ceiling, annotates successful responses with the current
+`policy_max_depth` so Claude knows the limit without probing.
+Malformed policy files fall back to the conservative default
+silently — a broken file can't lock the researcher out.
 
-- **Default:** variable names + types.
-- **Opt-in:** variable labels.
-- **Opt-in:** categorical level names.
-- **Opt-in:** 5th/95th numeric bounds.
-- **Never:** raw values, min, max, median, individual observations.
+**Depths (least to most permissive):**
+- `names_only` — variable names only.
+- `names_types` — + type per variable (conservative default).
+- `names_types_labels` — + variable labels and value labels.
+- `names_types_labels_summary` — + per-variable NA counts and
+  distinct-value counts for categoricals.
 
-Surface the policy in the TUI when a dataset is first opened so
-the researcher makes an explicit choice rather than inheriting a
-default silently.
+Never at any depth: raw values, min, max, median, individual
+observations. Those belong to `request_data` (with its own SDC
+rules) and `submit_script` (sanitized via the result pipeline).
+
+At app startup, the banner lists each dataset in cwd with its
+current ceiling, marked `explicit` (in policy file) vs
+`default` (inherited). No interactive TUI yet — researchers
+edit `.builder/policy.json` by hand. A wizard UX is a follow-on
+when there's feedback from researcher #1.
+
+Also covered: ceiling annotation on successful responses (so
+Claude learns the limit without probing), per-dataset independence
+(each dataset has its own ceiling), explicit-vs-default distinction
+in denial messages.
+
+Remaining (Phase 3 follow-ons, not blocking step 8):
+- Interactive TUI prompt at first-open of an un-policy'd dataset.
+- `builder policy` subcommand for CLI management of the policy file.
 
 ### 3. Packaging to `.dmg` (2–4 sessions)
 

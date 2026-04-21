@@ -28,9 +28,15 @@ from typing import Any
 
 from claude_agent_sdk import create_sdk_mcp_server, tool
 
-from builder import data_request, executor, schema
+from builder import data_request, executor, policy as policy_module, schema
 from builder.config import PathEscapeError, get_cwd, resolve_in_cwd
 from builder.data_request import SUPPORTED_REQUEST_TYPES
+from builder.policy import (
+    depth_allowed,
+    get_max_depth,
+    has_explicit_policy,
+    load_policy,
+)
 from builder.sanitizer import sanitize
 from builder.store import get_store
 
@@ -276,9 +282,11 @@ def _as_mcp_text(payload: dict[str, Any]) -> dict[str, Any]:
         "    - 'names_types_labels': + variable labels and value labels.\n"
         "    - 'names_types_labels_summary': + NA counts and distinct counts "
         "for categoricals.\n"
-        "  Conservative default: 'names_types'. Ask the researcher before "
-        "using 'names_types_labels_summary' if there's reason to think the "
-        "label strings are sensitive."
+        "  Conservative default: 'names_types'. Each successful response "
+        "includes a 'policy_max_depth' field showing the ceiling the "
+        "researcher has set for this dataset — you cannot exceed it. "
+        "Requests above the ceiling are denied with the current ceiling "
+        "named in the reason."
     ),
     {"dataset": str, "depth": str},
 )
@@ -322,6 +330,31 @@ async def get_schema(args: dict[str, Any]) -> dict[str, Any]:
             "dataset": dataset,
         })
 
+    # Researcher consent policy: compare requested depth against the
+    # ceiling set in `<cwd>/.builder/policy.json`. A missing policy
+    # file or a missing per-dataset entry uses the conservative
+    # default (`names_types`). The policy is a *ceiling* — Claude can
+    # still request something narrower than the ceiling if that's
+    # enough for the task.
+    policy_doc = load_policy(get_cwd())
+    ceiling = get_max_depth(policy_doc, path.name)
+    if depth in policy_module.VALID_DEPTHS and not depth_allowed(depth, ceiling):
+        explicit = has_explicit_policy(policy_doc, path.name)
+        return _as_mcp_text({
+            "status": "denied",
+            "reason": (
+                f"schema depth {depth!r} exceeds the researcher's "
+                f"policy ceiling for {path.name!r} "
+                f"({ceiling!r}{' — explicit' if explicit else ' — default'}"
+                f"). Ask for a narrower depth, or ask the researcher "
+                f"to raise the ceiling for this dataset in "
+                f".builder/policy.json."
+            ),
+            "dataset": dataset,
+            "requested_depth": depth,
+            "policy_max_depth": ceiling,
+        })
+
     try:
         payload = schema.extract(path, depth)
     except ValueError as e:
@@ -340,6 +373,10 @@ async def get_schema(args: dict[str, Any]) -> dict[str, Any]:
             "dataset": dataset,
         })
 
+    # Annotate the response with the policy ceiling so Claude knows
+    # the max depth this dataset allows for future calls, without
+    # needing to hit a denial to learn it.
+    payload["policy_max_depth"] = ceiling
     return _as_mcp_text(payload)
 
 
