@@ -106,10 +106,13 @@ Variants:
 **What it gets:**
 - Claude gets a debugging partner for failed scripts.
 - Text data becomes analyzable via local-model redaction.
-- Under B1, a slightly cleaner narrative ("Claude never authored
-  code that ran on your machine") — though since the existing
-  sandbox already isolates execution from Claude's reach, this is
-  a marketing distinction more than a privacy one.
+- Under B1, a narrow additional privacy property: an adaptive,
+  adversarial Claude can no longer choose exactly which
+  computation runs on the data. That's a real gain, but it's
+  bounded — it doesn't address the harder problem of cumulative
+  inference across many sanitized queries (the "20 questions"
+  attack), which is inherent to any interactive analysis system
+  regardless of who authored the code.
 
 **What it costs:**
 - Install gets much bigger — 15–17 GB for a reasonable model at
@@ -123,16 +126,24 @@ Variants:
 
 ## Why Option A was chosen
 
-The key realization: **the privacy guarantee doesn't depend on
-which option is chosen.** In both, Claude already can't touch the
-data directly — that's enforced by the tool interface, the
-sandbox, and the sanitizer. Those three layers work identically
-either way.
+The key realization: **the core privacy guarantee doesn't depend on
+which option is chosen.** In both, Claude can't touch the data
+directly — that's enforced by the tool interface, the sandbox, and
+the sanitizer. Those three layers work identically either way.
 
-A local model would add *capability* (debugging help, text-data
-handling), not privacy.
+A local model would close one narrower channel (an adaptive
+Claude choosing exactly which computations run) and would add
+capability (debugging help, text-data handling). It would not
+address the harder privacy problem — cumulative inference across
+many sanitized queries — which is inherent to any interactive
+analysis system and is handled by session-level budgets and SDC
+rules, not by code authorship.
 
-So the pragmatic decision is:
+So the privacy benefit of Option B is *limited* rather than
+transformative, and the costs (install footprint, RAM, worse code
+quality, maintenance) are concrete.
+
+The pragmatic decision:
 
 - **Ship Option A now.** The privacy properties are real, the
   architecture is tested, and it's usable by a real researcher on

@@ -34,11 +34,25 @@ layers:
 
 None of those three layers depends on *who authored the code*.
 Claude writing R is fine as long as Claude cannot directly touch
-data — which the tool interface and sandbox together enforce. A
-local LLM would add *capability* (debugging help, text-data
-handling), not privacy. It stays an optional future enhancement,
-re-enters the critical path only when a specific researcher use
-case demands it.
+data — which the tool interface and sandbox together enforce.
+
+A local LLM in the loop would close one narrow additional channel:
+an adaptive, adversarial Claude choosing exactly which
+computations run on the data. That's not nothing — it's a real but
+bounded gain. What it does *not* solve is the harder privacy
+problem, which is **cumulative inference from many sanitized
+queries** (the "20 questions" attack: each query is individually
+compliant, but the joint distribution of answers reveals more than
+any single one should). That problem is inherent to any
+interactive analysis system and is addressed — imperfectly — by
+session-level disclosure budgets and the sanitizer's SDC rules,
+not by who authored the code.
+
+So a local LLM offers *limited* privacy benefit (not zero, not
+primary) and would add real *capability* (debugging with raw
+stderr, text-data handling). It stays an optional future
+enhancement, re-enters the critical path when a specific
+researcher use case demands it.
 
 ## What's built
 
@@ -150,12 +164,17 @@ build it.
 - **Bundling a local LLM on the critical path.** 15–17 GB install
   footprint, requires 16 GB+ RAM, produces worse R/Stata than
   Claude — especially Stata, where the open training corpus is
-  thin. Adds zero privacy gain given the existing stack. Stays
-  available as a future optional helper for: error recovery using
-  raw stderr (which Claude can't see), text-data redaction so
-  free-text values can flow through the sanitizer, and quality
-  improvements in specific edge cases. Re-enters the discussion
-  when a real researcher's task actually needs one of these.
+  thin. Privacy benefit is narrow (closes the
+  frontier-authored-code channel for adaptive attackers) but does
+  not address cumulative-inference / adaptive-probing risks, which
+  are inherent to interactive analysis regardless of authorship
+  and are handled by session-level disclosure budgets and the
+  SDC rules. Stays available as a future optional helper for:
+  error recovery using raw stderr (which Claude can't see),
+  text-data redaction so free-text values can flow through the
+  sanitizer, and quality improvements in specific edge cases.
+  Re-enters the discussion when a real researcher's task actually
+  needs one of these.
 
 - **Mandatory safe variable IDs as the frontier-facing identity
   surface.** Schema exposure is policy, not architecture. If a
