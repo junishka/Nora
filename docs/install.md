@@ -37,34 +37,21 @@ You do **not** need Python, `uv`, `pip`, or any other development tooling. Every
 
 ## Running Builder
 
-Double-click `Builder.app` in `Applications` or Launchpad. A new Terminal window opens with Builder running. The first thing it asks is:
+Double-click `Builder.app` in `Applications` or Launchpad. A new Terminal window opens with the Builder chat running.
+
+The first thing it asks is where your data lives:
 
 ```
-┌────────────────────────────────────────────────────────────┐
-│ Welcome to Builder.                                        │
-│                                                            │
-│ Builder reads data only from one directory you choose.     │
-│ That directory is the sandbox — Claude's scripts can't     │
-│ reach anything outside it.                                 │
-│                                                            │
-│ Where do your data files live?                             │
-└────────────────────────────────────────────────────────────┘
-
 data directory (~/Documents):
 ```
 
-Enter the absolute path (or `~`-prefixed path) to the directory that contains the data files you want to analyze. This is Builder's sandbox for the session — Claude cannot read anything outside this directory.
+Enter the path to the folder containing the data files you want to analyze — absolute (`/Users/you/Project/data`) or home-prefixed (`~/Project/data`). That directory becomes Builder's sandbox for the session — Claude cannot read anything outside it.
 
 Tab-completion works. Press **Enter** to accept the default (`~/Documents`).
 
-After you pick a directory, the banner shows:
+After you pick a directory, Builder prints its banner — auth mode, detected runtimes (R, Stata), sandbox status, and a per-dataset permission summary — and drops you into the chat. You type; Claude responds.
 
-- Your Claude auth mode (subscription vs API key).
-- Which runtimes are installed (R, Stata, both, neither).
-- Whether the sandbox is active.
-- The schema policy for each dataset Builder detected in your directory.
-
-Then you type messages to Claude. The chat behaves like any terminal chat: you type, Claude responds inline.
+**Heads-up:** the `.dmg` currently ships the **terminal** Builder. There's also a web UI (`builder-ui`) that opens a native window and supports drag-and-drop file upload, but that runs from source only right now. See "Building from source" at the bottom.
 
 ## Schema policy — controlling what Claude sees
 
@@ -125,15 +112,24 @@ find ~ -type d -name .builder -print
 
 ## Building from source
 
-If you'd rather run the development checkout directly:
+If you'd rather run the development checkout directly — or you want the web UI with drag-and-drop file upload, which isn't in the current `.dmg`:
 
 ```bash
 git clone https://github.com/junishka/builder.git
 cd builder
 uv sync --group dev
-uv run pytest                                  # expect ~194 passed
-uv run python -m builder /path/to/your/data
+uv run pytest                       # expect ~194 passed
+
+# Terminal frontend (same as the .dmg ships)
+uv run builder                      # landing prompt for the data dir
+uv run builder /path/to/your/data
+
+# Web-UI frontend (native WKWebView window)
+uv run builder-ui                   # landing: drop files, pick folder, etc.
+uv run builder-ui /path/to/data
 ```
+
+The web UI opens a chat window with a drop zone for `.csv` / `.dta` / `.rds` files. Dropped files land in `~/.builder-sessions/<timestamp>_<id>/` — a per-session scratch dir that becomes the sandbox root. This is the cleanest way to share exactly the files you want to analyze without exposing a whole project folder.
 
 To rebuild the `.app` and `.dmg`:
 

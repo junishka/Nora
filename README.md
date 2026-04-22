@@ -12,15 +12,18 @@ disclosure-control sanitizer before Claude sees it. The researcher
 sees raw logs. Claude only ever sees sanitized, SDC-filtered
 results.
 
-See [`docs/overview.md`](docs/overview.md) for a plain-language
-description and [`docs/direction.md`](docs/direction.md) for the
-working architectural direction.
+See [`docs/handoff.md`](docs/handoff.md) for the single-page
+summary if you're picking the project up. [`docs/overview.md`](docs/overview.md)
+has a plain-language description; [`docs/direction.md`](docs/direction.md)
+has the long-form architectural direction and open-question log.
 
 ## Status
 
-Alpha. Privacy invariants are implemented and tested (194 tests),
-but this is not yet a product non-developers can install. See the
-[remaining work section in the direction doc](docs/direction.md#whats-remaining-prioritized).
+Alpha. Privacy invariants are implemented and tested (194 tests).
+Two frontends ship: a terminal UI (`builder`) and a pywebview-based
+web UI (`builder-ui`). The `.dmg` currently distributes the terminal
+entry point only; `builder-ui` runs from source. See
+[the handoff doc's status table](docs/handoff.md#where-it-stands).
 
 ## Platform requirements
 
@@ -58,13 +61,22 @@ from the development checkout, see "Running from source" below.
 git clone https://github.com/junishka/builder.git
 cd builder
 uv sync --group dev
-uv run pytest              # expect: 194 passed (on macOS with R installed)
-uv run python -m builder /path/to/your/data
+uv run pytest                       # expect: 194 passed
+
+# Terminal frontend
+uv run builder                      # landing prompt for the data dir
+uv run builder /path/to/your/data   # straight into chat
+
+# Web-UI frontend (native WKWebView window via pywebview)
+uv run builder-ui                   # landing screen: drop files or pick folder
+uv run builder-ui /path/to/data     # straight into chat
 ```
 
-The first argument is the directory containing the data files
-Builder is allowed to read. Leaving it off launches the interactive
-prompt (the same one `.app` users see).
+With no path argument, `builder-ui` opens a landing screen where you
+can drag `.csv` / `.dta` / `.rds` files onto a drop zone, click
+**Choose files…** (native multi-select), or **Choose folder…**.
+Dropped files land in `~/.builder-sessions/<timestamp>_<id>/`
+which becomes the sandbox root for that session.
 
 To rebuild the distributable `.app` and `.dmg`:
 
@@ -81,15 +93,21 @@ subprocesses.
 
 ## Project layout
 
-- `src/builder/` — Python source. `app.py` is the entry point;
-  `tools.py` defines the MCP interface; `executor.py` runs scripts
-  under the sandbox; `sanitizer.py` applies the SDC rules; `schema.py`
-  extracts dataset metadata; runtime libraries for R and Stata live
-  under `src/builder/runtime/`.
-- `tests/` — pytest suite. Property tests (via Hypothesis) are the
-  correctness backbone for the sanitizer.
-- `docs/` — working architectural direction and plain-language
-  overview.
+- `src/builder/` — Python source.
+  - `app.py` — terminal entry point, system prompt, chat loop.
+  - `ui.py` + `web/` — pywebview shell + HTML/CSS/JS frontend.
+  - `tools.py` — the five MCP tools Claude sees.
+  - `executor.py` — sandbox profile, R/Stata subprocess, per-run token.
+  - `sanitizer.py` + `sdc.py` + `text_safety.py` — disclosure control.
+  - `schema.py` — dataset metadata extraction (`.csv`/`.dta`/`.rds`).
+  - `policy.py` — per-dataset schema-depth ceilings + persistence.
+  - `store.py` — SQLite result store, audit log.
+  - `runtime/` — R library + five Stata `.ado` files scripts call.
+  - `chat_service.py` — typed event stream both frontends consume.
+- `tests/` — 194 tests. `test_sanitizer.py` is the property-test
+  backbone; `test_executor_*` cover the sandbox SBPL profile.
+- `docs/` — handoff, overview, direction, install, verification.
+- `packaging/` — PyInstaller spec + `.app`/`.dmg` build scripts.
 
 ## Security model
 

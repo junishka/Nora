@@ -1,13 +1,17 @@
 # Builder — architectural direction
 
-Working document. Last updated 2026-04-20 after reviewer feedback
-and the decision to stay with the current script-submission
-architecture ("Option A") rather than pivot to a plan-submission
-architecture with a local LLM translator.
+Working document. Last substantive update **2026-04-22**, after the
+web UI iteration pass (file upload, drag-drop, result panel with
+Open-in-R/Stata buttons, composer redesign, turn-state discipline,
+Permission chip). The core decision — stay with
+script-submission ("Option A") rather than pivot to plan-submission
+with a bundled local LLM — still stands from 2026-04-20.
 
-See [`docs/overview.md`](overview.md) for a plain-language
-description of what Builder is and why it exists. This document is
-about what the architecture is, what it isn't, and what's next.
+For the single-page overview aimed at someone picking this up, see
+[`docs/handoff.md`](handoff.md). [`docs/overview.md`](overview.md)
+is the plain-language description of what Builder is and why. This
+doc is the long-form record of what the architecture is, what it
+isn't, and why.
 
 ## The decision
 

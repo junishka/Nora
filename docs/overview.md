@@ -20,10 +20,11 @@ analysis while the actual values stay on the researcher's machine.
 
 ## How it works
 
-The researcher points Builder at a directory with their data files
-(CSVs, Stata `.dta`, R `.rds`). They start a chat with Claude
-through Builder's terminal interface. Claude is then restricted:
-no filesystem access, no shell, no network tools.
+The researcher either drags the data files into Builder's window
+(web UI: `builder-ui`) or points Builder at a directory (terminal
+UI: `builder`). Supported formats are `.csv`, `.dta` (Stata), and
+`.rds` (R). A chat starts with Claude through Builder; Claude is
+then restricted — no filesystem access, no shell, no network tools.
 
 Instead, Claude has exactly five operations, through a narrow tool
 interface:
