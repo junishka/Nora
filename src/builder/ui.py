@@ -95,6 +95,11 @@ class BuilderBridge:
         # A lock to serialize send_message calls. The SDK client
         # assumes one turn at a time.
         self._send_lock: asyncio.Lock | None = None
+        # Handle to the currently-running turn's asyncio Task, so
+        # `interrupt_turn` can cancel it when the researcher clicks
+        # the Stop button. None when no turn is in flight. Captured
+        # on the worker loop, cleared when the turn returns.
+        self._current_turn_task: asyncio.Task[None] | None = None
 
     # -------- lifecycle --------
 
@@ -350,16 +355,26 @@ class BuilderBridge:
             return {"ok": False, "reason": "empty dataset name"}
 
         current = load_policy(self.cwd)
+        # When the researcher selects the same depth as the app-wide
+        # default, drop any explicit entry for this dataset rather
+        # than saving "explicit at the default value." Result: the
+        # dataset's `explicit` flag goes back to False, matching the
+        # researcher's mental model that "I chose the default" is the
+        # same state as "I never changed it." Without this, a round
+        # trip (change away, change back) left the entry stuck at
+        # `explicit=True`.
+        updated_datasets = dict(current.datasets)
+        if depth == current.default_max_depth:
+            updated_datasets.pop(name, None)
+        else:
+            updated_datasets[name] = DatasetPolicy(
+                max_depth=depth,
+                set_at=datetime.now(timezone.utc).isoformat(),
+            )
         updated = BuilderPolicy(
             version=current.version,
             default_max_depth=current.default_max_depth,
-            datasets={
-                **current.datasets,
-                name: DatasetPolicy(
-                    max_depth=depth,
-                    set_at=datetime.now(timezone.utc).isoformat(),
-                ),
-            },
+            datasets=updated_datasets,
         )
         try:
             save_policy(self.cwd, updated)
@@ -389,6 +404,41 @@ class BuilderBridge:
         asyncio.run_coroutine_threadsafe(
             self._run_turn(text), self._loop
         )
+
+    def interrupt_turn(self) -> dict[str, Any]:
+        """Cancel the currently-running turn. Called when the
+        researcher clicks the Stop button. Cancellation propagates
+        through the asyncio Task running in ``_run_turn``: the
+        ``async for`` loop over ``chat_service.run_turn`` raises
+        CancelledError, we surface that as a ``turn_error`` event
+        with a clear message, and the Send button re-enables on the
+        JS side via its normal terminal-event handling.
+
+        The SDK's socket/subprocess may still be mid-write to the
+        upstream service when we cancel; we close the persistent
+        client so the next ``send_message`` opens a fresh one and
+        server-side state doesn't leak across turns.
+        """
+        if self._loop is None:
+            return {"ok": False, "reason": "worker loop not running"}
+        task = self._current_turn_task
+        if task is None or task.done():
+            return {"ok": False, "reason": "no turn in flight"}
+        # Cancel on the worker loop; safe from this thread.
+        self._loop.call_soon_threadsafe(task.cancel)
+        # Also tear down the client so any half-finished request
+        # doesn't leak into the next turn. Reopens lazily.
+        async def _close_client() -> None:
+            if self._client is not None:
+                try:
+                    await self._client.__aexit__(None, None, None)
+                except Exception:  # noqa: BLE001
+                    pass
+                finally:
+                    self._client = None
+
+        asyncio.run_coroutine_threadsafe(_close_client(), self._loop)
+        return {"ok": True}
 
     # -------- internals --------
 
@@ -462,6 +512,12 @@ class BuilderBridge:
 
     async def _run_turn(self, text: str) -> None:
         assert self._send_lock is not None
+        # Register this task so interrupt_turn() can cancel it. Using
+        # current_task() (set by the event loop) rather than passing
+        # the Task in from the scheduler — scheduler yields a
+        # concurrent.futures.Future wrapper, which isn't cancellable
+        # in the asyncio sense.
+        self._current_turn_task = asyncio.current_task()
         async with self._send_lock:
             try:
                 client = await self._ensure_client()
@@ -481,6 +537,16 @@ class BuilderBridge:
             try:
                 async for evt in chat_service.run_turn(client, text):
                     self._push_event(_event_to_dict(evt))
+            except asyncio.CancelledError:
+                # Researcher hit Stop. Surface a terminal event so
+                # the UI re-enables the composer via its standard
+                # event handler. Don't re-raise — cancellation is
+                # expected here, not an error condition.
+                self._push_event({
+                    "type": "turn_error",
+                    "message": "cancelled",
+                })
+                return
             except ClaudeSDKError as e:
                 self._push_event({
                     "type": "turn_error",
@@ -491,6 +557,8 @@ class BuilderBridge:
                     "type": "turn_error",
                     "message": f"turn failed: {e}",
                 })
+            finally:
+                self._current_turn_task = None
 
     def _push_event(self, payload: dict[str, Any]) -> None:
         """Send a JSON event to the web UI. pywebview's evaluate_js

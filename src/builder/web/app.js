@@ -20,15 +20,18 @@ const messagesEl = document.getElementById('messages');
 const form = document.getElementById('compose-form');
 const input = document.getElementById('compose-input');
 const sendBtn = document.getElementById('send-btn');
+const stopBtn = document.getElementById('stop-btn');
 const welcomeEl = document.getElementById('welcome');
 const cwdEl = document.getElementById('cwd-display');
 
 // Depth tiers — kept in sync with builder/policy.py::VALID_DEPTHS and
 // with the get_schema tool help. Displayed labels are researcher-
-// facing — plain English, not internal identifiers.
+// facing — plain English, not internal identifiers. "(default)" on
+// the names_types row flags the app-wide default choice, so
+// researchers know which option is the "unset" state.
 const DEPTH_TIERS = [
   { value: 'names_only',                 label: 'Names only' },
-  { value: 'names_types',                label: 'Names + types (default)' },
+  { value: 'names_types',                label: 'Names and types (default)' },
   { value: 'names_types_labels',         label: '+ labels / value labels' },
   { value: 'names_types_labels_summary', label: '+ NA count / distinct count' },
 ];
@@ -247,9 +250,36 @@ function autosize() {
 
 function setSending(sending) {
   turnInFlight = sending;
-  sendBtn.disabled = sending;
-  sendBtn.textContent = sending ? 'Working…' : 'Send';
+  // Toggle the Send / Stop icons rather than disabling the Send
+  // button. During a turn, Stop replaces Send in the same spot so
+  // the composer footprint doesn't reflow.
+  if (sending) {
+    sendBtn.classList.add('hidden');
+    stopBtn.classList.remove('hidden');
+  } else {
+    stopBtn.classList.add('hidden');
+    sendBtn.classList.remove('hidden');
+  }
   input.setAttribute('aria-busy', sending ? 'true' : 'false');
+}
+
+// Stop button — asks the bridge to cancel the in-flight turn. The
+// bridge cancels the asyncio task and tears down the SDK client so
+// no half-finished request leaks into the next turn; a terminal
+// "turn_error: cancelled" event arrives via the normal stream and
+// clears the UI state through setSending(false).
+if (stopBtn) {
+  stopBtn.addEventListener('click', async () => {
+    if (!window.pywebview || !window.pywebview.api) return;
+    stopBtn.disabled = true;
+    try {
+      await window.pywebview.api.interrupt_turn();
+    } catch (_) {
+      // swallow — the turn_error event below will re-enable things
+    } finally {
+      stopBtn.disabled = false;
+    }
+  });
 }
 
 // ----- Python → JS event handler -----------------------------------------
@@ -630,16 +660,12 @@ function updatePolicyChip(policy) {
 }
 
 function compactPolicyLabel(policy) {
-  const n = policy.datasets.length;
+  // Keep the chip short so it fits next to Send. Details live in
+  // the popup the chip opens. Show a customization count only when
+  // it would be useful information.
   const customized = policy.datasets.filter((d) => d.explicit).length;
-  const plural = n === 1 ? '' : 's';
-  if (customized === 0) {
-    return `Policy · ${n} ${plural ? 'datasets' : 'dataset'} @ default`;
-  }
-  if (customized === n) {
-    return `Policy · ${n} datasets · all custom`;
-  }
-  return `Policy · ${n} datasets · ${customized} custom`;
+  if (customized === 0) return 'Policy';
+  return `Policy · ${customized} custom`;
 }
 
 function buildPolicyPopup(policy) {

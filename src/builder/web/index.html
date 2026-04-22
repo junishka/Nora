@@ -65,11 +65,41 @@
           rows="1"
           autofocus
         ></textarea>
-        <button type="button" id="policy-chip" class="composer-chip" title="Schema policy — click to change per-dataset">
-          <span id="policy-chip-label">Policy</span>
-          <span class="chip-arrow">▾</span>
-        </button>
-        <button type="submit" id="send-btn">Send</button>
+        <div class="composer-bar">
+          <button
+            type="button"
+            id="policy-chip"
+            class="composer-chip"
+            title="Schema policy — click to change per-dataset"
+          >
+            <span id="policy-chip-label">Policy</span>
+            <span class="chip-arrow">▾</span>
+          </button>
+          <div class="composer-bar-spacer"></div>
+          <button
+            type="submit"
+            id="send-btn"
+            class="composer-action"
+            aria-label="Send"
+            title="Send (Enter)"
+          >
+            <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <line x1="12" y1="19" x2="12" y2="5"/>
+              <polyline points="5 12 12 5 19 12"/>
+            </svg>
+          </button>
+          <button
+            type="button"
+            id="stop-btn"
+            class="composer-action stop hidden"
+            aria-label="Stop"
+            title="Stop"
+          >
+            <svg viewBox="0 0 24 24" width="14" height="14" fill="currentColor">
+              <rect x="5" y="5" width="14" height="14" rx="1"/>
+            </svg>
+          </button>
+        </div>
       </form>
       <div id="policy-popup" class="policy-popup hidden"></div>
     </footer>
