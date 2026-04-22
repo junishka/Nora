@@ -428,70 +428,16 @@ body {
   background: #d33;
 }
 
-/* --- policy button + popup (next to Send) --- */
-
-.policy-btn {
-  padding: 10px 14px;
-  font-size: 15px;
-  background: var(--bg-surface);
-  color: var(--text);
-  border: 1px solid var(--border);
-  border-radius: var(--radius);
-  cursor: pointer;
-  font-family: inherit;
-  /* Match the Send button's height visually via the same vertical
-   * padding; slightly narrower horizontally because "Policy ▾" is
-   * a shorter label. */
-}
-
-.policy-btn:hover {
-  border-color: var(--accent);
-  color: var(--accent);
-}
-
-.policy-popup {
-  position: absolute;
-  right: 20px;
-  bottom: 78px;
-  max-width: min(480px, calc(100vw - 40px));
-  background: var(--bg-surface);
-  border: 1px solid var(--border);
-  border-radius: var(--radius);
-  padding: 14px 16px;
-  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.15);
-  font-size: 13px;
-  z-index: 10;
-}
-
-@media (prefers-color-scheme: dark) {
-  .policy-popup {
-    box-shadow: 0 8px 24px rgba(0, 0, 0, 0.5);
-  }
-}
-
-.policy-popup-header {
-  margin-bottom: 10px;
-  color: var(--text);
-}
-
-.policy-popup-sub {
-  color: var(--text-dim);
-  font-weight: 400;
-}
+/* Legacy .policy-btn + an earlier fixed-position .policy-popup
+ * block used to live here. Both are superseded by the
+ * .permission-wrap / .composer-chip / .policy-popup pair below
+ * (search for "composer meta bar" in this file). Leaving only the
+ * shared row / select styles that both the old and new popups
+ * use. */
 
 .policy-popup-empty {
   color: var(--text-dim);
   font-style: italic;
-}
-
-.policy-popup-list {
-  display: grid;
-  grid-template-columns: 1fr auto;
-  row-gap: 8px;
-  column-gap: 12px;
-  align-items: center;
-  max-height: 320px;
-  overflow-y: auto;
 }
 
 .policy-row {
@@ -534,35 +480,50 @@ body {
   font-size: 11px;
 }
 
-/* --- composer policy chip + popup ---
- * Chip sits discreetly at the bottom-left of the composer bar.
- * Minimal footprint so Send is visually dominant; opens a popup
- * above the chip with the per-dataset dropdowns. */
+/* --- composer meta bar (below the chat box) ---
+ * A thin status row under the composer, hosting the Permission
+ * chip on the left. Mirrors Claude Code / ChatGPT-style chrome:
+ * small, dim text, surfaces on hover. Room here for future
+ * indicators like a model badge or a turn-usage counter. */
+
+.composer-meta {
+  max-width: var(--max-width);
+  margin: 6px auto 0;
+  padding: 0 4px;
+  display: flex;
+  align-items: center;
+  font-size: 12px;
+  color: var(--text-dim);
+  gap: 8px;
+}
+
+.permission-wrap {
+  /* Anchor for the popup — position: absolute popup resolves
+   * against this wrapper, so the popup always appears just above
+   * the chip regardless of where we put the chip on the page. */
+  position: relative;
+}
 
 .composer-chip {
   display: inline-flex;
   align-items: center;
   gap: 4px;
-  padding: 4px 10px;
+  padding: 2px 6px;
   font-size: 12px;
   font-family: inherit;
   background: transparent;
   color: var(--text-dim);
-  border: 1px solid transparent;
-  border-radius: 6px;
+  border: none;
+  border-radius: 4px;
   cursor: pointer;
   white-space: nowrap;
-  max-width: 240px;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  transition: background 0.15s, color 0.15s, border-color 0.15s;
+  transition: color 0.15s, background 0.15s;
 }
 
 .composer-chip:hover,
 .composer-chip.open {
-  background: var(--bg-surface);
-  border-color: var(--border);
   color: var(--text);
+  background: var(--bg-surface);
 }
 
 .chip-arrow {
@@ -578,8 +539,8 @@ body {
 
 .policy-popup {
   position: absolute;
-  right: 20px;
-  bottom: 72px;
+  bottom: calc(100% + 8px);  /* sit just above the chip */
+  left: 0;
   background: var(--bg-surface);
   border: 1px solid var(--border);
   border-radius: var(--radius);

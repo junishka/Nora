@@ -66,15 +66,6 @@
           autofocus
         ></textarea>
         <div class="composer-bar">
-          <button
-            type="button"
-            id="policy-chip"
-            class="composer-chip"
-            title="Schema policy — click to change per-dataset"
-          >
-            <span id="policy-chip-label">Policy</span>
-            <span class="chip-arrow">▾</span>
-          </button>
           <div class="composer-bar-spacer"></div>
           <button
             type="submit"
@@ -101,7 +92,26 @@
           </button>
         </div>
       </form>
-      <div id="policy-popup" class="policy-popup hidden"></div>
+
+      <!-- Status bar below the composer — hosts the Permission chip
+           (plus room for future indicators like model/usage). Chip
+           lives outside the compose-form now so the chat box stays
+           minimal; the popup is anchored above the chip inside
+           .permission-wrap, so it follows the chip wherever it sits. -->
+      <div class="composer-meta">
+        <div class="permission-wrap">
+          <button
+            type="button"
+            id="policy-chip"
+            class="composer-chip"
+            title="What Claude sees about each dataset — click to change"
+          >
+            <span id="policy-chip-label">Permission</span>
+            <span class="chip-arrow">▾</span>
+          </button>
+          <div id="policy-popup" class="policy-popup hidden"></div>
+        </div>
+      </div>
     </footer>
   </div>
 

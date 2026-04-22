@@ -660,22 +660,24 @@ function updatePolicyChip(policy) {
 }
 
 function compactPolicyLabel(policy) {
-  // Keep the chip short so it fits next to Send. Details live in
-  // the popup the chip opens. Show a customization count only when
-  // it would be useful information.
+  // Chip label. "Permission" reads more clearly than the internal
+  // "Policy" term — it's what Claude is *permitted* to see, not a
+  // legal/admin policy. Count only surfaces when something's been
+  // customized; at default we keep the chip to a single word.
   const customized = policy.datasets.filter((d) => d.explicit).length;
-  if (customized === 0) return 'Policy';
-  return `Policy · ${customized} custom`;
+  if (customized === 0) return 'Permission';
+  return `Permission · ${customized} custom`;
 }
 
 function buildPolicyPopup(policy) {
   const wrapper = document.createElement('div');
   const header = document.createElement('div');
   header.className = 'policy-popup-header';
+  // Keep this copy short. The researcher is busy; they don't need
+  // a paragraph to understand a dropdown.
   header.innerHTML =
-    '<strong>Schema policy</strong><br>' +
-    'What Claude sees about each dataset. Default is conservative; ' +
-    'widen per-dataset if labels or counts aren\'t sensitive.';
+    '<strong>Permission</strong> — what Claude sees about each ' +
+    'dataset. Default: variable names and types.';
   wrapper.appendChild(header);
 
   const list = document.createElement('div');
