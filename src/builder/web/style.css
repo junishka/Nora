@@ -333,6 +333,42 @@ body {
   overflow-x: auto;
   margin: 6px 0;
   font-size: 12px;
+  position: relative;
+}
+
+.tool-card .tool-label {
+  margin: 4px 0;
+  font-size: 12px;
+  color: var(--text-dim);
+  font-family: inherit;
+}
+
+.tool-card .tool-code {
+  /* Keep the code block distinctive — monospace, preserve
+   * whitespace, scrollable. The language badge in the corner tells
+   * the researcher what runtime this will hit. */
+  white-space: pre;
+}
+
+.tool-card .tool-lang-badge {
+  position: absolute;
+  top: 6px;
+  right: 10px;
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.5px;
+  color: var(--text-dim);
+  background: rgba(0, 0, 0, 0.15);
+  padding: 2px 6px;
+  border-radius: 4px;
+  text-transform: uppercase;
+}
+
+.tool-card .tool-source {
+  font-size: 11px;
+  color: var(--text-dim);
+  font-family: ui-monospace, "SF Mono", Menlo, monospace;
+  margin: 4px 2px 0;
 }
 
 .tool-card.error {

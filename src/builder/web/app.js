@@ -367,8 +367,20 @@ function append(kind, text, markdown) {
 
 function appendToolCall(evt) {
   const card = document.createElement('div');
-  card.className = 'tool-card collapsed';
   card.dataset.callId = evt.call_id;
+
+  // Tool-call cards: start EXPANDED for submit_script so the
+  // researcher can see the code Claude is about to run. That's the
+  // "did my script disappear?" bug — a collapsed submit_script chip
+  // looks like nothing ran. Other tools (get_schema / request_data /
+  // list_results / expand_result) have less interesting inputs and
+  // stay collapsed to keep the chat compact. After the result
+  // arrives, appendToolResult collapses submit_script too (see
+  // `existingCard.classList.add('collapsed')` there) so post-run
+  // the space goes to the result panel.
+  const shortName = shortenToolName(evt.name);
+  const isSubmitScript = shortName === 'submit_script';
+  card.className = 'tool-card' + (isSubmitScript ? '' : ' collapsed');
 
   const header = document.createElement('div');
   header.className = 'tool-header';
@@ -377,16 +389,50 @@ function appendToolCall(evt) {
   arrow.textContent = '▼';
   const title = document.createElement('span');
   title.innerHTML =
-    '<span class="tool-name">' + shortenToolName(evt.name) + '</span>' +
+    '<span class="tool-name">' + shortName + '</span>' +
     ' <span class="tool-status">running…</span>';
   header.appendChild(arrow);
   header.appendChild(title);
 
   const body = document.createElement('div');
   body.className = 'tool-body';
-  const pre = document.createElement('pre');
-  pre.textContent = JSON.stringify(evt.input, null, 2);
-  body.appendChild(pre);
+
+  if (isSubmitScript) {
+    // Render the language + code + label prominently, not as JSON
+    // stringification. Researcher sees the actual script.
+    const input = evt.input || {};
+    const langText = (input.language || '').toString().toUpperCase();
+    if (input.label) {
+      const label = document.createElement('div');
+      label.className = 'tool-label';
+      label.textContent = input.label;
+      body.appendChild(label);
+    }
+    const pre = document.createElement('pre');
+    pre.className = 'tool-code lang-' + (input.language || 'text').toLowerCase();
+    // Small language badge inside the code block so the researcher
+    // knows whether this is R or Stata at a glance.
+    const badge = document.createElement('span');
+    badge.className = 'tool-lang-badge';
+    badge.textContent = langText || 'script';
+    pre.appendChild(badge);
+    const codeEl = document.createElement('code');
+    codeEl.textContent = input.code || '';
+    pre.appendChild(codeEl);
+    body.appendChild(pre);
+    if (input.source_dataset) {
+      const src = document.createElement('div');
+      src.className = 'tool-source';
+      src.textContent = 'source: ' + input.source_dataset;
+      body.appendChild(src);
+    }
+  } else {
+    // Other tools — show the input as JSON (it's short and
+    // structural, so stringification is fine).
+    const pre = document.createElement('pre');
+    pre.textContent = JSON.stringify(evt.input, null, 2);
+    body.appendChild(pre);
+  }
 
   header.addEventListener('click', () => card.classList.toggle('collapsed'));
 
