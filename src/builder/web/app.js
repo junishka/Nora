@@ -446,48 +446,150 @@ function appendToolResult(evt) {
   const existingCard = [...messagesEl.querySelectorAll('.tool-card')]
     .find((c) => c.dataset.callId === evt.call_id);
 
-  // Results from submit_script / expand_result carry a run_dir. Those
-  // get a full result panel with the native R/Stata output and action
-  // buttons ("Open output", "Open script in R/Stata", "Show folder").
-  // The panel appears whether or not raw_stdout is populated — the
-  // action buttons are useful even for scripts that produced no
-  // console output, because the staged .R / .do file is still there
-  // to re-open in RStudio / Stata.
+  // Previous design had a separate "result panel" appended below the
+  // tool card. Turned out to be fragile (sometimes didn't render, easy
+  // to miss). New design: everything goes INSIDE the existing tool
+  // card body. The card stays expanded; below the code (for
+  // submit_script) we add the native R/Stata output and the action
+  // buttons. One self-contained card per script run.
   const hasRunDir = !!evt.run_dir;
 
-  if (existingCard) {
-    if (evt.is_error) {
-      existingCard.classList.add('error');
-    }
-    const statusEl = existingCard.querySelector('.tool-status');
-    if (statusEl) statusEl.textContent = evt.is_error ? 'error' : 'done';
-    const body = existingCard.querySelector('.tool-body');
-
-    if (hasRunDir) {
-      existingCard.classList.add('collapsed');
-      messagesEl.appendChild(buildResultPanel(evt));
-    } else {
-      // Non-script tool (get_schema, request_data, list_results) —
-      // the JSON IS the useful output. Keep it inline in the card.
-      const resultPre = document.createElement('pre');
-      resultPre.textContent = prettyJson(evt.text);
-      body.appendChild(resultPre);
-    }
+  if (!existingCard) {
+    // Unusual: result arrived without a matching tool_call. Render a
+    // bare card with whatever we have.
+    const card = document.createElement('div');
+    card.className = 'tool-card' + (evt.is_error ? ' error' : '');
+    const pre = document.createElement('pre');
+    pre.textContent = prettyJson(evt.text);
+    card.appendChild(pre);
+    messagesEl.appendChild(card);
     scrollToBottom();
-  } else {
-    // No matching call card (unusual) — render a standalone.
-    if (hasRunDir) {
-      messagesEl.appendChild(buildResultPanel(evt));
-    } else {
-      const card = document.createElement('div');
-      card.className = 'tool-card' + (evt.is_error ? ' error' : '');
-      const pre = document.createElement('pre');
-      pre.textContent = prettyJson(evt.text);
-      card.appendChild(pre);
-      messagesEl.appendChild(card);
-    }
-    scrollToBottom();
+    return;
   }
+
+  if (evt.is_error) existingCard.classList.add('error');
+  const statusEl = existingCard.querySelector('.tool-status');
+  if (statusEl) statusEl.textContent = evt.is_error ? 'error' : 'done';
+  const body = existingCard.querySelector('.tool-body');
+
+  if (!hasRunDir) {
+    // Non-script tool (get_schema / request_data / list_results) —
+    // the JSON payload IS the useful output. Keep it inline.
+    const resultPre = document.createElement('pre');
+    resultPre.textContent = prettyJson(evt.text);
+    body.appendChild(resultPre);
+    scrollToBottom();
+    return;
+  }
+
+  // Script result — append the native output + actions to the SAME
+  // tool card. Stays expanded; the researcher sees code → divider →
+  // output → buttons without any extra clicks.
+  renderScriptResultInline(body, evt);
+  scrollToBottom();
+}
+
+function renderScriptResultInline(body, evt) {
+  /* Appends to an existing tool-body:
+   *   1. "Output" section: raw R/Stata stdout (monospace, scrollable,
+   *      capped height).
+   *   2. "stderr" section if non-empty (yellow-tinted).
+   *   3. Action buttons row: [Open script in R/Stata] [Show folder].
+   *   4. A collapsed "Sanitized output (what Claude saw)" section
+   *      for audit — hidden by default.
+   *   5. Run dir path note at the bottom.
+   */
+  const divider = document.createElement('div');
+  divider.className = 'tool-divider';
+  divider.textContent = 'Output';
+  body.appendChild(divider);
+
+  const stdoutText = (evt.raw_stdout || '').trimEnd();
+  if (stdoutText) {
+    const pre = document.createElement('pre');
+    pre.className = 'tool-output';
+    pre.textContent = stdoutText;
+    body.appendChild(pre);
+  } else {
+    const empty = document.createElement('div');
+    empty.className = 'tool-output-empty';
+    empty.textContent = '(the script produced no stdout; the structured result was still emitted)';
+    body.appendChild(empty);
+  }
+
+  if (evt.raw_stderr && evt.raw_stderr.trim()) {
+    const stderrLabel = document.createElement('div');
+    stderrLabel.className = 'tool-divider tool-divider-stderr';
+    stderrLabel.textContent = 'stderr';
+    body.appendChild(stderrLabel);
+    const stderrPre = document.createElement('pre');
+    stderrPre.className = 'tool-output tool-output-stderr';
+    stderrPre.textContent = evt.raw_stderr.trimEnd();
+    body.appendChild(stderrPre);
+  }
+
+  // Action buttons — Open output is gone (output is already inline).
+  if (evt.run_dir) {
+    const actions = document.createElement('div');
+    actions.className = 'tool-actions';
+
+    const lang = evt.language;  // "R" | "Stata" | undefined
+    const scriptFile = lang === 'Stata' ? 'script.do' : 'script.R';
+    const openInLabel =
+      lang === 'Stata' ? 'Open in Stata'
+        : lang === 'R' ? 'Open in R'
+        : 'Open script';
+    const openMode =
+      lang === 'Stata' ? 'run_stata'
+        : lang === 'R' ? 'run_r'
+        : null;
+
+    const openScriptBtn = document.createElement('button');
+    openScriptBtn.type = 'button';
+    openScriptBtn.className = 'tool-action';
+    openScriptBtn.textContent = openInLabel;
+    openScriptBtn.title =
+      lang === 'Stata'
+        ? 'Launch Stata with the script loaded.'
+        : lang === 'R'
+        ? 'Launch RStudio with the script loaded.'
+        : 'Open the R or Stata script in its default app.';
+    openScriptBtn.addEventListener('click', () => {
+      const primary = evt.run_dir + '/' + scriptFile;
+      const fallback = evt.run_dir + '/' + (scriptFile === 'script.R' ? 'script.do' : 'script.R');
+      openInNativeApp(primary, openScriptBtn, fallback, openMode);
+    });
+    actions.appendChild(openScriptBtn);
+
+    const openFolderBtn = document.createElement('button');
+    openFolderBtn.type = 'button';
+    openFolderBtn.className = 'tool-action';
+    openFolderBtn.textContent = 'Show folder';
+    openFolderBtn.title = 'Reveal the run directory in Finder.';
+    openFolderBtn.addEventListener('click', () =>
+      openInNativeApp(evt.run_dir, openFolderBtn, null, null)
+    );
+    actions.appendChild(openFolderBtn);
+
+    body.appendChild(actions);
+  }
+
+  // Sanitized payload — collapsed by default, for curious users / audit.
+  const sanitizedWrap = document.createElement('details');
+  sanitizedWrap.className = 'tool-sanitized';
+  const summary = document.createElement('summary');
+  summary.textContent = 'Sanitized payload (what Claude saw)';
+  sanitizedWrap.appendChild(summary);
+  const sanitizedPre = document.createElement('pre');
+  sanitizedPre.className = 'tool-output tool-output-sanitized';
+  sanitizedPre.textContent = prettyJson(evt.text);
+  sanitizedWrap.appendChild(sanitizedPre);
+  body.appendChild(sanitizedWrap);
+
+  const note = document.createElement('div');
+  note.className = 'tool-run-dir';
+  note.textContent = evt.run_dir;
+  body.appendChild(note);
 }
 
 function buildResultPanel(evt) {

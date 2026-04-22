@@ -371,6 +371,122 @@ body {
   margin: 4px 2px 0;
 }
 
+/* --- inline script-result pieces (appended into the tool-body
+ * after a submit_script run). --- */
+
+.tool-card .tool-divider {
+  margin: 14px 2px 6px;
+  padding-top: 10px;
+  border-top: 1px solid var(--border);
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  color: var(--text-dim);
+}
+
+.tool-card .tool-divider-stderr {
+  color: #b7791f;
+}
+
+.tool-card .tool-output {
+  /* The native R / Stata output block — monospace, preserved
+   * whitespace, max height so huge logs don't eat the whole chat.
+   * Scrolls vertically; .tool-run-dir points at the full file on
+   * disk if it got truncated. */
+  background: var(--bg);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 10px 12px;
+  margin: 4px 0;
+  font-family: ui-monospace, "SF Mono", Menlo, monospace;
+  font-size: 12px;
+  line-height: 1.5;
+  max-height: 320px;
+  overflow: auto;
+  white-space: pre;
+}
+
+.tool-card .tool-output-stderr {
+  border-color: rgba(183, 121, 31, 0.3);
+}
+
+.tool-card .tool-output-empty {
+  font-size: 12px;
+  color: var(--text-dim);
+  font-style: italic;
+  margin: 4px 2px;
+}
+
+.tool-card .tool-actions {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin: 10px 0 4px;
+}
+
+.tool-card .tool-action {
+  padding: 5px 12px;
+  font-size: 12px;
+  font-family: inherit;
+  background: var(--bg);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  cursor: pointer;
+  transition: border-color 0.15s, color 0.15s;
+}
+
+.tool-card .tool-action:hover:not(:disabled) {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+.tool-card .tool-action:disabled {
+  opacity: 0.6;
+  cursor: wait;
+}
+
+.tool-card .tool-sanitized {
+  margin-top: 10px;
+  font-size: 12px;
+}
+
+.tool-card .tool-sanitized > summary {
+  cursor: pointer;
+  color: var(--text-dim);
+  padding: 4px 2px;
+  list-style: none;
+  user-select: none;
+}
+
+.tool-card .tool-sanitized > summary::before {
+  content: "▸ ";
+  display: inline-block;
+  transition: transform 0.15s;
+}
+
+.tool-card .tool-sanitized[open] > summary::before {
+  content: "▾ ";
+}
+
+.tool-card .tool-sanitized:hover > summary {
+  color: var(--text);
+}
+
+.tool-card .tool-output-sanitized {
+  max-height: 220px;
+}
+
+.tool-card .tool-run-dir {
+  margin-top: 8px;
+  font-family: ui-monospace, "SF Mono", Menlo, monospace;
+  font-size: 11px;
+  color: var(--text-dim);
+  word-break: break-all;
+}
+
 .tool-card.error {
   border-color: #c23;
   background: var(--bg-error);
