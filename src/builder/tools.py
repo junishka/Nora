@@ -626,6 +626,10 @@ async def submit_script(args: dict[str, Any]) -> dict[str, Any]:
         # UI uses this to render the raw log alongside the sanitized
         # result.
         "_run_dir": str(exec_result.run_dir),
+        # Language the script was written in. The web UI uses this
+        # to label the "Open in R / Stata" button and pick the right
+        # invocation when launching the native app.
+        "_language": language,
     })
 
 
@@ -678,6 +682,8 @@ async def expand_result(args: dict[str, Any]) -> dict[str, Any]:
     # recognize.
     if row.raw_log_path:
         response["_run_dir"] = row.raw_log_path
+    if row.language:
+        response["_language"] = row.language
     return _as_mcp_text(response)
 
 

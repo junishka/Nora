@@ -65,14 +65,16 @@ class ToolCallResult:
     """The tool returned. ``text`` is the MCP text-content payload
     (JSON for our tools). ``is_error`` marks explicit failures.
 
-    The ``_run_dir`` hint — injected by ``tools.submit_script`` so the
-    TUI can show raw R/Stata output — is also surfaced here so the
-    web UI can do the same.
+    ``run_dir`` and ``language`` are hints ``tools.submit_script`` /
+    ``tools.expand_result`` inject so the UI can render the native
+    R/Stata output alongside the sanitized payload and offer the
+    right "Open in R/Stata" action.
     """
     call_id: str
     text: str
     is_error: bool
     run_dir: str | None = None
+    language: str | None = None
 
 
 @dataclass
@@ -181,12 +183,13 @@ async def run_turn(
 
 def _tool_result_event(block: ToolResultBlock) -> ToolCallResult:
     text = _extract_tool_result_text(block.content)
-    run_dir = _extract_run_dir(text)
+    run_dir, language = _extract_hints(text)
     return ToolCallResult(
         call_id=block.tool_use_id,
         text=text,
         is_error=bool(block.is_error),
         run_dir=run_dir,
+        language=language,
     )
 
 
@@ -206,21 +209,27 @@ def _extract_tool_result_text(
     return "\n".join(parts)
 
 
-def _extract_run_dir(text: str) -> str | None:
-    """Peel off the `_run_dir` hint `tools.submit_script` injects so
-    the UI can show raw R/Stata output. Returns None when the tool
-    result isn't a submit_script response."""
+def _extract_hints(text: str) -> tuple[str | None, str | None]:
+    """Peel off the ``_run_dir`` and ``_language`` hints
+    ``tools.submit_script`` / ``tools.expand_result`` inject so the
+    UI can show raw R/Stata output and pick the right "Open in …"
+    button. Returns ``(None, None)`` when the tool result isn't a
+    script-style response."""
     if not text.strip():
-        return None
+        return None, None
     try:
         import json
         parsed = json.loads(text)
     except (ValueError, TypeError):
-        return None
+        return None, None
     if not isinstance(parsed, dict):
-        return None
+        return None, None
     rd = parsed.get("_run_dir")
-    return rd if isinstance(rd, str) else None
+    lang = parsed.get("_language")
+    return (
+        rd if isinstance(rd, str) else None,
+        lang if isinstance(lang, str) else None,
+    )
 
 
 def _maybe_int(v: Any) -> int | None:

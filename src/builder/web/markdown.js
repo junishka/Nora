@@ -71,6 +71,27 @@
     let listItems = [];      // pending <li> content
     let paraLines = [];
 
+    // GitHub-flavored markdown pipe tables — the shape Claude emits
+    // when it hands back a regression coefficient table:
+    //   | Term | Coef. | SE |
+    //   |------|-------|-----|
+    //   | x    |  0.42 | 0.01 |
+    function splitCells(row) {
+      // Strip outer pipes, split on inner pipes, trim each cell.
+      const inner = row.replace(/^\s*\|/, '').replace(/\|\s*$/, '');
+      return inner.split('|').map((c) => c.trim());
+    }
+    function isTableSeparator(row) {
+      // The separator row — `|---|---|---|` (with optional colons for
+      // alignment, which we ignore for v1 — everything is left-
+      // aligned). Allow extra spaces and minimum of one dash per
+      // cell.
+      if (!/^\s*\|/.test(row) || !/\|\s*$/.test(row)) return false;
+      const cells = splitCells(row);
+      return cells.length >= 1
+        && cells.every((c) => /^:?-{3,}:?$/.test(c));
+    }
+
     function flushPara() {
       if (paraLines.length === 0) return;
       const body = paraLines
@@ -129,6 +150,44 @@
       if (!raw.trim()) {
         flushPara();
         flushList();
+        continue;
+      }
+
+      // Table detection: a header row (starts and ends with `|`),
+      // followed by a separator row (`|---|---|---|`). Consume all
+      // subsequent pipe-rows as body rows until a non-table line.
+      if (/^\s*\|.*\|\s*$/.test(raw) && i + 1 < lines.length
+          && isTableSeparator(lines[i + 1])) {
+        flushPara();
+        flushList();
+        const headerCells = splitCells(raw);
+        const rows = [];
+        i += 2;  // skip the header + the separator
+        while (i < lines.length && /^\s*\|.*\|\s*$/.test(lines[i])) {
+          rows.push(splitCells(lines[i]));
+          i++;
+        }
+        // Step back so the outer loop's `i++` doesn't skip the
+        // line that ended the table.
+        i--;
+        const parts = ['<table>', '<thead><tr>'];
+        headerCells.forEach((c) =>
+          parts.push('<th>' + renderInline(c) + '</th>')
+        );
+        parts.push('</tr></thead>');
+        if (rows.length) {
+          parts.push('<tbody>');
+          rows.forEach((row) => {
+            parts.push('<tr>');
+            row.forEach((c) =>
+              parts.push('<td>' + renderInline(c) + '</td>')
+            );
+            parts.push('</tr>');
+          });
+          parts.push('</tbody>');
+        }
+        parts.push('</table>');
+        out.push(parts.join(''));
         continue;
       }
 

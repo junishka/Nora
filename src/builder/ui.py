@@ -252,20 +252,28 @@ class BuilderBridge:
             return {"ok": False, "reason": "no valid files in drop"}
         return self._stage_session_from_blobs(decoded)
 
-    def open_path(self, path: str) -> dict[str, Any]:
-        """Open a file or folder in its macOS default handler (R scripts
-        → RStudio / R.app, .do files → Stata, text → TextEdit, folders
-        → Finder).
+    def open_path(
+        self, path: str, mode: str | None = None
+    ) -> dict[str, Any]:
+        """Open a file or folder in its macOS default handler.
+
+        ``mode`` tunes the invocation when the researcher wants more
+        than a plain "open":
+
+          - ``None`` (default) — hand to LaunchServices. R files
+            open in RStudio / R.app, .do files in Stata, logs in
+            TextEdit, folders in Finder.
+          - ``"run_stata"`` — launch Stata with the file as a
+            do-file argument. Whether Stata auto-runs on open
+            depends on the user's Stata preferences, but at
+            minimum Stata opens with the file loaded; the
+            researcher presses Cmd-D to execute.
+          - ``"run_r"`` — launch RStudio with the file. Same caveat
+            — user presses Cmd-Enter to source.
 
         **Restricted to Builder-managed locations** — only paths
-        inside the current session's working directory or inside the
-        ``~/.builder-sessions/`` tree are allowed. Anywhere else is
-        refused. This keeps a misbehaving page (or a hypothetical
-        malicious tool result smuggling a path) from asking us to
-        ``open /etc/passwd`` or a path outside the researcher's
-        intended scope.
-
-        Returns ``{ok: True}`` or ``{ok: False, reason}``.
+        inside the current session's working directory or inside
+        the ``~/.builder-sessions/`` tree are allowed.
         """
         if not path:
             return {"ok": False, "reason": "empty path"}
@@ -275,13 +283,10 @@ class BuilderBridge:
             return {"ok": False, "reason": f"bad path: {e}"}
         if not p.exists():
             return {"ok": False, "reason": f"not found: {p}"}
-        # Allowlist: inside the current session's cwd tree, or inside
-        # ~/.builder-sessions. Nothing else.
         allowed_roots: list[Path] = [SESSIONS_ROOT.resolve()]
         if self.cwd is not None:
             allowed_roots.append(self.cwd.resolve())
-        ok = any(_is_within(p, root) for root in allowed_roots)
-        if not ok:
+        if not any(_is_within(p, root) for root in allowed_roots):
             return {
                 "ok": False,
                 "reason": (
@@ -289,13 +294,39 @@ class BuilderBridge:
                     "refused as a precaution"
                 ),
             }
+        import subprocess
+        # Default: let LaunchServices pick the handler.
+        cmd: list[str] = ["/usr/bin/open", str(p)]
+        if mode == "run_stata":
+            # Try common Stata .app names in order of likelihood. We
+            # bias toward StataMP (most common on modern licenses)
+            # but fall back through SE and plain Stata. `open -a
+            # <AppName>` lets LaunchServices find the app regardless
+            # of where it's installed.
+            for app_name in ("StataMP", "StataSE", "StataNow", "Stata"):
+                cmd = ["/usr/bin/open", "-a", app_name, str(p)]
+                try:
+                    r = subprocess.run(cmd, capture_output=True, timeout=5)
+                    if r.returncode == 0:
+                        return {"ok": True, "app": app_name}
+                except (OSError, subprocess.TimeoutExpired):
+                    continue
+            # None worked — fall through to the default handler.
+            cmd = ["/usr/bin/open", str(p)]
+        elif mode == "run_r":
+            # Prefer RStudio; fall back to R.app; fall back to
+            # default handler.
+            for app_name in ("RStudio", "R"):
+                cmd2 = ["/usr/bin/open", "-a", app_name, str(p)]
+                try:
+                    r = subprocess.run(cmd2, capture_output=True, timeout=5)
+                    if r.returncode == 0:
+                        return {"ok": True, "app": app_name}
+                except (OSError, subprocess.TimeoutExpired):
+                    continue
+            cmd = ["/usr/bin/open", str(p)]
         try:
-            # `open` returns immediately after handing off to Launch
-            # Services. No need to wait on the resulting app.
-            import subprocess
-            subprocess.run(
-                ["/usr/bin/open", str(p)], check=False, timeout=5
-            )
+            subprocess.run(cmd, check=False, timeout=5)
         except (OSError, subprocess.TimeoutExpired) as e:
             return {"ok": False, "reason": f"open failed: {e}"}
         return {"ok": True}
@@ -569,6 +600,7 @@ def _event_to_dict(evt: Any) -> dict[str, Any]:
             "text": evt.text,
             "is_error": evt.is_error,
             "run_dir": evt.run_dir,
+            "language": evt.language,
             "raw_stdout": raw_stdout,
             "raw_stderr": raw_stderr,
         }

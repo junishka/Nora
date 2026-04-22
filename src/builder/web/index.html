@@ -26,7 +26,8 @@
             <polyline points="17 8 12 3 7 8"/>
             <line x1="12" y1="3" x2="12" y2="15"/>
           </svg>
-          <p class="drop-zone-hint">Drop one or more .csv, .dta, or .rds files here</p>
+          <p class="drop-zone-hint">Drop one or more .csv, .dta, or .rds files</p>
+          <p class="drop-zone-sub">2 GB per file · for larger, use Choose files…</p>
         </div>
       </div>
 
@@ -36,14 +37,6 @@
       </div>
 
       <div id="landing-status" class="landing-status"></div>
-
-      <p class="landing-fineprint">
-        Drag-drop loads files through memory (capped at 2 GB per file).
-        For larger datasets use <strong>Choose files…</strong> — it
-        copies directly from disk with no size limit.
-        <strong>Choose folder…</strong> uses an existing directory as
-        the sandbox scope without copying anything.
-      </p>
     </div>
   </div>
 
@@ -72,8 +65,13 @@
           rows="1"
           autofocus
         ></textarea>
+        <button type="button" id="policy-chip" class="composer-chip" title="Schema policy — click to change per-dataset">
+          <span id="policy-chip-label">Policy</span>
+          <span class="chip-arrow">▾</span>
+        </button>
         <button type="submit" id="send-btn">Send</button>
       </form>
+      <div id="policy-popup" class="policy-popup hidden"></div>
     </footer>
   </div>
 

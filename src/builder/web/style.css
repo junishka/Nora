@@ -124,6 +124,12 @@ body {
   font-size: 14px;
 }
 
+.drop-zone-sub {
+  margin: 4px 0 0;
+  font-size: 11px;
+  opacity: 0.7;
+}
+
 .landing-actions {
   display: flex;
   gap: 10px;
@@ -457,6 +463,98 @@ body {
   font-size: 11px;
 }
 
+/* --- composer policy chip + popup --- */
+
+.composer-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 8px 12px;
+  font-size: 13px;
+  font-family: inherit;
+  background: var(--bg);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  cursor: pointer;
+  white-space: nowrap;
+  max-width: 220px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.composer-chip:hover {
+  border-color: var(--accent);
+}
+
+.composer-chip.open {
+  border-color: var(--accent);
+}
+
+.chip-arrow {
+  font-size: 10px;
+  color: var(--text-dim);
+}
+
+#policy-chip-label {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.policy-popup {
+  position: absolute;
+  right: 20px;
+  bottom: 72px;
+  background: var(--bg-surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 12px 14px;
+  min-width: 320px;
+  max-width: 480px;
+  max-height: 300px;
+  overflow-y: auto;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.15);
+  z-index: 10;
+}
+
+.policy-popup.hidden {
+  display: none;
+}
+
+.policy-popup-header {
+  font-size: 12px;
+  color: var(--text-dim);
+  margin-bottom: 10px;
+  line-height: 1.4;
+}
+
+.policy-popup .policy-card-list {
+  /* Override the grid to stack vertically in the narrower popup.
+   * Each row: name on one line, dropdown on the next. */
+  display: block;
+}
+
+.policy-popup .policy-row {
+  display: block;
+  margin-bottom: 10px;
+}
+
+.policy-popup .policy-row:last-child {
+  margin-bottom: 0;
+}
+
+.policy-popup .policy-row-name {
+  display: block;
+  margin-bottom: 4px;
+  font-size: 12px;
+}
+
+.policy-popup .policy-row-select {
+  width: 100%;
+  min-width: 0;
+}
+
 /* --- rendered markdown (assistant text) --- */
 
 .message.assistant .message-body {
@@ -529,6 +627,43 @@ body {
   padding-left: 12px;
   margin: 8px 0;
   color: var(--text-dim);
+}
+
+.message.assistant .message-body table {
+  /* Coefficient tables etc. — researchers are used to reading
+   * them in R/Stata output. Keep the styling restrained so they
+   * don't fight the surrounding text. */
+  border-collapse: collapse;
+  margin: 10px 0;
+  font-size: 0.92em;
+  font-variant-numeric: tabular-nums;
+  width: auto;
+  max-width: 100%;
+  overflow-x: auto;
+  display: block;
+}
+
+.message.assistant .message-body table th,
+.message.assistant .message-body table td {
+  padding: 5px 12px;
+  border-bottom: 1px solid var(--border);
+  text-align: left;
+}
+
+.message.assistant .message-body table th {
+  font-weight: 600;
+  color: var(--text);
+  background: rgba(0, 0, 0, 0.04);
+}
+
+@media (prefers-color-scheme: dark) {
+  .message.assistant .message-body table th {
+    background: rgba(255, 255, 255, 0.05);
+  }
+}
+
+.message.assistant .message-body table tr:last-child td {
+  border-bottom: none;
 }
 
 .message.assistant .message-body a {

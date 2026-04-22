@@ -45,16 +45,10 @@ function showChat(payload) {
   chatEl.classList.remove('hidden');
   welcomeEl.textContent = payload.greeting || 'Ready.';
   cwdEl.textContent = payload.cwd || '';
-  // Remove any prior policy card so a re-show doesn't duplicate it
-  // (e.g., if a future feature re-renders the chat view).
-  const prior = document.getElementById('policy-card');
-  if (prior) prior.remove();
-  const card = buildPolicyCard(payload.policy);
-  if (card) {
-    // Insert above the welcome so it's the first thing the
-    // researcher sees.
-    messagesEl.insertBefore(card, messagesEl.firstChild);
-  }
+  // Policy is now a chip + popup in the composer, not a card at
+  // the top of the message list. Re-render chip label + popup
+  // contents from the fresh policy snapshot.
+  updatePolicyChip(payload.policy);
   input.focus();
 }
 
@@ -460,11 +454,23 @@ function buildResultPanel(evt) {
   panel.appendChild(sanitizedSection);
 
   if (evt.run_dir) {
-    // Action buttons — opt-in "show me the raw result in my native
-    // app" affordances. None of these fire automatically; researcher
-    // clicks what they want.
     const actions = document.createElement('div');
     actions.className = 'result-actions';
+
+    // Language-aware labels. ``evt.language`` is "R" or "Stata" when
+    // the event came from submit_script / expand_result; falls back
+    // to generic label otherwise.
+    const lang = evt.language;  // "R" | "Stata" | undefined
+    const scriptFile =
+      lang === 'Stata' ? 'script.do' : 'script.R';
+    const openInLabel =
+      lang === 'Stata' ? 'Open in Stata'
+        : lang === 'R' ? 'Open in R'
+        : 'Open script';
+    const openMode =
+      lang === 'Stata' ? 'run_stata'
+        : lang === 'R' ? 'run_r'
+        : null;
 
     const openOutputBtn = document.createElement('button');
     openOutputBtn.type = 'button';
@@ -473,23 +479,26 @@ function buildResultPanel(evt) {
     openOutputBtn.title =
       'Open the full R/Stata stdout log in your default text editor.';
     openOutputBtn.addEventListener('click', () =>
-      openInNativeApp(evt.run_dir + '/stdout.log', openOutputBtn)
+      openInNativeApp(evt.run_dir + '/stdout.log', openOutputBtn, null)
     );
     actions.appendChild(openOutputBtn);
 
     const openScriptBtn = document.createElement('button');
     openScriptBtn.type = 'button';
     openScriptBtn.className = 'result-action';
-    openScriptBtn.textContent = 'Open script';
+    openScriptBtn.textContent = openInLabel;
     openScriptBtn.title =
-      'Open the R or Stata script in its default app (RStudio / Stata). '
-      + 'You can re-run it there to see the native output yourself.';
+      lang === 'Stata'
+        ? 'Launch Stata with the script loaded. Press Cmd-D in the '
+          + 'do-file editor to run it.'
+        : lang === 'R'
+        ? 'Launch RStudio with the script loaded. Press Cmd-Enter '
+          + '(or Cmd-Shift-S) to run it.'
+        : 'Open the R or Stata script in its default app.';
     openScriptBtn.addEventListener('click', () => {
-      // Try script.R first; if not present try script.do. The bridge
-      // reports "not found" and we fall through silently.
-      openInNativeApp(evt.run_dir + '/script.R', openScriptBtn, () =>
-        openInNativeApp(evt.run_dir + '/script.do', openScriptBtn)
-      );
+      const primary = evt.run_dir + '/' + scriptFile;
+      const fallback = evt.run_dir + '/' + (scriptFile === 'script.R' ? 'script.do' : 'script.R');
+      openInNativeApp(primary, openScriptBtn, fallback, openMode);
     });
     actions.appendChild(openScriptBtn);
 
@@ -499,7 +508,7 @@ function buildResultPanel(evt) {
     openFolderBtn.textContent = 'Show folder';
     openFolderBtn.title = 'Reveal the run directory in Finder.';
     openFolderBtn.addEventListener('click', () =>
-      openInNativeApp(evt.run_dir, openFolderBtn)
+      openInNativeApp(evt.run_dir, openFolderBtn, null)
     );
     actions.appendChild(openFolderBtn);
 
@@ -514,18 +523,26 @@ function buildResultPanel(evt) {
   return panel;
 }
 
-async function openInNativeApp(path, btn, fallback) {
-  /* Ask the Python bridge to hand the path to macOS `open`. The
-   * bridge refuses anything outside Builder-managed directories, so
-   * this can't be used to launch arbitrary files. */
+async function openInNativeApp(path, btn, fallback, mode) {
+  /* Ask the Python bridge to hand the path to macOS `open`. ``mode``
+   * selects a Stata/R-specific launch (open -a StataMP / RStudio).
+   * ``fallback`` is a path to try if the primary fails. */
   if (!window.pywebview || !window.pywebview.api) return;
   const originalText = btn && btn.textContent;
   if (btn) { btn.disabled = true; btn.textContent = 'Opening…'; }
   try {
-    const result = await window.pywebview.api.open_path(path);
+    const result = await window.pywebview.api.open_path(path, mode || null);
     if (!result || !result.ok) {
-      if (fallback) { await fallback(); return; }
-      // Transient inline error on the button itself.
+      if (fallback) {
+        const f = await window.pywebview.api.open_path(fallback, mode || null);
+        if (f && f.ok) {
+          if (btn) {
+            btn.textContent = 'Opened';
+            setTimeout(() => { btn.textContent = originalText; }, 1500);
+          }
+          return;
+        }
+      }
       if (btn) btn.textContent = result && result.reason
         ? 'Error: ' + result.reason
         : 'Failed';
@@ -533,8 +550,6 @@ async function openInNativeApp(path, btn, fallback) {
         if (btn) btn.textContent = originalText;
       }, 3000);
     } else {
-      // Don't reset the text immediately — the app is launching.
-      // Restore shortly so the button doesn't look stuck.
       if (btn) {
         btn.textContent = 'Opened';
         setTimeout(() => { btn.textContent = originalText; }, 1500);
@@ -566,30 +581,55 @@ function scrollToBottom() {
   messagesEl.scrollTop = messagesEl.scrollHeight;
 }
 
-function buildPolicyCard(policy) {
-  /* A pinned card at the top of the chat showing each dataset with
-   * a depth-tier dropdown. Changing a dropdown persists immediately
-   * to `.builder/policy.json` via the bridge. The researcher never
-   * touches the JSON file or memorizes tier names — they pick from
-   * English labels in a native <select>. */
-  if (!policy) return null;
-  const datasets = policy.datasets || [];
-  if (datasets.length === 0) return null;
+// ----- policy chip + popup (next to composer) ----------------------------
 
-  const card = document.createElement('div');
-  card.id = 'policy-card';
-  card.className = 'policy-card';
+const policyChip = document.getElementById('policy-chip');
+const policyChipLabel = document.getElementById('policy-chip-label');
+const policyPopup = document.getElementById('policy-popup');
+let policyPopupBuiltFor = null;  // cached copy so we don't rebuild needlessly
 
+function updatePolicyChip(policy) {
+  /* Refresh the compact chip label + the per-dataset dropdowns
+   * inside the popup. Called on session start and after any policy
+   * mutation. */
+  if (!policy || !policy.datasets || policy.datasets.length === 0) {
+    policyChip.classList.add('hidden');
+    return;
+  }
+  policyChip.classList.remove('hidden');
+  policyChipLabel.textContent = compactPolicyLabel(policy);
+  policyPopupBuiltFor = policy;
+  policyPopup.innerHTML = '';
+  policyPopup.appendChild(buildPolicyPopup(policy));
+}
+
+function compactPolicyLabel(policy) {
+  const n = policy.datasets.length;
+  const customized = policy.datasets.filter((d) => d.explicit).length;
+  const plural = n === 1 ? '' : 's';
+  if (customized === 0) {
+    return `Policy · ${n} ${plural ? 'datasets' : 'dataset'} @ default`;
+  }
+  if (customized === n) {
+    return `Policy · ${n} datasets · all custom`;
+  }
+  return `Policy · ${n} datasets · ${customized} custom`;
+}
+
+function buildPolicyPopup(policy) {
+  const wrapper = document.createElement('div');
   const header = document.createElement('div');
-  header.className = 'policy-card-header';
+  header.className = 'policy-popup-header';
   header.innerHTML =
-    '<strong>Schema policy</strong> <span class="policy-card-sub">— what Claude sees about each dataset. Default is conservative; widen per-dataset if labels or summary counts aren\'t sensitive.</span>';
-  card.appendChild(header);
+    '<strong>Schema policy</strong><br>' +
+    'What Claude sees about each dataset. Default is conservative; ' +
+    'widen per-dataset if labels or counts aren\'t sensitive.';
+  wrapper.appendChild(header);
 
   const list = document.createElement('div');
   list.className = 'policy-card-list';
 
-  datasets.forEach((d) => {
+  policy.datasets.forEach((d) => {
     const row = document.createElement('div');
     row.className = 'policy-row';
 
@@ -617,20 +657,18 @@ function buildPolicyCard(policy) {
           d.name, depth
         );
         if (!result || !result.ok) {
-          // Revert on failure.
           if (prev) select.value = prev.value;
-          // Inline error hint.
           const err = document.createElement('span');
           err.className = 'policy-row-err';
-          err.textContent =
-            ' ' + (result && result.reason ? result.reason : 'update failed');
+          err.textContent = ' ' + (result && result.reason ? result.reason : 'failed');
           row.appendChild(err);
           setTimeout(() => err.remove(), 4000);
         } else {
-          // Mark the new value as the default-selected one so a
-          // future revert lands back here.
           [...select.options].forEach((o) => { o.defaultSelected = false; });
           select.options[select.selectedIndex].defaultSelected = true;
+          // Re-render the compact chip label to reflect the new
+          // customized count.
+          if (result.policy) updatePolicyChip(result.policy);
         }
       } catch (e) {
         if (prev) select.value = prev.value;
@@ -642,9 +680,23 @@ function buildPolicyCard(policy) {
     list.appendChild(row);
   });
 
-  card.appendChild(list);
-  return card;
+  wrapper.appendChild(list);
+  return wrapper;
 }
+
+// Chip click toggles the popup; click outside closes it.
+policyChip.addEventListener('click', (e) => {
+  e.stopPropagation();
+  const isOpen = !policyPopup.classList.contains('hidden');
+  policyPopup.classList.toggle('hidden');
+  policyChip.classList.toggle('open', !isOpen);
+});
+document.addEventListener('click', (e) => {
+  if (policyPopup.classList.contains('hidden')) return;
+  if (policyPopup.contains(e.target) || policyChip.contains(e.target)) return;
+  policyPopup.classList.add('hidden');
+  policyChip.classList.remove('open');
+});
 
 // Signal to the Python side that we're ready to receive events. pywebview
 // sets window.pywebview once its bridge is ready; until then we wait.
