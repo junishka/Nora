@@ -134,20 +134,31 @@ Never at any depth: raw values, min, max, median, individual
 observations. Those belong to `request_data` (with its own SDC
 rules) and `submit_script` (sanitized via the result pipeline).
 
-At app startup, the banner lists each dataset in cwd with its
-current ceiling, marked `explicit` (in policy file) vs
-`default` (inherited). No interactive TUI yet — researchers
-edit `.builder/policy.json` by hand. A wizard UX is a follow-on
-when there's feedback from researcher #1.
+Interactive editing now exists in both frontends:
+
+- **Terminal:** `/policy` slash-command (handled in `app.py`)
+  opens a dataset picker + depth menu; changes persist immediately
+  to `.builder/policy.json`. Startup banner still lists each
+  dataset with its ceiling and `explicit` vs `default` source.
+- **Web UI:** compact "Policy" chip beside the Send button; click
+  unfurls a popup with per-dataset dropdowns. Changes write
+  through the same bridge method (`set_dataset_policy`) as the
+  terminal path.
+
+The JSON file remains the single source of truth; both UIs just
+read and write it, so a researcher who prefers hand-editing can
+keep doing that. Unknown depths / malformed entries silently
+fall back to the conservative default — a broken policy never
+locks anyone out.
 
 Also covered: ceiling annotation on successful responses (so
-Claude learns the limit without probing), per-dataset independence
-(each dataset has its own ceiling), explicit-vs-default distinction
-in denial messages.
+Claude learns the limit without probing), per-dataset
+independence (each dataset has its own ceiling), explicit-vs-
+default distinction in denial messages.
 
-Remaining (Phase 3 follow-ons, not blocking step 8):
-- Interactive TUI prompt at first-open of an un-policy'd dataset.
-- `builder policy` subcommand for CLI management of the policy file.
+Still on the list: automatic prompt on first-open of an
+un-policy'd dataset (currently the conservative default just
+applies silently and the chip reflects it).
 
 ### 3. Packaging to `.dmg` (2–4 sessions)
 
@@ -187,29 +198,53 @@ current friction bites:
   and use that as cwd. Avoids the `~/Users/bb/…` path-expansion
   class of mistake entirely, and doesn't expose a whole project
   directory to the sandbox just to give Claude two files.
-- **Markdown + syntax-highlighted code in assistant text.** Drop
-  in `marked.js` + `highlight.js` via CDN (or bundled). Currently
-  assistant messages render as plain text.
-- **Inline raw R/Stata output panel in the web UI.** The terminal
-  reads `run_dir/stdout.log` on every `submit_script` result and
-  shows the native R/Stata output before the sanitized payload.
-  The web UI currently only notes the path — should read and
-  render the log directly, matching the terminal's split.
-- **Policy editing in the UI.** Web version of the `/policy`
-  wizard — a settings panel with per-dataset ceiling dropdowns.
-  Complementary to hiding the policy footer by default.
-- **Dataset picker sidebar / session list.** List datasets the
-  researcher has opened, recent plans, something like Claude.ai's
-  left rail.
-- **Bundling web assets into the PyInstaller `.app`.** Today the
-  `builder-ui` entry runs from source only; the `.dmg` only
+- **Markdown-rendered assistant text with tables and code blocks.**
+  *Done.* `src/builder/web/markdown.js` is an in-tree renderer that
+  covers paragraphs, headings, fenced code, inline code, bold /
+  italic, lists, blockquotes, HTTPS links, and GitHub-flavored
+  pipe tables (added after researcher feedback that coefficient
+  tables rendered as raw pipes). No CDN dependency — keeps
+  "nothing phones home" intact.
+- **Inline raw R/Stata output panel in the web UI.** *Done.*
+  `tool_result` events carry the first 32 KB of `stdout.log` and
+  `stderr.log`; the result panel renders them above the collapsed
+  sanitized JSON, mirroring the terminal split. Action buttons
+  ("Open output", "Open in Stata/R", "Show folder") let the
+  researcher launch the native app on the staged script with one
+  click.
+- **Policy editing in the UI.** *Done.* Compact "Policy" chip in
+  the composer footer unfurls a per-dataset dropdown popup. Shares
+  the same `set_dataset_policy` bridge method as the terminal's
+  `/policy` wizard.
+- **Dataset picker sidebar / session list.** Not done. Recent
+  sessions live on disk under `~/.builder-sessions/` but the UI
+  has no browser yet — re-opening a past session means relaunching
+  with an explicit path. Would make a nice left-rail feature
+  similar to Claude.ai's chat history.
+- **Bundling web assets into the PyInstaller `.app`.** Not done.
+  Today `builder-ui` runs from source only; the `.dmg` still only
   distributes the terminal `builder`. Fold `src/builder/web/` into
   the spec as data files and update the launcher to support both
   entry points.
+- **Turn-state discipline in the web UI.** *Done* (after
+  feedback that the Send button was re-enabling too early). The
+  bridge's `send_message` is fire-and-forget by design; the web
+  UI now latches `turnInFlight` on submit and only clears it
+  when `turn_done` / `turn_error` / `auth_failure` arrives, so a
+  quick tester can't pipeline prompts that interleave in the
+  transcript.
 
 ## Known-real, design-pending
 
 ### Cumulative-inference / cross-query composition
+
+**Status as of the current pilot:** this is the single biggest
+remaining gap against the full privacy goal. Acceptable for
+self-pilots and colleagues-you-hand-the-dmg-to (adversarial
+Claude and adversarial researchers aren't the threat model for
+a researcher analyzing their own data with their own account).
+Becomes *the* blocker before wider distribution, especially any
+pilot involving someone else's sensitive data.
 
 Builder's SDC rules (precision clamping, cell suppression,
 dominance, text-safety) constrain what any **single** sanitized
@@ -219,6 +254,12 @@ adversarial Claude — who issues 200 individually-compliant queries
 can learn things about the dataset that no single query would
 release. This is the "20 questions" attack, and it is inherent to
 every interactive analysis system (not a Builder-specific bug).
+
+`tools.py` (submit_script, request_data) currently serves each call
+independently; `store.py` keeps every sanitized result in a single
+growing SQLite table per cwd. The raw material for a release
+ledger is already on disk — what's missing is the accounting layer
+that reads it and the policy layer that decides when to stop.
 
 Session-level disclosure budgets are the first layer of defense,
 but naïve implementations ("count calls, stop at N") do not

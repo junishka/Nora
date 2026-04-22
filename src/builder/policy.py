@@ -44,11 +44,14 @@ Design notes:
   ``names_only`` if Claude doesn't need the labels for the task at
   hand. Builder enforces "at most", not "exactly".
 
-- There is no interactive TUI for editing the policy at v1.
-  Researchers edit ``.builder/policy.json`` by hand, and the app's
-  startup banner surfaces the current state so the choice isn't
-  silent. A proper wizard UX is a follow-on when there's feedback
-  from researcher #1.
+- Interactive policy editing is wired up in both frontends:
+  the terminal ``/policy`` slash-command (see
+  ``app.py:_run_policy_wizard``) opens a dataset picker + depth
+  menu; the web UI exposes a compact "Policy" chip next to the
+  composer (see ``web/app.js:updatePolicyChip``) that unfurls a
+  per-dataset dropdown. The JSON file is still the single source
+  of truth — both UIs just read and write it — so a researcher
+  comfortable editing it directly can still do that.
 
 - Unknown or malformed entries fall back to the conservative
   default rather than raising. A broken policy file should not

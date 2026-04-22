@@ -190,8 +190,21 @@ function readFileAsBase64(file) {
 
 // ----- send / receive -----------------------------------------------------
 
+// Turn lifecycle: the bridge's send_message is fire-and-forget (it
+// queues the turn on the asyncio worker and returns immediately),
+// so we can't tie the "is Claude still working" state to the await
+// on that call. Instead we latch `turnInFlight` to true on submit
+// and clear it when a terminal event arrives (turn_done /
+// turn_error / auth_failure). That keeps the Send button disabled
+// — and blocks Enter-to-send — while the prior turn is running,
+// so a quick tester can't pipeline prompts that interleave in the
+// transcript.
+
+let turnInFlight = false;
+
 form.addEventListener('submit', async (e) => {
   e.preventDefault();
+  if (turnInFlight) return;
   const text = input.value.trim();
   if (!text) return;
   if (!window.pywebview || !window.pywebview.api) {
@@ -204,17 +217,23 @@ form.addEventListener('submit', async (e) => {
   setSending(true);
   try {
     await window.pywebview.api.send_message(text);
+    // Don't clear setSending here — the await resolves as soon as
+    // the turn is QUEUED on the Python side, not when it finishes.
+    // The turn_done / turn_error / auth_failure event handler
+    // below is what flips the button back on.
   } catch (err) {
     appendError('send failed: ' + err);
-  } finally {
     setSending(false);
   }
 });
 
-// Shift-Enter inserts a newline; plain Enter sends.
+// Shift-Enter inserts a newline; plain Enter sends (but only when
+// a turn isn't already in flight — avoids queuing multiple prompts
+// by mashing Enter while Claude is thinking).
 input.addEventListener('keydown', (e) => {
   if (e.key === 'Enter' && !e.shiftKey) {
     e.preventDefault();
+    if (turnInFlight) return;
     form.dispatchEvent(new Event('submit'));
   }
 });
@@ -227,8 +246,10 @@ function autosize() {
 }
 
 function setSending(sending) {
+  turnInFlight = sending;
   sendBtn.disabled = sending;
-  sendBtn.textContent = sending ? '…' : 'Send';
+  sendBtn.textContent = sending ? 'Working…' : 'Send';
+  input.setAttribute('aria-busy', sending ? 'true' : 'false');
 }
 
 // ----- Python → JS event handler -----------------------------------------
@@ -252,13 +273,18 @@ window.builder_event = function (evt) {
       appendToolResult(evt);
       break;
     case 'turn_done':
-      // Could show token count later; for now silent.
+      // Terminal event: re-enable the composer. Token count could
+      // surface in a tray later; not necessary for the chat-flow
+      // guarantee this handler enforces.
+      setSending(false);
       break;
     case 'auth_failure':
       appendError('Auth failure: ' + (evt.reason || 'unknown'));
+      setSending(false);
       break;
     case 'turn_error':
       appendError(evt.message || 'unknown error');
+      setSending(false);
       break;
     case 'policy_updated':
       updatePolicySummary(evt.policy);
