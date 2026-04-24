@@ -5,34 +5,91 @@
  * bottom. One CSS file; no framework.
  */
 
+/* Palette: bordeaux → rose → peach with a teal accent. The user
+ * supplied a 10-swatch spectrum; tokens below pick from it in a way
+ * that keeps the chat bubble, tool card, topbar pill, composer, and
+ * buttons sharing the same family. The deepest wine/burgundy carries
+ * text and code-block chrome; the softest pink is the room tone;
+ * peachy pink rides between them; teal appears only as a secondary
+ * accent (cwd pill, info states) so it doesn't fight the pinks. */
 :root {
-  --bg: #f7f6f3;
-  --bg-surface: #ffffff;
-  --bg-user: #e7f1ff;
-  --bg-tool: #f2efea;
-  --bg-error: #fde2e1;
-  --text: #1f1f1f;
-  --text-dim: #6b6b6b;
-  --accent: #2563eb;
-  --border: #e5e5e5;
-  --code-bg: #282c34;
-  --code-text: #dcdcdc;
-  --max-width: 780px;
+  --burgundy:      #5d2c3e;   /* deep burgundy — text, code bg */
+  --wine:          #8e3a52;   /* wine/mauve — focus, tool-name */
+  --mauve:         #a87382;   /* dusty mauve — dim text, border */
+  --hot-pink:      #e05a8b;   /* hot pink — danger/highlight */
+  --pink:          #ee8ba9;   /* pink — accent-soft */
+  --pink-light:    #f5c6d3;   /* light pink — tool card */
+  --peach:         #f5c1b0;   /* peachy pink — user bubble */
+  --blue-gray:     #aebbc9;   /* pale blue-gray — neutral chrome */
+  --teal:          #3f6f87;   /* teal blue — secondary accent */
+  --dusty-purple:  #9a819d;   /* supporting tone */
+
+  --bg: #fbe3e8;            /* softest pink wash — room tone */
+  --bg-surface: #fceeeb;    /* cream-rose — composer / chip surface */
+  --bg-user: var(--peach);  /* warm peach chip for the researcher's words */
+  --bg-tool: var(--pink-light);
+  --bg-error: #e08a8a;      /* muted terracotta */
+  --text: var(--burgundy);
+  --text-dim: var(--mauve);
+  --accent: var(--teal);    /* focus ring, tool-name, links — bluish contrast to the warm pinks */
+  --accent-soft: var(--blue-gray);
+  --sage: var(--teal);      /* kept the var name for back-compat */
+  --border: #e8cdd4;        /* soft pink-mauve edge */
+  --code-bg: var(--burgundy);
+  --code-text: var(--pink-light);
+  --max-width: 960px;
   --radius: 12px;
+
+  --font-sans: 'Lexend', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+  --font-mono: ui-monospace, 'SF Mono', Menlo, monospace;
 }
 
+/* Dark-mode values. Applied when the OS prefers dark AND the user
+ * hasn't forced light via the topbar toggle, OR when the toggle
+ * explicitly selects dark. Stays on the "Mendl's at dusk" warm-
+ * charcoal palette — the bordeaux/pink light theme is daylight; at
+ * night we soften to espresso and golden-olive. Duplicated rather
+ * than chained so an OS flip mid-session still works without a
+ * reload. */
+/* Dark mode: neutral warm charcoal base, with palette colors used
+ * only as accents. Prior versions painted everything burgundy/pink,
+ * which looked loud and fought the "dim room" feel. Now the bg,
+ * surface, and bubble all sit in the dark-neutral range; mauve,
+ * pink, and teal appear only where they're meant to draw the eye
+ * (tool-name, accent-soft chrome, info states). Same tokens across
+ * both selectors so theme toggle doesn't produce drift. */
 @media (prefers-color-scheme: dark) {
-  :root {
-    --bg: #141412;
-    --bg-surface: #1e1e1c;
-    --bg-user: #1a365d;
-    --bg-tool: #2a2723;
-    --bg-error: #4a1a1a;
-    --text: #ececec;
-    --text-dim: #9a9a9a;
-    --accent: #3b82f6;
-    --border: #333330;
+  :root:not([data-theme="light"]) {
+    --bg: #1a1416;               /* near-black, faint warm red */
+    --bg-surface: #251c1f;       /* warm charcoal — sidebar, cards */
+    --bg-user: #4a2e36;           /* deep wine — user bubble, muted */
+    --bg-tool: #2a2023;          /* darker neutral — tool card */
+    --bg-error: #7a2e3a;         /* deep rose — alert (less alarming than hot pink) */
+    --text: #e6d5c7;             /* warm off-white — body text */
+    --text-dim: #8a7a82;         /* muted mauve-gray — secondary text */
+    --accent: #ee8ba9;           /* pink — focus, tool-name (palette highlight) */
+    --accent-soft: #a87382;      /* dusty mauve — soft accents */
+    --sage: #5a8aa0;             /* muted teal — info states */
+    --border: #3a2a30;
+    --code-bg: #120d10;
+    --code-text: #e6d5c7;
   }
+}
+
+:root[data-theme="dark"] {
+  --bg: #1a1416;
+  --bg-surface: #251c1f;
+  --bg-user: #4a2e36;
+  --bg-tool: #2a2023;
+  --bg-error: #7a2e3a;
+  --text: #e6d5c7;
+  --text-dim: #8a7a82;
+  --accent: #ee8ba9;
+  --accent-soft: #a87382;
+  --sage: #5a8aa0;
+  --border: #3a2a30;
+  --code-bg: #120d10;
+  --code-text: #e6d5c7;
 }
 
 * { box-sizing: border-box; }
@@ -41,11 +98,12 @@ html, body {
   margin: 0;
   padding: 0;
   height: 100vh;
-  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-  font-size: 15px;
-  line-height: 1.55;
+  font-family: var(--font-sans);
+  font-size: 16px;
+  line-height: 1.6;   /* Lexend reads best with slightly more leading */
   background: var(--bg);
   color: var(--text);
+  font-feature-settings: "ss01", "ss02";  /* Lexend readable variants */
 }
 
 body {
@@ -55,6 +113,175 @@ body {
 
 .hidden {
   display: none !important;
+}
+
+/* --- toasts ---
+ * Two toast anchors, each bound to the chip its messages belong
+ * to. Files-side toasts pop out to the LEFT of the + button;
+ * model-side toasts pop out to the RIGHT of the model chip. That
+ * way the researcher's eye follows the message to the control
+ * that fired it, rather than a floating bubble. Errors route to
+ * the main chat transcript (appendError) — these are reserved
+ * for short positive confirmations. */
+
+.add-wrap {
+  position: relative;  /* anchor for the files toast-container */
+}
+
+.model-wrap {
+  position: relative;  /* .permission-wrap already does this;
+                        * repeated here as a named override in
+                        * case the parent class is ever removed. */
+}
+
+.toast-container {
+  position: absolute;
+  top: 50%;
+  transform: translateY(-50%);
+  display: flex;
+  flex-direction: column-reverse;
+  gap: 6px;
+  z-index: 1000;
+  pointer-events: none;
+}
+
+.toast-container-left {
+  /* Sit to the LEFT of the + button. right: calc(100% + 8px)
+   * means the toast's right edge sits 8px beyond the parent's
+   * LEFT edge, putting the whole bubble in the gutter before
+   * the button. */
+  right: calc(100% + 8px);
+  align-items: flex-end;  /* stack from the right so short toasts align under longer ones */
+}
+
+.toast-container-right {
+  /* Mirror of -left: toast's left edge sits 8px beyond the
+   * parent's right edge. Used by the model chip so its toasts
+   * fan out toward the far edge of the composer row. */
+  left: calc(100% + 8px);
+  align-items: flex-start;
+}
+
+.toast {
+  pointer-events: auto;
+  width: max-content;
+  max-width: 320px;
+  padding: 8px 12px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--bg-surface);
+  color: var(--text);
+  font-size: 12.5px;
+  line-height: 1.4;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.2);
+  cursor: pointer;
+  animation: toast-in 0.18s ease-out;
+}
+
+.toast.info    { border-color: var(--accent-soft); }
+.toast.success { border-color: var(--sage); }
+.toast.error   { border-color: var(--hot-pink); color: var(--text); }
+
+.toast.fading {
+  animation: toast-out 0.2s ease-in forwards;
+}
+
+@keyframes toast-in {
+  from { opacity: 0; transform: translateY(6px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+
+@keyframes toast-out {
+  from { opacity: 1; transform: translateY(0); }
+  to   { opacity: 0; transform: translateY(6px); }
+}
+
+/* --- keyboard shortcuts overlay --- */
+
+.shortcuts-overlay {
+  position: fixed;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(0, 0, 0, 0.35);
+  z-index: 1100;
+  padding: 24px;
+}
+
+.shortcuts-card {
+  width: 420px;
+  max-width: 100%;
+  max-height: 80vh;
+  overflow-y: auto;
+  padding: 20px 22px;
+  background: var(--bg-surface);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  box-shadow: 0 20px 60px rgba(0, 0, 0, 0.3);
+}
+
+.shortcuts-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  font-weight: 600;
+  font-size: 14px;
+  margin-bottom: 14px;
+}
+
+.shortcuts-close {
+  width: 28px;
+  height: 28px;
+  padding: 0;
+  border: none;
+  border-radius: 50%;
+  background: transparent;
+  color: var(--text-dim);
+  font-size: 20px;
+  line-height: 1;
+  cursor: pointer;
+  transition: background 0.15s, color 0.15s;
+}
+
+.shortcuts-close:hover {
+  background: var(--bg);
+  color: var(--text);
+}
+
+.shortcuts-list {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: 10px 16px;
+  margin: 0;
+  font-size: 13px;
+}
+
+.shortcuts-list dt {
+  display: flex;
+  gap: 4px;
+  align-items: center;
+  justify-self: end;
+}
+
+.shortcuts-list dd {
+  margin: 0;
+  color: var(--text-dim);
+}
+
+kbd {
+  display: inline-block;
+  min-width: 22px;
+  padding: 1px 6px;
+  border: 1px solid var(--border);
+  border-bottom-width: 2px;
+  border-radius: 4px;
+  background: var(--bg);
+  color: var(--text);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  text-align: center;
+  line-height: 1.5;
 }
 
 /* --- landing --- */
@@ -182,34 +409,398 @@ body {
   line-height: 1.5;
 }
 
+.landing-sessions {
+  margin-top: 24px;
+  text-align: left;
+  border-top: 1px solid var(--border);
+  padding-top: 18px;
+}
+
+.landing-sessions-header {
+  font-size: 12px;
+  color: var(--text-dim);
+  letter-spacing: 0.3px;
+  text-transform: uppercase;
+  margin-bottom: 10px;
+  text-align: center;
+}
+
+.landing-sessions-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.landing-session {
+  display: block;
+  width: 100%;
+  padding: 10px 14px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--bg-surface);
+  color: var(--text);
+  font-family: inherit;
+  font-size: 13px;
+  text-align: left;
+  cursor: pointer;
+  transition: border-color 0.15s, background 0.15s;
+}
+
+.landing-session:hover {
+  border-color: var(--accent);
+  background: var(--bg);
+}
+
+.landing-session-when {
+  font-weight: 500;
+  margin-bottom: 2px;
+}
+
+.landing-session-meta {
+  font-size: 11px;
+  color: var(--text-dim);
+  font-family: var(--font-mono);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .chat {
+  /* Two-column layout: main transcript on the left, a collapsible
+   * session browser on the right. The main column keeps the prior
+   * column-flex internals (topbar, messages, composer). */
+  display: flex;
+  flex-direction: row;
+  flex: 1 1 auto;
+  min-height: 0;
+}
+
+.chat-main {
   display: flex;
   flex-direction: column;
   flex: 1 1 auto;
+  min-width: 0;   /* allow the transcript to shrink when sidebar expands */
+}
+
+/* --- sidebar --- */
+
+.sidebar {
+  /* Left rail. Width is driven by the ``--sidebar-width`` custom
+   * property (defaults to 280px, persisted via localStorage when
+   * the researcher drags the right-edge handle). Triple-locking the
+   * width via flex-basis / width / max-width protects the layout
+   * from any nested flex item reporting a huge intrinsic min-width
+   * (earlier versions ballooned to 80% of the window when a session
+   * row had six comma-joined CSV filenames). */
+  --sidebar-width: 280px;
+  flex: 0 0 var(--sidebar-width);
+  width: var(--sidebar-width);
+  max-width: var(--sidebar-width);
+  display: flex;
+  flex-direction: column;
   min-height: 0;
+  overflow: hidden;
+  position: relative;
+  border-right: 1px solid var(--border);
+  background: var(--bg-surface);
+  /* No width transition during drag — JS sets width on every
+   * mousemove, and a transition would make the rail lag the
+   * cursor. Only the collapse toggle needs animation. */
+}
+
+.sidebar.collapsed {
+  --sidebar-width: 36px;
+  transition: flex-basis 0.2s, width 0.2s, max-width 0.2s;
+}
+
+.sidebar-resize {
+  /* Thin invisible strip on the right edge. Cursor flips to
+   * ew-resize on hover so researchers discover they can drag it.
+   * Sits above the border-right so mouse events land on the strip
+   * rather than the content inside. */
+  position: absolute;
+  top: 0;
+  right: 0;
+  bottom: 0;
+  width: 6px;
+  cursor: ew-resize;
+  z-index: 5;
+  background: transparent;
+  transition: background 0.15s;
+}
+
+.sidebar-resize:hover,
+.sidebar-resize.dragging {
+  background: var(--accent-soft);
+}
+
+.sidebar.collapsed .sidebar-resize {
+  display: none;   /* no point dragging a 36px rail */
+}
+
+.sidebar.collapsed {
+  flex-basis: 36px;
+}
+
+.sidebar.collapsed .sidebar-title,
+.sidebar.collapsed .sidebar-new,
+.sidebar.collapsed .sidebar-list {
+  display: none;
+}
+
+.sidebar.collapsed .sidebar-toggle {
+  transform: rotate(180deg);
+}
+
+.sidebar-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 10px 12px;
+  border-bottom: 1px solid var(--border);
+  flex-shrink: 0;
+}
+
+.sidebar-title {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text-dim);
+  letter-spacing: 0.3px;
+  text-transform: uppercase;
+}
+
+.sidebar-toggle {
+  width: 24px;
+  height: 24px;
+  padding: 0;
+  border: none;
+  background: transparent;
+  color: var(--text-dim);
+  cursor: pointer;
+  font-size: 16px;
+  line-height: 1;
+  border-radius: 4px;
+  transition: color 0.15s, background 0.15s, transform 0.2s;
+}
+
+.sidebar-toggle:hover {
+  color: var(--text);
+  background: var(--bg);
+}
+
+.sidebar-new {
+  margin: 10px 12px 8px;
+  padding: 8px 12px;
+  font-size: 13px;
+  font-family: inherit;
+  background: var(--bg);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  cursor: pointer;
+  text-align: left;
+  transition: border-color 0.15s, color 0.15s;
+}
+
+.sidebar-new:hover {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+.sidebar-list {
+  flex: 1 1 auto;
+  overflow-y: auto;
+  padding: 4px 8px 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.session-row {
+  /* Grid: click target on the left, trash icon on the right. The
+   * active session tints the whole row; the trash button is always
+   * visible (small and muted) so users don't have to hover-discover
+   * the delete affordance. */
+  display: flex;
+  align-items: stretch;
+  gap: 2px;
+  border: 1px solid transparent;
+  border-radius: 8px;
+  transition: background 0.15s, border-color 0.15s;
+}
+
+.session-row:hover {
+  background: var(--bg);
+}
+
+.session-row.active {
+  background: var(--bg);
+  border-color: var(--accent-soft);
+}
+
+.session-item {
+  /* Each past session renders as a two-line item: timestamp on top,
+   * size + dataset filenames below. Click to switch cwd.
+   * ``flex: 1 1 0`` with basis 0 (rather than auto) means the item
+   * starts from zero width and grows to fill the row, ignoring the
+   * content's intrinsic width. Combined with overflow: hidden, this
+   * keeps a session with long dataset names from pushing the whole
+   * sidebar wider than 240px. */
+  flex: 1 1 0;
+  min-width: 0;
+  overflow: hidden;
+  padding: 8px 10px;
+  border: none;
+  border-radius: 7px 0 0 7px;
+  background: transparent;
+  color: var(--text);
+  font-family: inherit;
+  font-size: 13px;
+  text-align: left;
+  cursor: pointer;
+}
+
+.session-item:focus-visible {
+  /* Visible focus ring so arrow-key navigation shows the current
+   * row clearly. No ring on plain :focus — the item inherits focus
+   * from click, and we don't want a ring after a click.
+   */
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
+}
+
+.session-delete {
+  flex: 0 0 auto;
+  width: 28px;
+  padding: 0;
+  border: none;
+  border-radius: 0 7px 7px 0;
+  background: transparent;
+  color: var(--text-dim);
+  font-size: 18px;
+  line-height: 1;
+  cursor: pointer;
+  transition: color 0.15s, background 0.15s;
+}
+
+.session-delete:hover {
+  color: var(--bg-error);
+  background: rgba(0, 0, 0, 0.05);
+}
+
+@media (prefers-color-scheme: dark) {
+  .session-delete:hover {
+    background: rgba(255, 255, 255, 0.05);
+  }
+}
+
+.session-when {
+  font-weight: 500;
+  color: var(--text);
+}
+
+.session-datasets {
+  margin-top: 2px;
+  font-size: 11px;
+  color: var(--text-dim);
+  font-family: var(--font-mono);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.sidebar-list-empty {
+  padding: 12px;
+  font-size: 12px;
+  color: var(--text-dim);
+  font-style: italic;
+  text-align: center;
 }
 
 /* --- topbar --- */
 
 .topbar {
-  display: flex;
-  justify-content: space-between;
+  /* Three-column grid so the middle child (session title pill)
+   * sits at the true center of the bar, independent of how wide
+   * the "Builder" word-mark on the left or the theme toggle on
+   * the right happen to be. ``space-between`` on a flex row was
+   * centering the middle *between* the siblings, which only
+   * coincides with the bar's center when the siblings are
+   * identical widths. */
+  display: grid;
+  grid-template-columns: 1fr auto 1fr;
   align-items: center;
+  gap: 16px;
   padding: 10px 20px;
   background: var(--bg-surface);
   border-bottom: 1px solid var(--border);
   flex-shrink: 0;
+  min-width: 0;
 }
 
 .topbar-title {
   font-weight: 600;
   letter-spacing: 0.2px;
+  justify-self: start;
 }
 
 .topbar-meta {
+  justify-self: center;
+}
+
+.topbar-toggle {
+  justify-self: end;
+}
+
+.topbar-meta {
+  /* Session title pill — compact, readable, always visible. The
+   * abbreviation happens in JS (formatCwd / session_title); CSS
+   * just styles the chip. Max-width used to be 60% of the middle
+   * grid cell, which clipped short filenames aggressively. A
+   * concrete px cap lets longer names show while still protecting
+   * the bar from a 2-GB dataset's full path.
+   */
   font-size: 12px;
-  color: var(--text-dim);
-  font-family: ui-monospace, "SF Mono", Menlo, monospace;
+  color: var(--text);
+  opacity: 0.85;
+  font-family: var(--font-mono);
+  background: var(--bg);
+  padding: 4px 12px;
+  border-radius: 999px;
+  max-width: 560px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+}
+
+.topbar-toggle {
+  /* Small, unobtrusive round button next to the session pill. Uses
+   * a sun/moon glyph set by JS — transparent background, subtle
+   * border on hover. Parked here temporarily for palette testing;
+   * can move to a settings menu later. */
+  flex-shrink: 0;
+  width: 30px;
+  height: 30px;
+  padding: 0;
+  border: 1px solid transparent;
+  border-radius: 50%;
+  background: transparent;
+  color: var(--text);
+  opacity: 0.75;
+  cursor: pointer;
+  font-size: 15px;
+  line-height: 1;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  transition: opacity 0.15s, border-color 0.15s, background 0.15s;
+}
+
+.topbar-toggle:hover {
+  opacity: 1;
+  border-color: var(--border);
+  background: var(--bg);
 }
 
 /* --- message list --- */
@@ -222,6 +813,22 @@ body {
   flex-direction: column;
   gap: 16px;
   scroll-behavior: smooth;
+  /* Everything inside the transcript is draggable text. WKWebView
+   * sometimes inherits a "none" from chrome-like containers; this
+   * makes the default explicit so researchers can grab and copy
+   * code, tables, numbers — anything they see. Headers and click
+   * targets below can opt out individually. */
+  user-select: text;
+  -webkit-user-select: text;
+}
+
+.messages pre,
+.messages code,
+.messages .message-body,
+.messages .tool-output {
+  user-select: text;
+  -webkit-user-select: text;
+  cursor: text;
 }
 
 .message {
@@ -249,12 +856,20 @@ body {
 .message.user .message-body {
   background: var(--bg-user);
   max-width: 75%;
+  /* Text inherits --text. Light-mode bubble is peach with burgundy
+   * text (high contrast); dark-mode bubble is deep wine with warm
+   * cream text (also high contrast). Each mode picks its own
+   * readable pairing without a cross-mode lock. */
 }
 
 .message.assistant .message-body {
-  background: var(--bg-surface);
-  border: 1px solid var(--border);
-  margin-right: 40px;
+  /* No bubble — assistant text sits on the page background like a
+   * book paragraph. Only the user's own words get a colored chip;
+   * Claude's prose is the page. */
+  background: transparent;
+  border: none;
+  padding-left: 0;
+  padding-right: 40px;
 }
 
 .message.thinking .message-body {
@@ -266,18 +881,217 @@ body {
   margin-right: 60px;
 }
 
-.message.system .message-body {
-  background: transparent;
+/* --- thinking card (collapsible reasoning trace) --- */
+
+.thinking-card {
+  max-width: var(--max-width);
+  width: 100%;
+  margin: 0 auto;
+  padding: 6px 12px;
+  font-size: 12.5px;
+  color: var(--text-dim);
+  font-style: italic;
+}
+
+.thinking-header {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  cursor: pointer;
+  user-select: none;
+  padding: 2px 4px;
+  border-radius: 4px;
+  transition: background 0.15s, color 0.15s;
+}
+
+.thinking-header:hover {
+  color: var(--text);
+  background: var(--bg-surface);
+}
+
+.thinking-arrow {
+  font-size: 10px;
+  transition: transform 0.15s;
+}
+
+.thinking-card.collapsed .thinking-arrow {
+  transform: rotate(-90deg);
+}
+
+.thinking-label {
+  font-weight: 500;
+  font-style: normal;
+  text-transform: uppercase;
+  letter-spacing: 0.4px;
+  font-size: 11px;
+}
+
+.thinking-body {
+  margin-top: 6px;
+  padding: 8px 12px;
+  border-left: 2px solid var(--border);
+  white-space: pre-wrap;
+  line-height: 1.55;
+}
+
+.thinking-card.collapsed .thinking-body {
+  display: none;
+}
+
+/* --- cat-paws + yarn loading indicator ---
+ * Two 🐾 emoji paws on either side of a CSS-drawn yarn ball; the
+ * ball rolls side-to-side between them while each paw tilts
+ * toward the ball as it arrives. The whole scene is small enough
+ * to sit inline with the loading label. */
+
+.loading-indicator {
+  max-width: var(--max-width);
+  width: 100%;
+  margin: 4px auto 0;
+  padding: 6px 4px;
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
   color: var(--text-dim);
   font-size: 13px;
+  font-style: italic;
+}
+
+.cats-yarn {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 2px;
+  width: 56px;
+  height: 22px;
+  font-size: 14px;
+  line-height: 1;
+}
+
+.cat-paw {
+  /* Tilt each paw toward the yarn ball when it's "on that side"
+   * of the bounce. Left paw leans right at animation start (when
+   * ball is on the left), settles back as ball crosses over, and
+   * the right paw mirrors. Phases offset by 1.1s (half the ball
+   * cycle) so the tap-tap rhythm reads clearly. */
+  display: inline-block;
+  font-size: 13px;
+  opacity: 0.9;
+  transform-origin: center center;
+}
+
+.cat-paw-left {
+  animation: paw-tap-left 2.2s ease-in-out infinite;
+}
+
+.cat-paw-right {
+  animation: paw-tap-right 2.2s ease-in-out infinite;
+}
+
+.yarn-ball {
+  /* The ball sits between the paws and slides left-right. Rotation
+   * ties to direction: rolling right → clockwise, rolling left →
+   * counter-clockwise. We do both translate + rotate in the same
+   * keyframes so the rolling reads honestly. */
+  position: relative;
+  display: inline-block;
+  width: 14px;
+  height: 14px;
+  animation: yarn-roll 2.2s ease-in-out infinite;
+}
+
+.yarn-ball-core {
+  position: absolute;
+  inset: 0;
+  border-radius: 50%;
+  background: var(--accent-soft);
+  box-shadow: inset -2px -2px 3px rgba(0, 0, 0, 0.15);
+}
+
+.yarn-ball-strand {
+  /* Thin curved line wrapped around the ball — drawn as a ring
+   * with a gap to suggest winding. */
+  position: absolute;
+  inset: 2px;
+  border-radius: 50%;
+  border: 1.5px solid var(--accent);
+  border-top-color: transparent;
+  border-right-color: transparent;
+  opacity: 0.75;
+}
+
+@keyframes yarn-roll {
+  0%   { transform: translateX(-10px) rotate(0deg); }
+  50%  { transform: translateX(10px)  rotate(360deg); }
+  100% { transform: translateX(-10px) rotate(0deg); }
+}
+
+@keyframes paw-tap-left {
+  /* Ball hits the left paw at t=0 and t=100% (it's back there).
+   * Paw leans in (rotate toward ball) and recoils slightly. */
+  0%   { transform: rotate(12deg)  translateX(1px); }
+  10%  { transform: rotate(2deg)   translateX(0); }
+  50%  { transform: rotate(0deg)   translateX(0); }
+  90%  { transform: rotate(2deg)   translateX(0); }
+  100% { transform: rotate(12deg)  translateX(1px); }
+}
+
+@keyframes paw-tap-right {
+  /* Mirrored. Ball hits the right paw at t=50%. */
+  0%   { transform: rotate(0deg)   translateX(0); }
+  40%  { transform: rotate(-2deg)  translateX(0); }
+  50%  { transform: rotate(-12deg) translateX(-1px); }
+  60%  { transform: rotate(-2deg)  translateX(0); }
+  100% { transform: rotate(0deg)   translateX(0); }
+}
+
+.loading-text::after {
+  /* Subtle trailing-dots pulse alongside the spin. */
+  content: '';
+  animation: loading-dots 1.4s steps(4, end) infinite;
+}
+
+@keyframes loading-dots {
+  0%   { content: ''; }
+  25%  { content: '.'; }
+  50%  { content: '..'; }
+  75%  { content: '...'; }
+  100% { content: ''; }
+}
+
+/* System + error messages in the chat look the same: a centered,
+ * dim, pill-shaped environment notice. They read as "from the
+ * bot's environment", not as conversational content — distinct
+ * from Claude's own paragraphs and from the user's right-aligned
+ * bubble. Error coloring is a subtle tint rather than a full red
+ * panel so repeated notices don't drown out the transcript. */
+.message.system,
+.message.error {
+  display: flex;
+  justify-content: center;
+  margin: 6px 0;
+}
+
+.message.system .message-body,
+.message.error .message-body {
+  background: rgba(128, 128, 128, 0.08);
+  color: var(--text-dim);
+  border: 1px solid rgba(128, 128, 128, 0.12);
+  border-radius: 999px;          /* pill */
+  padding: 6px 14px;
+  font-size: 12.5px;
   text-align: center;
-  padding: 8px;
+  max-width: min(80%, 520px);
+  opacity: 0.85;
 }
 
 .message.error .message-body {
-  background: var(--bg-error);
-  color: var(--text);
-  border: 1px solid #c23;
+  /* A touch of the error hue — noticeable but still reads as
+   * environment, not alarm. */
+  background: rgba(194, 51, 51, 0.08);
+  border-color: rgba(194, 51, 51, 0.25);
+  color: var(--text-dim);
 }
 
 /* --- tool call cards --- */
@@ -291,7 +1105,7 @@ body {
   border-radius: var(--radius);
   padding: 10px 14px;
   font-size: 13px;
-  font-family: ui-monospace, "SF Mono", Menlo, monospace;
+  font-family: var(--font-mono);
 }
 
 .tool-card .tool-header {
@@ -367,7 +1181,7 @@ body {
 .tool-card .tool-source {
   font-size: 11px;
   color: var(--text-dim);
-  font-family: ui-monospace, "SF Mono", Menlo, monospace;
+  font-family: var(--font-mono);
   margin: 4px 2px 0;
 }
 
@@ -400,7 +1214,7 @@ body {
   border-radius: 6px;
   padding: 10px 12px;
   margin: 4px 0;
-  font-family: ui-monospace, "SF Mono", Menlo, monospace;
+  font-family: var(--font-mono);
   font-size: 12px;
   line-height: 1.5;
   max-height: 320px;
@@ -481,7 +1295,7 @@ body {
 
 .tool-card .tool-run-dir {
   margin-top: 8px;
-  font-family: ui-monospace, "SF Mono", Menlo, monospace;
+  font-family: var(--font-mono);
   font-size: 11px;
   color: var(--text-dim);
   word-break: break-all;
@@ -495,26 +1309,117 @@ body {
 /* --- composer --- */
 
 .composer {
-  background: var(--bg-surface);
-  border-top: 1px solid var(--border);
+  /* No background or top border: the footer should melt into the
+   * conversation area above. Only the compose-form itself (the
+   * rounded input box) carries its own surface color. The sidebar
+   * to the left still has its own surface since it's a distinct
+   * region; the composer is a continuation of the transcript. */
+  background: transparent;
   padding: 12px 20px 16px;
   flex-shrink: 0;
   position: relative;  /* so .policy-popup absolute-positions against the composer footer */
 }
 
+.compose-attachments {
+  /* Staged image thumbs above the composer. Sits just above the
+   * input box, same max-width so it aligns with the form. Hidden
+   * by the .hidden class until a drop populates it. */
+  max-width: var(--max-width);
+  margin: 0 auto 6px;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  padding: 2px 6px;
+}
+
+.compose-attachment {
+  position: relative;
+  width: 56px;
+  height: 56px;
+  border-radius: 8px;
+  overflow: hidden;
+  border: 1px solid var(--border);
+  background: var(--bg-surface);
+}
+
+.compose-attachment img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  display: block;
+}
+
+.compose-attachment-remove {
+  position: absolute;
+  top: 2px;
+  right: 2px;
+  width: 18px;
+  height: 18px;
+  padding: 0;
+  border: none;
+  border-radius: 50%;
+  background: rgba(0, 0, 0, 0.6);
+  color: white;
+  font-size: 12px;
+  line-height: 1;
+  cursor: pointer;
+}
+
+.compose-attachment-remove:hover {
+  background: var(--hot-pink);
+}
+
+/* Data/script file chip — same attachment row as image thumbs, but
+ * text-based because there's no preview to show. Sized to fit the
+ * filename; word chars wrap at ~22ch so long paths don't stretch
+ * the row. */
+.compose-attachment.compose-attachment-file {
+  width: auto;
+  min-width: 80px;
+  max-width: 240px;
+  height: auto;
+  padding: 6px 28px 6px 10px;  /* right padding leaves room for the × */
+  display: flex;
+  align-items: center;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  color: var(--text);
+}
+
+.compose-attachment-filename {
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 200px;
+}
+
+#compose-form.drop-target {
+  /* Visual cue while an image is being dragged over the composer.
+   * Pink dashed outline reads as "drop here" without the landing
+   * page's full drop-zone chrome. */
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px var(--accent-soft);
+}
+
 #compose-form {
   max-width: var(--max-width);
   margin: 0 auto;
-  /* New layout: textarea on top, bottom-bar with policy chip + send
-   * underneath. Vertical flex instead of horizontal. Mimics
-   * Claude Code / ChatGPT composer. */
+  /* Horizontal layout: textarea on the left, send/stop icon on the
+   * right, both inside one rounded box. ``align-items: flex-end``
+   * pins the button to the bottom as the textarea grows upward —
+   * Claude Code / ChatGPT composer shape. */
   display: flex;
-  flex-direction: column;
+  flex-direction: row;
+  align-items: flex-end;
   gap: 8px;
   padding: 8px 10px;
   border: 1px solid var(--border);
   border-radius: var(--radius);
-  background: var(--bg);
+  /* Lifted surface (--bg-surface) so the form reads as a distinct
+   * input area against the composer's transparent footer and the
+   * messages background — previously it matched --bg and melted
+   * into the conversation. */
+  background: var(--bg-surface);
   transition: border-color 0.15s;
 }
 
@@ -523,7 +1428,8 @@ body {
 }
 
 #compose-input {
-  width: 100%;
+  flex: 1 1 auto;
+  min-width: 0;
   padding: 6px 4px;
   font-size: 15px;
   line-height: 1.5;
@@ -539,36 +1445,31 @@ body {
   outline: none;
 }
 
-.composer-bar {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-}
-
-.composer-bar-spacer {
-  flex: 1 1 auto;
-}
-
 .composer-action {
-  /* Circular icon button at the right of the composer. Send and
-   * Stop use the same footprint so toggling between them doesn't
-   * reflow the bar. */
-  width: 32px;
-  height: 32px;
+  /* Low-chrome icon button sitting next to the textarea. Send and
+   * Stop share a footprint so toggling between them doesn't reflow.
+   * No accent background — a plain glyph that darkens on hover, like
+   * Claude Code's composer. */
+  flex: 0 0 auto;
+  width: 28px;
+  height: 28px;
   padding: 0;
-  border-radius: 50%;
+  border-radius: 6px;
   border: none;
   cursor: pointer;
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  background: var(--accent);
-  color: white;
-  transition: background 0.15s, opacity 0.15s;
+  background: transparent;
+  color: var(--text-dim);
+  font-size: 16px;
+  line-height: 1;
+  transition: background 0.15s, color 0.15s;
 }
 
 .composer-action:hover:not(:disabled) {
-  opacity: 0.88;
+  background: var(--bg-surface);
+  color: var(--text);
 }
 
 .composer-action:disabled {
@@ -577,7 +1478,31 @@ body {
 }
 
 .composer-action.stop {
-  background: #d33;
+  /* Empty square at the center, wrapped in a lighter border. No
+   * filled glyph — the button's own border is the square. Calm
+   * in-flight state, no red alarm. */
+  border: 1px solid var(--border);
+  background: transparent;
+}
+
+.composer-action.stop:hover:not(:disabled) {
+  background: var(--bg);
+  border-color: var(--text-dim);
+}
+
+.composer-action.stop .stop-square {
+  /* Small solid square centered inside the button. The surrounding
+   * border + this inner square together read as "stop" without
+   * needing an svg icon. */
+  display: block;
+  width: 8px;
+  height: 8px;
+  background: var(--text-dim);
+  border-radius: 1px;
+}
+
+.composer-action.stop:hover .stop-square {
+  background: var(--text);
 }
 
 /* Legacy .policy-btn + an earlier fixed-position .policy-popup
@@ -597,7 +1522,7 @@ body {
 }
 
 .policy-row-name {
-  font-family: ui-monospace, "SF Mono", Menlo, monospace;
+  font-family: var(--font-mono);
   font-size: 12.5px;
   color: var(--text);
   overflow: hidden;
@@ -647,6 +1572,121 @@ body {
   font-size: 12px;
   color: var(--text-dim);
   gap: 8px;
+}
+
+.composer-meta-spacer {
+  flex: 1 1 auto;
+}
+
+.context-chip {
+  /* Right-aligned context-usage indicator. Static (no click target),
+   * so no hover state or border — just dim text that warms up as
+   * usage climbs. Matches Claude Code's "Context X / Y" footer. */
+  cursor: default;
+  font-variant-numeric: tabular-nums;  /* digits don't jitter as count changes */
+}
+
+
+/* --- model picker popup rows --- */
+
+.model-option {
+  position: relative;   /* anchors the tooltip pseudo-element */
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  width: 100%;
+  padding: 8px 10px;
+  border: 1px solid transparent;
+  border-radius: 8px;
+  background: transparent;
+  color: var(--text);
+  font-family: inherit;
+  font-size: 13px;
+  text-align: left;
+  cursor: pointer;
+  transition: background 0.15s, border-color 0.15s;
+}
+
+#model-popup {
+  /* Override the shared .policy-popup's overflow-y: auto so the
+   * per-option hover tooltips aren't clipped when they extend
+   * outside the popup's left edge. The model list is always short
+   * (three entries), so max-height scrolling isn't needed here. */
+  overflow: visible;
+  max-height: none;
+}
+
+.model-option[data-tooltip]:hover::after {
+  /* Short hover note sitting just outside the popup's left edge.
+   * width: max-content keeps the pill exactly as wide as its text,
+   * and white-space: nowrap ensures short labels stay on one line
+   * rather than stretching the pill toward the tooltip's max-width.
+   */
+  content: attr(data-tooltip);
+  position: absolute;
+  right: calc(100% + 8px);
+  top: 50%;
+  transform: translateY(-50%);
+  z-index: 20;
+  padding: 6px 10px;
+  width: max-content;
+  max-width: 180px;
+  font-size: 11.5px;
+  line-height: 1.4;
+  font-family: inherit;
+  font-weight: 500;
+  color: var(--text);
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  box-shadow: 0 6px 18px rgba(0, 0, 0, 0.15);
+  white-space: nowrap;
+  pointer-events: none;
+}
+
+
+.model-option + .model-option {
+  margin-top: 4px;
+}
+
+.model-option:hover {
+  background: var(--bg);
+}
+
+.model-option.active {
+  background: var(--bg);
+  border-color: var(--accent-soft);
+}
+
+.model-option-name {
+  font-weight: 500;
+}
+
+.model-option-ctx {
+  font-size: 11px;
+  color: var(--text-dim);
+  font-family: var(--font-mono);
+}
+
+.context-chip:hover,
+.context-chip.open {
+  background: transparent;
+  color: var(--text-dim);
+}
+
+.context-chip.warn {
+  /* Dusty purple — stands apart from the pink spectrum without
+   * being alarmist. "Heads up, starting to fill." */
+  color: var(--dusty-purple);
+}
+
+.context-chip.danger {
+  /* Hot pink from the palette — the most saturated color in the
+   * room, so it catches the eye without clashing. "Next turn may
+   * hit the ceiling." */
+  color: var(--hot-pink);
+  font-weight: 600;
 }
 
 .permission-wrap {
@@ -742,10 +1782,111 @@ body {
   min-width: 0;
 }
 
+/* --- redesigned permission popup: button-based tier selector --- */
+
+.policy-dataset {
+  margin-top: 12px;
+}
+
+.policy-dataset:first-child {
+  margin-top: 0;
+}
+
+.policy-dataset-name {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  color: var(--text-dim);
+  margin-bottom: 6px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.policy-options {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  overflow: hidden;
+  background: var(--bg);
+}
+
+.policy-option {
+  /* Each tier sits as a full-width row inside a stacked list.
+   * The selected one is tinted with bg-surface and uses the
+   * accent-soft border on the check dot. */
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+  padding: 8px 12px;
+  border: none;
+  background: transparent;
+  color: var(--text);
+  font-family: inherit;
+  font-size: 13px;
+  text-align: left;
+  cursor: pointer;
+  transition: background 0.12s, color 0.12s;
+}
+
+.policy-option:hover:not(.selected) {
+  background: var(--bg-surface);
+}
+
+.policy-option.selected {
+  background: var(--bg-surface);
+  color: var(--accent);
+  font-weight: 500;
+}
+
+.policy-option-check {
+  flex: 0 0 auto;
+  width: 14px;
+  text-align: center;
+  font-size: 11px;
+  line-height: 1;
+  color: var(--text-dim);
+}
+
+.policy-option.selected .policy-option-check {
+  color: var(--accent);
+}
+
+.policy-option-label {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
 /* --- rendered markdown (assistant text) --- */
 
 .message.assistant .message-body {
   white-space: normal;  /* override the default pre-wrap — we render blocks */
+}
+
+/* While the typewriter animation is running we're showing plain
+ * textContent, not rendered markdown yet. Keep pre-wrap so newlines
+ * visually break the same way they will once markdown takes over,
+ * avoiding a reflow jolt at the swap. The caret gives the classic
+ * "typing" cue. */
+.message.assistant .message-body.typing {
+  white-space: pre-wrap;
+}
+
+.message.assistant .message-body.typing::after {
+  content: "\2582";  /* lower one-eighth block — reads as a caret */
+  display: inline-block;
+  margin-left: 1px;
+  color: var(--text-dim);
+  animation: typing-caret 0.9s steps(1, end) infinite;
+}
+
+@keyframes typing-caret {
+  0%, 55% { opacity: 1; }
+  56%, 100% { opacity: 0; }
 }
 
 .message.assistant .message-body p {
@@ -782,7 +1923,7 @@ body {
   background: rgba(0, 0, 0, 0.08);
   padding: 1px 5px;
   border-radius: 4px;
-  font-family: ui-monospace, "SF Mono", Menlo, monospace;
+  font-family: var(--font-mono);
   font-size: 0.92em;
 }
 
@@ -932,7 +2073,7 @@ body {
   padding: 12px 14px;
   background: transparent;
   overflow-x: auto;
-  font-family: ui-monospace, "SF Mono", Menlo, monospace;
+  font-family: var(--font-mono);
   font-size: 12.5px;
   line-height: 1.5;
   white-space: pre;
@@ -943,7 +2084,7 @@ body {
   padding: 6px 14px;
   font-size: 11px;
   color: var(--text-dim);
-  font-family: ui-monospace, "SF Mono", Menlo, monospace;
+  font-family: var(--font-mono);
   background: rgba(0, 0, 0, 0.02);
 }
 
@@ -990,19 +2131,67 @@ body {
   cursor: wait;
 }
 
-/* --- scrollbar polish --- */
+/* --- scrollbar polish ---
+ * WKWebView uses overlay scrollbars when macOS is set to "Show
+ * scroll bars: Automatically" or "When scrolling", so the rail only
+ * fades in on scroll. `overflow-y: scroll` on the containers below
+ * forces a persistent, styled scrollbar regardless of the system
+ * setting. Colors use solid rgba against the pink light-mode bg so
+ * the thumb stays visible without relying on opacity.
+ */
 
-.messages::-webkit-scrollbar {
-  width: 8px;
+.messages {
+  overflow-y: scroll;
 }
 
-.messages::-webkit-scrollbar-thumb {
-  background: rgba(0, 0, 0, 0.15);
-  border-radius: 4px;
+.sidebar-list {
+  overflow-y: scroll;
+}
+
+.messages::-webkit-scrollbar,
+.sidebar-list::-webkit-scrollbar {
+  width: 10px;
+}
+
+.messages::-webkit-scrollbar-track,
+.sidebar-list::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+/* Default (light) scrollbar — burgundy at enough opacity to stay
+ * visible on the pink bg. The light rule is the base; dark mode
+ * overrides it only when the OS prefers dark AND the researcher
+ * hasn't forced light via the topbar toggle. Without the
+ * :not([data-theme="light"]) guard, the scrollbar kept rendering
+ * in cream (the dark-mode color) when the OS was dark but the
+ * theme toggle was set to light, so it vanished against the pink. */
+.messages::-webkit-scrollbar-thumb,
+.sidebar-list::-webkit-scrollbar-thumb {
+  background: rgba(93, 44, 62, 0.45);
+  border-radius: 5px;
+}
+
+.messages::-webkit-scrollbar-thumb:hover,
+.sidebar-list::-webkit-scrollbar-thumb:hover {
+  background: rgba(93, 44, 62, 0.7);
 }
 
 @media (prefers-color-scheme: dark) {
-  .messages::-webkit-scrollbar-thumb {
-    background: rgba(255, 255, 255, 0.15);
+  :root:not([data-theme="light"]) .messages::-webkit-scrollbar-thumb,
+  :root:not([data-theme="light"]) .sidebar-list::-webkit-scrollbar-thumb {
+    background: rgba(240, 227, 214, 0.25);
   }
+  :root:not([data-theme="light"]) .messages::-webkit-scrollbar-thumb:hover,
+  :root:not([data-theme="light"]) .sidebar-list::-webkit-scrollbar-thumb:hover {
+    background: rgba(240, 227, 214, 0.45);
+  }
+}
+
+:root[data-theme="dark"] .messages::-webkit-scrollbar-thumb,
+:root[data-theme="dark"] .sidebar-list::-webkit-scrollbar-thumb {
+  background: rgba(240, 227, 214, 0.25);
+}
+:root[data-theme="dark"] .messages::-webkit-scrollbar-thumb:hover,
+:root[data-theme="dark"] .sidebar-list::-webkit-scrollbar-thumb:hover {
+  background: rgba(240, 227, 214, 0.45);
 }

@@ -74,8 +74,11 @@ VALID_DEPTHS: tuple[str, ...] = (
     "names_types_labels_summary",
 )
 
-# The conservative default the researcher gets without opting in.
-DEFAULT_MAX_DEPTH = "names_types"
+# Default schema depth for new datasets. NA count + distinct count is
+# the richest non-leaky tier (below that, Claude is reasoning about
+# variables with almost no metadata). Researchers can still dial it
+# down per dataset via the Permission chip.
+DEFAULT_MAX_DEPTH = "names_types_labels_summary"
 
 # Map depth → rank so we can compare "is requested at most the ceiling".
 _DEPTH_RANK: dict[str, int] = {d: i for i, d in enumerate(VALID_DEPTHS)}

@@ -69,6 +69,7 @@
     let codeLang = '';
     let listType = null;     // 'ul' | 'ol' | null
     let listItems = [];      // pending <li> content
+    let pendingBlankInList = false;  // see "Blank line" handling below
     let paraLines = [];
 
     // GitHub-flavored markdown pipe tables — the shape Claude emits
@@ -111,6 +112,7 @@
       out.push('</' + tag + '>');
       listType = null;
       listItems = [];
+      pendingBlankInList = false;
     }
 
     function flushCode() {
@@ -146,10 +148,19 @@
         continue;
       }
 
-      // Blank line ends the current block.
+      // Blank line ends the current paragraph, but doesn't
+      // immediately close an open list. Claude often emits loose
+      // lists with a blank line between items (`1. foo\n\n1. bar`);
+      // closing the `<ol>` at every blank means each item becomes
+      // its own single-item list that restarts numbering at 1. We
+      // instead set a flag and let the next non-blank line decide:
+      // if it's another list item, we continue the list; otherwise
+      // we flush.
       if (!raw.trim()) {
         flushPara();
-        flushList();
+        if (listType !== null) {
+          pendingBlankInList = true;
+        }
         continue;
       }
 
@@ -217,6 +228,7 @@
         if (listType !== 'ul') flushList();
         listType = 'ul';
         listItems.push(ul[1]);
+        pendingBlankInList = false;
         continue;
       }
 
@@ -227,10 +239,14 @@
         if (listType !== 'ol') flushList();
         listType = 'ol';
         listItems.push(ol[1]);
+        pendingBlankInList = false;
         continue;
       }
 
-      // Otherwise accumulate into the current paragraph.
+      // Otherwise accumulate into the current paragraph. If a blank
+      // line separated us from an open list and this line isn't a
+      // list item, the list is done — close it before starting the
+      // paragraph.
       flushList();
       paraLines.push(raw);
     }

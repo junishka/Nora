@@ -282,7 +282,7 @@ def _as_mcp_text(payload: dict[str, Any]) -> dict[str, Any]:
         "    - 'names_types_labels': + variable labels and value labels.\n"
         "    - 'names_types_labels_summary': + NA counts and distinct counts "
         "for categoricals.\n"
-        "  Conservative default: 'names_types'. Each successful response "
+        "  Default: 'names_types_labels_summary'. Each successful response "
         "includes a 'policy_max_depth' field showing the ceiling the "
         "researcher has set for this dataset — you cannot exceed it. "
         "Requests above the ceiling are denied with the current ceiling "
@@ -299,7 +299,7 @@ async def get_schema(args: dict[str, Any]) -> dict[str, Any]:
     inside the cwd). Escape attempts get a policy-shaped denial.
     """
     dataset = args.get("dataset", "")
-    depth = args.get("depth", "names_types")
+    depth = args.get("depth", policy_module.DEFAULT_MAX_DEPTH)
 
     if not dataset:
         return _as_mcp_text({
@@ -332,10 +332,10 @@ async def get_schema(args: dict[str, Any]) -> dict[str, Any]:
 
     # Researcher consent policy: compare requested depth against the
     # ceiling set in `<cwd>/.builder/policy.json`. A missing policy
-    # file or a missing per-dataset entry uses the conservative
-    # default (`names_types`). The policy is a *ceiling* — Claude can
-    # still request something narrower than the ceiling if that's
-    # enough for the task.
+    # file or a missing per-dataset entry uses the app default
+    # (``policy.DEFAULT_MAX_DEPTH``). The policy is a *ceiling* —
+    # Claude can still request something narrower than the ceiling
+    # if that's enough for the task.
     policy_doc = load_policy(get_cwd())
     ceiling = get_max_depth(policy_doc, path.name)
     if depth in policy_module.VALID_DEPTHS and not depth_allowed(depth, ceiling):
@@ -549,6 +549,12 @@ async def submit_script(args: dict[str, Any]) -> dict[str, Any]:
                 "resubmit."
             ),
             "_run_dir": str(exec_result.run_dir),
+            # Language hint must travel on error paths too: the UI
+            # uses it to strip the Stata preamble from raw stdout
+            # and to pick the right "Open in Stata" / "Open in R"
+            # button. Without it, errored Stata runs leaked the
+            # preamble into the visible output.
+            "_language": language,
         })
 
     # --- Sanitizer ---------------------------------------------------------
@@ -583,6 +589,7 @@ async def submit_script(args: dict[str, Any]) -> dict[str, Any]:
                 "larger sample) and resubmit."
             ),
             "_run_dir": str(exec_result.run_dir),
+            "_language": language,
         })
 
     # --- Row-count change check --------------------------------------------

@@ -1,4 +1,4 @@
-*! version 0.0.2  Builder runtime: emit a descriptive payload from r().
+*! version 0.0.3  Builder runtime: emit a descriptive payload from r().
 *!
 *! Call after Stata's `summarize` command. Reads r(N), r(mean), r(sd) and
 *! computes `missing_count` as the count of missing values for the
@@ -18,6 +18,15 @@
 *! Note: Stata's r() after `summarize` doesn't carry the variable name,
 *! so the researcher passes it as a positional argument. Callers can
 *! still override `missing_count` with the `missing(<int>)` option.
+*!
+*! IMPORTANT: call this helper IMMEDIATELY after `summarize`. Most
+*! intervening r-class commands (save, count, tab, sum scalar, ...)
+*! overwrite r() and will wipe the mean/sd/etc. this helper needs.
+*! In particular, `save` sets its own r(N) but wipes r(mean)/r(sd),
+*! which used to slip past an r(N)-only guard and silently produce
+*! a payload missing the mean and SD — sanitizer would reject it
+*! and the researcher would see "no result" despite Stata's exit 0.
+*! The guard below checks r(mean) specifically to catch that case.
 
 program define builder_result_sum
     version 13
@@ -31,8 +40,16 @@ program define builder_result_sum
     local label : subinstr local label "`=char(13)'" " ", all
     local label : subinstr local label "`=char(9)'" " ", all
 
-    if "`r(N)'" == "" {
-        display as error "builder_result_sum: no summarize results in memory. Run `summarize' first."
+    * Guard on r(mean), not r(N). r(N) is set by many r-class commands
+    * (save, count, etc.), so an r(N)-only check silently passes when
+    * an intervening command wiped summarize's scalars. r(mean) is
+    * specific to summarize (and a handful of others that leave the
+    * right shape in place, like mean/total). If it's empty, either
+    * summarize wasn't run, or a subsequent r-class command clobbered
+    * the result — both are recoverable by re-running summarize
+    * immediately before this helper.
+    if "`r(mean)'" == "" {
+        display as error "builder_result_sum: summarize results not in r(). Either `summarize' wasn't run, or an intervening r-class command (e.g., save, count) wiped the scalars. Call `builder_result_sum' immediately after `summarize'."
         exit 198
     }
 

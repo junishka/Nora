@@ -100,6 +100,12 @@ class BuilderBridge:
         # the Stop button. None when no turn is in flight. Captured
         # on the worker loop, cleared when the turn returns.
         self._current_turn_task: asyncio.Task[None] | None = None
+        # Which Claude model the researcher has selected. Defaults to
+        # Sonnet 4.6 (1M context). Changed via `set_model` from the
+        # composer chip; takes effect on the next turn because
+        # `_ensure_client` reads it when opening a fresh SDK client.
+        from builder.app import DEFAULT_MODEL
+        self._model: str = DEFAULT_MODEL
 
     # -------- lifecycle --------
 
@@ -401,9 +407,428 @@ class BuilderBridge:
                 ),
             })
             return
+        # Record the researcher's message so replay reconstructs the
+        # whole exchange. The JS side already rendered the bubble on
+        # its own (appendUser) before calling us, so we only persist
+        # here rather than re-pushing to the UI.
+        self._persist_event({"type": "user_message", "text": text})
         asyncio.run_coroutine_threadsafe(
             self._run_turn(text), self._loop
         )
+
+    def send_message_with_images(
+        self, text: str, images: list[dict[str, Any]]
+    ) -> None:
+        """Send a user message with one or more attached images.
+        ``images[i] = {"data": <base64>, "mime": <image/png|jpeg|webp|gif>}``.
+        The SDK's query() takes a string shortcut OR an async
+        iterable of message dicts; for vision we need the latter so
+        we can attach image content blocks alongside the text.
+        """
+        if self._loop is None:
+            self._push_event({"type": "turn_error", "message": "worker loop not running"})
+            return
+        if self.cwd is None:
+            self._push_event({
+                "type": "turn_error",
+                "message": "no working directory set — choose files or a folder first",
+            })
+            return
+        # Persist as a user_message text-only for the chat log (we
+        # don't store image bytes in the JSONL — the storage cost
+        # would dwarf the analytical log and replay doesn't need
+        # them). Flag that images were attached so future session
+        # browsers can show a marker.
+        self._persist_event({
+            "type": "user_message",
+            "text": text,
+            "attachments": len(images),
+        })
+        asyncio.run_coroutine_threadsafe(
+            self._run_turn(text, images=images), self._loop
+        )
+
+    def add_files(self) -> dict[str, Any]:
+        """Open a native file picker that accepts both data files
+        (.csv/.dta/.rds) and images (.png/.jpg/.webp/.gif), and route
+        each selected file according to its extension:
+
+          Data files → copied into the session's working directory
+                       so Claude can reference them through
+                       ``get_schema`` / ``submit_script``.
+          Images    → read, base64-encoded, and returned so the
+                       frontend can stage them as attachments on
+                       the next outgoing message (vision).
+
+        Returns ``{ok, added: [data filenames], images: [{data,
+        mime, name}], policy, session_title}``.
+        """
+        if self._window is None:
+            return {"ok": False, "reason": "window not ready"}
+        if self.cwd is None:
+            return {"ok": False, "reason": "no active session — start one first"}
+        try:
+            import webview
+            # pywebview validates filter strings with a regex that only
+            # allows [\w\s] before the parens — the old "Data + images"
+            # label tripped that check because of the `+`. Keep the
+            # description to plain words.
+            file_types = (
+                "Everything Builder handles (*.csv;*.dta;*.rds;*.do;*.r;*.gph;*.log;*.smcl;*.rmd;*.png;*.jpg;*.jpeg;*.webp;*.gif)",
+                "Data files (*.csv;*.dta;*.rds)",
+                "Scripts and logs (*.do;*.r;*.gph;*.log;*.smcl;*.rmd)",
+                "Images (*.png;*.jpg;*.jpeg;*.webp;*.gif)",
+                "All files (*.*)",
+            )
+            result = self._window.create_file_dialog(
+                webview.OPEN_DIALOG,
+                allow_multiple=True,
+                file_types=file_types,
+            )
+        except Exception as e:  # noqa: BLE001
+            return {"ok": False, "reason": f"dialog error: {e}"}
+        if not result:
+            return {"ok": False, "reason": "cancelled"}
+
+        import base64
+        # Anything in this set is copied into the session cwd so
+        # Claude can reference it through get_schema / submit_script,
+        # or so the researcher can open it alongside the chat. Data
+        # files, R and Stata scripts, Stata graphs, log output, and
+        # R Markdown all qualify.
+        _COPY_EXTS = {
+            ".csv", ".dta", ".rds",              # data
+            ".do",                                # Stata script
+            ".r",                                 # R script
+            ".gph",                               # Stata graph
+            ".log", ".smcl",                      # Stata / R logs
+            ".rmd",                               # R Markdown
+        }
+        _IMAGE_EXTS_MIMES = {
+            ".png": "image/png",
+            ".jpg": "image/jpeg",
+            ".jpeg": "image/jpeg",
+            ".webp": "image/webp",
+            ".gif": "image/gif",
+        }
+        _IMAGE_MAX_BYTES = 5 * 1024 * 1024
+
+        added: list[str] = []
+        images: list[dict[str, str]] = []
+        skipped: list[str] = []
+
+        for s in result:
+            try:
+                src = Path(s).expanduser().resolve()
+            except OSError as e:
+                return {"ok": False, "reason": f"bad path: {e}"}
+            if not src.is_file():
+                return {"ok": False, "reason": f"not a file: {src}"}
+            ext = src.suffix.lower()
+            if ext in _COPY_EXTS:
+                try:
+                    shutil.copy2(src, self.cwd / src.name)
+                    added.append(src.name)
+                except OSError as e:
+                    return {"ok": False, "reason": f"copy failed: {e}"}
+            elif ext in _IMAGE_EXTS_MIMES:
+                try:
+                    raw = src.read_bytes()
+                except OSError as e:
+                    return {"ok": False, "reason": f"image read failed: {e}"}
+                if len(raw) > _IMAGE_MAX_BYTES:
+                    skipped.append(f"{src.name} (>5 MB)")
+                    continue
+                images.append({
+                    "data": base64.b64encode(raw).decode("ascii"),
+                    "mime": _IMAGE_EXTS_MIMES[ext],
+                    "name": src.name,
+                })
+            else:
+                skipped.append(src.name)
+
+        return {
+            "ok": True,
+            "added": added,
+            "images": images,
+            "skipped": skipped,
+            "policy": self._policy_summary(),
+            "session_title": _session_title(self.cwd),
+        }
+
+    def add_files_from_blobs(
+        self, files: list[dict[str, Any]]
+    ) -> dict[str, Any]:
+        """Twin of :meth:`add_files`, but for files dropped or pasted
+        directly onto the composer from JS — no native dialog involved.
+
+        Each ``files[i]`` is ``{name, content (base64), mime?}``. Data
+        and script files are copied into ``self.cwd``; images are
+        decoded and returned so the frontend can stage them as vision
+        attachments. Returns the same shape as :meth:`add_files`.
+        """
+        if self.cwd is None:
+            return {
+                "ok": False,
+                "reason": "no active session — start one first",
+            }
+        if not files:
+            return {"ok": False, "reason": "no files"}
+
+        import base64
+        _COPY_EXTS = {
+            ".csv", ".dta", ".rds",
+            ".do", ".r",
+            ".gph",
+            ".log", ".smcl",
+            ".rmd",
+        }
+        _IMAGE_EXTS_MIMES = {
+            ".png": "image/png",
+            ".jpg": "image/jpeg",
+            ".jpeg": "image/jpeg",
+            ".webp": "image/webp",
+            ".gif": "image/gif",
+        }
+        _IMAGE_MAX_BYTES = 5 * 1024 * 1024
+
+        added: list[str] = []
+        images: list[dict[str, str]] = []
+        skipped: list[str] = []
+
+        for item in files:
+            name = item.get("name", "")
+            content_b64 = item.get("content", "")
+            if not name or not isinstance(content_b64, str):
+                continue
+            if "," in content_b64:
+                content_b64 = content_b64.split(",", 1)[1]
+            try:
+                blob = base64.b64decode(content_b64, validate=False)
+            except Exception:  # noqa: BLE001
+                return {"ok": False, "reason": f"could not decode {name!r}"}
+            safe_name = Path(name).name
+            ext = Path(safe_name).suffix.lower()
+            if ext in _COPY_EXTS:
+                try:
+                    (self.cwd / safe_name).write_bytes(blob)
+                    added.append(safe_name)
+                except OSError as e:
+                    return {"ok": False, "reason": f"copy failed: {e}"}
+            elif ext in _IMAGE_EXTS_MIMES:
+                if len(blob) > _IMAGE_MAX_BYTES:
+                    skipped.append(f"{safe_name} (>5 MB)")
+                    continue
+                images.append({
+                    "data": base64.b64encode(blob).decode("ascii"),
+                    "mime": _IMAGE_EXTS_MIMES[ext],
+                    "name": safe_name,
+                })
+            else:
+                skipped.append(safe_name)
+
+        return {
+            "ok": True,
+            "added": added,
+            "images": images,
+            "skipped": skipped,
+            "policy": self._policy_summary(),
+            "session_title": _session_title(self.cwd),
+        }
+
+    def list_models(self) -> dict[str, Any]:
+        """Return the list of selectable Claude models and which one
+        is currently active. The JS side renders a popup from this
+        so the frontend doesn't need to hard-code the model catalog
+        separately from the backend."""
+        from builder.app import SUPPORTED_MODELS
+        return {
+            "ok": True,
+            "current": self._model,
+            "models": [
+                {
+                    "id": mid,
+                    "label": info["label"],
+                    "context_window": info["context_window"],
+                }
+                for mid, info in SUPPORTED_MODELS.items()
+            ],
+        }
+
+    def set_model(self, model_id: str) -> dict[str, Any]:
+        """Switch the active Claude model. Uses the SDK client's
+        in-place ``set_model`` so the running conversation is
+        preserved; Claude picks the new model up on the next turn
+        with full memory of what was said before. If no client is
+        open yet (model swapped before the first message), we just
+        stash the choice and the client opens fresh with the new
+        model on first send_message.
+
+        Mid-turn switches are refused so we don't race the streaming
+        response.
+        """
+        from builder.app import SUPPORTED_MODELS
+        if model_id not in SUPPORTED_MODELS:
+            return {"ok": False, "reason": f"unknown model: {model_id}"}
+        if self._current_turn_task is not None and not self._current_turn_task.done():
+            return {
+                "ok": False,
+                "reason": "a turn is in flight; wait for it to finish",
+            }
+        if model_id == self._model:
+            return {"ok": True, "model": model_id, "unchanged": True}
+
+        self._model = model_id
+        # Swap the model on the existing client in place. Previous
+        # version closed+reopened, which lost the conversation; the
+        # SDK exposes set_model for exactly this case.
+        if self._loop is not None and self._client is not None:
+            async def _swap() -> None:
+                await self._client.set_model(model_id)
+            fut = asyncio.run_coroutine_threadsafe(_swap(), self._loop)
+            try:
+                fut.result(timeout=5)
+            except Exception as e:  # noqa: BLE001
+                # If the SDK rejects the model id (e.g., unrecognized
+                # `[1m]` suffix) fall back to the teardown path so
+                # at worst the researcher gets a fresh conversation
+                # rather than a broken client.
+                try:
+                    await_close = asyncio.run_coroutine_threadsafe(
+                        self._client.__aexit__(None, None, None), self._loop
+                    )
+                    await_close.result(timeout=3)
+                except Exception:  # noqa: BLE001
+                    pass
+                self._client = None
+                return {
+                    "ok": False,
+                    "reason": f"model switch failed: {e}. Conversation reset.",
+                }
+
+        info = SUPPORTED_MODELS[model_id]
+        return {
+            "ok": True,
+            "model": model_id,
+            "label": info["label"],
+            "context_window": info["context_window"],
+        }
+
+    def list_sessions(self) -> dict[str, Any]:
+        """Return a newest-first list of past Builder sessions living
+        under ``~/.builder-sessions/``. Each entry carries the
+        absolute path, the directory name, a human-friendly timestamp,
+        the names of the data files inside, and the on-disk size in
+        bytes so the sidebar can show what's heavy. Also flags the
+        session that's currently loaded.
+        """
+        current = str(self.cwd.resolve()) if self.cwd else None
+        entries: list[dict[str, Any]] = []
+        if not SESSIONS_ROOT.exists():
+            return {"ok": True, "sessions": entries, "current": current}
+
+        _DATA_EXTS = (".csv", ".dta", ".rds")
+        for child in SESSIONS_ROOT.iterdir():
+            if not child.is_dir():
+                continue
+            try:
+                stat = child.stat()
+            except OSError:
+                continue
+            # Timestamp parsing — dir names look like
+            # `20260422T160059Z_f13630f4`. Fall back to mtime if the
+            # prefix doesn't match (user manually renamed, etc.).
+            ts = _parse_session_timestamp(child.name) or stat.st_mtime
+            datasets: list[str] = []
+            try:
+                for f in child.iterdir():
+                    if f.is_file() and f.suffix.lower() in _DATA_EXTS:
+                        datasets.append(f.name)
+            except OSError:
+                pass
+            datasets.sort()
+            entries.append({
+                "path": str(child.resolve()),
+                "name": child.name,
+                "timestamp": ts,  # epoch seconds, JS formats
+                "datasets": datasets,
+                "size": _dir_size(child),
+            })
+        entries.sort(key=lambda e: e["timestamp"], reverse=True)
+        return {"ok": True, "sessions": entries, "current": current}
+
+    def delete_session(self, path: str) -> dict[str, Any]:
+        """Delete a session directory and everything under it: data
+        copies, run dirs, results.db, chat_history.jsonl. Refuses to
+        delete the currently-active session (which would leave the
+        backend pointing at a vanished cwd). Only paths inside
+        ``~/.builder-sessions/`` are allowed.
+        """
+        if not path:
+            return {"ok": False, "reason": "empty path"}
+        try:
+            target = Path(path).expanduser().resolve()
+        except OSError as e:
+            return {"ok": False, "reason": f"bad path: {e}"}
+        if not _is_within(target, SESSIONS_ROOT.resolve()):
+            return {
+                "ok": False,
+                "reason": "path is outside ~/.builder-sessions/",
+            }
+        if not target.exists():
+            return {"ok": False, "reason": "already gone"}
+        if self.cwd and target == self.cwd.resolve():
+            return {
+                "ok": False,
+                "reason": "cannot delete the active session — switch first",
+            }
+        try:
+            shutil.rmtree(target)
+        except OSError as e:
+            return {"ok": False, "reason": f"delete failed: {e}"}
+        return {"ok": True, "path": str(target)}
+
+    def switch_session(self, path: str) -> dict[str, Any]:
+        """Switch the active working directory to an existing Builder
+        session. Closes the current SDK client so the next turn
+        starts a fresh conversation against the new cwd. Chat history
+        from the previous session isn't replayed (persistence is a
+        future feature); the researcher sees a clean slate pointed at
+        the chosen session's data.
+        """
+        if not path:
+            return {"ok": False, "reason": "empty path"}
+        try:
+            target = Path(path).expanduser().resolve()
+        except OSError as e:
+            return {"ok": False, "reason": f"bad path: {e}"}
+        if not target.is_dir():
+            return {"ok": False, "reason": f"not a directory: {target}"}
+        # Only allow switching into paths we manage — prevents a
+        # page-side exploit from pointing cwd at an arbitrary folder.
+        if not _is_within(target, SESSIONS_ROOT.resolve()):
+            return {
+                "ok": False,
+                "reason": "path is outside ~/.builder-sessions/",
+            }
+
+        # Close the existing client so the new cwd gets a fresh SDK
+        # session instead of leaking state across directories.
+        if self._loop is not None and self._client is not None:
+            async def _close() -> None:
+                try:
+                    await self._client.__aexit__(None, None, None)
+                except Exception:  # noqa: BLE001
+                    pass
+                finally:
+                    self._client = None
+            fut = asyncio.run_coroutine_threadsafe(_close(), self._loop)
+            try:
+                fut.result(timeout=3)
+            except Exception:  # noqa: BLE001
+                pass
+
+        return self._set_cwd(target)
 
     def interrupt_turn(self) -> dict[str, Any]:
         """Cancel the currently-running turn. Called when the
@@ -490,11 +915,15 @@ class BuilderBridge:
 
     def _ready_payload(self) -> dict[str, Any]:
         """The event body emitted after cwd is finalized — tells the
-        UI to switch from landing to chat view."""
+        UI to switch from landing to chat view. ``session_title`` is
+        a human-friendly label for the topbar: the primary dataset
+        name if there's one, otherwise a short timestamp from the
+        dir name. Always something a researcher would recognize."""
         assert self.cwd is not None
         return {
             "type": "ready",
             "cwd": str(self.cwd),
+            "session_title": _session_title(self.cwd),
             "greeting": (
                 "Connected. Tell Claude about your research question, "
                 "or ask what datasets are available."
@@ -506,11 +935,24 @@ class BuilderBridge:
         assert self.cwd is not None
         if self._client is None:
             from builder.app import _build_options
-            opts = _build_options(self.cwd)
+            # Ask the SDK to resume the cwd's prior conversation when
+            # we already have persisted history for this session.
+            # First-ever open of a session has no history, so Claude
+            # starts fresh; switching into an old session or landing
+            # in one that already hosted a chat keeps the memory.
+            history_path = self.cwd / ".builder" / "chat_history.jsonl"
+            resume = history_path.exists() and history_path.stat().st_size > 0
+            opts = _build_options(
+                self.cwd,
+                model=self._model,
+                continue_conversation=resume,
+            )
             self._client = await ClaudeSDKClient(options=opts).__aenter__()
         return self._client
 
-    async def _run_turn(self, text: str) -> None:
+    async def _run_turn(
+        self, text: str, images: list[dict[str, Any]] | None = None
+    ) -> None:
         assert self._send_lock is not None
         # Register this task so interrupt_turn() can cancel it. Using
         # current_task() (set by the event loop) rather than passing
@@ -535,7 +977,9 @@ class BuilderBridge:
                 return
 
             try:
-                async for evt in chat_service.run_turn(client, text):
+                async for evt in chat_service.run_turn(
+                    client, text, images=images
+                ):
                     self._push_event(_event_to_dict(evt))
             except asyncio.CancelledError:
                 # Researcher hit Stop. Surface a terminal event so
@@ -563,6 +1007,12 @@ class BuilderBridge:
     def _push_event(self, payload: dict[str, Any]) -> None:
         """Send a JSON event to the web UI. pywebview's evaluate_js
         takes a string of JS to run in the page's context."""
+        # Persist the event to the session's chat history before
+        # firing it at the UI. Only transcript-forming events get
+        # recorded; transient status (turn_done / auth_failure /
+        # ready / policy_updated) would clutter the log without
+        # helping a future re-open.
+        self._persist_event(payload)
         if self._window is None:
             return
         js = f"window.builder_event({json.dumps(payload)});"
@@ -571,11 +1021,65 @@ class BuilderBridge:
         except Exception:  # noqa: BLE001 — webview may be closing
             pass
 
+    # Event types we keep in the chat log. Everything else is either
+    # transient (turn_done, auth_failure) or reconstructible from
+    # session state (ready, policy_updated).
+    _PERSIST_TYPES = frozenset({
+        "assistant_text",
+        "assistant_thinking",
+        "tool_call",
+        "tool_result",
+        "user_message",
+    })
+
+    def _persist_event(self, payload: dict[str, Any]) -> None:
+        if self.cwd is None:
+            return
+        etype = payload.get("type")
+        if etype not in self._PERSIST_TYPES:
+            return
+        try:
+            history_dir = self.cwd / ".builder"
+            history_dir.mkdir(parents=True, exist_ok=True)
+            path = history_dir / "chat_history.jsonl"
+            with path.open("a", encoding="utf-8") as f:
+                f.write(json.dumps(payload, ensure_ascii=False) + "\n")
+        except OSError:
+            # Persistence failing shouldn't block live chat. The
+            # transcript on screen stays intact; replay just won't
+            # include this event.
+            pass
+
+    def get_chat_history(self) -> dict[str, Any]:
+        """Return the persisted chat log for the active session so
+        the UI can replay past messages after a session switch.
+        Empty list if the session has no history yet."""
+        if self.cwd is None:
+            return {"ok": True, "events": []}
+        path = self.cwd / ".builder" / "chat_history.jsonl"
+        events: list[dict[str, Any]] = []
+        if not path.exists():
+            return {"ok": True, "events": events}
+        try:
+            with path.open("r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        events.append(json.loads(line))
+                    except json.JSONDecodeError:
+                        continue
+        except OSError as e:
+            return {"ok": False, "reason": str(e)}
+        return {"ok": True, "events": events}
+
     def _policy_summary(self) -> dict[str, Any]:
         """Compact JSON-serializable summary of the current policy +
         dataset list for the topbar footer."""
         if self.cwd is None:
-            return {"default_max_depth": "names_types", "datasets": []}
+            from builder.policy import DEFAULT_MAX_DEPTH
+            return {"default_max_depth": DEFAULT_MAX_DEPTH, "datasets": []}
         from builder.app import _scan_datasets
         policy = load_policy(self.cwd)
         return {
@@ -600,6 +1104,79 @@ def _is_within(child: Path, parent: Path) -> bool:
         return True
     except (ValueError, OSError):
         return False
+
+
+def _dir_size(path: Path) -> int:
+    """Walk a directory and sum file sizes. Returns 0 on any I/O
+    error rather than raising — the sidebar display is cosmetic, so
+    a permission hiccup on one run dir shouldn't break the list.
+    Uses os.scandir for speed (cached stat) and skips symlinks to
+    avoid walking into arbitrary locations."""
+    total = 0
+    stack = [path]
+    while stack:
+        current = stack.pop()
+        try:
+            with os.scandir(current) as it:
+                for entry in it:
+                    try:
+                        if entry.is_symlink():
+                            continue
+                        if entry.is_file(follow_symlinks=False):
+                            total += entry.stat(follow_symlinks=False).st_size
+                        elif entry.is_dir(follow_symlinks=False):
+                            stack.append(Path(entry.path))
+                    except OSError:
+                        continue
+        except OSError:
+            continue
+    return total
+
+
+def _session_title(cwd: Path) -> str:
+    """Human-friendly title for a session. Preference order:
+      1. A single dataset's filename (most common case: one upload).
+      2. "<first> +N more" when multiple datasets live in the dir.
+      3. A "Session MMM DD, HH:MM" stamp derived from the dir name.
+      4. The dir's basename as a last-resort fallback.
+    The goal is that the topbar always shows something a researcher
+    recognizes, never a raw absolute path.
+    """
+    _DATA_EXTS = (".csv", ".dta", ".rds")
+    try:
+        datasets = sorted(
+            p.name for p in cwd.iterdir()
+            if p.is_file() and p.suffix.lower() in _DATA_EXTS
+        )
+    except OSError:
+        datasets = []
+    if len(datasets) == 1:
+        return datasets[0]
+    if len(datasets) > 1:
+        return f"{datasets[0]} +{len(datasets) - 1} more"
+
+    ts = _parse_session_timestamp(cwd.name)
+    if ts is not None:
+        from datetime import datetime
+        return "Session " + datetime.fromtimestamp(ts).strftime("%b %d, %H:%M")
+    return cwd.name
+
+
+def _parse_session_timestamp(name: str) -> float | None:
+    """Parse the ``YYYYMMDDThhmmssZ_<id>`` prefix of a session dir
+    name and return it as epoch seconds. Returns None if the name
+    doesn't match (e.g. manually renamed dirs); callers fall back to
+    mtime."""
+    from datetime import datetime, timezone
+    import re
+    m = re.match(r"^(\d{8}T\d{6}Z)", name)
+    if not m:
+        return None
+    try:
+        dt = datetime.strptime(m.group(1), "%Y%m%dT%H%M%SZ")
+        return dt.replace(tzinfo=timezone.utc).timestamp()
+    except ValueError:
+        return None
 
 
 def _new_session_dir() -> Path:
@@ -677,6 +1254,8 @@ def _event_to_dict(evt: Any) -> dict[str, Any]:
             "type": "turn_done",
             "input_tokens": evt.input_tokens,
             "output_tokens": evt.output_tokens,
+            "cache_read_input_tokens": evt.cache_read_input_tokens,
+            "cache_creation_input_tokens": evt.cache_creation_input_tokens,
             "cost_usd": evt.cost_usd,
         }
     if isinstance(evt, chat_service.AuthFailure):
@@ -798,7 +1377,9 @@ def main() -> None:
 
     try:
         # debug=False: no dev-tools context menu in production. Flip
-        # to True while iterating on the web UI.
+        # to True while iterating on the web UI — WKWebView remembers
+        # the inspector-open state across launches, so leaving it on
+        # means the Web Inspector pops up every restart.
         webview.start(debug=False)
     finally:
         bridge.stop_loop()
