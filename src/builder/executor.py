@@ -63,6 +63,69 @@ RESULT_TOKEN_FIELD = "_token"
 RUN_TOKEN_ENV_VAR = "BUILDER_RUN_TOKEN"
 
 
+# Env vars we pass through to the R / Stata subprocess. Everything
+# NOT in this set is stripped when we build ``subprocess_env``.
+#
+# Why an allowlist, not an ``os.environ`` inheritance: Claude-authored
+# scripts can call ``Sys.getenv()`` (R) or read shell variables
+# (Stata) and stuff the results into any allowed numeric / string
+# field that reaches the sanitizer. If the parent process carries
+# ``ANTHROPIC_API_KEY`` (it does — the SDK uses it to authenticate),
+# AWS credentials, or any other secret, a prompt-injected script can
+# exfiltrate them through e.g. a coefficient dict whose keys are
+# "leak_bit_0", "leak_bit_1", … survived precisely by the
+# dict_numeric sanitizer rule. The filesystem/network sandbox
+# doesn't stop this — the bytes never leave the process boundary
+# sandbox-exec protects.
+#
+# The explicit allowlist is PATH (so the interpreter can find
+# system tools), HOME (R and Stata read config from here), LANG /
+# LC_* (locale — determines number/date formatting), TMPDIR (R and
+# Stata write scratch files here), USER / LOGNAME (some R packages
+# read them), and SHELL / TERM (completeness; harmless). Everything
+# else — including API keys, AWS creds, OpenAI tokens, whatever the
+# researcher has in their shell — is dropped.
+_SUBPROCESS_ENV_ALLOWLIST: frozenset[str] = frozenset({
+    "PATH",
+    "HOME",
+    "LANG",
+    "LC_ALL",
+    "LC_CTYPE",
+    "LC_COLLATE",
+    "LC_MESSAGES",
+    "LC_MONETARY",
+    "LC_NUMERIC",
+    "LC_TIME",
+    "TMPDIR",
+    "TEMP",
+    "TMP",
+    "USER",
+    "LOGNAME",
+    "SHELL",
+    "TERM",
+    # macOS Homebrew Python / R sometimes need this to locate
+    # dylibs; Stata needs STATATMP. Low-risk to pass through.
+    "DYLD_FALLBACK_LIBRARY_PATH",
+    "STATATMP",
+    # R-specific: respect the researcher's existing R library
+    # paths so Builder doesn't force-reinstall packages they
+    # already have.
+    "R_LIBS",
+    "R_LIBS_USER",
+    "R_LIBS_SITE",
+})
+
+
+def _filter_env(parent_env: dict[str, str]) -> dict[str, str]:
+    """Return only the entries of ``parent_env`` on the allowlist.
+
+    Kept as a separate function so tests can assert that secrets
+    don't leak through, and so a future audit can point at one
+    place for "what Claude's scripts can see from the shell".
+    """
+    return {k: v for k, v in parent_env.items() if k in _SUBPROCESS_ENV_ALLOWLIST}
+
+
 def _generate_run_token() -> str:
     """Return a random per-run token embedded in every valid payload.
 
@@ -243,8 +306,12 @@ def run_script(
     # unsets the env var so user code loaded afterward can't read it
     # directly. See ``_validate_and_strip_token`` below.
     run_token = _generate_run_token()
+    # Build the subprocess env from an explicit allowlist, not
+    # ``{**os.environ}``. See _SUBPROCESS_ENV_ALLOWLIST above for
+    # the rationale. Builder-specific vars are set last so a
+    # pathological entry in the parent env can't shadow them.
     subprocess_env = {
-        **os.environ,
+        **_filter_env(dict(os.environ)),
         "BUILDER_RESULT_PATH": str(result_path),
         "BUILDER_LIB_DIR": str(lib_dir),
         "BUILDER_CWD": str(cwd),

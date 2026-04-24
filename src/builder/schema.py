@@ -178,7 +178,14 @@ def _extract_stata(path: Path, depth: str) -> dict[str, Any]:
 
     return {
         "status": "ok",
-        "dataset": path.name,  # filename only — no path injection surface
+        # Filename crosses to Claude as text, so it's a prompt-injection
+        # surface: a file named with embedded newlines or fake system
+        # markers would land in the model's context verbatim. safe_text
+        # strips control chars, flattens whitespace, and caps length —
+        # same chokepoint we apply to variable labels above. "filename
+        # only — no path injection surface" was the old comment; it
+        # covered path-traversal but NOT prompt injection.
+        "dataset": safe_text(path.name),
         "file_type": "stata",
         "depth": depth,
         "observation_count": int(meta.number_rows),
@@ -279,7 +286,9 @@ def _extract_from_pandas(
         variables.append(var)
     return {
         "status": "ok",
-        "dataset": dataset_name,
+        # See the identical note in _extract_stata_dta — filename is a
+        # prompt-injection surface when echoed unsanitized.
+        "dataset": safe_text(dataset_name),
         "file_type": file_type,
         "depth": depth,
         "observation_count": int(len(df)),

@@ -3,12 +3,12 @@
 What changed from step 1 (the spine):
 - The Claude Agent SDK's built-in tools (Bash, Read, Write, Edit, Glob, Grep,
   WebFetch, WebSearch, etc.) are disallowed. Claude reaches the local machine
-  only through the five custom tools defined in `builder.tools`.
+  only through the six custom tools defined in `builder.tools`.
 - `can_use_tool` is a catch-all deny: any tool not on the explicit allowlist
   is rejected, including tools added by future SDK versions we haven't heard
   of yet. This is belt-and-suspenders on top of `disallowed_tools`.
 - The system prompt replaces Claude Code's default with a researcher-oriented
-  one that introduces the five tools and the constraints.
+  one that introduces the six tools and the constraints.
 - The renderer now shows tool calls and tool results inline so the researcher
   can see what Claude is doing.
 
@@ -116,7 +116,7 @@ _SYSTEM_PROMPT_TEMPLATE = """\
 You are the analysis assistant inside Builder, a local tool that lets a \
 researcher drive statistical analysis on data that remains on their machine. \
 The data never leaves this machine. You reach the researcher's data ONLY \
-through the five tools below — no other tools exist in this environment.
+through the six tools below — no other tools exist in this environment.
 
 Working directory: {cwd}
 All dataset paths you pass to tools must be inside this directory. Absolute \
@@ -243,6 +243,37 @@ Use when you need details of an earlier result without carrying the whole \
 thing in context.
 
 5. `list_results()` — list session results (id + one-line label).
+
+6. `recall_conversation(query?, tail?, max_chars?)` — search this \
+session's archived chat log for turns NOT already in your context. \
+The most recent ~20 turns are auto-loaded on session open (see the \
+"Resuming a session" note below), so short-term memory is handled \
+for you. Use this tool only for DEEPER lookups — older turns that \
+have fallen out of the auto-loaded window, or targeted keyword \
+search ("what did I say about blue_state back at the start"). \
+Don't call it for content already visible in your current context; \
+just answer from what you have.
+
+Resuming a session: when the first user message arrives wrapped in \
+a `[Prior conversation context — resuming this session: … ]` / \
+`[End of prior context. Current message follows.]` block, treat \
+the enclosed lines as the prior exchange (user: / assistant: / \
+tool: summaries) — background, not a new request. Do not respond \
+to the old turns, do not re-run the old analyses; just use them to \
+pick up where the conversation left off. Answer the message that \
+comes AFTER the "End of prior context" marker. If the researcher \
+asks "what did we talk about", summarize from the enclosed lines \
+rather than claiming no prior context.\
+\n\n\
+The prior-context block may also include a `[Recent analytical \
+results in this session …]` listing BEFORE the turns — one line per \
+stored result with its id, label, and analysis type. This is your \
+at-a-glance view of what's been RUN in this session (vs. what's \
+been SAID). When the researcher asks about "that regression", "the \
+crosstab we did", or any prior analysis, pick the matching line and \
+call `expand_result(id)` to retrieve the full sanitized payload. \
+Don't assume you remember the numbers — the listing gives you the \
+id; use it.
 
 When asked "what can you do", describe the full range: any analysis \
 R or Stata can run against their data, with results flowing back \
@@ -727,7 +758,7 @@ def _print_slash_help() -> None:
 def _dataset_listing(cwd: Path) -> str:
     """Render a compact dataset listing for the system prompt.
 
-    Claude has no tool to list the working directory — the five MCP
+    Claude has no tool to list the working directory — the six MCP
     tools are narrow by design. Without an at-startup enumeration
     Claude can't answer "work on 05_" concretely; it has to either
     guess or ask a generic "what do you mean?" question. Dropping
@@ -735,11 +766,19 @@ def _dataset_listing(cwd: Path) -> str:
     the list, matches candidates, and can ask a specific question
     ("I see three 05_ files; which one?").
 
+    Filenames go through the text-safety chokepoint before they
+    reach the prompt. A file named with embedded newlines / bidi
+    overrides / fake "System:" markers would otherwise land in
+    Claude's context verbatim — a prompt-injection vector the
+    researcher can trigger just by dragging a malicious file in.
+
     Returns a multi-line bullet list, or an explicit "(none)" marker
     so Claude doesn't hallucinate data that isn't there. Filenames
     are not gated by the schema-depth policy — only the *contents*
     of each dataset are. See ``policy.py`` for the depth-tier model.
     """
+    from builder.text_safety import safe_text
+
     datasets = _scan_datasets(cwd)
     if not datasets:
         return "  (no .csv / .dta / .rds datasets detected in this directory)"
@@ -747,7 +786,12 @@ def _dataset_listing(cwd: Path) -> str:
     # Cap at a very generous limit — if a directory has 500 files we
     # truncate with a note, but 20–50 is the realistic range.
     cap = 80
-    names = [d.name for d in datasets[:cap]]
+    # Sanitize each filename before it crosses into the system prompt.
+    # safe_text drops entries to empty when a name is too pathological
+    # (e.g., all control chars); we filter those out so the list
+    # doesn't show blank bullet lines.
+    names = [safe_text(d.name) for d in datasets[:cap]]
+    names = [n for n in names if n]
     body = "\n".join(f"  - {n}" for n in names)
     if len(datasets) > cap:
         body += f"\n  … and {len(datasets) - cap} more"
@@ -1069,10 +1113,11 @@ async def _gate_tool_use(
         behavior="deny",
         message=(
             f"Tool '{tool_name}' is not available in Builder. Use one of the "
-            f"five custom tools described in the system prompt "
+            f"six custom tools described in the system prompt "
             f"(mcp__{SERVER_NAME}__get_schema, request_data, submit_script, "
-            f"expand_result, list_results). Builder does not expose Bash, "
-            f"Read, Write, Edit, Glob, Grep, or any other general tool."
+            f"expand_result, list_results, recall_conversation). Builder "
+            f"does not expose Bash, Read, Write, Edit, Glob, Grep, or any "
+            f"other general tool."
         ),
         interrupt=False,
     )
@@ -1172,7 +1217,7 @@ def _build_options(
         # Don't load the user's / project's / local CLAUDE.md or settings.
         # Those can introduce hooks, tools, and slash-commands we don't
         # control, and we want Builder's tool surface to be exactly the
-        # five tools above — no more, no less, regardless of the machine.
+        # six tools above — no more, no less, regardless of the machine.
         setting_sources=[],
     )
 

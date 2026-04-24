@@ -115,86 +115,49 @@ body {
   display: none !important;
 }
 
-/* --- toasts ---
- * Two toast anchors, each bound to the chip its messages belong
- * to. Files-side toasts pop out to the LEFT of the + button;
- * model-side toasts pop out to the RIGHT of the model chip. That
- * way the researcher's eye follows the message to the control
- * that fired it, rather than a floating bubble. Errors route to
- * the main chat transcript (appendError) — these are reserved
- * for short positive confirmations. */
+/* --- status line ---
+ * Replaces the old anchored-bubble toasts. One centered line of
+ * dim text above the composer form. Fills for 4s when a notice
+ * fires (session switched, model switched, can't delete active,
+ * file added), then fades out. Layout-stable: the strip reserves
+ * its own line height when empty so the composer doesn't jump
+ * when notices appear and disappear. No bubble, no chrome. */
 
-.add-wrap {
-  position: relative;  /* anchor for the files toast-container */
-}
-
-.model-wrap {
-  position: relative;  /* .permission-wrap already does this;
-                        * repeated here as a named override in
-                        * case the parent class is ever removed. */
-}
-
-.toast-container {
+.status-line {
+  /* Absolutely centered over the composer-meta row so it sits at
+   * the geometric center of the row regardless of how wide the
+   * left chips (+, Permission) or right chips (Model, context) are.
+   * Flex-spacer centering drifts when the two sides have different
+   * widths; absolute positioning pins it to true center. No
+   * background, no chrome — just centered dim text at the same
+   * visual level as the surrounding chips. Empty by default; fills
+   * for 4s when a notice fires. pointer-events: none lets clicks
+   * fall through to whatever's underneath. */
   position: absolute;
+  left: 50%;
   top: 50%;
-  transform: translateY(-50%);
-  display: flex;
-  flex-direction: column-reverse;
-  gap: 6px;
-  z-index: 1000;
-  pointer-events: none;
-}
-
-.toast-container-left {
-  /* Sit to the LEFT of the + button. right: calc(100% + 8px)
-   * means the toast's right edge sits 8px beyond the parent's
-   * LEFT edge, putting the whole bubble in the gutter before
-   * the button. */
-  right: calc(100% + 8px);
-  align-items: flex-end;  /* stack from the right so short toasts align under longer ones */
-}
-
-.toast-container-right {
-  /* Mirror of -left: toast's left edge sits 8px beyond the
-   * parent's right edge. Used by the model chip so its toasts
-   * fan out toward the far edge of the composer row. */
-  left: calc(100% + 8px);
-  align-items: flex-start;
-}
-
-.toast {
-  pointer-events: auto;
-  width: max-content;
-  max-width: 320px;
-  padding: 8px 12px;
-  border: 1px solid var(--border);
-  border-radius: 10px;
-  background: var(--bg-surface);
-  color: var(--text);
-  font-size: 12.5px;
+  transform: translate(-50%, -50%);
+  padding: 0 8px;
+  text-align: center;
+  color: var(--text-dim);
+  font-size: 12px;
   line-height: 1.4;
-  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.2);
-  cursor: pointer;
-  animation: toast-in 0.18s ease-out;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 50%;
+  pointer-events: none;
+  opacity: 0;
+  transition: opacity 0.18s ease-out;
 }
 
-.toast.info    { border-color: var(--accent-soft); }
-.toast.success { border-color: var(--sage); }
-.toast.error   { border-color: var(--hot-pink); color: var(--text); }
-
-.toast.fading {
-  animation: toast-out 0.2s ease-in forwards;
+.status-line.visible {
+  opacity: 0.85;
 }
 
-@keyframes toast-in {
-  from { opacity: 0; transform: translateY(6px); }
-  to   { opacity: 1; transform: translateY(0); }
-}
-
-@keyframes toast-out {
-  from { opacity: 1; transform: translateY(0); }
-  to   { opacity: 0; transform: translateY(6px); }
-}
+.status-line.info    { color: var(--text-dim); }
+.status-line.success { color: var(--sage); }
+.status-line.error   { color: var(--hot-pink); }
 
 /* --- keyboard shortcuts overlay --- */
 
@@ -822,6 +785,34 @@ kbd {
   -webkit-user-select: text;
 }
 
+/* The welcome greeting sits at the top of the transcript, centered
+ * horizontally, on a single line. We used to vertically-center it
+ * when the transcript was empty, but that produced a jarring
+ * "drop" the moment the first real message arrived. Keeping it at
+ * the top from the start means conversation flows naturally
+ * beneath it with no displacement. The welcome-only class is
+ * still toggled (for future styling) but no longer rearranges
+ * layout. In welcome-only mode we widen the system-message body
+ * so the greeting text fits on one line rather than wrapping. */
+/* Override `.message`'s 960px column cap for the welcome message
+ * specifically. Without this, the greeting's flex container is
+ * capped at 960px and sits inside the chat-main area — on a wide
+ * window the 960px column is itself offset from the window's
+ * true horizontal center (because the sidebar eats a fixed chunk
+ * on the left). Widening to 100% lets the inner justify-content
+ * center the text relative to the whole chat column instead. */
+.messages.welcome-only .message.system {
+  max-width: 100%;
+  width: 100%;
+}
+
+.messages.welcome-only .message.system .message-body {
+  max-width: min(95%, 900px);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
 .messages pre,
 .messages code,
 .messages .message-body,
@@ -1066,6 +1057,12 @@ kbd {
  * from Claude's own paragraphs and from the user's right-aligned
  * bubble. Error coloring is a subtle tint rather than a full red
  * panel so repeated notices don't drown out the transcript. */
+/* System / welcome / error notices are framing text, not
+ * conversation. They sit centered with no background or border —
+ * they whisper "from the environment" without competing visually
+ * with Claude's or the researcher's actual words. Error keeps a
+ * faint rose tint on the text itself so it still reads as
+ * "something went wrong", but no panel, no pill. */
 .message.system,
 .message.error {
   display: flex;
@@ -1075,23 +1072,20 @@ kbd {
 
 .message.system .message-body,
 .message.error .message-body {
-  background: rgba(128, 128, 128, 0.08);
+  background: transparent;
+  border: none;
   color: var(--text-dim);
-  border: 1px solid rgba(128, 128, 128, 0.12);
-  border-radius: 999px;          /* pill */
-  padding: 6px 14px;
+  padding: 6px 12px;
   font-size: 12.5px;
   text-align: center;
   max-width: min(80%, 520px);
-  opacity: 0.85;
+  opacity: 0.8;
 }
 
 .message.error .message-body {
-  /* A touch of the error hue — noticeable but still reads as
-   * environment, not alarm. */
-  background: rgba(194, 51, 51, 0.08);
-  border-color: rgba(194, 51, 51, 0.25);
-  color: var(--text-dim);
+  /* Subtle rose tint on the text only — no panel, no chrome. */
+  color: var(--hot-pink);
+  opacity: 0.9;
 }
 
 /* --- tool call cards --- */
@@ -1572,6 +1566,7 @@ kbd {
   font-size: 12px;
   color: var(--text-dim);
   gap: 8px;
+  position: relative;  /* anchors the absolutely-positioned #status-line */
 }
 
 .composer-meta-spacer {

@@ -12,7 +12,12 @@ from pathlib import Path
 
 import pytest
 
-from builder.store import ResultStore
+from builder.store import (
+    ResultStore,
+    close_store,
+    get_store,
+    reset_store_for_tests,
+)
 
 
 @pytest.fixture
@@ -135,3 +140,102 @@ def test_unicode_roundtrip(store: ResultStore):
     assert row.label == "régression — n=200"
     assert row.script_code == "# résidus… émission"
     assert row.transformations == ["clamped — 4 sig figs"]
+
+
+# ---------------------------------------------------------------------------
+# Cross-session isolation — the get_store cache
+# ---------------------------------------------------------------------------
+#
+# Earlier versions cached exactly one ResultStore process-wide, so
+# after a session switch Project A could see Project B's sanitized
+# results in the same app process. These tests lock in the fix:
+# get_store is now keyed by resolved cwd, and close_store drops
+# the cached handle so the UI switch path can force a clean state.
+
+
+@pytest.fixture(autouse=True)
+def _reset_store_cache():
+    """Every test starts with an empty cache. Without this, state
+    from an earlier test in the same run can mask a real bug in
+    the cache logic under test."""
+    reset_store_for_tests()
+    yield
+    reset_store_for_tests()
+
+
+def test_get_store_is_per_cwd(tmp_path: Path):
+    """Two different cwds must get two different stores pointing at
+    two different DBs — NOT a shared singleton."""
+    session_a = tmp_path / "session-a"
+    session_b = tmp_path / "session-b"
+    session_a.mkdir()
+    session_b.mkdir()
+
+    store_a = get_store(session_a)
+    store_b = get_store(session_b)
+
+    assert store_a is not store_b
+    assert store_a.db_path.parent.parent == session_a
+    assert store_b.db_path.parent.parent == session_b
+
+
+def test_get_store_same_cwd_returns_same_instance(tmp_path: Path):
+    """Repeated calls for the same cwd reuse the handle — sqlite
+    connections aren't free, and the UI tool calls hit get_store
+    on every invocation."""
+    (tmp_path / "s").mkdir()
+    first = get_store(tmp_path / "s")
+    second = get_store(tmp_path / "s")
+    assert first is second
+
+
+def test_get_store_normalizes_path(tmp_path: Path):
+    """Two cwd paths that resolve to the same directory share one
+    store. Without this, a cwd passed as './data' could race with
+    the same cwd passed as its absolute form on the same sqlite
+    file through two different handles."""
+    session = tmp_path / "s"
+    session.mkdir()
+    via_absolute = get_store(session)
+    via_relative = get_store(session / "." / "nested" / "..")
+    assert via_absolute is via_relative
+
+
+def test_insert_in_one_cwd_is_invisible_from_another(tmp_path: Path):
+    """The core cross-session-leak regression test. Insert a row
+    into Project A's store; a fresh get_store for Project B must
+    see zero rows. Previously Project B got Project A's store
+    back and saw all its results."""
+    (tmp_path / "a").mkdir()
+    (tmp_path / "b").mkdir()
+
+    get_store(tmp_path / "a").insert(
+        label="project-a secret result",
+        analysis_type="linear_regression",
+        sanitized_payload=_sample_payload(),
+        language="R",
+        script_code="x",
+        transformations=["a"],
+    )
+
+    b = get_store(tmp_path / "b")
+    assert b.count() == 0
+    assert b.list_all() == []
+
+
+def test_close_store_drops_cache_entry(tmp_path: Path):
+    """After close_store(cwd), the next get_store(cwd) must open a
+    fresh handle rather than returning the closed one."""
+    session = tmp_path / "s"
+    session.mkdir()
+    first = get_store(session)
+    close_store(session)
+    second = get_store(session)
+    assert first is not second
+
+
+def test_close_store_is_safe_with_no_cached_entry(tmp_path: Path):
+    """close_store for a cwd that was never opened must be a
+    no-op, not an error — the UI calls it defensively on every
+    session switch."""
+    close_store(tmp_path / "never-opened")  # must not raise

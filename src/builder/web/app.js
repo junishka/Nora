@@ -98,7 +98,7 @@ applyStoredTheme();
 // by the <select>'s own selected-state, and the backend default
 // (DEFAULT_MAX_DEPTH in policy.py) decides which one that is.
 const DEPTH_TIERS = [
-  { value: 'names_only',                 label: 'Names only' },
+  { value: 'names_only',                 label: 'Variable names only' },
   { value: 'names_types',                label: '+ types' },
   { value: 'names_types_labels',         label: '+ labels / value labels' },
   { value: 'names_types_labels_summary', label: '+ NA count / distinct count' },
@@ -186,6 +186,7 @@ function showChat(payload) {
   welcomeBody.textContent = payload.greeting || 'Ready.';
   welcomeMsg.appendChild(welcomeBody);
   messagesEl.appendChild(welcomeMsg);
+  setWelcomeOnlyMode(true);
 
   // Topbar shows a friendly session title (dataset name or a
   // timestamped "Session ..." label), not the raw path. Full path
@@ -221,6 +222,7 @@ async function replayHistory() {
     // Drop the default welcome "system" line so replayed history
     // starts the transcript instead of below the greeting.
     messagesEl.innerHTML = '';
+    setWelcomeOnlyMode(false);
     replayMode = true;
     try {
       events.forEach((evt) => replayEvent(evt));
@@ -903,7 +905,7 @@ window.builder_event = function (evt) {
       setSending(false);
       break;
     case 'policy_updated':
-      updatePolicySummary(evt.policy);
+      updatePolicyChip(evt.policy);
       break;
     default:
       console.warn('unknown event type', evt);
@@ -924,6 +926,11 @@ function appendAssistant(text) {
     append('assistant', text || '', /*markdown=*/ true);
     return;
   }
+  const textSafe = text || '';
+  if (textSafe.length > 900) {
+    append('assistant', textSafe, /*markdown=*/ true);
+    return;
+  }
   // The SDK hands us complete text blocks per turn, not token-by-token
   // deltas, so real streaming isn't available at this layer. To give
   // the conversation a "typing" feel anyway, we drop in the bubble
@@ -932,6 +939,7 @@ function appendAssistant(text) {
   // Errors / tool calls arriving mid-animation force an instant
   // finish so the transcript order stays honest.
   finalizeActiveTypewriter();
+  setWelcomeOnlyMode(false);
   const wrapper = document.createElement('div');
   wrapper.className = 'message assistant';
   const body = document.createElement('div');
@@ -939,15 +947,15 @@ function appendAssistant(text) {
   wrapper.appendChild(body);
   messagesEl.appendChild(wrapper);
   scrollToBottom();
-  runTypewriter(body, text || '', () => {
+  runTypewriter(body, textSafe, () => {
     // Swap from plain-text animation to rendered markdown. Clearing
     // the `typing` class drops the caret and flips white-space back
     // to normal so paragraphs/lists/tables lay out correctly.
     body.classList.remove('typing');
-    if (text && window.BuilderMarkdown) {
-      body.innerHTML = window.BuilderMarkdown.render(text);
+    if (textSafe && window.BuilderMarkdown) {
+      body.innerHTML = window.BuilderMarkdown.render(textSafe);
     } else {
-      body.textContent = text || '';
+      body.textContent = textSafe;
     }
     scrollToBottom();
   });
@@ -1015,6 +1023,7 @@ function appendThinking(text) {
    * header expands. Mirrors the submit_script card shape so the
    * interaction model is consistent. */
   finalizeActiveTypewriter();
+  setWelcomeOnlyMode(false);
   const card = document.createElement('div');
   card.className = 'thinking-card collapsed';
 
@@ -1053,6 +1062,7 @@ function append(kind, text, markdown) {
   // User / system / error messages appear instantly. Make sure any
   // typewriter from the previous turn lands first, so a fresh user
   // bubble doesn't appear above a still-animating assistant bubble.
+  setWelcomeOnlyMode(false);
   finalizeActiveTypewriter();
   const wrapper = document.createElement('div');
   wrapper.className = 'message ' + kind;
@@ -1075,6 +1085,7 @@ function appendToolCall(evt) {
   // Claude summarizes whatever matters from them in the chat text
   // that follows.
   finalizeActiveTypewriter();
+  setWelcomeOnlyMode(false);
   const shortName = shortenToolName(evt.name);
   if (shortName !== 'submit_script') return;
 
@@ -1144,6 +1155,7 @@ function appendToolCall(evt) {
 }
 
 function appendToolResult(evt) {
+  setWelcomeOnlyMode(false);
   // Non-submit_script tool calls don't create cards in
   // appendToolCall, so there's nothing to update here — silent pass.
   const existingCard = [...messagesEl.querySelectorAll('.tool-card')]
@@ -1315,6 +1327,11 @@ function scrollToBottom() {
   messagesEl.scrollTop = messagesEl.scrollHeight;
 }
 
+function setWelcomeOnlyMode(enabled) {
+  if (!messagesEl) return;
+  messagesEl.classList.toggle('welcome-only', !!enabled);
+}
+
 // ----- policy chip + popup (next to composer) ----------------------------
 
 const policyChip = document.getElementById('policy-chip');
@@ -1390,9 +1407,13 @@ function buildPolicyPopup(policy) {
   const wrapper = document.createElement('div');
   const header = document.createElement('div');
   header.className = 'policy-popup-header';
+  // Compact but informative: names the control, the unit it acts on,
+  // and the one-way semantic (ceiling, not target). Drops the
+  // "default: …" crutch — the active tier is visible in the row
+  // selection itself.
   header.innerHTML =
-    '<strong>Permission</strong> — what Claude sees about each ' +
-    'dataset. Default: variable names and types.';
+    '<strong>Permission</strong> — ceiling on variable details ' +
+    'Claude sees, per dataset. It can ask for less, never more.';
   wrapper.appendChild(header);
 
   policy.datasets.forEach((d) => {
@@ -2049,55 +2070,37 @@ function dataUrlFromBase64(b64, mime) {
 // through appendError() so they land in the transcript alongside
 // the turn they belong to.
 
-// Two anchored toast containers: one tucked to the LEFT of the +
-// button, one to the RIGHT of the model chip. `anchor` picks which
-// one a given toast lands in — default 'files' for + / session
-// notices, 'model' for anything originating from the model chip.
-const toastContainers = {
-  files: document.getElementById('toast-container-files'),
-  model: document.getElementById('toast-container-model'),
-};
+// Single centered status line above the composer. Replaces the
+// older anchored-bubble toasts that popped up in different spots
+// depending on which chip fired them — researchers read those as
+// "random popups". Every transient notice now lands in the same
+// strip as plain dim text and auto-clears after 4s. The `anchor`
+// argument is accepted for backwards-compat but ignored; everything
+// flows through this one channel.
+const statusLineEl = document.getElementById('status-line');
+let statusClearTimer = null;
 
-// Dedupe recent identical messages. If a toast with the same text
-// fires within the window, reuse the existing bubble (reset its
-// timer) instead of stacking a duplicate. Fixes the "7 identical
-// errors pile up" behavior when the user clicks + repeatedly.
-const RECENT_TOAST_MS = 3000;
-const recentToasts = new Map();  // key "anchor|kind|message" → { el, timer }
-
-function toast(message, kind, anchor) {
-  const pick = anchor || 'files';
-  const container = toastContainers[pick] || toastContainers.files;
-  if (!container) { console.log('[toast]', kind, message); return; }
-  const key = pick + '|' + (kind || 'info') + '|' + message;
-  const existing = recentToasts.get(key);
-  if (existing && existing.el.isConnected) {
-    clearTimeout(existing.timer);
-    existing.timer = setTimeout(() => dismissToast(existing.el), 4000);
-    return existing.el;
+function toast(message, kind /*, anchor */) {
+  if (!statusLineEl) { console.log('[status]', kind, message); return; }
+  // Rebuild classes so kind-tinting doesn't accumulate across notices.
+  statusLineEl.className = 'status-line visible ' + (kind || 'info');
+  statusLineEl.textContent = message;
+  if (statusClearTimer) {
+    clearTimeout(statusClearTimer);
+    statusClearTimer = null;
   }
-  const el = document.createElement('div');
-  el.className = 'toast ' + (kind || 'info');
-  el.textContent = message;
-  el.addEventListener('click', () => dismissToast(el));
-  container.appendChild(el);
-  const entry = {
-    el,
-    timer: setTimeout(() => dismissToast(el), 4000),
-  };
-  recentToasts.set(key, entry);
-  setTimeout(() => {
-    if (recentToasts.get(key) === entry) recentToasts.delete(key);
-  }, RECENT_TOAST_MS + 4000);
-  return el;
+  statusClearTimer = setTimeout(() => {
+    statusLineEl.classList.remove('visible');
+    // Leave text in place during the fade — the next notice
+    // replaces it anyway, and empty content after a fade looks
+    // abrupt.
+    statusClearTimer = null;
+  }, 4000);
 }
 
-function dismissToast(el) {
-  if (!el || el.dataset.toastDismissed === '1') return;
-  el.dataset.toastDismissed = '1';
-  el.classList.add('fading');
-  setTimeout(() => el.remove(), 250);
-}
+// Kept so callers that imported this helper don't break; with the
+// single-line design there's no bubble to dismiss.
+function dismissToast() { /* no-op */ }
 
 // ----- keyboard shortcuts ------------------------------------------------
 

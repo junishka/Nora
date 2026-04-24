@@ -215,23 +215,67 @@ class _Txn:
 
 
 # ---------------------------------------------------------------------------
-# Convenience: single-process store pinned to the cwd
+# Convenience: per-cwd store cache
 # ---------------------------------------------------------------------------
+#
+# Earlier versions cached exactly one ``ResultStore`` instance and
+# returned it regardless of the requested cwd — so after a session
+# switch, tool calls against the new cwd were writing to the OLD
+# session's ``results.db``. Catastrophic: Project A could see
+# Project B's stored sanitized results by calling ``list_results``
+# in the same app process.
+#
+# We now key the cache by the resolved cwd. Switching sessions gets
+# a fresh store that points at the new session's DB; re-opening the
+# same session reuses the existing one (SQLite connection open is
+# cheap but not free — reuse is a modest win, and the file handle
+# limit is finite).
 
-_store: ResultStore | None = None
+_stores: dict[Path, ResultStore] = {}
 
 
 def get_store(cwd: Path) -> ResultStore:
-    """Return the process-wide store for `cwd`, creating it on first call."""
-    global _store
-    if _store is None:
-        _store = ResultStore(cwd / STORE_SUBDIR / DB_FILENAME)
-    return _store
+    """Return the store pinned to ``cwd`` — NOT a process-wide
+    singleton.
+
+    Resolves the cwd before keying the cache so two paths that
+    normalize to the same directory (one with symlinks or ``./``,
+    one without) share a store rather than racing on the same
+    sqlite file through two different handles.
+    """
+    key = cwd.resolve()
+    existing = _stores.get(key)
+    if existing is not None:
+        return existing
+    store = ResultStore(key / STORE_SUBDIR / DB_FILENAME)
+    _stores[key] = store
+    return store
+
+
+def close_store(cwd: Path) -> None:
+    """Close and drop the cached store for ``cwd``.
+
+    Called from the UI bridge when the session switches so the new
+    cwd's store isn't shadowed by a stale handle. Safe to call when
+    no store exists for this cwd — it's a no-op in that case.
+    """
+    key = cwd.resolve()
+    existing = _stores.pop(key, None)
+    if existing is not None:
+        try:
+            existing.close()
+        except Exception:  # noqa: BLE001 — closing a dead handle shouldn't crash the switch
+            pass
 
 
 def reset_store_for_tests() -> None:
-    """Test-only hook: drop the cached process-wide store."""
-    global _store
-    if _store is not None:
-        _store.close()
-    _store = None
+    """Test-only hook: close and drop every cached store. Used to
+    clear process-wide state between tests so one test's store
+    can't leak into the next."""
+    global _stores
+    for store in list(_stores.values()):
+        try:
+            store.close()
+        except Exception:  # noqa: BLE001
+            pass
+    _stores = {}

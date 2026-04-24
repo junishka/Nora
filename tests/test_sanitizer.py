@@ -524,3 +524,285 @@ def test_scalar_string_hard_reject_becomes_empty():
     assert result.ok
     # safe_text hard-rejects at 10x the default cap (120) → 1200. 10000 > 1200.
     assert result.sanitized["variable"] == ""
+
+
+# ---------------------------------------------------------------------------
+# OLS cross-field integrity: coefficient-dict keys must name a
+# declared predictor. Without this constraint, a prompt-injected
+# Claude can exfiltrate arbitrary numbers by emitting coefficient
+# entries whose KEYS are a smuggled payload — the inner dict
+# accepts any well-formed key through _collect_allowed and
+# precision-clamping just rounds, never rejects.
+# ---------------------------------------------------------------------------
+
+def _ols_base(coef: dict) -> dict:
+    """Minimal well-formed OLS payload for focused testing."""
+    return {
+        "type": "linear_regression",
+        "n": 1000,
+        "response_variable": "y",
+        "predictor_variables": ["x1", "x2"],
+        "coefficients": coef,
+        "standard_errors": {k: 0.01 for k in coef},
+        "t_statistics": {k: 1.0 for k in coef},
+        "p_values": {k: 0.05 for k in coef},
+        "r_squared": 0.5,
+    }
+
+
+def test_ols_drops_undeclared_coefficient_keys():
+    """Keys not on the declared predictor list (+ intercept aliases)
+    are dropped. Regression test for the exfil path where Claude
+    emits ``coefficients: {leak1: 0.001, leak2: 0.002}`` in addition
+    to the real predictors — the leak keys must not survive."""
+    payload = _ols_base({
+        "(Intercept)": 0.5,
+        "x1": 1.0,
+        "x2": 2.0,
+        "leak_bit_0": 0.001,
+        "leak_bit_1": 0.002,
+    })
+    r = sanitize(payload)
+    assert r.ok
+    coefs = r.sanitized["coefficients"]
+    assert "(Intercept)" in coefs
+    assert "x1" in coefs
+    assert "x2" in coefs
+    assert "leak_bit_0" not in coefs
+    assert "leak_bit_1" not in coefs
+    # All three dict_numeric siblings are filtered the same way.
+    assert "leak_bit_0" not in r.sanitized["standard_errors"]
+    assert "leak_bit_0" not in r.sanitized["t_statistics"]
+    assert "leak_bit_0" not in r.sanitized["p_values"]
+    # Transformation log records the drop so the researcher can see it.
+    assert any("undeclared key" in t for t in r.transformations)
+
+
+def test_ols_accepts_stata_cons_intercept():
+    """Stata reports the intercept as ``_cons``; must be accepted."""
+    payload = _ols_base({"_cons": 0.5, "x1": 1.0, "x2": 2.0})
+    r = sanitize(payload)
+    assert r.ok
+    assert "_cons" in r.sanitized["coefficients"]
+
+
+def test_ols_accepts_lowercase_intercept():
+    """Permissive alias for runtime libraries that normalize naming."""
+    payload = _ols_base({"intercept": 0.5, "x1": 1.0, "x2": 2.0})
+    r = sanitize(payload)
+    assert r.ok
+    assert "intercept" in r.sanitized["coefficients"]
+
+
+def test_ols_empty_predictor_list_keeps_only_intercept_aliases():
+    """A model with no predictors declared (edge case: intercept-only
+    regression) should retain the intercept and drop everything else."""
+    payload = {
+        "type": "linear_regression",
+        "n": 1000,
+        "response_variable": "y",
+        "predictor_variables": [],
+        "coefficients": {"(Intercept)": 1.5, "x1": 2.0, "leak": 99.9},
+        "standard_errors": {"(Intercept)": 0.1, "x1": 0.1, "leak": 0.1},
+        "t_statistics": {"(Intercept)": 15.0, "x1": 20.0, "leak": 999.0},
+        "p_values": {"(Intercept)": 0.0, "x1": 0.0, "leak": 0.0},
+        "r_squared": 0.5,
+    }
+    r = sanitize(payload)
+    assert r.ok
+    assert list(r.sanitized["coefficients"].keys()) == ["(Intercept)"]
+
+
+def _ttest_base(ci=None) -> dict:
+    """Minimal well-formed t_test payload; pass in a
+    confidence_interval value to vary that field."""
+    p = {
+        "type": "t_test",
+        "test_type": "two_sample",
+        "n1": 100,
+        "n2": 100,
+        "mean1": 1.0,
+        "t_statistic": 2.0,
+        "p_value": 0.04,
+    }
+    if ci is not None:
+        p["confidence_interval"] = ci
+    return p
+
+
+def test_ttest_ci_length_2_is_accepted():
+    """A well-formed CI with exactly [lower, upper] passes through
+    (subject to precision clamping)."""
+    r = sanitize(_ttest_base(ci=[0.1, 0.9]))
+    assert r.ok
+    assert "confidence_interval" in r.sanitized
+    assert len(r.sanitized["confidence_interval"]) == 2
+
+
+def test_ttest_ci_length_3_is_dropped():
+    """Regression test for the exfil path: a 3-element list used
+    to slip through unclamped (the old clamp-only-if-length-2
+    check silently preserved the extra number). Now the whole
+    field is dropped with a transformation log entry."""
+    r = sanitize(_ttest_base(ci=[0.1, 0.9, 9.9999]))
+    assert r.ok
+    assert "confidence_interval" not in r.sanitized
+    assert any("confidence_interval" in t for t in r.transformations)
+
+
+def test_ttest_ci_length_1_is_dropped():
+    """Symmetric check on the other boundary — a single value is
+    also not a valid interval."""
+    r = sanitize(_ttest_base(ci=[0.5]))
+    assert r.ok
+    assert "confidence_interval" not in r.sanitized
+
+
+def test_ttest_ci_empty_list_is_dropped():
+    r = sanitize(_ttest_base(ci=[]))
+    assert r.ok
+    assert "confidence_interval" not in r.sanitized
+
+
+def test_ttest_ci_length_2_is_precision_clamped():
+    """A valid [lower, upper] CI still goes through the precision
+    clamp based on the smallest-group n — unchanged behavior, just
+    guards against a refactor that accidentally removes the clamp
+    along with the length check."""
+    r = sanitize(_ttest_base(ci=[0.123456789, 0.987654321]))
+    assert r.ok
+    # sigfigs_for_n(100) = 3 by default; exact values aren't critical,
+    # but neither endpoint should retain 9-digit precision.
+    ci = r.sanitized["confidence_interval"]
+    assert ci[0] != 0.123456789
+    assert ci[1] != 0.987654321
+
+
+# ---------------------------------------------------------------------------
+# Structural size caps — bound the data-channel bandwidth available
+# through allowed dict / list fields. Each per-entry cap (40 chars
+# via safe_key) is already enforced; these entry-count caps are the
+# other dimension of the same bound.
+# ---------------------------------------------------------------------------
+
+def test_ols_rejects_over_predictor_cap():
+    """50 predictors passes, 51 rejects. The exact number isn't the
+    point — the point is that an attacker can't declare 10000 fake
+    predictors to exfiltrate via their names."""
+    preds = [f"x{i}" for i in range(51)]
+    payload = {
+        "type": "linear_regression",
+        "n": 1000,
+        "response_variable": "y",
+        "predictor_variables": preds,
+        "coefficients": {p: 1.0 for p in preds},
+        "standard_errors": {p: 0.1 for p in preds},
+        "t_statistics": {p: 10.0 for p in preds},
+        "p_values": {p: 0.0 for p in preds},
+        "r_squared": 0.5,
+    }
+    r = sanitize(payload)
+    assert not r.ok
+    assert "structural cap" in (r.rejection_reason or "")
+
+
+def test_ols_accepts_at_predictor_cap():
+    """Exactly at the cap passes — don't make legit wide regressions
+    fail just because they're near the edge."""
+    preds = [f"x{i}" for i in range(50)]
+    payload = {
+        "type": "linear_regression",
+        "n": 1000,
+        "response_variable": "y",
+        "predictor_variables": preds,
+        "coefficients": {p: 1.0 for p in preds},
+        "standard_errors": {p: 0.1 for p in preds},
+        "t_statistics": {p: 10.0 for p in preds},
+        "p_values": {p: 0.0 for p in preds},
+        "r_squared": 0.5,
+    }
+    r = sanitize(payload)
+    assert r.ok
+
+
+def test_frequency_table_rejects_over_cell_cap():
+    counts = {f"level_{i}": 100 for i in range(201)}
+    r = sanitize({
+        "type": "frequency_table",
+        "variable": "x",
+        "counts": counts,
+        "n": 20100,
+        "missing_count": 0,
+    })
+    assert not r.ok
+    assert "structural cap" in (r.rejection_reason or "")
+
+
+def test_crosstab_rejects_over_cell_cap():
+    # 51 × 51 = 2601 cells — over the 2500 cap.
+    counts = {
+        f"row_{i}": {f"col_{j}": 100 for j in range(51)}
+        for i in range(51)
+    }
+    r = sanitize({
+        "type": "crosstab",
+        "row_variable": "r",
+        "col_variable": "c",
+        "counts": counts,
+    })
+    assert not r.ok
+    assert "structural cap" in (r.rejection_reason or "")
+
+
+def test_crosstab_accepts_at_cell_cap():
+    """50 × 50 = 2500 cells — exactly at the cap, passes."""
+    counts = {
+        f"row_{i}": {f"col_{j}": 100 for j in range(50)}
+        for i in range(50)
+    }
+    r = sanitize({
+        "type": "crosstab",
+        "row_variable": "r",
+        "col_variable": "c",
+        "counts": counts,
+    })
+    assert r.ok
+
+
+def test_magnitude_table_rejects_over_cell_cap():
+    cells = {
+        f"grp_{i}": {"value": 1000.0, "n": 100, "max_share": 0.1}
+        for i in range(201)
+    }
+    r = sanitize({
+        "type": "magnitude_table",
+        "row_variable": "g",
+        "value_variable": "v",
+        "aggregation": "sum",
+        "cells": cells,
+    })
+    assert not r.ok
+    assert "structural cap" in (r.rejection_reason or "")
+
+
+def test_ols_missing_predictor_variables_rejects_payload():
+    """``predictor_variables`` is a required field; omitting it
+    rejects the payload outright. This test documents that we
+    never fall back to "allow all keys" as a safety net — the
+    missing-field rejection happens BEFORE the key-filter logic
+    can see the payload, so the bug class is prevented at two
+    layers."""
+    payload = {
+        "type": "linear_regression",
+        "n": 1000,
+        "response_variable": "y",
+        # predictor_variables deliberately omitted.
+        "coefficients": {"(Intercept)": 1.5, "x1": 2.0, "leak": 99.9},
+        "standard_errors": {"(Intercept)": 0.1, "x1": 0.1, "leak": 0.1},
+        "t_statistics": {"(Intercept)": 15.0, "x1": 20.0, "leak": 999.0},
+        "p_values": {"(Intercept)": 0.0, "x1": 0.0, "leak": 0.0},
+        "r_squared": 0.5,
+    }
+    r = sanitize(payload)
+    assert not r.ok
+    assert "predictor_variables" in (r.rejection_reason or "")

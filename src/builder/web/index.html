@@ -159,30 +159,22 @@
         </button>
       </form>
 
-      <!-- Status bar below the composer — hosts the Permission chip
-           on the left and a context-usage indicator on the right.
-           Chip lives outside the compose-form so the chat box stays
-           minimal; the popup is anchored above the chip inside
-           .permission-wrap, so it follows the chip wherever it sits.
-           The context chip mirrors Claude Code's "Context X / Y" —
-           updated after each turn_done event. -->
+      <!-- Status row: + button and Permission chip on the left,
+           model chip and context chip on the right, and a single
+           centered status notice in the middle. Transient messages
+           (session switched, model switched, can't delete active,
+           file added, etc.) land in #status-line as dim centered
+           text and auto-clear after a few seconds. Flanking
+           flex-spacers keep the notice precisely centered across
+           the row regardless of left/right chip widths. -->
       <div class="composer-meta">
-        <div class="add-wrap">
-          <button
-            type="button"
-            id="add-files-btn"
-            class="composer-chip composer-chip-action"
-            aria-label="Add data files or images"
-            title="Add data files (.csv, .dta, .rds) or images. Data files land in the session; images attach to your next message."
-          >+</button>
-          <!-- Success notices for + actions pop out to the LEFT of
-               the + button, so they read as belonging to it.
-               Model-related toasts live in a separate container
-               anchored to the model chip on the far right. Errors
-               don't live here — they go into the main chat
-               transcript so they stay visible. -->
-          <div id="toast-container-files" class="toast-container toast-container-left" aria-live="polite"></div>
-        </div>
+        <button
+          type="button"
+          id="add-files-btn"
+          class="composer-chip composer-chip-action"
+          aria-label="Add data files or images"
+          title="Add data files (.csv, .dta, .rds) or images. Data files land in the session; images attach to your next message."
+        >+</button>
         <div class="permission-wrap">
           <button
             type="button"
@@ -196,12 +188,18 @@
           <div id="policy-popup" class="policy-popup hidden"></div>
         </div>
         <div class="composer-meta-spacer"></div>
+        <!-- Absolutely positioned at the center of the row — see
+             .status-line in style.css. Lives in the flow for DOM
+             locality but doesn't participate in the flex layout,
+             so left and right chip widths can't push it off
+             center. -->
+        <div id="status-line" class="status-line" aria-live="polite"></div>
         <!-- Model picker. Click opens a popup with the selectable
              models; the current label lives in #model-chip-label.
              The popup uses the same .policy-popup + .permission-wrap
              pattern as the permission chip so positioning and
              outside-click dismissal work identically. -->
-        <div class="permission-wrap model-wrap">
+        <div class="permission-wrap">
           <button
             type="button"
             id="model-chip"
@@ -212,12 +210,6 @@
             <span class="chip-arrow">▾</span>
           </button>
           <div id="model-popup" class="policy-popup hidden"></div>
-          <!-- Model-related toasts (switch success, restart hints)
-               pop out to the right of the chip so they read as
-               belonging to it. Separate container from the files
-               toasts that live next to the + button on the far
-               left. -->
-          <div id="toast-container-model" class="toast-container toast-container-right" aria-live="polite"></div>
         </div>
         <span
           id="context-chip"
@@ -229,10 +221,11 @@
     </div>  <!-- /chat-main -->
   </div>
 
-  <!-- Toast container now lives inside the composer-meta row, anchored
-       above the + button. See .add-wrap in index.html / .toast-container
-       in style.css. Errors route to the main chat transcript via
-       appendError(); toasts here are for quick success notices only. -->
+  <!-- Transient notices render inline in #status-line inside the
+       composer footer (see .status-line in style.css). Errors that
+       belong to the conversation flow still go through appendError()
+       so they land in the transcript with the turn that produced
+       them. -->
 
   <!-- Keyboard shortcuts overlay. Hidden by default, shown when the
        researcher presses `?` outside the composer. -->

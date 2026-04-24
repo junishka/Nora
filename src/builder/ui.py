@@ -45,6 +45,7 @@ from typing import Any
 from claude_agent_sdk import ClaudeSDKClient, ClaudeSDKError
 
 from builder import chat_service
+from builder.chat_history import Turn, read_turns
 from builder.config import set_cwd
 from builder.env_detect import detect_environment
 from builder.policy import (
@@ -106,6 +107,13 @@ class BuilderBridge:
         # `_ensure_client` reads it when opening a fresh SDK client.
         from builder.app import DEFAULT_MODEL
         self._model: str = DEFAULT_MODEL
+        # Memory: whenever we open a fresh SDK client (first turn,
+        # model switch, session switch, app restart) we prepend the
+        # last N turns from chat_history.jsonl to the first user
+        # message so Claude picks up where we left off. The flag is
+        # set when the client is (re)opened and cleared after the
+        # prefix has been emitted exactly once.
+        self._needs_context_prefix: bool = False
 
     # -------- lifecycle --------
 
@@ -814,19 +822,7 @@ class BuilderBridge:
 
         # Close the existing client so the new cwd gets a fresh SDK
         # session instead of leaking state across directories.
-        if self._loop is not None and self._client is not None:
-            async def _close() -> None:
-                try:
-                    await self._client.__aexit__(None, None, None)
-                except Exception:  # noqa: BLE001
-                    pass
-                finally:
-                    self._client = None
-            fut = asyncio.run_coroutine_threadsafe(_close(), self._loop)
-            try:
-                fut.result(timeout=3)
-            except Exception:  # noqa: BLE001
-                pass
+        self._close_client_blocking()
 
         return self._set_cwd(target)
 
@@ -872,6 +868,22 @@ class BuilderBridge:
         payload. Builds up the config.get_cwd side-effect at the
         module level so other code (schema, policy, executor) picks
         it up via the singleton."""
+        # Session switch safety: if cwd changes, tear down the active
+        # SDK client so the next turn starts a fresh conversation AND
+        # drop the cached ResultStore for the old cwd so future tool
+        # calls resolve the new session's DB. Earlier versions kept a
+        # process-wide singleton store that stuck to whichever cwd
+        # asked first — Project A could then see Project B's stored
+        # sanitized results. See builder/store.py :: get_store.
+        old_cwd = self.cwd.resolve() if self.cwd is not None else None
+        new_cwd = path.resolve()
+        if old_cwd is not None and old_cwd != new_cwd:
+            self._close_client_blocking()
+            try:
+                from builder.store import close_store
+                close_store(old_cwd)
+            except Exception:  # noqa: BLE001 — store close isn't safety-critical
+                pass
         self.cwd = path
         set_cwd(path)
         return {"ok": True, "state": "ready", **self._ready_payload()}
@@ -935,19 +947,22 @@ class BuilderBridge:
         assert self.cwd is not None
         if self._client is None:
             from builder.app import _build_options
-            # Ask the SDK to resume the cwd's prior conversation when
-            # we already have persisted history for this session.
-            # First-ever open of a session has no history, so Claude
-            # starts fresh; switching into an old session or landing
-            # in one that already hosted a chat keeps the memory.
-            history_path = self.cwd / ".builder" / "chat_history.jsonl"
-            resume = history_path.exists() and history_path.stat().st_size > 0
             opts = _build_options(
                 self.cwd,
                 model=self._model,
-                continue_conversation=resume,
+                # We don't use the SDK's conversation resume — that
+                # reaches into the CLI's own session store which is
+                # opaque and can silently miss. Instead we open a
+                # fresh conversation every time and prepend our own
+                # condensed history on the first turn (see the
+                # ``_needs_context_prefix`` branch in ``_run_turn``).
+                continue_conversation=False,
             )
             self._client = await ClaudeSDKClient(options=opts).__aenter__()
+            # Fresh client → next turn must carry the prior-turns
+            # prefix so Claude picks up memory. Cleared after one
+            # successful emission so mid-session turns stay lean.
+            self._needs_context_prefix = True
         return self._client
 
     async def _run_turn(
@@ -976,27 +991,62 @@ class BuilderBridge:
                 })
                 return
 
+            # Memory: on the first turn after a fresh client open,
+            # prepend the condensed prior-turn transcript so Claude
+            # picks up where the conversation left off. The prefix
+            # is wrapped in a clearly-marked block so Claude treats
+            # it as background rather than as content to respond to.
+            # We clear the flag preemptively but restore it on any
+            # error/cancellation so the researcher never loses
+            # memory injection because the first turn after a
+            # reopen happened to fail.
+            prompt = text
+            carried_prefix = False
+            if self._needs_context_prefix:
+                prefix = _build_context_prefix(self.cwd)
+                if prefix:
+                    prompt = prefix + "\n\n" + text
+                    carried_prefix = True
+                self._needs_context_prefix = False
+
             try:
                 async for evt in chat_service.run_turn(
-                    client, text, images=images
+                    client, prompt, images=images
                 ):
                     self._push_event(_event_to_dict(evt))
+                # Refresh the durable session snapshot after a clean
+                # turn. Best-effort — write_session_state swallows
+                # OSError internally so a disk-full or permission
+                # hiccup can't break chat. We skip this on cancel /
+                # error paths so a partial turn doesn't get recorded
+                # as "last activity".
+                try:
+                    from builder.session_state import write_session_state
+                    write_session_state(self.cwd, model=self._model)
+                except Exception:  # noqa: BLE001 — never let state write break a turn
+                    pass
             except asyncio.CancelledError:
                 # Researcher hit Stop. Surface a terminal event so
                 # the UI re-enables the composer via its standard
                 # event handler. Don't re-raise — cancellation is
                 # expected here, not an error condition.
+                if carried_prefix:
+                    self._needs_context_prefix = True
                 self._push_event({
                     "type": "turn_error",
                     "message": "cancelled",
                 })
                 return
             except ClaudeSDKError as e:
+                if carried_prefix:
+                    self._needs_context_prefix = True
                 self._push_event({
                     "type": "turn_error",
                     "message": f"SDK error during turn: {e}",
                 })
             except Exception as e:  # noqa: BLE001
+                if carried_prefix:
+                    self._needs_context_prefix = True
                 self._push_event({
                     "type": "turn_error",
                     "message": f"turn failed: {e}",
@@ -1038,17 +1088,60 @@ class BuilderBridge:
         etype = payload.get("type")
         if etype not in self._PERSIST_TYPES:
             return
+        # Stamp the event with a UTC ISO timestamp if the caller
+        # didn't provide one. Readers (chat_history.read_turns,
+        # session_state writer) tolerate missing timestamps for
+        # backwards compat with older logs, but adding one per
+        # event going forward lets us surface "last active" times,
+        # order events from mixed sources, and feed the rolling
+        # session summary. We don't mutate the caller's dict —
+        # a shallow copy is cheap and avoids surprising _push_event
+        # consumers that keep the original reference.
+        record = dict(payload)
+        record.setdefault(
+            "timestamp",
+            datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        )
         try:
             history_dir = self.cwd / ".builder"
             history_dir.mkdir(parents=True, exist_ok=True)
             path = history_dir / "chat_history.jsonl"
             with path.open("a", encoding="utf-8") as f:
-                f.write(json.dumps(payload, ensure_ascii=False) + "\n")
+                f.write(json.dumps(record, ensure_ascii=False) + "\n")
         except OSError:
             # Persistence failing shouldn't block live chat. The
             # transcript on screen stays intact; replay just won't
             # include this event.
             pass
+
+    def _close_client_blocking(self) -> None:
+        """Best-effort close of the persistent SDK client.
+
+        Safe to call repeatedly. Used by session switches and teardown
+        paths to guarantee the next turn starts with a fresh SDK
+        conversation.
+        """
+        if self._client is None:
+            return
+        if self._loop is None:
+            self._client = None
+            return
+
+        async def _close() -> None:
+            if self._client is None:
+                return
+            try:
+                await self._client.__aexit__(None, None, None)
+            except Exception:  # noqa: BLE001
+                pass
+            finally:
+                self._client = None
+
+        fut = asyncio.run_coroutine_threadsafe(_close(), self._loop)
+        try:
+            fut.result(timeout=3)
+        except Exception:  # noqa: BLE001
+            self._client = None
 
     def get_chat_history(self) -> dict[str, Any]:
         """Return the persisted chat log for the active session so
@@ -1093,6 +1186,31 @@ class BuilderBridge:
                 for p in _scan_datasets(self.cwd)
             ],
         }
+
+
+def _build_context_prefix(cwd: Path | None) -> str:
+    """Thin shim around :func:`builder.chat_history.build_context_prefix`.
+
+    Kept as a module-local alias because ``_run_turn`` references it;
+    the actual pure-function implementation (no SDK deps, trivially
+    testable) lives in chat_history.py alongside the Turn reader.
+    Production callers pull recent results from the sanitized-payload
+    store here — tests import the pure function directly and inject
+    their own results list.
+    """
+    from builder.chat_history import build_context_prefix
+
+    if cwd is None:
+        return ""
+    # Pull recent results from the store. Opening it may fail on a
+    # brand-new cwd whose .builder/results.db hasn't been created
+    # yet — swallow and treat as "no prior results".
+    try:
+        from builder.store import get_store
+        rows: list[Any] = list(get_store(cwd).list_all())
+    except Exception:  # noqa: BLE001 — store unavailable shouldn't block resume
+        rows = []
+    return build_context_prefix(cwd, results=rows)
 
 
 def _is_within(child: Path, parent: Path) -> bool:

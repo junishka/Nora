@@ -12,12 +12,16 @@ in Stata must emit payloads whose shape matches one of these types.
 Anything outside the allowlist is dropped; anything violating a hard SDC
 rule causes the whole payload to be rejected.
 
-**Coverage: four v0 types.**
+**Coverage: six v0 types.**
 - `linear_regression` — OLS and its variants (robust SE, clustered SE).
 - `t_test` — one-sample, two-sample, paired, Welch.
 - `descriptive` — per-variable n, mean, sd, missing count (never min/max/
   median/quantiles at v0; those leak individual observations).
-- `frequency_table` — 1D level-count tables with primary suppression.
+- `frequency_table` — 1D level-count tables with primary + secondary
+  suppression.
+- `crosstab` — 2D contingency tables, no margins emitted (avoids the
+  τ-ARGUS-class secondary-suppression problem).
+- `magnitude_table` — sum/mean by group, with (1, k)-dominance.
 
 **Design principles baked in here:**
 1. **Allowlist fields, don't blocklist.** If a field isn't listed as
@@ -25,17 +29,54 @@ rule causes the whole payload to be rejected.
    enumerate forbidden fields — the attacker's attack surface is the set
    of field names Builder has NOT thought about, and there are infinitely
    many such names.
-2. **Hard vs soft rules.** Hard (minimum-N violations) reject the whole
-   payload. Soft (precision clamping, cell suppression) transform in
-   place and log.
+2. **Hard vs soft rules.** Hard (minimum-N violations, structural size
+   cap overflows) reject the whole payload. Soft (precision clamping,
+   cell suppression, undeclared-key drops) transform in place and log.
 3. **Transformations are logged.** Every modification the sanitizer makes
    is recorded in `SanitizerResult.transformations`, so the researcher
    can audit what Claude actually saw vs what the script produced.
-4. **Secondary cell suppression is NOT implemented.** 1D freq tables with
-   one suppressed cell are back-solvable from the total `n`. This is a
-   known gap; step 5 closes it via τ-ARGUS integration. In the meantime,
-   Claude seeing that some suppressed cells *sum to* a small number is
-   still much less disclosive than seeing the values themselves.
+4. **Structural size caps.** Each allowed dict / list field has an
+   entry-count cap on top of the per-entry character cap enforced by
+   `safe_key` / `safe_text`. The two limits together bound how much
+   data a prompt-injected script can smuggle through an allowed field.
+   See `_OLS_MAX_PREDICTORS`, `_FREQ_MAX_CELLS`, `_XTAB_MAX_CELLS`,
+   `_MAGTAB_MAX_CELLS`.
+
+**Known gaps / residual risks — documented so a maintainer doesn't have
+to rediscover them.**
+
+1. **`predictor_variables` has no upstream data authority.** The OLS
+   coefficient-dict filter uses this list as the allowlist for inner
+   keys (fix: dropped undeclared keys with a transformation log).
+   But nothing ties `predictor_variables` itself back to the source
+   dataset's columns — the script declares it, and the sanitizer
+   trusts it. A prompt-injected script that emits both a fake
+   `predictor_variables` and matching fake coefficient keys survives
+   the filter. Closing this gap would require the sanitizer to read
+   the source dataset's schema, which breaks its data-isolation
+   invariant. A better fix lives in the runtime library: require a
+   model object (not free-form args) and derive predictor_variables
+   from the model's `xlevels`.
+
+2. **`builder$result(...)` generic escape hatch.** The R and Stata
+   runtime libraries expose a generic constructor that lets a script
+   emit any supported-type payload with hand-crafted fields. Legit
+   use case: bootstraps, custom statistics. But this is the path
+   that bypasses gap #1 — without it, only `builder$from_lm(model)`
+   would be available, and the model object would authoritatively
+   define the variable names. Removing the escape hatch is a
+   research-workflow trade-off and stays out of scope for the
+   security pass.
+
+3. **Data-derived names are still a channel.** Category / level names
+   in frequency tables, crosstabs, and magnitude tables originate in
+   the researcher's data (reading dataset values). A prompt-injected
+   script can fabricate category names to encode bits — each name
+   capped at 40 chars by `safe_key`, total cell count capped by the
+   structural caps. Bandwidth is bounded (≈8 KB per payload) but not
+   zero. To eliminate entirely, the runtime library would need to
+   verify category names come from the actual data (same constraint
+   as #1 — requires data access during payload construction).
 """
 
 from __future__ import annotations
@@ -209,6 +250,22 @@ _MAGTAB_ALLOWED_STRING_FIELDS: frozenset[str] = frozenset(
 # Aggregation kinds we understand. The runtime library should only emit
 # these; anything else is rejected as a schema violation.
 _MAGTAB_VALID_AGGREGATIONS: frozenset[str] = frozenset(("sum", "mean"))
+
+
+# --- Structural size caps --------------------------------------------------
+# Hard limits on the number of top-level entries each payload type can
+# carry. Primarily a defense-in-depth measure: the per-entry key cap
+# (40 chars via safe_key) plus these entry-count caps bound how much
+# data a prompt-injected script can smuggle through an allowed field.
+#
+# Numbers picked to comfortably accommodate legitimate research
+# output and reject anything that looks engineered — a regression
+# with 60 predictors isn't interpretable statistics, a frequency
+# table with 300 distinct levels isn't a useful summary.
+_OLS_MAX_PREDICTORS = 50
+_FREQ_MAX_CELLS = 200
+_XTAB_MAX_CELLS = 2500          # allows up to ~50 × 50
+_MAGTAB_MAX_CELLS = 200
 
 
 # --- Crosstab (2D frequency table, no margins emitted) ---------------------
@@ -405,6 +462,24 @@ def _sanitize_linear_regression(
             rejection_reason=str(e),
         )
 
+    # Structural size cap on predictor_variables. Each predictor name
+    # goes through safe_key (40-char cap) already; this check bounds
+    # the total number of names, so the data channel available through
+    # this list is bounded in both dimensions. Also catches
+    # accidentally-huge models that wouldn't be interpretable research
+    # output anyway.
+    raw_predictors = raw.get("predictor_variables")
+    if isinstance(raw_predictors, list) and len(raw_predictors) > _OLS_MAX_PREDICTORS:
+        return SanitizerResult(
+            ok=False, analysis_type="linear_regression",
+            rejection_reason=(
+                f"predictor_variables has {len(raw_predictors)} entries; "
+                f"the structural cap is {_OLS_MAX_PREDICTORS}. A regression "
+                f"with that many predictors isn't interpretable output — "
+                f"rejected as probable adversarial payload."
+            ),
+        )
+
     transformations: list[str] = []
     out = _collect_allowed(
         raw,
@@ -416,7 +491,47 @@ def _sanitize_linear_regression(
         transformations=transformations,
     )
 
-    # Precision clamp every numeric field and every dict-of-numeric field.
+    # Cross-field integrity: each coefficient-dict key must name a
+    # declared predictor OR the intercept. Without this, a prompt-
+    # injected Claude can smuggle arbitrary numbers out by emitting
+    # e.g. ``coefficients: {leak_bit_0: 0.001, leak_bit_1: 0.002, …}``
+    # — the inner dict accepts any well-formed key through
+    # ``_collect_allowed``, and precision-clamping just rounds the
+    # smuggled values, it doesn't reject them.
+    #
+    # R reports the intercept as ``(Intercept)``; Stata as ``_cons``.
+    # We accept both plus a permissive ``intercept`` form in case
+    # the runtime library normalizes. Any other key not declared in
+    # ``predictor_variables`` is dropped with a transformation log
+    # entry so the researcher can see what got stripped.
+    declared_predictors = set(out.get("predictor_variables") or [])
+    allowed_coefficient_keys = declared_predictors | {
+        "(Intercept)", "_cons", "intercept",
+    }
+    for dict_field in _OLS_ALLOWED_DICT_NUMERIC:
+        if dict_field not in out:
+            continue
+        d = out[dict_field]
+        if not isinstance(d, dict):
+            continue
+        kept: dict[str, float] = {}
+        dropped: list[str] = []
+        for k, v in d.items():
+            if k in allowed_coefficient_keys:
+                kept[k] = v
+            else:
+                dropped.append(k)
+        if dropped:
+            transformations.append(
+                f"dropped {len(dropped)} undeclared key(s) from "
+                f"{dict_field!r}: {sorted(dropped)[:5]}"
+                + (" …" if len(dropped) > 5 else "")
+            )
+        out[dict_field] = kept
+
+    # Precision clamp every numeric field and every dict-of-numeric
+    # field. Clamp AFTER the cross-field key filter above so we only
+    # pay the rounding cost on keys that survive the filter.
     n = out["n"]
     sigfigs = sigfigs_for_n(n)
     for key in _OLS_ALLOWED_NUMERIC_FIELDS:
@@ -503,6 +618,21 @@ def _sanitize_t_test(raw: dict[str, Any], config: SDCConfig) -> SanitizerResult:
         transformations=transformations,
     )
 
+    # ``confidence_interval`` must be a 2-element [lower, upper]
+    # list. The generic list_numeric filter accepts any length, so
+    # without this check a 3+ element list would survive and could
+    # smuggle arbitrary numbers out — one real bound plus arbitrary
+    # extras. Drop any length != 2 with a transformation note.
+    if "confidence_interval" in out:
+        ci = out["confidence_interval"]
+        if not isinstance(ci, list) or len(ci) != 2:
+            transformations.append(
+                f"dropped 'confidence_interval': expected a 2-element "
+                f"[lower, upper] list, got "
+                f"{len(ci) if isinstance(ci, list) else type(ci).__name__}"
+            )
+            del out["confidence_interval"]
+
     # Use the smallest group for conservative sig-fig scaling. If only
     # one n is present (one_sample, paired), use that.
     n_for_precision = n1 if not needs_n2 else min(n1, n2)  # type: ignore[arg-type]
@@ -510,7 +640,8 @@ def _sanitize_t_test(raw: dict[str, Any], config: SDCConfig) -> SanitizerResult:
     for key in _TTEST_ALLOWED_NUMERIC_FIELDS:
         if key in out:
             out[key] = clamp_precision(out[key], n_for_precision)
-    if "confidence_interval" in out and len(out["confidence_interval"]) == 2:
+    if "confidence_interval" in out:
+        # Length was already verified as 2 above.
         out["confidence_interval"] = [
             clamp_precision(x, n_for_precision)
             for x in out["confidence_interval"]
@@ -597,6 +728,19 @@ def _sanitize_frequency_table(
             ok=False, analysis_type="frequency_table",
             rejection_reason=(
                 "counts must be a non-empty dict of level→count"
+            ),
+        )
+    if len(raw_counts) > _FREQ_MAX_CELLS:
+        # Structural cap: 200 distinct levels is already more than any
+        # readable frequency table. Bounds the data channel available
+        # through level-name strings.
+        return SanitizerResult(
+            ok=False, analysis_type="frequency_table",
+            rejection_reason=(
+                f"counts has {len(raw_counts)} distinct levels; "
+                f"the structural cap is {_FREQ_MAX_CELLS}. Collapse "
+                f"rare levels, use a different summary, or rejected "
+                f"as probable adversarial payload."
             ),
         )
     # Count values must be non-negative ints. Keys are level *names* — they
@@ -719,6 +863,22 @@ def _sanitize_crosstab(
             rejection_reason=(
                 "counts must be a non-empty dict-of-dicts "
                 "(row_level → col_level → int)"
+            ),
+        )
+    # Structural cap on the total cell count (sum over rows of inner
+    # dict sizes). A 50×50 crosstab is already dense; anything bigger
+    # isn't readable output.
+    total_cells = 0
+    for inner in raw_counts.values():
+        if isinstance(inner, dict):
+            total_cells += len(inner)
+    if total_cells > _XTAB_MAX_CELLS:
+        return SanitizerResult(
+            ok=False, analysis_type="crosstab",
+            rejection_reason=(
+                f"counts contains {total_cells} cells; the structural "
+                f"cap is {_XTAB_MAX_CELLS}. Pre-aggregate the table, "
+                f"or rejected as probable adversarial payload."
             ),
         )
 
@@ -869,6 +1029,17 @@ def _sanitize_magnitude_table(
             rejection_reason=(
                 "cells must be a non-empty dict of group_level → "
                 "{value, n, max_share}"
+            ),
+        )
+    if len(raw_cells) > _MAGTAB_MAX_CELLS:
+        # Same rationale as the other table caps — bound the
+        # data-channel bandwidth through group-name strings.
+        return SanitizerResult(
+            ok=False, analysis_type="magnitude_table",
+            rejection_reason=(
+                f"cells has {len(raw_cells)} groups; the structural "
+                f"cap is {_MAGTAB_MAX_CELLS}. Aggregate to fewer "
+                f"groups, or rejected as probable adversarial payload."
             ),
         )
 

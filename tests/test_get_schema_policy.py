@@ -19,6 +19,7 @@ from pathlib import Path
 
 from builder.config import set_cwd
 from builder.policy import (
+    DEFAULT_MAX_DEPTH,
     BuilderPolicy,
     DatasetPolicy,
     save_policy,
@@ -37,12 +38,29 @@ def _call_get_schema(args: dict) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# Happy path — no policy file → conservative default applies
+# Happy path — no policy file → permissive default applies
 # ---------------------------------------------------------------------------
+#
+# The default used to be ``names_types`` (conservative). It's now
+# ``names_types_labels_summary`` (NA count + distinct count tier) —
+# researchers want Claude reasoning about the richest non-leaky
+# metadata by default and can dial down per-dataset via the Permission
+# chip. These tests lock in the new default and the fact that every
+# depth on the ladder succeeds without a policy file.
+
+
+def test_default_is_names_types_labels_summary():
+    """Guard: if someone flips the default again (e.g. back to a
+    conservative tier), this test catches it so the prompt copy,
+    Permission chip labels, and downstream test expectations can
+    all be updated together."""
+    assert DEFAULT_MAX_DEPTH == "names_types_labels_summary"
+
 
 def test_default_policy_allows_names_types(tmp_path: Path):
-    """No policy file → default ceiling is names_types. A request at
-    that ceiling succeeds and the response advertises the ceiling."""
+    """No policy file → default ceiling is the permissive tier.
+    A narrower request (names_types) succeeds and the response
+    advertises the default ceiling."""
     set_cwd(tmp_path)
     csv = tmp_path / "d.csv"
     csv.write_text("x,y\n1,2\n3,4\n5,6\n")
@@ -50,7 +68,7 @@ def test_default_policy_allows_names_types(tmp_path: Path):
     resp = _call_get_schema({"dataset": "d.csv", "depth": "names_types"})
     assert resp["status"] == "ok"
     assert resp["depth"] == "names_types"
-    assert resp["policy_max_depth"] == "names_types"
+    assert resp["policy_max_depth"] == DEFAULT_MAX_DEPTH
 
 
 def test_default_policy_allows_names_only(tmp_path: Path):
@@ -65,24 +83,22 @@ def test_default_policy_allows_names_only(tmp_path: Path):
     assert resp["depth"] == "names_only"
 
 
-def test_default_policy_denies_names_types_labels(tmp_path: Path):
-    """Conservative default ceiling is names_types; asking for labels
-    must be denied unless the researcher has opted in per-dataset."""
+def test_default_policy_allows_names_types_labels(tmp_path: Path):
+    """Labels-tier is below the new permissive default and is allowed
+    without an explicit policy."""
     set_cwd(tmp_path)
     csv = tmp_path / "d.csv"
     csv.write_text("x,y\n1,2\n3,4\n5,6\n")
 
     resp = _call_get_schema({"dataset": "d.csv", "depth": "names_types_labels"})
-    assert resp["status"] == "denied"
-    assert resp["requested_depth"] == "names_types_labels"
-    assert resp["policy_max_depth"] == "names_types"
-    # The reason should mention the ceiling so Claude can explain to
-    # the researcher what needs to change to unlock.
-    assert "default" in resp["reason"].lower()
+    assert resp["status"] == "ok"
+    assert resp["depth"] == "names_types_labels"
+    assert resp["policy_max_depth"] == DEFAULT_MAX_DEPTH
 
 
-def test_default_policy_denies_summary(tmp_path: Path):
-    """Even further above the ceiling — still denied."""
+def test_default_policy_allows_summary(tmp_path: Path):
+    """NA-count/distinct-count is the new default ceiling itself —
+    allowed without any explicit policy."""
     set_cwd(tmp_path)
     csv = tmp_path / "d.csv"
     csv.write_text("x,y\n1,2\n3,4\n5,6\n")
@@ -91,7 +107,36 @@ def test_default_policy_denies_summary(tmp_path: Path):
         "dataset": "d.csv",
         "depth": "names_types_labels_summary",
     })
+    assert resp["status"] == "ok"
+    assert resp["depth"] == "names_types_labels_summary"
+    assert resp["policy_max_depth"] == "names_types_labels_summary"
+
+
+def test_explicit_lower_policy_denies_above_ceiling(tmp_path: Path):
+    """When the researcher explicitly lowers the ceiling for a
+    dataset below the default, requests above that ceiling must be
+    denied — this is the core privacy guarantee of the policy layer.
+    (Replaces two earlier 'default denies X' tests that became
+    irrelevant when the default was raised.)"""
+    set_cwd(tmp_path)
+    csv = tmp_path / "d.csv"
+    csv.write_text("x,y\n1,2\n3,4\n5,6\n")
+
+    save_policy(tmp_path, BuilderPolicy(
+        datasets={"d.csv": DatasetPolicy(
+            max_depth="names_types",
+            set_at="2026-04-21T00:00:00+00:00",
+        )},
+    ))
+
+    resp = _call_get_schema({"dataset": "d.csv", "depth": "names_types_labels"})
     assert resp["status"] == "denied"
+    assert resp["requested_depth"] == "names_types_labels"
+    assert resp["policy_max_depth"] == "names_types"
+    # Reason should mention it's an explicit ceiling (not the default)
+    # so Claude can tell the researcher their own setting is what's
+    # blocking, not Builder's baseline.
+    assert "explicit" in resp["reason"].lower()
 
 
 # ---------------------------------------------------------------------------

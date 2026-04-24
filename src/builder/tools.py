@@ -1,12 +1,12 @@
 """Builder — MCP tool surface (step 2 of the build ladder, mocked stage).
 
 This module defines the *exhaustive* interface through which the frontier
-model is allowed to reach the researcher's local machine. Five tools, no
+model is allowed to reach the researcher's local machine. Six tools, no
 others. The Claude Agent SDK's built-in tools (Bash, Read, Write, Edit,
 Glob, Grep, WebFetch, WebSearch, etc.) are disabled at the `app.py` layer
 via `disallowed_tools` + a `can_use_tool` catch-all.
 
-All five tools return mocked structured payloads at this stage — the goal of
+All tools return structured payloads. Earlier steps returned mocked values — the goal of
 step 2 is to define and enforce the interface, not to actually execute
 scripts or read data. Step 3 wires in real schema extraction; step 4 wires
 in the executor + sanitizer choke point; step 5 turns the pass-through
@@ -727,6 +727,177 @@ async def list_results(args: dict[str, Any]) -> dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
+# Tool: recall_conversation
+# ---------------------------------------------------------------------------
+
+@tool(
+    "recall_conversation",
+    (
+        "Search this session's archived chat log for turns NOT already "
+        "in your context. The most recent ~20 turns are auto-loaded "
+        "when a session opens, so you already have short-term memory; "
+        "use this tool for DEEPER lookups into older history.\n\n"
+        "When to call this:\n"
+        "- The researcher references an analysis or exchange from "
+        "earlier in a long session that's no longer in your context "
+        "window (\"the regression we ran at the start\", \"what did "
+        "I ask yesterday about the gate variable\").\n"
+        "- You need the exact wording of something older — quote it "
+        "back verbatim rather than paraphrasing.\n"
+        "- The auto-injected history starts with "
+        "\"N earlier turns omitted\" and the researcher's question "
+        "clearly points at those omitted turns.\n\n"
+        "Do NOT call this for content already visible to you in the "
+        "current conversation — answer from context. The tool is a "
+        "disk read; use it when context genuinely can't answer the "
+        "question.\n\n"
+        "Arguments (all optional):\n"
+        "  query: case-insensitive substring matched against user + "
+        "assistant text and tool labels. Returns matching turns with "
+        "±2 neighboring turns for context, most-recent first.\n"
+        "  tail: last N turns regardless of query. Useful with a "
+        "large N to page further back than the auto-injected window.\n"
+        "  context: neighbor turns to include around each match "
+        "(default 2). Only applies when ``query`` is set.\n"
+        "  max_chars: soft cap on total text returned (default ~8000).\n\n"
+        "Returns {turn_count (total in archive), turns (list of "
+        "{index, user, assistant, tools: [{name,label,result_id?}], "
+        "result_ids, timestamp?})}. Thinking traces and raw tool-"
+        "result bodies are excluded — use list_results / expand_result "
+        "for stored sanitized payloads."
+    ),
+    {"query": str, "tail": int, "context": int, "max_chars": int},
+)
+async def recall_conversation(args: dict[str, Any]) -> dict[str, Any]:
+    """Search or tail the persisted chat log for the active session.
+
+    Returns grouped Turn records (not loose event snippets), with the
+    option to include ±N neighboring turns around each query match so
+    Claude sees the conversation flow around the hit rather than a
+    context-free line.
+    """
+    from builder.chat_history import read_turns as _read_turns
+
+    query = (args.get("query") or "").strip()
+    tail_raw = args.get("tail")
+    context_raw = args.get("context")
+    max_chars_raw = args.get("max_chars")
+
+    # Defaults: no args → last 10 turns. Query-only → all matches.
+    if not query and (tail_raw is None or tail_raw == 0):
+        tail = 10
+    else:
+        try:
+            tail = int(tail_raw) if tail_raw is not None else 0
+        except (TypeError, ValueError):
+            tail = 0
+    try:
+        context_n = int(context_raw) if context_raw is not None else 2
+    except (TypeError, ValueError):
+        context_n = 2
+    context_n = max(0, min(context_n, 5))  # clamp — don't let a typo blow the budget
+    try:
+        max_chars = int(max_chars_raw) if max_chars_raw is not None else 8000
+    except (TypeError, ValueError):
+        max_chars = 8000
+
+    turns = _read_turns(get_cwd())
+    if not turns:
+        return _as_mcp_text({
+            "status": "ok",
+            "turn_count": 0,
+            "turns": [],
+            "note": "No chat history yet for this session.",
+        })
+
+    turn_count = len(turns)
+
+    # Pick which turns to return.
+    #   - query: matching turns + `context_n` neighbors on each side,
+    #     most-recent first.
+    #   - tail > 0: last N turns, chronological.
+    #   - default (shouldn't hit here — we set tail=10 above): all
+    #     turns, chronological.
+    if query:
+        q = query.lower()
+
+        def _matches(t: Turn) -> bool:
+            if q in (t.user or "").lower():
+                return True
+            if q in (t.assistant or "").lower():
+                return True
+            for use in t.tools:
+                if q in (use.label or "").lower():
+                    return True
+            return False
+
+        matching_indices = [i for i, t in enumerate(turns) if _matches(t)]
+        # Expand each match with ±context_n neighbors, dedup via set,
+        # then sort. Most-recent first at the end so newest matches
+        # appear at the top of the response.
+        keep_set: set[int] = set()
+        for idx in matching_indices:
+            lo = max(0, idx - context_n)
+            hi = min(turn_count - 1, idx + context_n)
+            keep_set.update(range(lo, hi + 1))
+        picked_indices = sorted(keep_set, reverse=True)
+        picked = [turns[i] for i in picked_indices]
+        chronological_output = False
+    elif tail > 0:
+        picked = turns[-tail:]
+        chronological_output = True
+    else:
+        picked = list(turns)
+        chronological_output = True
+
+    # Budget: render newest-first so the newest survive if we hit
+    # the cap, then flip to chronological for tail/default output.
+    PER_FIELD_CAP = 1200
+    FRAMING_PER_TURN = 80  # rough overhead per turn in the payload dict
+
+    def _cap(s: str) -> str:
+        return s if len(s) <= PER_FIELD_CAP else s[:PER_FIELD_CAP] + "…[truncated]"
+
+    rendered: list[dict[str, Any]] = []
+    running = 0
+    budget_order = list(picked) if not chronological_output else list(reversed(picked))
+    for t in budget_order:
+        entry: dict[str, Any] = {"index": t.index}
+        if t.user:
+            entry["user"] = _cap(t.user)
+        if t.assistant:
+            entry["assistant"] = _cap(t.assistant)
+        if t.tools:
+            entry["tools"] = [
+                {
+                    "name": use.name,
+                    "label": use.label,
+                    **({"result_id": use.result_id} if use.result_id else {}),
+                    **({"is_error": True} if use.is_error else {}),
+                }
+                for use in t.tools
+            ]
+        if t.result_ids:
+            entry["result_ids"] = list(t.result_ids)
+        if t.timestamp:
+            entry["timestamp"] = t.timestamp
+        cost = FRAMING_PER_TURN + len(entry.get("user", "")) + len(entry.get("assistant", ""))
+        if running + cost > max_chars and rendered:
+            break
+        running += cost
+        rendered.append(entry)
+    if chronological_output:
+        rendered.reverse()
+
+    return _as_mcp_text({
+        "status": "ok",
+        "turn_count": turn_count,
+        "returned": len(rendered),
+        "turns": rendered,
+    })
+
+
+# ---------------------------------------------------------------------------
 # Server registration
 # ---------------------------------------------------------------------------
 
@@ -740,6 +911,7 @@ ALLOWED_TOOL_NAMES: tuple[str, ...] = (
     f"mcp__{SERVER_NAME}__submit_script",
     f"mcp__{SERVER_NAME}__expand_result",
     f"mcp__{SERVER_NAME}__list_results",
+    f"mcp__{SERVER_NAME}__recall_conversation",
 )
 
 
@@ -754,5 +926,6 @@ def build_server() -> dict[str, Any]:
             submit_script,
             expand_result,
             list_results,
+            recall_conversation,
         ],
     )
