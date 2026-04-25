@@ -1,9 +1,12 @@
 # Nora — architectural direction
 
-Working document. Last substantive update **2026-04-22**, after the
-web UI iteration pass (file upload, drag-drop, result panel with
-Open-in-R/Stata buttons, composer redesign, turn-state discipline,
-Permission chip). The core decision — stay with
+Working document. Last substantive update **2026-04-25**, after the
+Builder → Nora rename, the .app-launches-web-UI fix, the memory
+stack (warm-start prefix + recall_conversation tool + durable
+session_state.json), the security-review fixes (env-var allowlist,
+per-cwd store, filename sanitization, OLS coefficient-key
+constraint, CI length, structural size caps), and the product-
+identity prompt rule. The core decision — stay with
 script-submission ("Option A") rather than pivot to plan-submission
 with a bundled local LLM — still stands from 2026-04-20.
 
@@ -243,16 +246,22 @@ current friction bites:
   the composer footer unfurls a per-dataset dropdown popup. Shares
   the same `set_dataset_policy` bridge method as the terminal's
   `/policy` wizard.
-- **Dataset picker sidebar / session list.** Not done. Recent
-  sessions live on disk under `~/.nora-sessions/` but the UI
-  has no browser yet — re-opening a past session means relaunching
-  with an explicit path. Would make a nice left-rail feature
-  similar to Claude.ai's chat history.
-- **Bundling web assets into the PyInstaller `.app`.** Not done.
-  Today `nora-ui` runs from source only; the `.dmg` still only
-  distributes the terminal `nora`. Fold `src/nora/web/` into
-  the spec as data files and update the launcher to support both
-  entry points.
+- **Dataset picker sidebar / session list.** *Done.* Left rail in
+  the web UI lists every session under `~/.nora-sessions/` with
+  timestamp + dataset label + on-disk size; click switches into
+  the session, the chat replays from `chat_history.jsonl`, and the
+  warm-start prefix injects the recent turns + recent results so
+  the model picks up where the conversation left off. Sidebar is
+  collapsible and drag-to-resize.
+- **Bundling web assets into the PyInstaller `.app`.** *Done.*
+  The spec lists `src/nora/web/` (HTML / JS / CSS / Lottie / vendored
+  player) as data files; the .app's bundle entry is
+  `__main_ui__.py` which calls `nora.ui:main`, so a double-click
+  opens the pywebview chat window directly with no Terminal popup.
+  Logs go to `~/Library/Logs/Nora/nora-YYYY-MM-DD.log` for
+  debugging when it fails to start. The .dmg pipeline produces a
+  working bundle locally; what's still missing is the Apple
+  Developer Program signature for distribution to other people.
 - **Turn-state discipline in the web UI.** *Done* (after
   feedback that the Send button was re-enabling too early). The
   bridge's `send_message` is fire-and-forget by design; the web

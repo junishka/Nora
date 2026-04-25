@@ -1,20 +1,24 @@
 # Nora — handoff
 
-Single-page entry point for picking this project up. Current as of
-the last commit on `main`. If something here disagrees with the code,
-trust the code and file a patch to this doc.
+Single-page entry point for picking this project up. Last
+substantive update **2026-04-25**, after the Builder → Nora rename
+and the .app-launches-web-UI fix. If something here disagrees with
+the code, trust the code and file a patch to this doc.
 
 ## What Nora is (one paragraph)
 
 A local macOS app that lets a researcher drive statistical analysis
-(R or Stata) on their own data with Claude, without that data leaving
-the machine. Claude reaches the researcher's files through a narrow
-MCP interface (six tools, nothing else — no Bash, no filesystem, no
-network). Scripts run under `sandbox-exec` with network denied and a
-tight subpath-allowlist for reads; every output passes through a
-disclosure-control sanitizer (SDC rules from Eurostat / UK ONS
-guidance) before anything reaches Claude. The researcher sees raw
-R/Stata output in the UI; Claude only ever sees sanitized summaries.
+(R or Stata) on their own data with Claude as the model behind the
+scenes, without that data leaving the machine. From the researcher's
+point of view, Nora is one product they talk to — Claude is the
+model wired into the loop, not exposed in the UI. Claude reaches
+the researcher's files through a narrow MCP interface (six tools,
+nothing else — no Bash, no filesystem, no network). Scripts run
+under `sandbox-exec` with network denied and a tight subpath-allowlist
+for reads; every output passes through a disclosure-control sanitizer
+(SDC rules from Eurostat / UK ONS guidance) before anything reaches
+the model. The researcher sees raw R/Stata output in the UI; the
+model only ever sees sanitized summaries.
 
 ## Where it stands
 
@@ -32,7 +36,8 @@ R/Stata output in the UI; Claude only ever sees sanitized summaries.
 | **Durable session state** — `.nora/session_state.json` written after each turn (last exchange, recent results, datasets, model) | ✅ done |
 | **Terminal UI** (`nora`) — Rich-based chat, `/policy` wizard | ✅ done |
 | **Web UI** (`nora-ui`) — pywebview shell, sessions sidebar, theme toggle, model picker, drag-drop file/image upload, typewriter, Lottie cat loading indicator, status line, Permission/Model chips with popups | ✅ done |
-| **Packaging** (`.app` + `.dmg`) — bundles the **web UI**; .app launches pywebview directly with no Terminal | ✅ done (unsigned — local-build only until Apple Developer Program signing) |
+| **Packaging** (`.app` + `.dmg`) — bundles the **web UI**; .app launches pywebview directly with no Terminal popup | ✅ done & smoke-tested locally (unsigned — local-build only until Apple Developer Program signing) |
+| **Product-identity prompt rule** — model introduces itself as Nora, not as "the assistant inside Nora" or by model name | ✅ done |
 | **Real-researcher pilot** | ⏳ self-pilot in progress |
 | **Cross-query composition / release ledger** | ⏭ named, deferred |
 | **Apple Developer Program signing + notarization for distributable .dmg** | ⏭ blocked on $99/yr cert |
@@ -180,12 +185,24 @@ outside cloud-sync roots, persistent across restarts.
   (stderr-based repair, text-data redaction).
 - **macOS-only for now.** Sandbox relies on `sandbox-exec`. Linux
   would need `bubblewrap`/`nsjail`, Windows is on nobody's path.
-- **Schema policy is a ceiling, not a fixed value.** Claude can
+- **Schema policy is a ceiling, not a fixed value.** The model can
   request any depth ≤ ceiling. Researchers edit via the Permission
   chip (web) or `/policy` slash-command (terminal).
 - **Stata batch `-b do <path>` breaks on spaces.** Executor passes
   `script.do` (bare filename) with subprocess cwd set to the run
   dir. Don't "improve" back to an absolute path.
+- **The product is Nora; the model behind it is Claude.** Don't
+  expose "Claude" in user-facing copy. The system prompt has an
+  explicit identity rule telling the model to introduce itself as
+  Nora and not as "the assistant inside Nora" or any other framing.
+  Same goes for docs and UI strings — when the user sees the
+  product name, it's Nora.
+- **GitHub repo is still named `builder`** (URL: github.com/junishka/builder).
+  Renaming a GitHub repo is an out-of-band action; URLs in install
+  instructions still point there. The local clone gets renamed at
+  `git clone … nora` time so the on-disk dir matches the product
+  name. If/when the repo gets renamed too, update the `git clone`
+  URLs in README and install.md.
 
 ## Next concrete step
 

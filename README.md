@@ -1,17 +1,18 @@
 # Nora
 
-Local privacy layer that lets Claude help a researcher analyze
-sensitive data without that data leaving the researcher's machine.
+Local research assistant that helps analyze sensitive data without
+that data leaving the researcher's machine. Claude is the model
+behind Nora — wired in via the Claude Agent SDK — but the product
+the researcher talks to is Nora.
 
-Claude talks to the researcher; a narrow MCP tool interface
-restricts Claude to six operations (`get_schema`, `request_data`,
+Nora exposes the model to the researcher's data through a narrow
+MCP tool interface — six operations (`get_schema`, `request_data`,
 `submit_script`, `expand_result`, `list_results`,
-`recall_conversation`); scripts run
-locally under macOS `sandbox-exec` with network denied and a narrow
-subpath-allowlist for file reads; every output passes through a
-disclosure-control sanitizer before Claude sees it. The researcher
-sees raw logs. Claude only ever sees sanitized, SDC-filtered
-results.
+`recall_conversation`); scripts run locally under macOS
+`sandbox-exec` with network denied and a narrow subpath-allowlist
+for file reads; every output passes through a disclosure-control
+sanitizer before the model sees it. The researcher sees raw logs.
+The model only ever sees sanitized, SDC-filtered results.
 
 See [`docs/handoff.md`](docs/handoff.md) for the single-page
 summary if you're picking the project up. [`docs/overview.md`](docs/overview.md)
