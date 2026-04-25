@@ -929,11 +929,13 @@ kbd {
   display: none;
 }
 
-/* --- cat-paws + yarn loading indicator ---
- * Two 🐾 emoji paws on either side of a CSS-drawn yarn ball; the
- * ball rolls side-to-side between them while each paw tilts
- * toward the ball as it arrives. The whole scene is small enough
- * to sit inline with the loading label. */
+/* --- Lottie cat-loading indicator ---
+ * An illustrated cat pushing a yarn ball, rendered through the
+ * locally-bundled @lottiefiles/lottie-player web component. The
+ * JSON lives at src/builder/web/cat-loading.json; see index.html
+ * for the script tag that registers the <lottie-player> element.
+ * Replaces the earlier two-emoji-paws + CSS-drawn yarn ball —
+ * more character, honest retro-illustrated feel. */
 
 .loading-indicator {
   max-width: var(--max-width);
@@ -941,100 +943,37 @@ kbd {
   margin: 4px auto 0;
   padding: 6px 4px;
   display: inline-flex;
-  align-items: center;
+  /* Align on the row's BOTTOM, not its center. The Lottie source
+   * has the cat biased toward the lower portion of its 512×512
+   * canvas, so center-aligning the row put the label up at the
+   * cat's head level. flex-end + a small positive translateY on
+   * the label below put the text where the cat's body sits. */
+  align-items: flex-end;
   gap: 10px;
   color: var(--text-dim);
   font-size: 13px;
   font-style: italic;
 }
 
-.cats-yarn {
-  position: relative;
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  gap: 2px;
-  width: 56px;
-  height: 22px;
-  font-size: 14px;
-  line-height: 1;
+.cat-loading {
+  /* Fixed intrinsic size so the animation sits inline with the
+   * status label without jumping as the Lottie player initializes
+   * (it renders async). Bumped from 56 → 72 so the cat reads
+   * clearly at a glance — previous size was recognisable as "a
+   * thing happening" but you had to squint to see it was a cat. */
+  width: 72px;
+  height: 72px;
+  flex: 0 0 auto;
 }
 
-.cat-paw {
-  /* Tilt each paw toward the yarn ball when it's "on that side"
-   * of the bounce. Left paw leans right at animation start (when
-   * ball is on the left), settles back as ball crosses over, and
-   * the right paw mirrors. Phases offset by 1.1s (half the ball
-   * cycle) so the tap-tap rhythm reads clearly. */
-  display: inline-block;
-  font-size: 13px;
-  opacity: 0.9;
-  transform-origin: center center;
-}
-
-.cat-paw-left {
-  animation: paw-tap-left 2.2s ease-in-out infinite;
-}
-
-.cat-paw-right {
-  animation: paw-tap-right 2.2s ease-in-out infinite;
-}
-
-.yarn-ball {
-  /* The ball sits between the paws and slides left-right. Rotation
-   * ties to direction: rolling right → clockwise, rolling left →
-   * counter-clockwise. We do both translate + rotate in the same
-   * keyframes so the rolling reads honestly. */
-  position: relative;
-  display: inline-block;
-  width: 14px;
-  height: 14px;
-  animation: yarn-roll 2.2s ease-in-out infinite;
-}
-
-.yarn-ball-core {
-  position: absolute;
-  inset: 0;
-  border-radius: 50%;
-  background: var(--accent-soft);
-  box-shadow: inset -2px -2px 3px rgba(0, 0, 0, 0.15);
-}
-
-.yarn-ball-strand {
-  /* Thin curved line wrapped around the ball — drawn as a ring
-   * with a gap to suggest winding. */
-  position: absolute;
-  inset: 2px;
-  border-radius: 50%;
-  border: 1.5px solid var(--accent);
-  border-top-color: transparent;
-  border-right-color: transparent;
-  opacity: 0.75;
-}
-
-@keyframes yarn-roll {
-  0%   { transform: translateX(-10px) rotate(0deg); }
-  50%  { transform: translateX(10px)  rotate(360deg); }
-  100% { transform: translateX(-10px) rotate(0deg); }
-}
-
-@keyframes paw-tap-left {
-  /* Ball hits the left paw at t=0 and t=100% (it's back there).
-   * Paw leans in (rotate toward ball) and recoils slightly. */
-  0%   { transform: rotate(12deg)  translateX(1px); }
-  10%  { transform: rotate(2deg)   translateX(0); }
-  50%  { transform: rotate(0deg)   translateX(0); }
-  90%  { transform: rotate(2deg)   translateX(0); }
-  100% { transform: rotate(12deg)  translateX(1px); }
-}
-
-@keyframes paw-tap-right {
-  /* Mirrored. Ball hits the right paw at t=50%. */
-  0%   { transform: rotate(0deg)   translateX(0); }
-  40%  { transform: rotate(-2deg)  translateX(0); }
-  50%  { transform: rotate(-12deg) translateX(-1px); }
-  60%  { transform: rotate(-2deg)  translateX(0); }
-  100% { transform: rotate(0deg)   translateX(0); }
+.loading-text {
+  /* Sits near the bottom of the row so the label baseline lines up
+   * with the cat's lower body / paws, not the middle. Small upward
+   * nudge so the descenders of ``g`` / ``p`` don't collide with
+   * the cat's baseline but the bulk of the text still reads as
+   * "at paw level". Tune this between 0 and -8px if the source
+   * animation is swapped for one with different internal biasing. */
+  transform: translateY(-4px);
 }
 
 .loading-text::after {

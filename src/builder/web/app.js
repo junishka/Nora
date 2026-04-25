@@ -814,19 +814,17 @@ function showLoadingIndicator() {
   el.id = 'loading-indicator';
   el.className = 'loading-indicator';
   el.setAttribute('aria-label', 'Claude is ' + label);
-  // Two cat paws batting a yarn ball back and forth. The paws stay
-  // put and tilt toward the ball on contact; the ball itself rolls
-  // and translates side-to-side between them. All CSS-driven — no
-  // image assets.
+  // Illustrated Lottie animation: a cat whose paw pushes a yarn
+  // ball. Replaces the earlier CSS-only two-paws-and-a-ball stack —
+  // more character, honest "retro-illustrated" feel, no hand-rolled
+  // keyframes to maintain. The JSON is bundled at
+  // src/builder/web/cat-loading.json; the player is the locally-
+  // bundled lottie-player web component (see index.html). background
+  // transparent so it themes cleanly light / dark.
   el.innerHTML =
-    '<span class="cats-yarn" aria-hidden="true">' +
-      '<span class="cat-paw cat-paw-left">🐾</span>' +
-      '<span class="yarn-ball">' +
-        '<span class="yarn-ball-core"></span>' +
-        '<span class="yarn-ball-strand"></span>' +
-      '</span>' +
-      '<span class="cat-paw cat-paw-right">🐾</span>' +
-    '</span>' +
+    '<lottie-player class="cat-loading" src="cat-loading.json" ' +
+    'background="transparent" speed="0.6" autoplay loop ' +
+    'aria-hidden="true"></lottie-player>' +
     '<span class="loading-text">' + label + '</span>';
   messagesEl.appendChild(el);
   scrollToBottom();
