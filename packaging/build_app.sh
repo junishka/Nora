@@ -2,30 +2,37 @@
 #
 # Build Builder.app from the PyInstaller output.
 #
+# The bundled binary is the WEB UI (entry point:
+# src/builder/__main_ui__.py) — the pywebview shell. The terminal CLI
+# is intentionally NOT bundled in the .app; double-click should give
+# the chat window, not Terminal. The CLI stays available from source
+# via ``uv run builder``.
+#
 # Pipeline:
 #   1. `uv run pyinstaller packaging/builder.spec --clean --noconfirm`
 #      produces `dist/builder/` (one-dir bundle).
-#   2. Assemble Builder.app manually — no osacompile — so we control
-#      the launcher mechanism. Contents/MacOS/Builder is our own
-#      shell script from packaging/launcher.sh; see that file for
-#      why we avoid AppleScript.
+#   2. Assemble Builder.app manually (no osacompile) so we control
+#      the launcher. Contents/MacOS/Builder is the shell script from
+#      packaging/launcher.sh — it just execs the bundled binary;
+#      pywebview opens its own native window.
 #   3. Copy the PyInstaller bundle into
 #      Builder.app/Contents/Resources/builder/.
-#   4. Write an Info.plist that points at our launcher and sets the
-#      usual bundle metadata.
+#   4. Write an Info.plist marking it a normal GUI app (LSUIElement
+#      false → dock icon visible, Cmd-Q works as expected).
 #
 # Gatekeeper note: the resulting .app is unsigned. First-run workaround
 # (right-click → Open, or `xattr -cr Builder.app`) is documented in
 # docs/install.md. Proper code-signing is deferred until wider
-# distribution justifies paying for the Apple Developer Program.
+# distribution justifies paying for the Apple Developer Program; until
+# then the .dmg pipeline is mostly developer-internal.
 #
 # Usage (from repo root):
 #   bash packaging/build_app.sh
 #
 # Produces:
-#   dist/Builder.app      — the macOS application bundle
+#   dist/Builder.app      — the macOS application bundle (web UI)
 #   dist/builder/         — the raw PyInstaller output (kept for
-#                            direct CLI invocation and debugging)
+#                            direct invocation and debugging)
 
 set -euo pipefail
 
@@ -81,10 +88,10 @@ cat > "$APP_BUNDLE/Contents/Info.plist" <<'PLIST'
     <string>????</string>
     <key>LSMinimumSystemVersion</key>
     <string>11.0</string>
-    <!-- LSUIElement=false means Builder shows up in Launchpad / Dock -->
-    <!-- during the brief moment the launcher runs before spawning    -->
-    <!-- Terminal. Set to true to hide (feels cleaner but then        -->
-    <!-- Cmd-Q-on-Builder doesn't work; keep visible).                -->
+    <!-- LSUIElement=false: standard GUI app — dock icon present,    -->
+    <!-- shows up in Cmd-Tab, Cmd-Q quits cleanly. Earlier comment   -->
+    <!-- here referenced spawning Terminal; the launcher no longer   -->
+    <!-- does that, so the only window the user sees is pywebview's. -->
     <key>LSUIElement</key>
     <false/>
     <key>NSHighResolutionCapable</key>
