@@ -798,18 +798,21 @@ kbd {
 }
 
 /* Override `.message`'s 960px column cap for the welcome message
- * specifically. Without this, the greeting's flex container is
- * capped at 960px and sits inside the chat-main area — on a wide
- * window the 960px column is itself offset from the window's
- * true horizontal center (because the sidebar eats a fixed chunk
- * on the left). Widening to 100% lets the inner justify-content
- * center the text relative to the whole chat column instead. */
-.messages.welcome-only .message.system {
+ * specifically (.welcome-greeting is a permanent class set in
+ * showChat — kept on after welcome-only is cleared). Without this,
+ * the greeting's flex container would be capped at 960px and sit
+ * left-of-center on a wide window because the sidebar eats space
+ * on the left side of chat-main; widening to 100% lets the inner
+ * justify-content center the text relative to the whole chat
+ * column. The class persists after the first message lands so the
+ * greeting stays horizontally centered as the conversation flows
+ * beneath it. */
+.message.system.welcome-greeting {
   max-width: 100%;
   width: 100%;
 }
 
-.messages.welcome-only .message.system .message-body {
+.message.system.welcome-greeting .message-body {
   max-width: min(95%, 900px);
   white-space: nowrap;
   overflow: hidden;

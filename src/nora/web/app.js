@@ -179,7 +179,14 @@ function showChat(payload) {
   // target session has persisted events on disk.
   messagesEl.innerHTML = '';
   const welcomeMsg = document.createElement('div');
-  welcomeMsg.className = 'message system';
+  // .welcome-greeting is a permanent class (not toggled with
+  // welcome-only) so the horizontal centering — full chat-area
+  // width with body justify-content:center — applies even AFTER
+  // the first message arrives. Without this, removing welcome-only
+  // dropped the welcome back into the 960px column cap, which
+  // sits left-of-center on a wide window because the sidebar
+  // eats space on the left side.
+  welcomeMsg.className = 'message system welcome-greeting';
   const welcomeBody = document.createElement('div');
   welcomeBody.className = 'message-body';
   welcomeBody.id = 'welcome';
