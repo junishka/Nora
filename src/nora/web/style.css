@@ -785,15 +785,18 @@ kbd {
   -webkit-user-select: text;
 }
 
-/* The welcome greeting sits at the top of the transcript, centered
- * horizontally, on a single line. We used to vertically-center it
- * when the transcript was empty, but that produced a jarring
- * "drop" the moment the first real message arrived. Keeping it at
- * the top from the start means conversation flows naturally
- * beneath it with no displacement. The welcome-only class is
- * still toggled (for future styling) but no longer rearranges
- * layout. In welcome-only mode we widen the system-message body
- * so the greeting text fits on one line rather than wrapping. */
+/* When the transcript holds only the greeting, vertically center
+ * it inside the chat area — feels less abandoned on a wide empty
+ * window than a single line floating at the top. The instant a
+ * real message arrives the JS clears the welcome-only class
+ * (showChat / replayHistory / appendAssistant / appendThinking /
+ * appendToolCall / appendToolResult / append all flip the flag),
+ * the centering rule stops applying, and the welcome falls to the
+ * top with the conversation flowing beneath. */
+.messages.welcome-only {
+  justify-content: center;
+}
+
 /* Override `.message`'s 960px column cap for the welcome message
  * specifically. Without this, the greeting's flex container is
  * capped at 960px and sits inside the chat-main area — on a wide
