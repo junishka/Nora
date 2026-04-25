@@ -12,7 +12,7 @@ from pathlib import Path
 
 import pytest
 
-from builder.store import (
+from nora.store import (
     ResultStore,
     close_store,
     get_store,
@@ -22,7 +22,7 @@ from builder.store import (
 
 @pytest.fixture
 def store(tmp_path: Path) -> ResultStore:
-    return ResultStore(tmp_path / ".builder" / "results.db")
+    return ResultStore(tmp_path / ".nora" / "results.db")
 
 
 def _sample_payload() -> dict:
@@ -104,7 +104,7 @@ def test_list_all_orders_by_creation(store: ResultStore):
 
 
 def test_persistence_across_connections(tmp_path: Path):
-    db = tmp_path / ".builder" / "results.db"
+    db = tmp_path / ".nora" / "results.db"
     s1 = ResultStore(db)
     s1.insert(
         label="persistent",

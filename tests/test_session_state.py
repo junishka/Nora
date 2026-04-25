@@ -1,6 +1,6 @@
 """Tests for the per-session durable state file.
 
-``session_state.json`` is Builder's "at a glance" summary of a
+``session_state.json`` is Nora's "at a glance" summary of a
 session — last active time, last user/assistant exchange, recent
 analytic results, active model, datasets present. The file is the
 foundation for the session-list preview, the warm-start prefix's
@@ -29,7 +29,7 @@ from pathlib import Path
 
 import pytest
 
-from builder.session_state import (
+from nora.session_state import (
     SESSION_STATE_FILENAME,
     SESSION_STATE_VERSION,
     RecentResult,
@@ -52,14 +52,14 @@ class _StubResult:
 
 
 def _write_chat_log(cwd: Path, events: list[dict]) -> None:
-    (cwd / ".builder").mkdir(exist_ok=True)
-    with (cwd / ".builder" / "chat_history.jsonl").open("w") as f:
+    (cwd / ".nora").mkdir(exist_ok=True)
+    with (cwd / ".nora" / "chat_history.jsonl").open("w") as f:
         for e in events:
             f.write(json.dumps(e) + "\n")
 
 
 def _state_path(cwd: Path) -> Path:
-    return cwd / ".builder" / SESSION_STATE_FILENAME
+    return cwd / ".nora" / SESSION_STATE_FILENAME
 
 
 # ---------------------------------------------------------------------------
@@ -98,7 +98,7 @@ def test_write_joins_multi_block_assistant_reply(tmp_path: Path):
     _write_chat_log(tmp_path, [
         {"type": "user_message", "text": "run it"},
         {"type": "assistant_text", "text": "First, schema check."},
-        {"type": "tool_call", "name": "mcp__builder__get_schema",
+        {"type": "tool_call", "name": "mcp__nora__get_schema",
          "call_id": "c1", "input": {"dataset": "x.csv", "depth": "names_types"}},
         {"type": "tool_result", "call_id": "c1", "text": "{}", "is_error": False},
         {"type": "assistant_text", "text": "Result: coefficient -0.15."},
@@ -153,7 +153,7 @@ def test_write_is_atomic(tmp_path: Path, monkeypatch):
     # Force os.replace to fail, simulating a crash after the temp
     # file was written. The writer should swallow the error and
     # leave the prior file untouched on disk.
-    import builder.session_state as ss_mod
+    import nora.session_state as ss_mod
     original_replace = ss_mod.os.replace
 
     def _boom(src, dst):
@@ -177,13 +177,13 @@ def test_read_returns_none_when_file_missing(tmp_path: Path):
 
 
 def test_read_returns_none_on_malformed_json(tmp_path: Path):
-    (tmp_path / ".builder").mkdir()
+    (tmp_path / ".nora").mkdir()
     _state_path(tmp_path).write_text("{ not valid json")
     assert read_session_state(tmp_path) is None
 
 
 def test_read_returns_none_on_wrong_version(tmp_path: Path):
-    (tmp_path / ".builder").mkdir()
+    (tmp_path / ".nora").mkdir()
     _state_path(tmp_path).write_text(json.dumps({
         "version": 99,
         "last_active_at": "x",
@@ -223,7 +223,7 @@ def test_read_handles_missing_optional_fields(tmp_path: Path):
     """Older state files may not have every field the current
     SessionState dataclass defines. The reader should fill in
     empty defaults rather than crashing."""
-    (tmp_path / ".builder").mkdir()
+    (tmp_path / ".nora").mkdir()
     _state_path(tmp_path).write_text(json.dumps({
         "version": SESSION_STATE_VERSION,
         "last_active_at": "2026-04-24T00:00:00+00:00",

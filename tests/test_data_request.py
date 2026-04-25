@@ -20,8 +20,8 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from builder.data_request import SUPPORTED_REQUEST_TYPES, handle
-from builder.sanitizer import SDCConfig
+from nora.data_request import SUPPORTED_REQUEST_TYPES, handle
+from nora.sanitizer import SDCConfig
 
 
 @pytest.fixture
@@ -183,7 +183,7 @@ def test_tool_help_request_types_match_runtime_allowlist():
     text from SUPPORTED_REQUEST_TYPES; this test locks in the
     single-source-of-truth arrangement.
     """
-    from builder import tools
+    from nora import tools
 
     # The rendered enumeration that the @tool decorator interpolated
     # into the help string at import time.

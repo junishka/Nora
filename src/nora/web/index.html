@@ -1,0 +1,261 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Nora</title>
+  <!-- Lexend: research-backed, designed for reading proficiency —
+       letter shapes are spaced and proportioned to reduce visual
+       noise, which helps dyslexic readers (and everyone else). Loads
+       from Google Fonts when online; falls back to system UI fonts
+       offline, so the app stays usable on a locked-down network. -->
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link
+    href="https://fonts.googleapis.com/css2?family=Lexend:wght@300;400;500;600;700&display=swap"
+    rel="stylesheet"
+  />
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <!-- Landing view: shown when no cwd is set (launched without argv).
+       The researcher drops files or clicks a button to pick them. -->
+  <div id="landing" class="landing hidden">
+    <div class="landing-card">
+      <div class="landing-logo">Nora</div>
+      <h1>Share data with Claude</h1>
+      <p class="landing-lead">
+        Choose the data files you want Claude to help you analyze.
+        They stay on this machine — Claude only sees schema and
+        disclosure-controlled summaries.
+      </p>
+
+      <div id="drop-zone" class="drop-zone">
+        <div class="drop-zone-main">
+          <svg width="36" height="36" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
+            <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
+            <polyline points="17 8 12 3 7 8"/>
+            <line x1="12" y1="3" x2="12" y2="15"/>
+          </svg>
+          <p class="drop-zone-hint">Drop one or more .csv, .dta, or .rds files</p>
+          <p class="drop-zone-sub">For files larger than 2 GB, use Choose files</p>
+        </div>
+      </div>
+
+      <div class="landing-actions">
+        <button id="choose-files-btn" type="button" class="landing-btn primary">Choose files</button>
+        <button id="choose-folder-btn" type="button" class="landing-btn">Choose folder</button>
+      </div>
+
+      <div id="landing-status" class="landing-status"></div>
+
+      <!-- Past sessions list: shown when ~/.nora-sessions/ has
+           anything in it, so a researcher who just wants to resume
+           doesn't have to re-upload or hunt through the chat-view
+           sidebar. Populated by JS (loadLandingSessions). -->
+      <div id="landing-sessions" class="landing-sessions hidden">
+        <div class="landing-sessions-header">Or resume a past session</div>
+        <div id="landing-sessions-list" class="landing-sessions-list"></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Chat view: shown once the session's working directory is set. -->
+  <div id="chat" class="chat hidden">
+    <!-- Left-side session browser. Collapsible so it doesn't eat
+         horizontal space when the researcher just wants to chat.
+         Populated by JS (loadSessions) from list_sessions(). The
+         right edge carries a thin drag-handle for resizing. -->
+    <aside id="sidebar" class="sidebar">
+      <div class="sidebar-header">
+        <span class="sidebar-title">Sessions</span>
+        <button
+          type="button"
+          id="sidebar-toggle"
+          class="sidebar-toggle"
+          aria-label="Collapse sidebar"
+          title="Collapse sidebar"
+        >‹</button>
+      </div>
+      <button
+        type="button"
+        id="new-session-btn"
+        class="sidebar-new"
+        title="Start a new session"
+      >+ New session</button>
+      <div id="sidebar-list" class="sidebar-list"></div>
+      <div
+        id="sidebar-resize"
+        class="sidebar-resize"
+        title="Drag to resize"
+        aria-hidden="true"
+      ></div>
+    </aside>
+
+    <div class="chat-main">
+    <header class="topbar">
+      <div class="topbar-title">Nora</div>
+      <div class="topbar-meta" id="topbar-meta">
+        <span id="cwd-display"></span>
+      </div>
+      <!-- Temporary theme toggle — lets a researcher with a dark
+           system theme preview the light palette (and vice versa)
+           without leaving Nora. Label swaps between sun / moon. -->
+      <button
+        type="button"
+        id="theme-toggle"
+        class="topbar-toggle"
+        aria-label="Toggle light/dark"
+        title="Switch theme"
+      >
+        <span id="theme-toggle-icon">☾</span>
+      </button>
+    </header>
+
+    <main id="messages" class="messages">
+      <div class="message system">
+        <div class="message-body" id="welcome">
+          Ready.
+        </div>
+      </div>
+    </main>
+
+    <footer class="composer">
+      <!-- Staged image thumbnails. Populated when the researcher
+           drops an image on the composer (or paste-pastes one).
+           Each thumb carries a remove button. The list sends along
+           with the next message; after send it's cleared. -->
+      <div id="compose-attachments" class="compose-attachments hidden"></div>
+      <form id="compose-form">
+        <textarea
+          id="compose-input"
+          placeholder="Ask Nora"
+          rows="1"
+          autofocus
+        ></textarea>
+        <button
+          type="submit"
+          id="send-btn"
+          class="composer-action"
+          aria-label="Send"
+          title="Send (Enter)"
+        >
+          <!-- Return-arrow glyph (↵) — matches Claude Code. Plain
+               monospace character keeps it low-chrome; no filled
+               accent background. -->
+          <span aria-hidden="true">↵</span>
+        </button>
+        <button
+          type="button"
+          id="stop-btn"
+          class="composer-action stop hidden"
+          aria-label="Stop"
+          title="Stop"
+        >
+          <!-- Empty centered square — the outer button already
+               carries the light border; filling an inner glyph would
+               duplicate the shape. Screen readers get the label. -->
+          <span class="stop-square" aria-hidden="true"></span>
+        </button>
+      </form>
+
+      <!-- Status row: + button and Permission chip on the left,
+           model chip and context chip on the right, and a single
+           centered status notice in the middle. Transient messages
+           (session switched, model switched, can't delete active,
+           file added, etc.) land in #status-line as dim centered
+           text and auto-clear after a few seconds. Flanking
+           flex-spacers keep the notice precisely centered across
+           the row regardless of left/right chip widths. -->
+      <div class="composer-meta">
+        <button
+          type="button"
+          id="add-files-btn"
+          class="composer-chip composer-chip-action"
+          aria-label="Add data files or images"
+          title="Add data files (.csv, .dta, .rds) or images. Data files land in the session; images attach to your next message."
+        >+</button>
+        <div class="permission-wrap">
+          <button
+            type="button"
+            id="policy-chip"
+            class="composer-chip"
+            title="What Claude sees about each dataset — click to change"
+          >
+            <span id="policy-chip-label">Permission</span>
+            <span class="chip-arrow">▾</span>
+          </button>
+          <div id="policy-popup" class="policy-popup hidden"></div>
+        </div>
+        <div class="composer-meta-spacer"></div>
+        <!-- Absolutely positioned at the center of the row — see
+             .status-line in style.css. Lives in the flow for DOM
+             locality but doesn't participate in the flex layout,
+             so left and right chip widths can't push it off
+             center. -->
+        <div id="status-line" class="status-line" aria-live="polite"></div>
+        <!-- Model picker. Click opens a popup with the selectable
+             models; the current label lives in #model-chip-label.
+             The popup uses the same .policy-popup + .permission-wrap
+             pattern as the permission chip so positioning and
+             outside-click dismissal work identically. -->
+        <div class="permission-wrap">
+          <button
+            type="button"
+            id="model-chip"
+            class="composer-chip"
+            title="Claude model — click to switch"
+          >
+            <span id="model-chip-label">Model</span>
+            <span class="chip-arrow">▾</span>
+          </button>
+          <div id="model-popup" class="policy-popup hidden"></div>
+        </div>
+        <span
+          id="context-chip"
+          class="composer-chip context-chip hidden"
+          title="Tokens used in the current conversation context"
+        ></span>
+      </div>
+    </footer>
+    </div>  <!-- /chat-main -->
+  </div>
+
+  <!-- Transient notices render inline in #status-line inside the
+       composer footer (see .status-line in style.css). Errors that
+       belong to the conversation flow still go through appendError()
+       so they land in the transcript with the turn that produced
+       them. -->
+
+  <!-- Keyboard shortcuts overlay. Hidden by default, shown when the
+       researcher presses `?` outside the composer. -->
+  <div id="shortcuts-overlay" class="shortcuts-overlay hidden" role="dialog" aria-label="Keyboard shortcuts">
+    <div class="shortcuts-card">
+      <div class="shortcuts-header">
+        Keyboard shortcuts
+        <button type="button" id="shortcuts-close" class="shortcuts-close" aria-label="Close">×</button>
+      </div>
+      <dl class="shortcuts-list">
+        <dt><kbd>Enter</kbd></dt><dd>Send message</dd>
+        <dt><kbd>Shift</kbd> + <kbd>Enter</kbd></dt><dd>New line in composer</dd>
+        <dt><kbd>⌘</kbd> + <kbd>K</kbd></dt><dd>Focus composer</dd>
+        <dt><kbd>⌘</kbd> + <kbd>R</kbd></dt><dd>Reload</dd>
+        <dt><kbd>↑</kbd> / <kbd>↓</kbd></dt><dd>Move between sessions (when sidebar focused)</dd>
+        <dt><kbd>Enter</kbd></dt><dd>Open focused session</dd>
+        <dt><kbd>Delete</kbd></dt><dd>Delete focused session</dd>
+        <dt><kbd>Esc</kbd></dt><dd>Close popups / this panel</dd>
+        <dt><kbd>?</kbd></dt><dd>Show this panel</dd>
+      </dl>
+    </div>
+  </div>
+
+  <script src="markdown.js"></script>
+  <!-- Lottie player for the cat-paw loading animation. Registers the
+       <lottie-player> custom element. Bundled locally (not a CDN
+       load) so Nora works offline. Library version 2.0.12 from
+       @lottiefiles/lottie-player on unpkg. See vendor notes in
+       lottie-player.js:LICENSE comment header. -->
+  <script src="lottie-player.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>

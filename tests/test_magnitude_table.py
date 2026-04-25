@@ -17,8 +17,8 @@ import math
 from hypothesis import given
 from hypothesis import strategies as st
 
-from builder.sanitizer import DEFAULT_CONFIG, SDCConfig, sanitize, supported_types
-from builder.sdc import (
+from nora.sanitizer import DEFAULT_CONFIG, SDCConfig, sanitize, supported_types
+from nora.sdc import (
     DOMINANCE_THRESHOLD_DEFAULT,
     dominance_fails,
     suppression_marker,

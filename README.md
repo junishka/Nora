@@ -1,4 +1,4 @@
-# Builder
+# Nora
 
 Local privacy layer that lets Claude help a researcher analyze
 sensitive data without that data leaving the researcher's machine.
@@ -21,9 +21,9 @@ has the long-form architectural direction and open-question log.
 ## Status
 
 Alpha. Privacy invariants are implemented and tested (194 tests).
-Two frontends ship: a terminal UI (`builder`) and a pywebview-based
-web UI (`builder-ui`). The `.dmg` currently distributes the terminal
-entry point only; `builder-ui` runs from source. See
+Two frontends ship: a terminal UI (`nora`) and a pywebview-based
+web UI (`nora-ui`). The `.dmg` currently distributes the terminal
+entry point only; `nora-ui` runs from source. See
 [the handoff doc's status table](docs/handoff.md#where-it-stands).
 
 ## Platform requirements
@@ -49,7 +49,7 @@ Also needs:
 
 ## Installing
 
-If you have a `Builder.dmg` handed to you, see
+If you have a `Nora.dmg` handed to you, see
 [`docs/install.md`](docs/install.md) for double-click install
 instructions and first-run Gatekeeper workaround.
 
@@ -59,42 +59,42 @@ from the development checkout, see "Running from source" below.
 ## Running from source (developer workflow)
 
 ```bash
-git clone https://github.com/junishka/builder.git
-cd builder
+git clone https://github.com/junishka/builder.git nora
+cd nora
 uv sync --group dev
 uv run pytest                       # expect: 194 passed
 
 # Terminal frontend
-uv run builder                      # landing prompt for the data dir
-uv run builder /path/to/your/data   # straight into chat
+uv run nora                      # landing prompt for the data dir
+uv run nora /path/to/your/data   # straight into chat
 
 # Web-UI frontend (native WKWebView window via pywebview)
-uv run builder-ui                   # landing screen: drop files or pick folder
-uv run builder-ui /path/to/data     # straight into chat
+uv run nora-ui                   # landing screen: drop files or pick folder
+uv run nora-ui /path/to/data     # straight into chat
 ```
 
-With no path argument, `builder-ui` opens a landing screen where you
+With no path argument, `nora-ui` opens a landing screen where you
 can drag `.csv` / `.dta` / `.rds` files onto a drop zone, click
 **Choose files…** (native multi-select), or **Choose folder…**.
-Dropped files land in `~/.builder-sessions/<timestamp>_<id>/`
+Dropped files land in `~/.nora-sessions/<timestamp>_<id>/`
 which becomes the sandbox root for that session.
 
 To rebuild the distributable `.app` and `.dmg`:
 
 ```bash
-bash packaging/build_app.sh   # → dist/Builder.app  (unsigned)
-bash packaging/build_dmg.sh   # → dist/Builder.dmg  (~34 MB)
+bash packaging/build_app.sh   # → dist/Nora.app  (unsigned)
+bash packaging/build_dmg.sh   # → dist/Nora.dmg  (~34 MB)
 ```
 
 The resulting `.app` bundles Python, all dependencies, and the
 runtime libraries — researchers running it don't need Python,
 `uv`, or any build tooling installed. R and (optionally) Stata are
-still required separately since Builder invokes them as
+still required separately since Nora invokes them as
 subprocesses.
 
 ## Project layout
 
-- `src/builder/` — Python source.
+- `src/nora/` — Python source.
   - `app.py` — terminal entry point, system prompt, chat loop.
   - `ui.py` + `web/` — pywebview shell + HTML/CSS/JS frontend.
   - `tools.py` — the six MCP tools Claude sees.

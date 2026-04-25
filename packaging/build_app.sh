@@ -1,31 +1,38 @@
 #!/usr/bin/env bash
 #
-# Build Builder.app from the PyInstaller output.
+# Build Nora.app from the PyInstaller output.
+#
+# The bundled binary is the WEB UI (entry point:
+# src/nora/__main_ui__.py) — the pywebview shell. The terminal CLI
+# is intentionally NOT bundled in the .app; double-click should give
+# the chat window, not Terminal. The CLI stays available from source
+# via ``uv run nora``.
 #
 # Pipeline:
-#   1. `uv run pyinstaller packaging/builder.spec --clean --noconfirm`
-#      produces `dist/builder/` (one-dir bundle).
-#   2. Assemble Builder.app manually — no osacompile — so we control
-#      the launcher mechanism. Contents/MacOS/Builder is our own
-#      shell script from packaging/launcher.sh; see that file for
-#      why we avoid AppleScript.
+#   1. `uv run pyinstaller packaging/nora.spec --clean --noconfirm`
+#      produces `dist/nora/` (one-dir bundle).
+#   2. Assemble Nora.app manually (no osacompile) so we control
+#      the launcher. Contents/MacOS/Nora is the shell script from
+#      packaging/launcher.sh — it just execs the bundled binary;
+#      pywebview opens its own native window.
 #   3. Copy the PyInstaller bundle into
-#      Builder.app/Contents/Resources/builder/.
-#   4. Write an Info.plist that points at our launcher and sets the
-#      usual bundle metadata.
+#      Nora.app/Contents/Resources/nora/.
+#   4. Write an Info.plist marking it a normal GUI app (LSUIElement
+#      false → dock icon visible, Cmd-Q works as expected).
 #
 # Gatekeeper note: the resulting .app is unsigned. First-run workaround
-# (right-click → Open, or `xattr -cr Builder.app`) is documented in
+# (right-click → Open, or `xattr -cr Nora.app`) is documented in
 # docs/install.md. Proper code-signing is deferred until wider
-# distribution justifies paying for the Apple Developer Program.
+# distribution justifies paying for the Apple Developer Program; until
+# then the .dmg pipeline is mostly developer-internal.
 #
 # Usage (from repo root):
 #   bash packaging/build_app.sh
 #
 # Produces:
-#   dist/Builder.app      — the macOS application bundle
-#   dist/builder/         — the raw PyInstaller output (kept for
-#                            direct CLI invocation and debugging)
+#   dist/Nora.app      — the macOS application bundle (web UI)
+#   dist/nora/         — the raw PyInstaller output (kept for
+#                            direct invocation and debugging)
 
 set -euo pipefail
 
@@ -33,29 +40,29 @@ REPO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO_ROOT"
 
 DIST_DIR="$REPO_ROOT/dist"
-PYINSTALLER_OUT="$DIST_DIR/builder"
-APP_BUNDLE="$DIST_DIR/Builder.app"
+PYINSTALLER_OUT="$DIST_DIR/nora"
+APP_BUNDLE="$DIST_DIR/Nora.app"
 
 echo "==> Running PyInstaller"
-uv run pyinstaller packaging/builder.spec --clean --noconfirm >/dev/null
+uv run pyinstaller packaging/nora.spec --clean --noconfirm >/dev/null
 
-if [[ ! -x "$PYINSTALLER_OUT/builder" ]]; then
-    echo "PyInstaller did not produce $PYINSTALLER_OUT/builder" >&2
+if [[ ! -x "$PYINSTALLER_OUT/nora" ]]; then
+    echo "PyInstaller did not produce $PYINSTALLER_OUT/nora" >&2
     exit 1
 fi
 
-echo "==> Assembling Builder.app"
+echo "==> Assembling Nora.app"
 rm -rf "$APP_BUNDLE"
 mkdir -p "$APP_BUNDLE/Contents/MacOS"
-mkdir -p "$APP_BUNDLE/Contents/Resources/builder"
+mkdir -p "$APP_BUNDLE/Contents/Resources/nora"
 
 # Launcher script — the .app's executable per Info.plist.
-cp "$REPO_ROOT/packaging/launcher.sh" "$APP_BUNDLE/Contents/MacOS/Builder"
-chmod +x "$APP_BUNDLE/Contents/MacOS/Builder"
+cp "$REPO_ROOT/packaging/launcher.sh" "$APP_BUNDLE/Contents/MacOS/Nora"
+chmod +x "$APP_BUNDLE/Contents/MacOS/Nora"
 
-# PyInstaller bundle — lives under Resources/builder/.
+# PyInstaller bundle — lives under Resources/nora/.
 # `cp -R` preserves the _internal/ layout PyInstaller generates.
-cp -R "$PYINSTALLER_OUT/." "$APP_BUNDLE/Contents/Resources/builder/"
+cp -R "$PYINSTALLER_OUT/." "$APP_BUNDLE/Contents/Resources/nora/"
 
 echo "==> Writing Info.plist"
 cat > "$APP_BUNDLE/Contents/Info.plist" <<'PLIST'
@@ -64,27 +71,27 @@ cat > "$APP_BUNDLE/Contents/Info.plist" <<'PLIST'
 <plist version="1.0">
 <dict>
     <key>CFBundleName</key>
-    <string>Builder</string>
+    <string>Nora</string>
     <key>CFBundleDisplayName</key>
-    <string>Builder</string>
+    <string>Nora</string>
     <key>CFBundleIdentifier</key>
-    <string>app.junishka.builder</string>
+    <string>app.junishka.nora</string>
     <key>CFBundleVersion</key>
     <string>0.0.1</string>
     <key>CFBundleShortVersionString</key>
     <string>0.0.1</string>
     <key>CFBundleExecutable</key>
-    <string>Builder</string>
+    <string>Nora</string>
     <key>CFBundlePackageType</key>
     <string>APPL</string>
     <key>CFBundleSignature</key>
     <string>????</string>
     <key>LSMinimumSystemVersion</key>
     <string>11.0</string>
-    <!-- LSUIElement=false means Builder shows up in Launchpad / Dock -->
-    <!-- during the brief moment the launcher runs before spawning    -->
-    <!-- Terminal. Set to true to hide (feels cleaner but then        -->
-    <!-- Cmd-Q-on-Builder doesn't work; keep visible).                -->
+    <!-- LSUIElement=false: standard GUI app — dock icon present,    -->
+    <!-- shows up in Cmd-Tab, Cmd-Q quits cleanly. Earlier comment   -->
+    <!-- here referenced spawning Terminal; the launcher no longer   -->
+    <!-- does that, so the only window the user sees is pywebview's. -->
     <key>LSUIElement</key>
     <false/>
     <key>NSHighResolutionCapable</key>

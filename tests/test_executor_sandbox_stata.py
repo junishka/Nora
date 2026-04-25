@@ -24,8 +24,8 @@ from pathlib import Path
 
 import pytest
 
-from builder.env_detect import find_sandbox_exec, find_stata
-from builder.executor import run_script
+from nora.env_detect import find_sandbox_exec, find_stata
+from nora.executor import run_script
 
 
 def _sandbox_apply_works() -> bool:
@@ -73,7 +73,7 @@ def test_stata_sandbox_allows_runtime_write(tmp_path: Path):
     code = '''
 sysuse auto, clear
 regress price mpg
-builder_result_regress, label("stata-happy-path")
+nora_result_regress, label("stata-happy-path")
 '''
     r = run_script("Stata", code, tmp_path)
     assert r.ok, f"Stata script failed: error={r.error}\nstdout tail={r.raw_stdout[-500:]}"
@@ -103,7 +103,7 @@ def test_stata_sandbox_allows_cwd_read(tmp_path: Path):
     code = '''
 import delimited "data.csv", clear
 regress y x
-builder_result_regress, label("stata-cwd-read")
+nora_result_regress, label("stata-cwd-read")
 '''
     r = run_script("Stata", code, tmp_path)
     assert r.ok, f"Stata script failed: error={r.error}\nstdout tail={r.raw_stdout[-500:]}"
@@ -136,7 +136,7 @@ if _rc == 0 {{
 
 sysuse auto, clear
 regress price mpg
-builder_result_regress, label("stata-probe=`probe_status'")
+nora_result_regress, label("stata-probe=`probe_status'")
 '''
 
 
@@ -190,14 +190,14 @@ def test_stata_sandbox_blocks_write_outside_run_dir(tmp_path: Path):
     caches = Path("/Library/Caches")
     if not caches.is_dir():
         pytest.skip("/Library/Caches not present")
-    probe = caches / f".builder_test_permcheck_{uuid.uuid4().hex[:8]}"
+    probe = caches / f".nora_test_permcheck_{uuid.uuid4().hex[:8]}"
     try:
         probe.write_text("x")
         probe.unlink()
     except OSError:
         pytest.skip("/Library/Caches not user-writable here")
 
-    victim = caches / f".builder_test_stata_victim_{uuid.uuid4().hex[:8]}.txt"
+    victim = caches / f".nora_test_stata_victim_{uuid.uuid4().hex[:8]}.txt"
     if victim.exists():
         victim.unlink()
     try:
@@ -210,7 +210,7 @@ if _rc == 0 {{
 
 sysuse auto, clear
 regress price mpg
-builder_result_regress, label("stata-write-probe")
+nora_result_regress, label("stata-write-probe")
 '''
         r = run_script("Stata", code, tmp_path)
         assert not victim.exists(), (

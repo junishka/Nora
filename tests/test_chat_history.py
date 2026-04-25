@@ -16,7 +16,7 @@ import pytest
 
 from dataclasses import dataclass as _dc
 
-from builder.chat_history import (
+from nora.chat_history import (
     Turn,
     ToolUse,
     build_context_prefix,
@@ -27,7 +27,7 @@ from builder.chat_history import (
 
 @_dc
 class _StubResult:
-    """Minimal stand-in for builder.store.StoredResult — carries just
+    """Minimal stand-in for nora.store.StoredResult — carries just
     the fields build_context_prefix reads."""
     id: str
     label: str
@@ -39,8 +39,8 @@ def _write_jsonl(tmp_path: Path, events: list[dict[str, Any]]) -> Path:
     """Set up a session cwd with a seeded chat_history.jsonl and
     return the cwd — not the file path. read_turns expects a cwd
     rooted at the session dir, not a bare log path."""
-    (tmp_path / ".builder").mkdir()
-    log = tmp_path / ".builder" / "chat_history.jsonl"
+    (tmp_path / ".nora").mkdir()
+    log = tmp_path / ".nora" / "chat_history.jsonl"
     with log.open("w") as f:
         for e in events:
             f.write(json.dumps(e) + "\n")
@@ -56,8 +56,8 @@ def test_missing_file_returns_empty(tmp_path: Path):
 
 
 def test_empty_file_returns_empty(tmp_path: Path):
-    (tmp_path / ".builder").mkdir()
-    (tmp_path / ".builder" / "chat_history.jsonl").write_text("")
+    (tmp_path / ".nora").mkdir()
+    (tmp_path / ".nora" / "chat_history.jsonl").write_text("")
     assert read_turns(tmp_path) == []
 
 
@@ -91,7 +91,7 @@ def test_assistant_text_blocks_joined(tmp_path: Path):
     cwd = _write_jsonl(tmp_path, [
         {"type": "user_message", "text": "run OLS"},
         {"type": "assistant_text", "text": "Sure, first let me check the schema."},
-        {"type": "tool_call", "name": "mcp__builder__get_schema",
+        {"type": "tool_call", "name": "mcp__nora__get_schema",
          "call_id": "c1", "input": {"dataset": "x.csv", "depth": "names_types"}},
         {"type": "tool_result", "call_id": "c1", "text": "{}", "is_error": False},
         {"type": "assistant_text", "text": "Coefficient is -0.15 (p=0.04)."},
@@ -120,7 +120,7 @@ def test_multiple_turns_separated_by_user_message(tmp_path: Path):
 def test_tool_call_and_result_paired_by_call_id(tmp_path: Path):
     cwd = _write_jsonl(tmp_path, [
         {"type": "user_message", "text": "run it"},
-        {"type": "tool_call", "name": "mcp__builder__submit_script",
+        {"type": "tool_call", "name": "mcp__nora__submit_script",
          "call_id": "abc", "input": {"language": "R", "label": "OLS fit"}},
         {"type": "tool_result", "call_id": "abc",
          "text": '{"result_id": "r-42", "status": "ok"}',
@@ -141,7 +141,7 @@ def test_tool_call_and_result_paired_by_call_id(tmp_path: Path):
 def test_tool_call_error_result_flagged(tmp_path: Path):
     cwd = _write_jsonl(tmp_path, [
         {"type": "user_message", "text": "run bad script"},
-        {"type": "tool_call", "name": "mcp__builder__submit_script",
+        {"type": "tool_call", "name": "mcp__nora__submit_script",
          "call_id": "x", "input": {"language": "R", "label": "boom"}},
         {"type": "tool_result", "call_id": "x",
          "text": "execution failed", "is_error": True},
@@ -165,8 +165,8 @@ def test_orphan_events_before_first_user_message_are_dropped(tmp_path: Path):
 
 
 def test_malformed_lines_are_skipped(tmp_path: Path):
-    (tmp_path / ".builder").mkdir()
-    log = tmp_path / ".builder" / "chat_history.jsonl"
+    (tmp_path / ".nora").mkdir()
+    log = tmp_path / ".nora" / "chat_history.jsonl"
     log.write_text(
         '{"type": "user_message", "text": "ok"}\n'
         'not-json-at-all\n'
@@ -276,7 +276,7 @@ def test_build_prefix_with_only_results_no_turns(tmp_path: Path):
 def test_build_prefix_turns_and_results_together(tmp_path: Path):
     cwd = _write_jsonl(tmp_path, [
         {"type": "user_message", "text": "run OLS"},
-        {"type": "tool_call", "name": "mcp__builder__submit_script",
+        {"type": "tool_call", "name": "mcp__nora__submit_script",
          "call_id": "c1",
          "input": {"language": "R", "label": "OLS of log(salary)"}},
         {"type": "tool_result", "call_id": "c1",

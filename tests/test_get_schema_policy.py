@@ -1,7 +1,7 @@
 """Integration tests for the get_schema MCP tool's policy enforcement.
 
 These tests exercise the full tool-handler path:
-``get_schema`` loads the policy from ``<cwd>/.builder/policy.json``,
+``get_schema`` loads the policy from ``<cwd>/.nora/policy.json``,
 compares the requested depth against the per-dataset ceiling, and
 denies requests that exceed it. Successful responses carry a
 ``policy_max_depth`` field so Claude knows what the ceiling is
@@ -17,14 +17,14 @@ import asyncio
 import json
 from pathlib import Path
 
-from builder.config import set_cwd
-from builder.policy import (
+from nora.config import set_cwd
+from nora.policy import (
     DEFAULT_MAX_DEPTH,
-    BuilderPolicy,
+    NoraPolicy,
     DatasetPolicy,
     save_policy,
 )
-from builder.tools import get_schema
+from nora.tools import get_schema
 
 
 def _call_get_schema(args: dict) -> dict:
@@ -122,7 +122,7 @@ def test_explicit_lower_policy_denies_above_ceiling(tmp_path: Path):
     csv = tmp_path / "d.csv"
     csv.write_text("x,y\n1,2\n3,4\n5,6\n")
 
-    save_policy(tmp_path, BuilderPolicy(
+    save_policy(tmp_path, NoraPolicy(
         datasets={"d.csv": DatasetPolicy(
             max_depth="names_types",
             set_at="2026-04-21T00:00:00+00:00",
@@ -135,7 +135,7 @@ def test_explicit_lower_policy_denies_above_ceiling(tmp_path: Path):
     assert resp["policy_max_depth"] == "names_types"
     # Reason should mention it's an explicit ceiling (not the default)
     # so Claude can tell the researcher their own setting is what's
-    # blocking, not Builder's baseline.
+    # blocking, not Nora's baseline.
     assert "explicit" in resp["reason"].lower()
 
 
@@ -150,7 +150,7 @@ def test_explicit_policy_raises_ceiling(tmp_path: Path):
     csv = tmp_path / "d.csv"
     csv.write_text("x,y\n1,2\n3,4\n5,6\n")
 
-    save_policy(tmp_path, BuilderPolicy(
+    save_policy(tmp_path, NoraPolicy(
         datasets={"d.csv": DatasetPolicy(
             max_depth="names_types_labels",
             set_at="2026-04-21T00:00:00+00:00",
@@ -171,7 +171,7 @@ def test_explicit_policy_denial_mentions_explicit(tmp_path: Path):
     csv = tmp_path / "d.csv"
     csv.write_text("x,y\n1,2\n3,4\n5,6\n")
 
-    save_policy(tmp_path, BuilderPolicy(
+    save_policy(tmp_path, NoraPolicy(
         datasets={"d.csv": DatasetPolicy(
             max_depth="names_only",
             set_at="2026-04-21T00:00:00+00:00",
@@ -193,7 +193,7 @@ def test_policy_applies_per_dataset(tmp_path: Path):
     csv_b = tmp_path / "sensitive.csv"
     csv_b.write_text("x,y\n1,2\n3,4\n")
 
-    save_policy(tmp_path, BuilderPolicy(
+    save_policy(tmp_path, NoraPolicy(
         datasets={
             "public.csv": DatasetPolicy(max_depth="names_types_labels_summary"),
             "sensitive.csv": DatasetPolicy(max_depth="names_only"),

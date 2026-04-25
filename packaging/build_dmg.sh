@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
 #
-# Build Builder.dmg — a drag-to-/Applications installer for Builder.app.
+# Build Nora.dmg — a drag-to-/Applications installer for Nora.app.
 #
-# Requires `dist/Builder.app` to already exist (run build_app.sh first
-# if needed). Produces `dist/Builder.dmg`.
+# Requires `dist/Nora.app` to already exist (run build_app.sh first
+# if needed). Produces `dist/Nora.dmg`.
 #
 # Structure the .dmg presents when mounted:
-#   Builder.dmg/
-#     Builder.app         # drag this...
+#   Nora.dmg/
+#     Nora.app         # drag this...
 #     Applications -> /Applications  # ...into here
 #
 # We could go further with a custom background image and icon
@@ -26,12 +26,12 @@ REPO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO_ROOT"
 
 DIST_DIR="$REPO_ROOT/dist"
-APP_BUNDLE="$DIST_DIR/Builder.app"
-DMG_OUT="$DIST_DIR/Builder.dmg"
+APP_BUNDLE="$DIST_DIR/Nora.app"
+DMG_OUT="$DIST_DIR/Nora.dmg"
 STAGING="$DIST_DIR/dmg-staging"
 
 if [[ ! -d "$APP_BUNDLE" ]]; then
-    echo "Builder.app not found at $APP_BUNDLE — run build_app.sh first." >&2
+    echo "Nora.app not found at $APP_BUNDLE — run build_app.sh first." >&2
     exit 1
 fi
 
@@ -53,7 +53,7 @@ echo "==> Building $DMG_OUT"
 # avoids APFS-specific packaging which some older macOS versions
 # can't mount.
 /usr/bin/hdiutil create \
-    -volname "Builder" \
+    -volname "Nora" \
     -srcfolder "$STAGING" \
     -fs HFS+ \
     -format UDZO \

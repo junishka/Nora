@@ -1,4 +1,4 @@
-"""Restart- and lifecycle-focused tests for BuilderBridge memory.
+"""Restart- and lifecycle-focused tests for NoraBridge memory.
 
 The memory stack relies on a small state machine on the bridge:
 
@@ -29,8 +29,8 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from builder.chat_history import build_context_prefix
-from builder.ui import BuilderBridge
+from nora.chat_history import build_context_prefix
+from nora.ui import NoraBridge
 
 
 # ---------------------------------------------------------------------------
@@ -41,7 +41,7 @@ def test_bridge_starts_with_clean_memory_state(tmp_path: Path):
     """A freshly-constructed bridge has no client and no pending
     context prefix — memory injection is opt-in, triggered only
     when a client is actually opened."""
-    bridge = BuilderBridge(cwd=tmp_path)
+    bridge = NoraBridge(cwd=tmp_path)
     assert bridge._client is None
     assert bridge._needs_context_prefix is False
 
@@ -54,10 +54,10 @@ def test_persist_event_adds_iso_timestamp(tmp_path: Path):
     """Persisted events get stamped with a UTC ISO timestamp so the
     Turn reader can order them and the session_state file can show
     'last active' times."""
-    bridge = BuilderBridge(cwd=tmp_path)
+    bridge = NoraBridge(cwd=tmp_path)
     bridge._persist_event({"type": "user_message", "text": "hello"})
 
-    log = tmp_path / ".builder" / "chat_history.jsonl"
+    log = tmp_path / ".nora" / "chat_history.jsonl"
     assert log.exists()
     rec = json.loads(log.read_text().splitlines()[0])
     assert "timestamp" in rec
@@ -72,11 +72,11 @@ def test_persist_event_skips_non_persist_types(tmp_path: Path):
     """Transient events (turn_done, auth_failure, ready, etc.) must
     not pollute the chat log — otherwise replay reconstructs phantom
     turns."""
-    bridge = BuilderBridge(cwd=tmp_path)
+    bridge = NoraBridge(cwd=tmp_path)
     bridge._persist_event({"type": "turn_done", "input_tokens": 100})
     bridge._persist_event({"type": "ready"})
 
-    log = tmp_path / ".builder" / "chat_history.jsonl"
+    log = tmp_path / ".nora" / "chat_history.jsonl"
     # No file written at all — persistence only happens for log-worthy
     # types.
     assert not log.exists()
@@ -86,14 +86,14 @@ def test_persist_event_preserves_caller_timestamp(tmp_path: Path):
     """If the caller already supplied a timestamp (replay, import
     from external log), we don't overwrite it — otherwise importing
     a log would rewrite all its times to 'now'."""
-    bridge = BuilderBridge(cwd=tmp_path)
+    bridge = NoraBridge(cwd=tmp_path)
     bridge._persist_event({
         "type": "user_message",
         "text": "x",
         "timestamp": "2024-01-01T00:00:00+00:00",
     })
     rec = json.loads(
-        (tmp_path / ".builder" / "chat_history.jsonl").read_text().splitlines()[0]
+        (tmp_path / ".nora" / "chat_history.jsonl").read_text().splitlines()[0]
     )
     assert rec["timestamp"] == "2024-01-01T00:00:00+00:00"
 
@@ -105,7 +105,7 @@ def test_persist_event_preserves_caller_timestamp(tmp_path: Path):
 def test_close_client_blocking_when_no_client(tmp_path: Path):
     """No client to close: no-op, no error. Safe to call
     defensively from Stop / switch / teardown paths."""
-    bridge = BuilderBridge(cwd=tmp_path)
+    bridge = NoraBridge(cwd=tmp_path)
     assert bridge._client is None
     bridge._close_client_blocking()  # must not raise
     assert bridge._client is None
@@ -116,7 +116,7 @@ def test_close_client_blocking_without_loop(tmp_path: Path):
     the async close, but we still need to drop the reference so the
     next turn opens fresh. Otherwise Stop after a startup failure
     would leak the half-initialized client."""
-    bridge = BuilderBridge(cwd=tmp_path)
+    bridge = NoraBridge(cwd=tmp_path)
     bridge._client = MagicMock()  # pretend there's a client
     bridge._loop = None
 
@@ -136,7 +136,7 @@ def test_set_cwd_closes_client_on_cwd_change(tmp_path: Path):
     (tmp_path / "a").mkdir()
     (tmp_path / "b").mkdir()
 
-    bridge = BuilderBridge(cwd=tmp_path / "a")
+    bridge = NoraBridge(cwd=tmp_path / "a")
     # Simulate a live client. _close_client_blocking handles the
     # no-loop case by just clearing the reference, so we don't
     # need a working event loop here.
@@ -154,7 +154,7 @@ def test_set_cwd_same_path_keeps_client(tmp_path: Path):
     call would waste a conversation."""
     (tmp_path / "a").mkdir()
 
-    bridge = BuilderBridge(cwd=tmp_path / "a")
+    bridge = NoraBridge(cwd=tmp_path / "a")
     sentinel = MagicMock()
     bridge._client = sentinel
 
@@ -174,8 +174,8 @@ def test_cold_start_prefix_contains_prior_exchange(tmp_path: Path):
     from a previous run. ``build_context_prefix`` must render a
     block that contains the prior user + assistant exchange so
     Claude picks up where the researcher left off."""
-    (tmp_path / ".builder").mkdir()
-    log = tmp_path / ".builder" / "chat_history.jsonl"
+    (tmp_path / ".nora").mkdir()
+    log = tmp_path / ".nora" / "chat_history.jsonl"
     log.write_text(
         json.dumps({"type": "user_message", "text": "what does the gate do?"}) + "\n"
         + json.dumps({"type": "assistant_text",
@@ -203,13 +203,13 @@ def test_cold_start_prefix_across_multiple_sessions(tmp_path: Path):
     after a switch."""
     session_a = tmp_path / "a"
     session_b = tmp_path / "b"
-    (session_a / ".builder").mkdir(parents=True)
-    (session_b / ".builder").mkdir(parents=True)
+    (session_a / ".nora").mkdir(parents=True)
+    (session_b / ".nora").mkdir(parents=True)
 
-    (session_a / ".builder" / "chat_history.jsonl").write_text(
+    (session_a / ".nora" / "chat_history.jsonl").write_text(
         json.dumps({"type": "user_message", "text": "about dataset A"}) + "\n"
     )
-    (session_b / ".builder" / "chat_history.jsonl").write_text(
+    (session_b / ".nora" / "chat_history.jsonl").write_text(
         json.dumps({"type": "user_message", "text": "about dataset B"}) + "\n"
     )
 
@@ -230,7 +230,7 @@ def test_interrupt_turn_no_running_turn(tmp_path: Path):
     """Stop with nothing in flight: surfaces a clean error rather
     than raising. The UI can then re-enable the composer without
     special-casing."""
-    bridge = BuilderBridge(cwd=tmp_path)
+    bridge = NoraBridge(cwd=tmp_path)
 
     # Need a running loop for the interrupt_turn code path that
     # uses call_soon_threadsafe. We spin up a tiny one for the test.
@@ -249,7 +249,7 @@ def test_interrupt_turn_no_running_turn(tmp_path: Path):
 # ---------------------------------------------------------------------------
 
 def test_needs_context_prefix_survives_restart_of_bridge(tmp_path: Path):
-    """A fresh BuilderBridge starts with the flag False. That's
+    """A fresh NoraBridge starts with the flag False. That's
     correct — the flag means 'the NEXT turn must inject a prefix'.
     On cold boot, the flag flips True inside ``_ensure_client`` when
     it opens the first client of the process, not at construction.
@@ -258,11 +258,11 @@ def test_needs_context_prefix_survives_restart_of_bridge(tmp_path: Path):
     'helpfully' pre-sets the flag to True in __init__ (and thereby
     double-injects the prefix on the first-ever turn of a brand-new
     session) gets caught."""
-    bridge1 = BuilderBridge(cwd=tmp_path)
+    bridge1 = NoraBridge(cwd=tmp_path)
     assert bridge1._needs_context_prefix is False
 
     # Simulate an app reopen: a second bridge against the same cwd.
-    bridge2 = BuilderBridge(cwd=tmp_path)
+    bridge2 = NoraBridge(cwd=tmp_path)
     assert bridge2._needs_context_prefix is False
 
 
@@ -279,7 +279,7 @@ def test_needs_context_prefix_survives_restart_of_bridge(tmp_path: Path):
 #    False → set True by ``_ensure_client`` → consumed by
 #    ``_run_turn`` → reset to False is simple, but verifying the
 #    full loop needs a mocked async client context manager.
-#    Smoke-test: restart Builder in a session with prior history,
+#    Smoke-test: restart Nora in a session with prior history,
 #    send a message, confirm Claude references earlier turns.
 #
 # 2. Carried-prefix restoration on cancel / error. The
@@ -302,4 +302,4 @@ def test_needs_context_prefix_survives_restart_of_bridge(tmp_path: Path):
 #    branch of ``_run_turn``. Covered by the session_state tests
 #    for the writer itself; the hook wiring is verified by
 #    inspection and a smoke test (send a message, confirm
-#    ``.builder/session_state.json`` timestamps refresh).
+#    ``.nora/session_state.json`` timestamps refresh).

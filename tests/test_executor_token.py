@@ -1,7 +1,7 @@
 """Unit + integration tests for the per-run authenticity token.
 
 The token is the executor's defense against a malicious script writing
-hand-crafted JSON directly to ``BUILDER_RESULT_PATH`` and bypassing
+hand-crafted JSON directly to ``NORA_RESULT_PATH`` and bypassing
 the runtime library. The runtime library embeds a random per-run
 token in every emitted payload; the executor validates it and strips
 it before the payload reaches the sanitizer.
@@ -14,7 +14,7 @@ Two kinds of tests here:
   payloads with the right token get the token stripped before flowing
   on.
 
-- **Integration test** that a real R script bypassing the builder
+- **Integration test** that a real R script bypassing the nora
   library fails. Gated on ``Rscript`` + ``sandbox-apply`` preflight,
   same as the other sandbox integration tests. This is the
   end-to-end proof that the defense actually works against the
@@ -34,8 +34,8 @@ from pathlib import Path
 
 import pytest
 
-from builder.env_detect import find_sandbox_exec
-from builder.executor import (
+from nora.env_detect import find_sandbox_exec
+from nora.executor import (
     RESULT_TOKEN_FIELD,
     _generate_run_token,
     _validate_and_strip_token,
@@ -148,7 +148,7 @@ requires_sandbox_apply = pytest.mark.skipif(
 @requires_sandbox_apply
 @requires_rscript
 def test_bypass_without_token_is_rejected(tmp_path: Path):
-    """A script that writes hand-crafted JSON to BUILDER_RESULT_PATH
+    """A script that writes hand-crafted JSON to NORA_RESULT_PATH
     without going through the runtime library must be rejected.
 
     This is the core defense the token adds. Before the token, the
@@ -158,10 +158,10 @@ def test_bypass_without_token_is_rejected(tmp_path: Path):
     authenticity check before it reaches the sanitizer.
     """
     # Note: this R script explicitly does NOT call anything from the
-    # `builder` runtime. It just opens the result file and writes a
+    # `nora` runtime. It just opens the result file and writes a
     # plausible-looking regression payload.
     code = (
-        'result_path <- Sys.getenv("BUILDER_RESULT_PATH")\n'
+        'result_path <- Sys.getenv("NORA_RESULT_PATH")\n'
         'con <- file(result_path, open = "w", encoding = "UTF-8")\n'
         'writeLines(paste0(\n'
         '  \'{"type":"linear_regression","n":100,\',\n'
@@ -195,7 +195,7 @@ def test_legitimate_script_with_token_succeeds(tmp_path: Path):
     validation doesn't reject legitimate payloads."""
     code = (
         'df <- data.frame(x = 1:12, y = (1:12) * 2)\n'
-        'builder$from_lm(lm(y ~ x, data = df), label = "legit")\n'
+        'nora$from_lm(lm(y ~ x, data = df), label = "legit")\n'
     )
     r = run_script("R", code, tmp_path)
     assert r.ok, f"legitimate script failed: {r.error}"

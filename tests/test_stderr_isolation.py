@@ -24,9 +24,9 @@ from pathlib import Path
 
 import pytest
 
-from builder.config import set_cwd
-from builder.env_detect import detect_environment
-from builder.tools import submit_script
+from nora.config import set_cwd
+from nora.env_detect import detect_environment
+from nora.tools import submit_script
 
 
 # A token nothing should reasonably produce organically, so its presence
@@ -48,7 +48,7 @@ message("{_INJECTION_CANARY} STDERR")
 set.seed(1)
 x <- rnorm(50); y <- rnorm(50)
 m <- lm(y ~ x)
-builder$from_lm(m)
+nora$from_lm(m)
 """
     # @tool-decorated functions are wrapped in SdkMcpTool; the underlying
     # async function lives on `.handler`.

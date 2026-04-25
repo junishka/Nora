@@ -13,7 +13,7 @@ import pytest
 from hypothesis import HealthCheck, assume, given, settings
 from hypothesis import strategies as st
 
-from builder.sdc import (
+from nora.sdc import (
     MinimumNViolation,
     clamp_precision,
     require_minimum_n,
