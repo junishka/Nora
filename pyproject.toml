@@ -1,5 +1,5 @@
 [project]
-name = "builder"
+name = "nora"
 version = "0.0.1"
 description = "Local privacy layer letting Claude drive statistical analysis on a researcher's own machine (macOS-only at this stage)"
 requires-python = ">=3.10"
@@ -31,17 +31,17 @@ dependencies = [
     "pyreadstat>=1.2",
     "pyreadr>=0.5",
     "pandas>=2.0",
-    # Web UI shell (`builder-ui` entry point). pywebview wraps a native
+    # Web UI shell (`nora-ui` entry point). pywebview wraps a native
     # WKWebView window on macOS — no Chromium bundled, ~25 MB added to
-    # the .app rather than ~120 MB for Electron. Terminal UI (`builder`)
+    # the .app rather than ~120 MB for Electron. Terminal UI (`nora`)
     # keeps working without it; pywebview is imported lazily by the UI
     # entry point.
     "pywebview>=5.0",
 ]
 
 [project.scripts]
-builder = "builder.app:main"
-builder-ui = "builder.ui:main"
+nora = "nora.app:main"
+nora-ui = "nora.ui:main"
 
 [dependency-groups]
 dev = [
@@ -59,7 +59,7 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/builder"]
+packages = ["src/nora"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

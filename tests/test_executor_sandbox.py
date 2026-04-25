@@ -36,8 +36,8 @@ from pathlib import Path
 
 import pytest
 
-from builder.env_detect import find_sandbox_exec
-from builder.executor import run_script
+from nora.env_detect import find_sandbox_exec
+from nora.executor import run_script
 
 
 _RSCRIPT = shutil.which("Rscript")
@@ -95,7 +95,7 @@ def test_sandbox_allows_cwd_read_and_runtime_write(tmp_path: Path, tiny_csv: Pat
     """The profile must let R read data from cwd and emit a result payload."""
     code = r'''
 df <- read.csv("data.csv")
-builder$from_lm(lm(y ~ x, data = df), label = "ok")
+nora$from_lm(lm(y ~ x, data = df), label = "ok")
 '''
     r = run_script("R", code, tmp_path)
     assert r.ok, f"script failed: error={r.error}\nstderr={r.raw_stderr}"
@@ -140,7 +140,7 @@ def test_sandbox_blocks_read_outside_allowlist(tmp_path: Path, tiny_csv: Path):
         '  error = function(e) paste("DENIED:", conditionMessage(e)),\n'
         '  warning = function(w) paste("DENIED:", conditionMessage(w)))\n'
         'df <- data.frame(x = 1:12, y = (1:12) * 2)\n'
-        'builder$from_lm(lm(y ~ x, data = df), '
+        'nora$from_lm(lm(y ~ x, data = df), '
         'label = paste0("probe=", substr(paste(probe, collapse="|"), 1, 80)))\n'
     )
     r = run_script("R", code, tmp_path)
@@ -170,7 +170,7 @@ def test_sandbox_blocks_home_dotfile_reads(tmp_path: Path, tiny_csv: Path):
         '  error = function(e) paste("DENIED:", conditionMessage(e)),\n'
         '  warning = function(w) paste("DENIED:", conditionMessage(w)))\n'
         'df <- data.frame(x = 1:12, y = (1:12) * 3)\n'
-        'builder$from_lm(lm(y ~ x, data = df), '
+        'nora$from_lm(lm(y ~ x, data = df), '
         'label = paste0("home-probe=", substr(paste(probe, collapse="|"), 1, 80)))\n'
     )
     r = run_script("R", code, tmp_path)
@@ -202,14 +202,14 @@ def test_sandbox_blocks_write_outside_run_dir(tmp_path: Path, tiny_csv: Path):
         pytest.skip("/Library/Caches not present")
     # Probe whether the test process itself can write there; if not,
     # the test can't distinguish sandbox-denied from permission-denied.
-    probe = caches / f".builder_test_permcheck_{uuid.uuid4().hex[:8]}"
+    probe = caches / f".nora_test_permcheck_{uuid.uuid4().hex[:8]}"
     try:
         probe.write_text("x")
         probe.unlink()
     except OSError:
         pytest.skip("/Library/Caches not user-writable here")
 
-    victim = caches / f".builder_test_victim_{uuid.uuid4().hex[:8]}.txt"
+    victim = caches / f".nora_test_victim_{uuid.uuid4().hex[:8]}.txt"
     if victim.exists():
         victim.unlink()
     try:
@@ -217,7 +217,7 @@ def test_sandbox_blocks_write_outside_run_dir(tmp_path: Path, tiny_csv: Path):
             f'tryCatch(writeLines("pwned", "{victim}"), '
             'error = function(e) e, warning = function(w) w)\n'
             'df <- data.frame(x = 1:12, y = (1:12) * 4)\n'
-            'builder$from_lm(lm(y ~ x, data = df), label = "write-probe")\n'
+            'nora$from_lm(lm(y ~ x, data = df), label = "write-probe")\n'
         )
         r = run_script("R", code, tmp_path)
         assert not victim.exists(), (
@@ -239,7 +239,7 @@ def test_run_script_refuses_without_sandbox(tmp_path: Path):
     """If sandbox-exec is unavailable (e.g. Linux/Windows), run_script
     must refuse rather than fall through to an unsandboxed subprocess.
     """
-    from builder import env_detect, executor
+    from nora import env_detect, executor
 
     fake_env = env_detect.Environment(
         r=env_detect.Tool(name="R", binary="/bin/true"),

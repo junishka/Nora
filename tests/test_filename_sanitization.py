@@ -18,8 +18,8 @@ import pandas as pd
 import pytest
 from pathlib import Path
 
-from builder.app import _dataset_listing
-from builder.schema import extract
+from nora.app import _dataset_listing
+from nora.schema import extract
 
 
 # ---------------------------------------------------------------------------

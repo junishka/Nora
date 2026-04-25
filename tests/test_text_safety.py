@@ -22,8 +22,8 @@ import re
 from hypothesis import HealthCheck, given, settings
 from hypothesis import strategies as st
 
-from builder.sanitizer import sanitize
-from builder.text_safety import (
+from nora.sanitizer import sanitize
+from nora.text_safety import (
     DEFAULT_KEY_MAX_LEN,
     DEFAULT_TEXT_MAX_LEN,
     safe_key,

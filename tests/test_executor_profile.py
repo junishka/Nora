@@ -18,14 +18,14 @@ from pathlib import Path
 
 import pytest
 
-from builder.executor import _sandbox_profile_string
+from nora.executor import _sandbox_profile_string
 
 
 @pytest.fixture
 def example_profile() -> str:
     """Render the profile for a plausible run to inspect."""
     return _sandbox_profile_string(
-        run_dir=Path("/private/var/folders/ab/cdefg/T/builder/run-1234"),
+        run_dir=Path("/private/var/folders/ab/cdefg/T/nora/run-1234"),
         cwd=Path("/Users/testuser/project"),
         home=Path("/Users/testuser"),
     )
@@ -188,7 +188,7 @@ def test_cwd_is_read_allowed(example_profile: str):
 
 
 def test_run_dir_is_read_and_write_allowed(example_profile: str):
-    run_entry = '(subpath "/private/var/folders/ab/cdefg/T/builder/run-1234")'
+    run_entry = '(subpath "/private/var/folders/ab/cdefg/T/nora/run-1234")'
     # Should appear in BOTH the read and write clauses.
     assert example_profile.count(run_entry) >= 2
 

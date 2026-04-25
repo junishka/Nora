@@ -1,12 +1,12 @@
-# Builder — overview
+# Nora — overview
 
-Plain-language description of what Builder is and the architectural
+Plain-language description of what Nora is and the architectural
 choice behind the current design. Intended for people who haven't
 been in the design conversation.
 
-## What Builder is
+## What Nora is
 
-Builder is a tool that sits on a researcher's own computer and lets
+Nora is a tool that sits on a researcher's own computer and lets
 them use Claude (or another AI assistant) to analyze sensitive data
 — medical records, HR data, survey responses, IRB-restricted
 research — without sending that data to any third party.
@@ -15,15 +15,15 @@ The problem it solves: AI assistants are useful for data analysis,
 but using one normally means either uploading the data or
 describing it in detail to the assistant. Both expose the data.
 Researchers with confidential datasets legally or ethically can't
-do that. Builder is a thin local layer that lets Claude help with
+do that. Nora is a thin local layer that lets Claude help with
 analysis while the actual values stay on the researcher's machine.
 
 ## How it works
 
-The researcher either drags the data files into Builder's window
-(web UI: `builder-ui`) or points Builder at a directory (terminal
-UI: `builder`). Supported formats are `.csv`, `.dta` (Stata), and
-`.rds` (R). A chat starts with Claude through Builder; Claude is
+The researcher either drags the data files into Nora's window
+(web UI: `nora-ui`) or points Nora at a directory (terminal
+UI: `nora`). Supported formats are `.csv`, `.dta` (Stata), and
+`.rds` (R). A chat starts with Claude through Nora; Claude is
 then restricted — no filesystem access, no shell, no network tools.
 
 Instead, Claude has exactly six operations, through a narrow tool
@@ -37,11 +37,11 @@ interface:
 3. **Submit an R or Stata script** to analyze the data.
 4. **See previous results.**
 5. **Expand a specific result** for more detail.
-6. **Recall earlier turns** of the conversation — Builder persists
+6. **Recall earlier turns** of the conversation — Nora persists
    the chat log to disk and Claude can search older turns when
    the auto-loaded recent window isn't enough.
 
-When Claude submits a script, Builder runs it locally in a
+When Claude submits a script, Nora runs it locally in a
 **sandbox** that blocks network access and restricts which files
 the script can read (only the researcher's data directory plus the
 paths R/Stata need to start up). The output of the script passes
@@ -51,8 +51,18 @@ cells with fewer than 10 observations, never reveals individual
 observations like min/max, and never passes through raw text values
 from the data.
 
-The researcher sees the full raw script output in their terminal.
-Claude sees only the sanitized version.
+The researcher sees the full raw script output in the chat window
+(in a result panel under each script run). Claude sees only the
+sanitized version.
+
+Nora also remembers the conversation across restarts. Every turn
+is persisted to a per-session log file; when Claude opens a fresh
+client (after the researcher closes and reopens, switches sessions,
+or changes models), the recent turns plus a list of stored
+analytical results are auto-injected as the warm-start prefix so
+the conversation picks up where it left off. Older turns that have
+fallen out of that window can be retrieved on demand via the
+`recall_conversation` tool.
 
 The load-bearing property: **Claude never directly touches the
 data.** It writes questions about the data (as code) and gets back
@@ -62,7 +72,7 @@ sanitizer.
 
 ## The architectural choice
 
-A question that came up during design review: should Builder
+A question that came up during design review: should Nora
 include a **local AI model** — an open-source coder model like
 Qwen3-Coder-30B running on the researcher's own laptop — as part
 of the pipeline?
@@ -85,7 +95,7 @@ sanitizer filters the output → Claude sees the sanitized result.
   message stays on the researcher's machine for privacy reasons —
   so Claude can't see exactly what went wrong. It has to guess
   from limited context.
-- Builder can't yet analyze text-heavy data — survey open-ends,
+- Nora can't yet analyze text-heavy data — survey open-ends,
   clinical notes, legal documents. The sanitizer currently rejects
   free-text values as too risky to pass through without a way to
   redact PII.
@@ -164,21 +174,29 @@ The pragmatic decision:
 
 ## What stands between Option A and a usable tool
 
-Roughly in priority order:
+What's done since this overview was first written:
 
-1. **Remaining security hardening** from the review: tighten
-   `/private/etc` reads so system config files can't be exfiltrated
-   through result payloads, and close the runtime-library bypass so
-   hand-crafted result JSON can't substitute for legitimate
-   runtime-library output.
-2. **Researcher consent UI for schema depth** — today the depth at
-   which Builder describes a dataset to Claude is a code default.
-   It should be a per-dataset choice the researcher makes
-   explicitly, with conservative defaults.
-3. **Packaging as a double-click install** — today Builder requires
-   a terminal and Python tooling. Researchers need a `.dmg`.
-4. **One real researcher on real data.** The most important
+- ✅ Security hardening: env-var allowlist (subprocess can't see
+  `ANTHROPIC_API_KEY` or shell secrets), per-cwd store binding (no
+  cross-session leak), filename / variable-name sanitization at
+  every prompt-injection surface, OLS coefficient-key constraint,
+  confidence-interval length constraint, structural size caps on
+  every dict / list payload field.
+- ✅ Researcher consent UI: per-dataset Permission chip in the
+  web UI; `/policy` slash-command in the terminal UI. Both edit
+  the same `.nora/policy.json`.
+- ✅ Packaging: `.app` is built and launches the web UI directly
+  (no Terminal popup). Build pipeline produces a `.dmg` too. Both
+  work locally.
+
+What's left:
+
+1. **Apple Developer Program signing** so the .dmg can actually be
+   handed to a researcher. Without it, Gatekeeper refuses unsigned
+   apps cleanly enough that the right-click-Open workaround is
+   real friction. $99/yr cert.
+2. **One real researcher on real data.** The most important
    missing signal. Everything else is preparation for it.
 
-Items 1–3 are a few weeks of work. Item 4 is where the real
+The signing is paperwork-and-dollars; the pilot is where the real
 feedback lives.

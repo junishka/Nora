@@ -1,6 +1,6 @@
 """Regression tests for the subprocess env-var allowlist.
 
-Builder scripts inherit only the env vars on an explicit allowlist
+Nora scripts inherit only the env vars on an explicit allowlist
 (see ``executor._SUBPROCESS_ENV_ALLOWLIST``). The reason: a prompt-
 injected Claude can call ``Sys.getenv()`` from R and stuff results
 into any allowed numeric / string field that reaches the sanitizer,
@@ -13,17 +13,17 @@ These tests lock in:
 - Shell secrets (API keys, AWS creds, arbitrary undocumented vars)
   are NOT visible in the subprocess env.
 - The allowlisted vars ARE forwarded (so R / Stata keep working).
-- Builder-specific vars (BUILDER_RUN_TOKEN, BUILDER_RESULT_PATH,
-  BUILDER_LIB_DIR, BUILDER_CWD) take precedence over any
+- Nora-specific vars (NORA_RUN_TOKEN, NORA_RESULT_PATH,
+  NORA_LIB_DIR, NORA_CWD) take precedence over any
   pathological same-named entry in the parent env.
 
-If you add a new env var Builder needs, update both the allowlist
+If you add a new env var Nora needs, update both the allowlist
 and these tests — they're the canonical spec.
 """
 
 from __future__ import annotations
 
-from builder.executor import (
+from nora.executor import (
     RUN_TOKEN_ENV_VAR,
     _SUBPROCESS_ENV_ALLOWLIST,
     _filter_env,
@@ -55,12 +55,12 @@ def test_arbitrary_vars_are_dropped():
     """An arbitrary marker var shouldn't survive either — the
     allowlist is the ONLY way through, not a denylist."""
     parent = {
-        "BUILDER_TEST_SECRET": "TOPSECRET123",
+        "NORA_TEST_SECRET": "TOPSECRET123",
         "RANDOM_SECRET_1234": "leak",
         "HOME": "/home/user",
     }
     filtered = _filter_env(parent)
-    assert "BUILDER_TEST_SECRET" not in filtered
+    assert "NORA_TEST_SECRET" not in filtered
     assert "RANDOM_SECRET_1234" not in filtered
     assert filtered["HOME"] == "/home/user"
 
@@ -91,18 +91,18 @@ def test_locale_and_path_are_allowlisted():
     assert "TMPDIR" in _SUBPROCESS_ENV_ALLOWLIST
 
 
-def test_builder_run_token_var_is_not_on_allowlist():
-    """BUILDER_RUN_TOKEN is set explicitly by the executor per run.
+def test_nora_run_token_var_is_not_on_allowlist():
+    """NORA_RUN_TOKEN is set explicitly by the executor per run.
     If it were on the allowlist, a pathological parent-env entry
     could pre-seed a token the attacker knows — defeating the
     whole runtime-library authenticity check. Keep it OUT of the
     allowlist; the executor merges its own value in after the
     allowlist filter."""
     assert RUN_TOKEN_ENV_VAR not in _SUBPROCESS_ENV_ALLOWLIST
-    assert "BUILDER_RUN_TOKEN" not in _SUBPROCESS_ENV_ALLOWLIST
-    assert "BUILDER_RESULT_PATH" not in _SUBPROCESS_ENV_ALLOWLIST
-    assert "BUILDER_LIB_DIR" not in _SUBPROCESS_ENV_ALLOWLIST
-    assert "BUILDER_CWD" not in _SUBPROCESS_ENV_ALLOWLIST
+    assert "NORA_RUN_TOKEN" not in _SUBPROCESS_ENV_ALLOWLIST
+    assert "NORA_RESULT_PATH" not in _SUBPROCESS_ENV_ALLOWLIST
+    assert "NORA_LIB_DIR" not in _SUBPROCESS_ENV_ALLOWLIST
+    assert "NORA_CWD" not in _SUBPROCESS_ENV_ALLOWLIST
 
 
 def test_empty_parent_env_yields_empty_filtered():

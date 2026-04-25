@@ -1,4 +1,4 @@
-# Builder — architectural direction
+# Nora — architectural direction
 
 Working document. Last substantive update **2026-04-22**, after the
 web UI iteration pass (file upload, drag-drop, result panel with
@@ -9,7 +9,7 @@ with a bundled local LLM — still stands from 2026-04-20.
 
 For the single-page overview aimed at someone picking this up, see
 [`docs/handoff.md`](handoff.md). [`docs/overview.md`](overview.md)
-is the plain-language description of what Builder is and why. This
+is the plain-language description of what Nora is and why. This
 doc is the long-form record of what the architecture is, what it
 isn't, and why.
 
@@ -24,7 +24,7 @@ writes structured plans and a bundled local LLM compiles them into
 R/Stata. After working through the argument, that proposal was
 rejected as over-correction.
 
-The privacy guarantee in Builder comes from three independent
+The privacy guarantee in Nora comes from three independent
 layers:
 
 1. **The tool interface** — Claude can only do six things
@@ -61,27 +61,46 @@ researcher use case demands it.
 
 ## What's built
 
-As of 2026-04-20, the implementation covers:
+As of 2026-04-25, the implementation covers:
 
-- Spine + full SDK lockdown (5 MCP tools, every built-in disabled,
-  four defense layers).
-- Schema extractor for `.csv` / `.dta` / `.rds` with configurable
-  depth tiers.
-- Executor with `(deny default)` subpath-allowlist sandbox. Pure
-  unit tests lock in the SBPL profile shape; integration tests
-  verify real sandbox behavior (gated on `Rscript` + sandbox-apply
-  preflight).
+- Spine + full SDK lockdown (6 MCP tools — get_schema, request_data,
+  submit_script, expand_result, list_results, recall_conversation —
+  every built-in disabled, four defense layers).
+- Schema extractor for `.csv` / `.dta` / `.rds` with four depth
+  tiers; default is `names_types_labels_summary`.
+- Executor with `(deny default)` subpath-allowlist sandbox AND an
+  explicit subprocess env-var allowlist (PATH/HOME/LANG/LC_*/TMPDIR/
+  USER/SHELL/R_LIBS — no ANTHROPIC_API_KEY, AWS creds, or other
+  shell secrets visible to scripts). Per-run HMAC token authenticates
+  payloads from the runtime library. Pure unit tests lock in the
+  SBPL profile shape; integration tests verify real sandbox behavior
+  (gated on `Rscript` + sandbox-apply preflight).
 - Sanitizer across six analysis families (linear regression,
   t-test, descriptive, frequency table, crosstab, magnitude table)
-  with full R + Stata parity.
+  with full R + Stata parity. OLS coefficient-key constraint
+  (inner keys must match declared predictors); confidence-interval
+  length constraint (must be exactly 2); structural size caps on
+  every dict / list payload field; filename + variable-name
+  sanitization at every prompt-injection surface.
 - Runtime libraries (R + five Stata `.ado` files) with
   JSON-escaped labels and CR/LF/TAB handling.
-- SQLite result store.
-- 152 tests, ~3,600 Hypothesis-generated adversarial cases. Pushed
+- SQLite result store, keyed by resolved cwd (no cross-session leak
+  in the same process).
+- Memory stack: every turn persisted to `.nora/chat_history.jsonl`
+  with timestamps; warm-start prefix injected on every fresh SDK
+  client open (last ~20 turns + recent result IDs); `recall_conversation`
+  tool for older lookups with neighboring-context expansion;
+  durable `.nora/session_state.json` snapshot regenerated after
+  each turn (last exchange, recent results, datasets, model).
+- Web UI: pywebview shell, sessions sidebar, theme toggle, model
+  picker, drag-drop file/image upload, typewriter assistant, Lottie
+  cat loading indicator, status line, Permission/Model chips with
+  popups, image-paste support.
+- Packaging: `.app` launches the web UI directly (no Terminal popup),
+  `.dmg` build pipeline. Local-only until Apple Developer Program
+  signing is in place.
+- 283 tests, ~3,600 Hypothesis-generated adversarial cases. Pushed
   to [github.com/junishka/builder](https://github.com/junishka/builder).
-
-Full implementation status in
-`memory/project_builder_current_state.md`.
 
 ## What's remaining (prioritized)
 
@@ -94,7 +113,7 @@ Full implementation status in
   Closes reads of `/etc/passwd` and similar through the
   result-payload exfil channel.
 - **Runtime-library contract.** Today a malicious script can write
-  hand-crafted JSON directly to `BUILDER_RESULT_PATH`, bypassing
+  hand-crafted JSON directly to `NORA_RESULT_PATH`, bypassing
   the runtime library. Fix options, ordered by the strength of
   guarantee they actually provide:
   - **(a) Stricter sanitizer structural checks** that reject
@@ -102,7 +121,7 @@ Full implementation status in
     a determined attacker can replicate the shape.
   - **(b) Per-run token** the runtime library embeds in every
     payload; executor validates. **Raises attacker cost** — the
-    trivial write-to-BUILDER_RESULT_PATH bypass stops working. Does
+    trivial write-to-NORA_RESULT_PATH bypass stops working. Does
     **not** provide a strong guarantee: R closures are
     introspectable, so a script that knows the architecture can
     find the token in the library's loaded environment. Useful
@@ -117,23 +136,26 @@ Full implementation status in
   matters for researchers handling more sensitive data than
   current pilots.
 
-### 2. Researcher consent UI for schema depth — *done (file-based v1)*
+### 2. Researcher consent UI for schema depth — *done*
 
 Schema depth is now an explicit researcher policy in
-`<cwd>/.builder/policy.json` rather than a code default. Each
+`<cwd>/.nora/policy.json` rather than a code default. Each
 dataset has a per-file `max_depth` ceiling (or inherits
 `default_max_depth`); `get_schema` denies requests above the
 ceiling, annotates successful responses with the current
 `policy_max_depth` so Claude knows the limit without probing.
-Malformed policy files fall back to the conservative default
-silently — a broken file can't lock the researcher out.
+Malformed policy files fall back to the default silently — a
+broken file can't lock the researcher out.
 
 **Depths (least to most permissive):**
 - `names_only` — variable names only.
-- `names_types` — + type per variable (conservative default).
+- `names_types` — + a coarse type per variable.
 - `names_types_labels` — + variable labels and value labels.
 - `names_types_labels_summary` — + per-variable NA counts and
-  distinct-value counts for categoricals.
+  distinct-value counts for categoricals. **Default.** (The
+  default was raised from `names_types` once the per-dataset
+  Permission UI made it cheap for researchers to dial it down
+  for any dataset where the labels / counts are sensitive.)
 
 Never at any depth: raw values, min, max, median, individual
 observations. Those belong to `request_data` (with its own SDC
@@ -143,7 +165,7 @@ Interactive editing now exists in both frontends:
 
 - **Terminal:** `/policy` slash-command (handled in `app.py`)
   opens a dataset picker + depth menu; changes persist immediately
-  to `.builder/policy.json`. Startup banner still lists each
+  to `.nora/policy.json`. Startup banner still lists each
   dataset with its ceiling and `explicit` vs `default` source.
 - **Web UI:** compact "Policy" chip beside the Send button; click
   unfurls a popup with per-dataset dropdowns. Changes write
@@ -169,7 +191,7 @@ applies silently and the chip reflects it).
 
 The "install must be double-click" rule has been owed since early
 in the project. Current path (`uv sync` + `uv run python -m
-builder`) is a developer workflow.
+`nora`) is a developer workflow.
 
 Approach:
 - PyInstaller (or py2app / Briefcase — decision open) to a `.app`
@@ -199,12 +221,12 @@ current friction bites:
   just able to upload the data instead of choosing path."*
   Implementation sketch: launch the app into a "no data yet" state
   with a drop zone; on drop, copy the files into a managed dir
-  (e.g. `~/Library/Application Support/Builder/sessions/<id>/`)
+  (e.g. `~/Library/Application Support/Nora/sessions/<id>/`)
   and use that as cwd. Avoids the `~/Users/bb/…` path-expansion
   class of mistake entirely, and doesn't expose a whole project
   directory to the sandbox just to give Claude two files.
 - **Markdown-rendered assistant text with tables and code blocks.**
-  *Done.* `src/builder/web/markdown.js` is an in-tree renderer that
+  *Done.* `src/nora/web/markdown.js` is an in-tree renderer that
   covers paragraphs, headings, fenced code, inline code, bold /
   italic, lists, blockquotes, HTTPS links, and GitHub-flavored
   pipe tables (added after researcher feedback that coefficient
@@ -222,13 +244,13 @@ current friction bites:
   the same `set_dataset_policy` bridge method as the terminal's
   `/policy` wizard.
 - **Dataset picker sidebar / session list.** Not done. Recent
-  sessions live on disk under `~/.builder-sessions/` but the UI
+  sessions live on disk under `~/.nora-sessions/` but the UI
   has no browser yet — re-opening a past session means relaunching
   with an explicit path. Would make a nice left-rail feature
   similar to Claude.ai's chat history.
 - **Bundling web assets into the PyInstaller `.app`.** Not done.
-  Today `builder-ui` runs from source only; the `.dmg` still only
-  distributes the terminal `builder`. Fold `src/builder/web/` into
+  Today `nora-ui` runs from source only; the `.dmg` still only
+  distributes the terminal `nora`. Fold `src/nora/web/` into
   the spec as data files and update the launcher to support both
   entry points.
 - **Turn-state discipline in the web UI.** *Done* (after
@@ -251,14 +273,14 @@ a researcher analyzing their own data with their own account).
 Becomes *the* blocker before wider distribution, especially any
 pilot involving someone else's sensitive data.
 
-Builder's SDC rules (precision clamping, cell suppression,
+Nora's SDC rules (precision clamping, cell suppression,
 dominance, text-safety) constrain what any **single** sanitized
 result reveals. They do not constrain the **joint distribution of
 answers across many queries**. A researcher — or an adaptive,
 adversarial Claude — who issues 200 individually-compliant queries
 can learn things about the dataset that no single query would
 release. This is the "20 questions" attack, and it is inherent to
-every interactive analysis system (not a Builder-specific bug).
+every interactive analysis system (not a Nora-specific bug).
 
 `tools.py` (submit_script, request_data) currently serves each call
 independently; `store.py` keeps every sanitized result in a single
@@ -292,7 +314,7 @@ post-2020 approach, τ-ARGUS's query-log mechanisms) before
 implementing. Do not ship a query counter that looks like
 protection but isn't.
 
-When does this become urgent? When Builder is used against data
+When does this become urgent? When Nora is used against data
 where repeated-query inference is a realistic attacker scenario —
 clinical trial data, HR data at the individual level, regulated
 datasets. Not urgent for pilot-scale public-ish research.
@@ -339,7 +361,7 @@ datasets. Not urgent for pilot-scale public-ish research.
 - **Mandatory safe variable IDs as the frontier-facing identity
   surface.** Schema exposure is policy, not architecture. If a
   researcher's dataset has non-sensitive variable names and they
-  opt in to sharing them with Claude, that's their call. Builder
+  opt in to sharing them with Claude, that's their call. Nora
   enforces conservative defaults and makes the choice visible; it
   doesn't enforce a ceiling.
 

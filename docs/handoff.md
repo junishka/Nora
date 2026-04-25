@@ -1,10 +1,10 @@
-# Builder — handoff
+# Nora — handoff
 
 Single-page entry point for picking this project up. Current as of
 the last commit on `main`. If something here disagrees with the code,
 trust the code and file a patch to this doc.
 
-## What Builder is (one paragraph)
+## What Nora is (one paragraph)
 
 A local macOS app that lets a researcher drive statistical analysis
 (R or Stata) on their own data with Claude, without that data leaving
@@ -21,57 +21,74 @@ R/Stata output in the UI; Claude only ever sees sanitized summaries.
 | Layer | Status |
 |---|---|
 | **Data-boundary architecture** — tool interface + sandbox + sanitizer | ✅ implemented and tested |
-| **Schema extraction** (.csv / .dta / .rds, four depth tiers) | ✅ done |
+| **Schema extraction** (.csv / .dta / .rds, four depth tiers) | ✅ done; default tier is `names_types_labels_summary` |
 | **Executor** ((deny default) sandbox, R + Stata, runtime libraries, per-run token) | ✅ done, verified on real data |
-| **Sanitizer** (six analysis families, SDC rules, text-safety) | ✅ done, ~3,600 Hypothesis cases |
-| **Result store** (SQLite, audit log, expand_result) | ✅ done |
+| **Env-var allowlist** in subprocess env (no ANTHROPIC_API_KEY etc. visible to scripts) | ✅ done |
+| **Sanitizer** (six analysis families, SDC rules, text-safety, structural size caps) | ✅ done, ~3,600 Hypothesis cases |
+| **Result store** (SQLite, audit log, `expand_result`, **per-cwd cache**) | ✅ done; cache rebinds on session switch |
 | **Permission policy** (per-dataset schema-depth ceiling, UI dropdowns) | ✅ done |
-| **Terminal UI** (`builder`) — Rich-based chat, `/policy` wizard | ✅ done |
-| **Web UI** (`builder-ui`) — pywebview shell, drag-drop upload, result panels, Open-in-R/Stata buttons | ✅ done |
-| **Packaging** (`.app` + `.dmg`) — terminal `builder` only | ✅ done (unsigned; right-click → Open first time) |
-| **Real-researcher pilot** (step 8) | ⏳ self-pilot in progress |
+| **Filename / variable-name sanitization** at every prompt-injection surface | ✅ done |
+| **Memory stack** — chat-history persisted, warm-start prefix injected on every fresh client, `recall_conversation` tool for older lookups | ✅ done |
+| **Durable session state** — `.nora/session_state.json` written after each turn (last exchange, recent results, datasets, model) | ✅ done |
+| **Terminal UI** (`nora`) — Rich-based chat, `/policy` wizard | ✅ done |
+| **Web UI** (`nora-ui`) — pywebview shell, sessions sidebar, theme toggle, model picker, drag-drop file/image upload, typewriter, Lottie cat loading indicator, status line, Permission/Model chips with popups | ✅ done |
+| **Packaging** (`.app` + `.dmg`) — bundles the **web UI**; .app launches pywebview directly with no Terminal | ✅ done (unsigned — local-build only until Apple Developer Program signing) |
+| **Real-researcher pilot** | ⏳ self-pilot in progress |
 | **Cross-query composition / release ledger** | ⏭ named, deferred |
-| **Web UI bundled into the .app** | ⏭ not done |
-| **Dataset-picker sidebar / session browser** | ⏭ not done |
+| **Apple Developer Program signing + notarization for distributable .dmg** | ⏭ blocked on $99/yr cert |
+| **Stata batch wrapper around `_cons` "omitted" edge case** | ⏭ named, low-priority |
 
-194 tests passing, covering: SDK lockdown, schema, executor SBPL
+283 tests passing, covering: SDK lockdown, schema, executor SBPL
 profile (pure unit tests + integration gated on Rscript), sanitizer
 (property tests), policy, text-safety, row-count audit, stderr
-isolation, per-run token authenticity.
+isolation, per-run token authenticity, env-var allowlist
+(subprocess can't see shell secrets), cross-session store isolation,
+filename prompt-injection, OLS coefficient-key constraint,
+confidence-interval length constraint, structural size caps, plus
+the memory-stack tests (turn-grouping reader, warm-start prefix
+generation, durable session-state writer, bridge lifecycle paths
+for cwd-switch / interrupt / timestamp persistence).
 
 ## Running it
 
 ```bash
-# Terminal UI — same-shell chat
-uv run builder                              # opens landing prompt
-uv run builder /path/to/data                # opens straight into chat
+# Web UI — native WKWebView window. The recommended frontend.
+uv run nora-ui                           # landing: drop files or pick folder
+uv run nora-ui /path/to/data             # opens straight into chat
 
-# Web UI — native WKWebView window
-uv run builder-ui                           # landing: drop files or pick folder
-uv run builder-ui /path/to/data             # opens straight into chat
+# Terminal UI — same-shell chat. Power-user / shell-only path.
+uv run nora                              # opens landing prompt
+uv run nora /path/to/data                # opens straight into chat
 
 # Tests
-uv run pytest -q                            # expect 194 passing
+uv run pytest -q                            # expect 283 passing
 
-# Build distributable .dmg (terminal only, unsigned)
-bash packaging/build_app.sh                 # → dist/Builder.app (~68 MB)
-bash packaging/build_dmg.sh                 # → dist/Builder.dmg (~34 MB)
+# Build the .app + .dmg locally. Bundles the web UI.
+# Distribution to other people is blocked on Apple Developer Program
+# signing — the unsigned .dmg trips Gatekeeper for anyone who didn't build it themselves.
+bash packaging/build_app.sh                 # → dist/Nora.app (~70 MB)
+bash packaging/build_dmg.sh                 # → dist/Nora.dmg (~35 MB)
+open dist/Nora.app                       # smoke test the build
+tail -F ~/Library/Logs/Nora/nora-*.log  # if it doesn't open
 ```
 
 Auth is inherited from the `claude` CLI (subscription) or
-`ANTHROPIC_API_KEY` (per-token). Builder doesn't handle auth itself.
+`ANTHROPIC_API_KEY` (per-token). Nora doesn't handle auth itself.
+The subprocess env-var allowlist (executor.py) keeps `ANTHROPIC_API_KEY`
+out of script-visible env so a prompt-injected R/Stata script can't
+exfiltrate it through an "allowed" numeric field.
 
 ## Architecture at a glance
 
 Three independent privacy layers. A break in any one is a bug; a
 break in two at the same time is a privacy incident.
 
-1. **Tool interface** (`src/builder/tools.py`) — Claude has exactly
+1. **Tool interface** (`src/nora/tools.py`) — Claude has exactly
    six tools: `get_schema`, `request_data`, `submit_script`,
    `expand_result`, `list_results`, `recall_conversation`. SDK
    built-ins (Bash, Read, Write, …) are disabled via
    `disallowed_tools` + `can_use_tool` catch-all + `setting_sources=[]`.
-2. **Sandbox** (`src/builder/executor.py`) — `sandbox-exec` with
+2. **Sandbox** (`src/nora/executor.py`) — `sandbox-exec` with
    `(deny default)` base, explicit subpath-allowlist for reads
    (cwd + runtime dirs + a minimal set of system paths), tighter
    allowlist for writes, network denied. Refuses to run if
@@ -79,15 +96,15 @@ break in two at the same time is a privacy incident.
    Executor also generates a per-run HMAC-style token that the
    runtime library embeds in every emitted payload — hand-crafted
    JSON without the token is rejected.
-3. **Sanitizer** (`src/builder/sanitizer.py`, `sdc.py`,
+3. **Sanitizer** (`src/nora/sanitizer.py`, `sdc.py`,
    `text_safety.py`) — allowlist of field names per analysis
    family, SDC rules (precision clamping by N, cell-size
    suppression threshold 10, secondary suppression for 1-D freq
    tables, (1, 85%)-dominance for magnitude tables), text-safety
    pass on every data-origin string.
 
-Session model: `builder-ui` without an argv opens a landing screen;
-dropped / picked files land in `~/.builder-sessions/<ts>_<id>/`
+Session model: `nora-ui` without an argv opens a landing screen;
+dropped / picked files land in `~/.nora-sessions/<ts>_<id>/`
 which becomes the cwd. That dir is spaces-free (Stata-safe),
 outside cloud-sync roots, persistent across restarts.
 
@@ -101,19 +118,20 @@ outside cloud-sync roots, persistent across restarts.
   `docs/direction.md` §"Known-real, design-pending" for the DP /
   τ-ARGUS / release-ledger options and why naïve query counters
   are worse than nothing.
-- **Web UI bundled into the .app.** `builder-ui` runs from source
-  only; the `.dmg` ships the terminal `builder` only. Fold
-  `src/builder/web/` into `packaging/builder.spec` as `datas` and
-  update the launcher to support both entry points.
-- **Stata signing / notarization.** `.dmg` is unsigned — first
-  run requires right-click → Open or `xattr -cr`. Needs Apple
-  Developer Program membership ($99/yr) before wider
-  distribution.
+- **`.app` / `.dmg` distribution to other people.** The local build
+  works (`.app` launches the web UI directly via pywebview, no
+  Terminal popup). What's missing is an Apple Developer Program
+  signature — without it, anyone you hand the .dmg to hits a hard
+  Gatekeeper warning and most users won't get past it. Right-click →
+  Open / `xattr -cr` workarounds are documented in install.md but
+  aren't acceptable for a "just install this" handoff. Cost: $99/yr.
+  Once signed, also worth notarizing for the cleanest first-launch
+  experience.
 
 ## Rough edges (work, but annoy)
 
 - Transformations log shows `"dropped unknown/forbidden field
-  'label'"` on every R submit_script because the `builder$from_lm(m,
+  'label'"` on every R submit_script because the `nora$from_lm(m,
   label=…)` arg is stripped by the schema allowlist. Harmless (the
   submit_script MCP-tool label is stored separately), but noisy.
   Fix: widen the per-type string allowlist to include `label`.
@@ -130,19 +148,23 @@ outside cloud-sync roots, persistent across restarts.
 
 | File | What's there |
 |---|---|
-| `src/builder/app.py` | Terminal entry point, system prompt, chat loop, rendering |
-| `src/builder/ui.py` | Web UI entry point, pywebview bridge, session staging |
-| `src/builder/tools.py` | The six MCP tools. Start here to understand Claude's surface |
-| `src/builder/executor.py` | Sandbox profile, R/Stata subprocess plumbing, per-run token |
-| `src/builder/sanitizer.py` + `sdc.py` | The SDC allowlist and clamp/suppress primitives |
-| `src/builder/runtime/builder.R` + `builder_result_*.ado` | Emitters the scripts call |
-| `src/builder/chat_service.py` | Typed event stream both UIs consume |
-| `src/builder/web/{index.html,app.js,markdown.js,style.css}` | Web frontend |
+| `src/nora/app.py` | Terminal entry point, system prompt, chat loop, rendering |
+| `src/nora/ui.py` | Web UI entry point, pywebview bridge, session staging |
+| `src/nora/tools.py` | The six MCP tools. Start here to understand Claude's surface |
+| `src/nora/executor.py` | Sandbox profile, R/Stata subprocess plumbing, per-run token |
+| `src/nora/sanitizer.py` + `sdc.py` | The SDC allowlist and clamp/suppress primitives |
+| `src/nora/runtime/nora.R` + `nora_result_*.ado` | Emitters the scripts call |
+| `src/nora/chat_service.py` | Typed event stream both UIs consume |
+| `src/nora/chat_history.py` | Turn-grouped reader over the persisted chat log; warm-start prefix renderer |
+| `src/nora/session_state.py` | Atomic writer / reader for `.nora/session_state.json` |
+| `src/nora/web/{index.html,app.js,markdown.js,style.css}` | Web frontend |
+| `src/nora/web/{cat-loading.json,lottie-player.js}` | Lottie loading-indicator asset + vendored player (MIT-licensed, pinned 2.0.12) |
+| `src/nora/__main_ui__.py` | Bundle entry — calls `nora.ui:main`. The .app launches this, NOT the terminal CLI |
 | `docs/direction.md` | Long-form architectural doc; open questions |
 | `docs/overview.md` | Plain-language description for researchers |
 | `docs/install.md` | Researcher-facing install flow |
 | `docs/verification.md` | Manual smoke-test recipes (incl. Stata, which CI can't) |
-| `tests/` | 194 tests. `test_sanitizer.py` is the property-test backbone |
+| `tests/` | 283 tests. `test_sanitizer.py` is the property-test backbone |
 
 ## Decisions worth not re-litigating
 
@@ -172,9 +194,12 @@ If you're picking this up to finish and ship it, in this order:
 1. **Run it yourself on your own data.** Catch the UX rough edges
    before anyone else sees them. The current author has done this
    once; a second pair of eyes surfaces new things.
-2. **Bundle the web UI into the .app.** Researcher friction here is
-   lower than almost anywhere else — the `.dmg` is the thing people
-   install, and right now it only ships the terminal frontend.
+2. **Sign and notarize the .app.** The build pipeline already
+   produces a working .app that launches the web UI directly with
+   no Terminal popup. The blocker for handing it to colleagues is
+   the missing Apple Developer Program signature — Gatekeeper
+   refuses unsigned apps cleanly enough that the right-click-Open
+   workaround is friction nobody should be subjected to. $99/yr.
 3. **Try it on a colleague's data** (or yours via a colleague). The
    difference between "self-pilot" and "someone who didn't build
    it" is where most real UX bugs live.

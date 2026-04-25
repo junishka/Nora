@@ -12,8 +12,8 @@ from __future__ import annotations
 from hypothesis import given, settings
 from hypothesis import strategies as st
 
-from builder.sanitizer import DEFAULT_CONFIG, sanitize, supported_types
-from builder.sdc import suppression_marker
+from nora.sanitizer import DEFAULT_CONFIG, sanitize, supported_types
+from nora.sdc import suppression_marker
 
 
 _name = st.text(

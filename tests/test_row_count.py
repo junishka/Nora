@@ -17,8 +17,8 @@ from pathlib import Path
 import pandas as pd
 import pytest
 
-from builder.config import set_cwd
-from builder.tools import _check_row_count, _effective_n
+from nora.config import set_cwd
+from nora.tools import _check_row_count, _effective_n
 
 
 # ---------------------------------------------------------------------------

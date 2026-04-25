@@ -18,10 +18,10 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from builder.policy import (
+from nora.policy import (
     DEFAULT_MAX_DEPTH,
     VALID_DEPTHS,
-    BuilderPolicy,
+    NoraPolicy,
     DatasetPolicy,
     depth_allowed,
     get_max_depth,
@@ -45,7 +45,7 @@ def test_load_missing_file_returns_default(tmp_path: Path):
 
 
 def test_load_corrupted_json_falls_back_to_default(tmp_path: Path):
-    """A broken JSON file must not lock the researcher out of Builder.
+    """A broken JSON file must not lock the researcher out of Nora.
     Default policy applies silently — the safe fallback is the
     conservative one."""
     policy_path(tmp_path).parent.mkdir()
@@ -127,9 +127,9 @@ def test_load_valid_policy(tmp_path: Path):
 # Save + round-trip
 # ---------------------------------------------------------------------------
 
-def test_save_creates_dot_builder_dir(tmp_path: Path):
-    """`.builder/` directory is created on save if it doesn't exist."""
-    policy = BuilderPolicy(datasets={
+def test_save_creates_dot_nora_dir(tmp_path: Path):
+    """`.nora/` directory is created on save if it doesn't exist."""
+    policy = NoraPolicy(datasets={
         "a.csv": DatasetPolicy(max_depth="names_types_labels", set_at="t"),
     })
     save_policy(tmp_path, policy)
@@ -137,7 +137,7 @@ def test_save_creates_dot_builder_dir(tmp_path: Path):
 
 
 def test_round_trip(tmp_path: Path):
-    original = BuilderPolicy(
+    original = NoraPolicy(
         default_max_depth="names_types",
         datasets={
             "a.csv": DatasetPolicy(
@@ -159,12 +159,12 @@ def test_round_trip(tmp_path: Path):
 # ---------------------------------------------------------------------------
 
 def test_get_max_depth_falls_back_to_default():
-    policy = BuilderPolicy(default_max_depth="names_types")
+    policy = NoraPolicy(default_max_depth="names_types")
     assert get_max_depth(policy, "missing.csv") == "names_types"
 
 
 def test_get_max_depth_returns_explicit_when_set():
-    policy = BuilderPolicy(
+    policy = NoraPolicy(
         default_max_depth="names_types",
         datasets={"x.csv": DatasetPolicy(max_depth="names_types_labels")},
     )
@@ -172,14 +172,14 @@ def test_get_max_depth_returns_explicit_when_set():
 
 
 def test_has_explicit_policy_true_for_set():
-    policy = BuilderPolicy(
+    policy = NoraPolicy(
         datasets={"x.csv": DatasetPolicy(max_depth="names_types")}
     )
     assert has_explicit_policy(policy, "x.csv")
 
 
 def test_has_explicit_policy_false_for_inherited():
-    policy = BuilderPolicy()
+    policy = NoraPolicy()
     assert not has_explicit_policy(policy, "x.csv")
 
 

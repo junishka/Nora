@@ -22,13 +22,13 @@ import pytest
 from hypothesis import HealthCheck, assume, given, settings
 from hypothesis import strategies as st
 
-from builder.sanitizer import (
+from nora.sanitizer import (
     DEFAULT_CONFIG,
     SDCConfig,
     sanitize,
     supported_types,
 )
-from builder.sdc import (
+from nora.sdc import (
     _SIGFIGS_CAP,  # noqa: PLC2701 — test-only access
     sigfigs_for_n,
     suppression_marker,

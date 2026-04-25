@@ -1,4 +1,4 @@
-# Builder — manual verification recipes
+# Nora — manual verification recipes
 
 Short recipes for developer-level sanity checks that CI can't run —
 either because a commercial dependency (Stata) isn't available on
@@ -27,17 +27,17 @@ From the repo root:
 ```bash
 uv run python -c "
 from pathlib import Path
-from builder.executor import run_script
+from nora.executor import run_script
 
-cwd = Path('/tmp/builder_verify')
+cwd = Path('/tmp/nora_verify')
 cwd.mkdir(exist_ok=True)
 
 print('=== R ===')
-r = run_script('R', 'builder\$from_lm(lm(mpg ~ wt, data = mtcars), label = \"smoke\")', cwd)
+r = run_script('R', 'nora\$from_lm(lm(mpg ~ wt, data = mtcars), label = \"smoke\")', cwd)
 print(f'ok={r.ok}, n={r.result_payload[\"n\"] if r.result_payload else None}')
 
 print('=== Stata ===')
-r = run_script('Stata', 'sysuse auto, clear\nregress price mpg\nbuilder_result_regress, label(\"smoke\")', cwd)
+r = run_script('Stata', 'sysuse auto, clear\nregress price mpg\nnora_result_regress, label(\"smoke\")', cwd)
 print(f'ok={r.ok}, n={r.result_payload[\"n\"] if r.result_payload else None}')
 "
 ```
@@ -65,8 +65,8 @@ cwd and runtime-dep paths:
 ```bash
 uv run python -c "
 from pathlib import Path
-from builder.executor import run_script
-cwd = Path('/tmp/builder_verify')
+from nora.executor import run_script
+cwd = Path('/tmp/nora_verify')
 cwd.mkdir(exist_ok=True)
 
 for target in ['/etc/passwd', '/Library/Keychains/System.keychain',
@@ -76,7 +76,7 @@ probe <- tryCatch(readLines(\"{target}\", n=1),
                   error = function(e) paste(\"DENIED:\", conditionMessage(e)),
                   warning = function(w) paste(\"DENIED:\", conditionMessage(w)))
 df <- data.frame(x=1:12, y=(1:12)*2)
-builder\$from_lm(lm(y ~ x, df), label = paste0(\"probe=\", substr(probe, 1, 60)))
+nora\$from_lm(lm(y ~ x, df), label = paste0(\"probe=\", substr(probe, 1, 60)))
 ''', cwd)
     label = r.result_payload['label'] if r.ok else '(executor-error)'
     print(f'{str(target):50s} => {label}')
@@ -94,11 +94,11 @@ payloads:
 ```bash
 uv run python -c "
 from pathlib import Path
-from builder.executor import run_script
-cwd = Path('/tmp/builder_verify')
+from nora.executor import run_script
+cwd = Path('/tmp/nora_verify')
 cwd.mkdir(exist_ok=True)
 r = run_script('R', '''
-result_path <- Sys.getenv(\"BUILDER_RESULT_PATH\")
+result_path <- Sys.getenv(\"NORA_RESULT_PATH\")
 con <- file(result_path, open = \"w\", encoding = \"UTF-8\")
 writeLines(\"{\\\"type\\\":\\\"linear_regression\\\",\\\"n\\\":1000,\\\"response_variable\\\":\\\"y\\\",\\\"predictor_variables\\\":[\\\"x\\\"],\\\"coefficients\\\":{\\\"x\\\":1.0},\\\"standard_errors\\\":{\\\"x\\\":0.1},\\\"r_squared\\\":0.5}\", con)
 close(con)
