@@ -2082,13 +2082,34 @@ kbd {
   overflow-y: scroll;
 }
 
+/* The selectors below cover three scrollable surfaces:
+ *   - the chat transcript itself (.messages)
+ *   - the session sidebar list
+ *   - any scrollable thing inside the transcript (.messages *)
+ * That last one catches the per-tool-card output panes — the raw
+ * R/Stata stdout block and the sanitized payload viewer. They use
+ * overflow:auto, and without this rule they fall back to WebKit's
+ * default white-track / gray-thumb scrollbar that clashes hard
+ * with the dark surrounding panel. */
 .messages::-webkit-scrollbar,
-.sidebar-list::-webkit-scrollbar {
+.sidebar-list::-webkit-scrollbar,
+.messages *::-webkit-scrollbar {
   width: 10px;
+  height: 10px;   /* horizontal scrollbar (e.g. wide tables) gets the same treatment */
 }
 
 .messages::-webkit-scrollbar-track,
-.sidebar-list::-webkit-scrollbar-track {
+.sidebar-list::-webkit-scrollbar-track,
+.messages *::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+.messages::-webkit-scrollbar-corner,
+.sidebar-list::-webkit-scrollbar-corner,
+.messages *::-webkit-scrollbar-corner {
+  /* WebKit draws a square at the intersection of horizontal +
+   * vertical scrollbars in default chrome (white in dark mode).
+   * Match the surrounding bg so it doesn't pop. */
   background: transparent;
 }
 
@@ -2100,32 +2121,38 @@ kbd {
  * in cream (the dark-mode color) when the OS was dark but the
  * theme toggle was set to light, so it vanished against the pink. */
 .messages::-webkit-scrollbar-thumb,
-.sidebar-list::-webkit-scrollbar-thumb {
+.sidebar-list::-webkit-scrollbar-thumb,
+.messages *::-webkit-scrollbar-thumb {
   background: rgba(93, 44, 62, 0.45);
   border-radius: 5px;
 }
 
 .messages::-webkit-scrollbar-thumb:hover,
-.sidebar-list::-webkit-scrollbar-thumb:hover {
+.sidebar-list::-webkit-scrollbar-thumb:hover,
+.messages *::-webkit-scrollbar-thumb:hover {
   background: rgba(93, 44, 62, 0.7);
 }
 
 @media (prefers-color-scheme: dark) {
   :root:not([data-theme="light"]) .messages::-webkit-scrollbar-thumb,
-  :root:not([data-theme="light"]) .sidebar-list::-webkit-scrollbar-thumb {
+  :root:not([data-theme="light"]) .sidebar-list::-webkit-scrollbar-thumb,
+  :root:not([data-theme="light"]) .messages *::-webkit-scrollbar-thumb {
     background: rgba(240, 227, 214, 0.25);
   }
   :root:not([data-theme="light"]) .messages::-webkit-scrollbar-thumb:hover,
-  :root:not([data-theme="light"]) .sidebar-list::-webkit-scrollbar-thumb:hover {
+  :root:not([data-theme="light"]) .sidebar-list::-webkit-scrollbar-thumb:hover,
+  :root:not([data-theme="light"]) .messages *::-webkit-scrollbar-thumb:hover {
     background: rgba(240, 227, 214, 0.45);
   }
 }
 
 :root[data-theme="dark"] .messages::-webkit-scrollbar-thumb,
-:root[data-theme="dark"] .sidebar-list::-webkit-scrollbar-thumb {
+:root[data-theme="dark"] .sidebar-list::-webkit-scrollbar-thumb,
+:root[data-theme="dark"] .messages *::-webkit-scrollbar-thumb {
   background: rgba(240, 227, 214, 0.25);
 }
 :root[data-theme="dark"] .messages::-webkit-scrollbar-thumb:hover,
-:root[data-theme="dark"] .sidebar-list::-webkit-scrollbar-thumb:hover {
+:root[data-theme="dark"] .sidebar-list::-webkit-scrollbar-thumb:hover,
+:root[data-theme="dark"] .messages *::-webkit-scrollbar-thumb:hover {
   background: rgba(240, 227, 214, 0.45);
 }

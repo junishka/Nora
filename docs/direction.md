@@ -27,9 +27,10 @@ rejected as over-correction.
 The privacy guarantee in Builder comes from three independent
 layers:
 
-1. **The tool interface** — Claude can only do five things
+1. **The tool interface** — Claude can only do six things
    (`get_schema`, `request_data`, `submit_script`, `expand_result`,
-   `list_results`). No filesystem, no shell, no network.
+   `list_results`, `recall_conversation`). No filesystem, no shell,
+   no network.
 2. **The sandbox** — scripts run under macOS `sandbox-exec` with a
    `(deny default)` profile and a narrow subpath-allowlist for
    reads; network denied entirely.

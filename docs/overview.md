@@ -26,7 +26,7 @@ UI: `builder`). Supported formats are `.csv`, `.dta` (Stata), and
 `.rds` (R). A chat starts with Claude through Builder; Claude is
 then restricted — no filesystem access, no shell, no network tools.
 
-Instead, Claude has exactly five operations, through a narrow tool
+Instead, Claude has exactly six operations, through a narrow tool
 interface:
 
 1. **Ask for the schema** of a dataset — variable names, types,
@@ -37,6 +37,9 @@ interface:
 3. **Submit an R or Stata script** to analyze the data.
 4. **See previous results.**
 5. **Expand a specific result** for more detail.
+6. **Recall earlier turns** of the conversation — Builder persists
+   the chat log to disk and Claude can search older turns when
+   the auto-loaded recent window isn't enough.
 
 When Claude submits a script, Builder runs it locally in a
 **sandbox** that blocks network access and restricts which files

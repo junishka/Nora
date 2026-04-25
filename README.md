@@ -4,8 +4,9 @@ Local privacy layer that lets Claude help a researcher analyze
 sensitive data without that data leaving the researcher's machine.
 
 Claude talks to the researcher; a narrow MCP tool interface
-restricts Claude to five operations (`get_schema`, `request_data`,
-`submit_script`, `expand_result`, `list_results`); scripts run
+restricts Claude to six operations (`get_schema`, `request_data`,
+`submit_script`, `expand_result`, `list_results`,
+`recall_conversation`); scripts run
 locally under macOS `sandbox-exec` with network denied and a narrow
 subpath-allowlist for file reads; every output passes through a
 disclosure-control sanitizer before Claude sees it. The researcher
@@ -96,7 +97,7 @@ subprocesses.
 - `src/builder/` — Python source.
   - `app.py` — terminal entry point, system prompt, chat loop.
   - `ui.py` + `web/` — pywebview shell + HTML/CSS/JS frontend.
-  - `tools.py` — the five MCP tools Claude sees.
+  - `tools.py` — the six MCP tools Claude sees.
   - `executor.py` — sandbox profile, R/Stata subprocess, per-run token.
   - `sanitizer.py` + `sdc.py` + `text_safety.py` — disclosure control.
   - `schema.py` — dataset metadata extraction (`.csv`/`.dta`/`.rds`).
@@ -114,7 +115,7 @@ subprocesses.
 Three independent layers provide the privacy guarantee:
 
 1. **Tool interface** — Claude has no general-purpose tools (no
-   filesystem, no shell, no network). Only the five MCP tools, and
+   filesystem, no shell, no network). Only the six MCP tools, and
    they're enumerated exhaustively.
 2. **Sandbox** — `(deny default)` `sandbox-exec` profile; narrow
    subpath-allowlist for reads and writes; network denied entirely.

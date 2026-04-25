@@ -52,6 +52,24 @@ RUNTIME_DATAS = [
     (str(RUNTIME_DIR / "__init__.py"), "builder/runtime"),
 ]
 
+# Web UI assets (HTML + JS + CSS + the bundled Lottie player + the
+# cat-loading animation JSON). The web shell (`builder-ui`) loads
+# these from ``Path(__file__).parent / "web"`` at runtime — see
+# ui.py near `webview.create_window`. PyInstaller's static import
+# scan can't see static asset files; without an explicit datas
+# entry the bundle ships without the UI.
+#
+# Globbed dynamically so anything dropped into web/ (a future asset,
+# a different Lottie animation, etc.) gets bundled without spec
+# edits — the rule is "everything in web/ goes into web/ in the
+# bundle". Hidden files (``.DS_Store`` etc.) are skipped.
+WEB_DIR = REPO_ROOT / "src" / "builder" / "web"
+WEB_DATAS = [
+    (str(p), "builder/web")
+    for p in sorted(WEB_DIR.iterdir())
+    if p.is_file() and not p.name.startswith(".")
+]
+
 # Hidden imports — things PyInstaller's static scan may miss because
 # they're loaded dynamically.
 HIDDEN_IMPORTS = [
@@ -67,7 +85,7 @@ a = Analysis(
     [ENTRY],
     pathex=[str(REPO_ROOT / "src")],
     binaries=[],
-    datas=RUNTIME_DATAS,
+    datas=RUNTIME_DATAS + WEB_DATAS,
     hiddenimports=HIDDEN_IMPORTS,
     hookspath=[],
     runtime_hooks=[],

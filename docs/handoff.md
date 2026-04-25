@@ -9,7 +9,7 @@ trust the code and file a patch to this doc.
 A local macOS app that lets a researcher drive statistical analysis
 (R or Stata) on their own data with Claude, without that data leaving
 the machine. Claude reaches the researcher's files through a narrow
-MCP interface (five tools, nothing else — no Bash, no filesystem, no
+MCP interface (six tools, nothing else — no Bash, no filesystem, no
 network). Scripts run under `sandbox-exec` with network denied and a
 tight subpath-allowlist for reads; every output passes through a
 disclosure-control sanitizer (SDC rules from Eurostat / UK ONS
@@ -67,10 +67,10 @@ Three independent privacy layers. A break in any one is a bug; a
 break in two at the same time is a privacy incident.
 
 1. **Tool interface** (`src/builder/tools.py`) — Claude has exactly
-   five tools: `get_schema`, `request_data`, `submit_script`,
-   `expand_result`, `list_results`. SDK built-ins (Bash, Read,
-   Write, …) are disabled via `disallowed_tools` + `can_use_tool`
-   catch-all + `setting_sources=[]`.
+   six tools: `get_schema`, `request_data`, `submit_script`,
+   `expand_result`, `list_results`, `recall_conversation`. SDK
+   built-ins (Bash, Read, Write, …) are disabled via
+   `disallowed_tools` + `can_use_tool` catch-all + `setting_sources=[]`.
 2. **Sandbox** (`src/builder/executor.py`) — `sandbox-exec` with
    `(deny default)` base, explicit subpath-allowlist for reads
    (cwd + runtime dirs + a minimal set of system paths), tighter
@@ -132,7 +132,7 @@ outside cloud-sync roots, persistent across restarts.
 |---|---|
 | `src/builder/app.py` | Terminal entry point, system prompt, chat loop, rendering |
 | `src/builder/ui.py` | Web UI entry point, pywebview bridge, session staging |
-| `src/builder/tools.py` | The five MCP tools. Start here to understand Claude's surface |
+| `src/builder/tools.py` | The six MCP tools. Start here to understand Claude's surface |
 | `src/builder/executor.py` | Sandbox profile, R/Stata subprocess plumbing, per-run token |
 | `src/builder/sanitizer.py` + `sdc.py` | The SDC allowlist and clamp/suppress primitives |
 | `src/builder/runtime/builder.R` + `builder_result_*.ado` | Emitters the scripts call |
