@@ -244,6 +244,7 @@ def test_run_script_refuses_without_sandbox(tmp_path: Path):
     fake_env = env_detect.Environment(
         r=env_detect.Tool(name="R", binary="/bin/true"),
         stata=None,
+        python=None,
         sandbox_exec=None,
     )
     r = executor.run_script("R", "cat('hi')", tmp_path, env=fake_env)

@@ -18,15 +18,89 @@
   <link rel="stylesheet" href="style.css" />
 </head>
 <body>
+  <!-- Auth view: shown on first launch (no provider configured) and
+       any time every credential is removed. The researcher enters at
+       least one API key (or signs in via the Claude CLI) before they
+       can land on the data picker. -->
+  <div id="auth" class="auth hidden">
+    <div class="auth-card">
+      <div class="landing-logo">Nora</div>
+      <h1>Connect a model</h1>
+      <p class="auth-lead">
+        Nora drives a frontier model against your data. Pick at least
+        one provider and paste an API key. Keys are stored in your
+        macOS Keychain, never on disk in cleartext.
+      </p>
+
+      <div class="auth-providers">
+        <!-- Anthropic row -->
+        <div class="auth-provider" data-provider="anthropic">
+          <div class="auth-provider-header">
+            <div class="auth-provider-name">Anthropic</div>
+            <div class="auth-provider-status" data-role="status"></div>
+          </div>
+          <div class="auth-provider-help">
+            Models: Sonnet 4.6, Opus 4.7, Haiku 4.5. Either paste an
+            API key or sign in via the Claude CLI
+            (<code>claude</code> in a terminal) — the subscription
+            path is detected automatically.
+          </div>
+          <div class="auth-provider-input">
+            <input
+              type="password"
+              data-role="key-input"
+              placeholder="sk-ant-..."
+              autocomplete="off"
+              spellcheck="false"
+            />
+            <button type="button" class="auth-btn primary" data-role="save-btn">Save</button>
+            <button type="button" class="auth-btn" data-role="forget-btn" disabled>Forget</button>
+          </div>
+        </div>
+
+        <!-- OpenAI row -->
+        <div class="auth-provider" data-provider="openai">
+          <div class="auth-provider-header">
+            <div class="auth-provider-name">OpenAI</div>
+            <div class="auth-provider-status" data-role="status"></div>
+          </div>
+          <div class="auth-provider-help">
+            Models: GPT-5.5, GPT-5.5 Pro (extended reasoning). API
+            key only — OpenAI subscriptions don't cover API usage.
+          </div>
+          <div class="auth-provider-input">
+            <input
+              type="password"
+              data-role="key-input"
+              placeholder="sk-..."
+              autocomplete="off"
+              spellcheck="false"
+            />
+            <button type="button" class="auth-btn primary" data-role="save-btn">Save</button>
+            <button type="button" class="auth-btn" data-role="forget-btn" disabled>Forget</button>
+          </div>
+        </div>
+      </div>
+
+      <div id="auth-status" class="auth-status"></div>
+
+      <div class="auth-footer">
+        <button id="auth-continue-btn" type="button" class="landing-btn primary" disabled>
+          Continue
+        </button>
+      </div>
+    </div>
+  </div>
+
   <!-- Landing view: shown when no cwd is set (launched without argv).
        The researcher drops files or clicks a button to pick them. -->
   <div id="landing" class="landing hidden">
     <div class="landing-card">
       <div class="landing-logo">Nora</div>
-      <h1>Share data with Claude</h1>
+      <h1>No raw access</h1>
       <p class="landing-lead">
-        Choose the data files you want Claude to help you analyze.
-        They stay on this machine — Claude only sees schema and
+        Choose the data files you want Nora to help you analyze.
+        They stay on this machine. Nora only sees schema and
         disclosure-controlled summaries.
       </p>
 
@@ -37,7 +111,7 @@
             <polyline points="17 8 12 3 7 8"/>
             <line x1="12" y1="3" x2="12" y2="15"/>
           </svg>
-          <p class="drop-zone-hint">Drop one or more .csv, .dta, or .rds files</p>
+          <p class="drop-zone-hint">Drop .csv, .tsv, .dta, .rds, .parquet, or .jsonl files</p>
           <p class="drop-zone-sub">For files larger than 2 GB, use Choose files</p>
         </div>
       </div>
@@ -56,6 +130,18 @@
       <div id="landing-sessions" class="landing-sessions hidden">
         <div class="landing-sessions-header">Or resume a past session</div>
         <div id="landing-sessions-list" class="landing-sessions-list"></div>
+      </div>
+
+      <!-- Bottom-of-card link to the auth screen. The auth screen
+           appears automatically only when no provider is configured;
+           this link is the way back when a researcher already signed
+           in via Claude CLI but later wants to add OpenAI too. -->
+      <div class="landing-footer">
+        <button
+          id="manage-providers-btn"
+          type="button"
+          class="landing-link"
+        >Manage providers</button>
       </div>
     </div>
   </div>
@@ -98,18 +184,35 @@
       <div class="topbar-meta" id="topbar-meta">
         <span id="cwd-display"></span>
       </div>
-      <!-- Temporary theme toggle — lets a researcher with a dark
-           system theme preview the light palette (and vice versa)
-           without leaving Nora. Label swaps between sun / moon. -->
-      <button
-        type="button"
-        id="theme-toggle"
-        class="topbar-toggle"
-        aria-label="Toggle light/dark"
-        title="Switch theme"
-      >
-        <span id="theme-toggle-icon">☾</span>
-      </button>
+      <!-- Right-corner cluster: Files chip + theme toggle. The
+           Files chip lives next to the theme toggle so the
+           "uploaded files" view is reachable from the same place
+           every other top-bar control sits. Popup drops down
+           anchored to the chip's right edge so it doesn't render
+           off-screen. -->
+      <div class="topbar-right">
+        <div class="permission-wrap">
+          <button
+            type="button"
+            id="files-chip"
+            class="topbar-chip hidden"
+            title="Files uploaded to this session"
+          >
+            <span id="files-chip-label">Files</span>
+            <span class="chip-arrow">▾</span>
+          </button>
+          <div id="files-popup" class="policy-popup hidden"></div>
+        </div>
+        <button
+          type="button"
+          id="theme-toggle"
+          class="topbar-toggle"
+          aria-label="Toggle light/dark"
+          title="Switch theme"
+        >
+          <span id="theme-toggle-icon">☾</span>
+        </button>
+      </div>
     </header>
 
     <main id="messages" class="messages">
@@ -173,7 +276,7 @@
           id="add-files-btn"
           class="composer-chip composer-chip-action"
           aria-label="Add data files or images"
-          title="Add data files (.csv, .dta, .rds) or images. Data files land in the session; images attach to your next message."
+          title="Add data, scripts (.py, .do, .r), or images. Scripts and images travel with your next message; data files land in the session."
         >+</button>
         <div class="permission-wrap">
           <button
@@ -204,7 +307,7 @@
             type="button"
             id="model-chip"
             class="composer-chip"
-            title="Claude model — click to switch"
+            title="Click to switch the active model"
           >
             <span id="model-chip-label">Model</span>
             <span class="chip-arrow">▾</span>

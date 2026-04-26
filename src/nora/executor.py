@@ -1,13 +1,13 @@
-"""Nora — executor for R / Stata scripts.
+"""Nora — executor for R / Stata / Python scripts.
 
 This is the only place in Nora that actually spawns subprocesses
 against the researcher's data. Its job is narrow:
 
 1. Stage the researcher's script and the Nora runtime library in a
    scoped scratch directory under ``<cwd>/.nora/runs/<run_id>/``.
-2. Invoke the right interpreter (``Rscript`` or ``stata-mp``) against
-   the script, with ``NORA_RESULT_PATH`` pointing at a file inside
-   the scratch dir.
+2. Invoke the right interpreter (``Rscript``, ``stata-mp``, or
+   ``python3``) against the script, with ``NORA_RESULT_PATH``
+   pointing at a file inside the scratch dir.
 3. Wrap the invocation in ``sandbox-exec`` with a profile that denies
    network access. (Defense in depth — the runtime library is still
    the only sanctioned I/O surface inside the script.)
@@ -43,7 +43,16 @@ from typing import Any, Literal
 from nora.env_detect import Environment, detect_environment
 
 
-Language = Literal["R", "Stata"]
+Language = Literal["R", "Stata", "Python"]
+
+
+# Hard-required Python packages — without these the runtime library
+# itself won't import. Reflects what ``nora/runtime/nora.py`` needs
+# at module load (NOT what the helpers need to do their job; e.g.,
+# ``from_lm`` needs statsmodels but the rest of the library works
+# without it). The executor refuses Python runs only when one of
+# these is missing.
+_PYTHON_HARD_REQUIRED: frozenset[str] = frozenset({"pandas", "numpy"})
 
 DEFAULT_TIMEOUT_SECONDS = 120
 
@@ -226,8 +235,10 @@ def run_script(
     still raise ``ValueError``.
     """
     env = env or detect_environment()
-    if language not in ("R", "Stata"):
-        raise ValueError(f"unsupported language {language!r}; must be R or Stata")
+    if language not in ("R", "Stata", "Python"):
+        raise ValueError(
+            f"unsupported language {language!r}; must be R, Stata, or Python"
+        )
 
     # 1. Scratch dir.
     run_dir = _make_run_dir(cwd)
@@ -273,23 +284,65 @@ def run_script(
             exit_code=None, result_payload=None,
             error=(
                 "Stata not found on this machine. Install Stata or submit "
-                "the script in R instead."
+                "the script in R or Python instead."
             ),
             run_dir=run_dir, script_path=None, duration_seconds=0.0,
         )
+    if language == "Python":
+        if env.python is None:
+            return ExecutionResult(
+                ok=False, language=language, raw_stdout="", raw_stderr="",
+                exit_code=None, result_payload=None,
+                error=(
+                    "python3 not found on PATH. Install Python 3 (the "
+                    "official installer from python.org or via Homebrew, "
+                    "``brew install python``) and re-launch Nora, or "
+                    "submit the script in R or Stata instead."
+                ),
+                run_dir=run_dir, script_path=None, duration_seconds=0.0,
+            )
+        # Hard-required packages: the runtime library imports them
+        # (or its emit-time encoder does). Soft-recommended ones
+        # (statsmodels, scipy) are only needed by specific helpers
+        # — refuse only on the hard set so a researcher who only
+        # uses descriptive helpers doesn't have to install OLS deps.
+        hard_missing = sorted(set(env.python.missing_packages) & _PYTHON_HARD_REQUIRED)
+        if hard_missing:
+            return ExecutionResult(
+                ok=False, language=language, raw_stdout="", raw_stderr="",
+                exit_code=None, result_payload=None,
+                error=(
+                    "Python is installed at "
+                    f"{env.python.binary} but the Nora runtime needs "
+                    f"these packages: {', '.join(hard_missing)}. "
+                    f"Install them with "
+                    f"``{env.python.binary} -m pip install {' '.join(hard_missing)}`` "
+                    f"and re-launch Nora."
+                ),
+                run_dir=run_dir, script_path=None, duration_seconds=0.0,
+            )
 
     # 2. Stage runtime + script.
     lib_dir = _stage_runtime(run_dir, language)
     script_path = _write_script(run_dir, language, code)
 
     # 3. Compose the command + sandbox profile.
+    extra_read_paths: tuple[str, ...] = ()
     if language == "R":
         cmd = _r_command(env.r.binary, lib_dir, script_path)  # type: ignore[union-attr]
-    else:
+    elif language == "Stata":
         cmd = _stata_command(env.stata.binary, lib_dir, script_path)  # type: ignore[union-attr]
+    else:  # Python
+        cmd = _python_command(env.python.binary, script_path)  # type: ignore[union-attr]
+        # Allow the interpreter to read its own stdlib + site-packages
+        # — critical for venv / pyenv / conda Pythons that live
+        # outside the system trees the default sandbox already covers.
+        extra_read_paths = env.python.extra_read_paths  # type: ignore[union-attr]
 
     # sandbox_exec presence is enforced above as a precondition.
-    profile_path = _write_sandbox_profile(run_dir, cwd)
+    profile_path = _write_sandbox_profile(
+        run_dir, cwd, extra_read_paths=extra_read_paths
+    )
     cmd = [env.sandbox_exec, "-f", str(profile_path), *cmd]
 
     # 4. Run.
@@ -300,7 +353,9 @@ def run_script(
     #     there instead of in the researcher's project. The Stata wrapper
     #     `cd`s to the researcher's cwd before running the user's code,
     #     so relative paths in the user script still work.
-    subprocess_cwd = cwd if language == "R" else run_dir
+    #   - Python: the researcher's project dir (same as R) — relative
+    #     paths in ``pd.read_csv("survey.csv")`` resolve naturally.
+    subprocess_cwd = run_dir if language == "Stata" else cwd
     # Generate a fresh per-run token. The runtime library reads it from
     # NORA_RUN_TOKEN, embeds it in every emitted payload, and (in R)
     # unsets the env var so user code loaded afterward can't read it
@@ -454,7 +509,7 @@ def _stage_runtime(run_dir: Path, language: Language) -> Path:
         for name in ("nora.R",):
             src = runtime_pkg.joinpath(name)
             (lib_dir / name).write_text(src.read_text(encoding="utf-8"))
-    else:  # Stata
+    elif language == "Stata":
         stata_ados = (
             "nora_result_regress.ado",
             "nora_result_ttest.ado",
@@ -465,6 +520,14 @@ def _stage_runtime(run_dir: Path, language: Language) -> Path:
         for name in stata_ados:
             src = runtime_pkg.joinpath(name)
             (lib_dir / name).write_text(src.read_text(encoding="utf-8"))
+    else:  # Python
+        # Single module — staged into lib_dir which the script's
+        # subprocess sees on PYTHONPATH (set in subprocess_env).
+        # Researchers ``import nora`` to reach the helpers exactly
+        # the way the R library does ``nora$from_lm`` / Stata does
+        # ``nora_result_regress``.
+        src = runtime_pkg.joinpath("nora.py")
+        (lib_dir / "nora.py").write_text(src.read_text(encoding="utf-8"))
     return lib_dir
 
 
@@ -487,6 +550,26 @@ def _write_script(run_dir: Path, language: Language, code: str) -> Path:
         path = run_dir / "script.R"
         path.write_text(code, encoding="utf-8")
         return path
+    if language == "Python":
+        # Two-line preamble puts the staged ``nora.py`` on
+        # ``sys.path`` so the researcher's ``import nora`` resolves
+        # cleanly. We use a preamble (rather than PYTHONPATH) because
+        # the interpreter is invoked with ``-I`` (isolated mode),
+        # which ignores all PYTHON* env vars by design — keeps a
+        # researcher's stray ``PYTHONSTARTUP`` from running before
+        # their script. Same shape as the Stata adopath preamble:
+        # explicit, visible in the scratch dir, easy to audit.
+        lib_dir = run_dir / "lib"
+        preamble = (
+            "import sys as _nora_sys\n"
+            f"_nora_sys.path.insert(0, {str(lib_dir)!r})\n"
+            "del _nora_sys\n"
+            "# ----- Nora preamble above; researcher code below -----\n"
+            "\n"
+        )
+        path = run_dir / "script.py"
+        path.write_text(preamble + code + "\n", encoding="utf-8")
+        return path
     # Stata: single .do file. Preamble + separator + researcher code.
     # Quoted paths in Stata's `adopath +` and `cd` handle spaces fine
     # at the language level — only the command-line `-b do <path>`
@@ -508,6 +591,19 @@ def _write_script(run_dir: Path, language: Language, code: str) -> Path:
 # ---------------------------------------------------------------------------
 # Command composition
 # ---------------------------------------------------------------------------
+
+def _python_command(python: str, script_path: Path) -> list[str]:
+    """Compose a ``python3`` invocation for the user's script.
+
+    ``-I`` (isolated mode) cuts the per-user site-packages dir and
+    ``PYTHONSTARTUP`` out of the picture so the script runs against
+    the interpreter's stdlib + the Nora-staged runtime + whatever's
+    on ``PYTHONPATH`` (which the executor sets to ``lib_dir`` plus
+    inherited paths). No ``site.USER_BASE`` reads, no surprise
+    pre-script hooks.
+    """
+    return [python, "-I", str(script_path)]
+
 
 def _r_command(rscript: str, lib_dir: Path, script_path: Path) -> list[str]:
     """Compose `Rscript` invocation that sources the runtime before the script.
@@ -569,7 +665,8 @@ def _read_stata_log(script_path: Path | None) -> str:
 # ---------------------------------------------------------------------------
 
 def _sandbox_profile_string(
-    run_dir: Path, cwd: Path, home: Path | None = None
+    run_dir: Path, cwd: Path, home: Path | None = None,
+    extra_read_paths: tuple[str, ...] = (),
 ) -> str:
     """Build the SBPL profile text. Pure function — no I/O.
 
@@ -577,11 +674,20 @@ def _sandbox_profile_string(
     generated profile without needing sandbox-exec to be callable in
     the test environment. See ``test_executor_profile.py`` for the
     invariants the profile must satisfy.
+
+    ``extra_read_paths`` is for runtimes whose interpreter lives
+    outside the system trees the default profile already covers
+    (e.g. a venv'd Python). Each entry is added as a read-subpath.
     """
-    return _build_profile(run_dir, cwd, home or Path.home())
+    return _build_profile(
+        run_dir, cwd, home or Path.home(), extra_read_paths,
+    )
 
 
-def _write_sandbox_profile(run_dir: Path, cwd: Path) -> Path:
+def _write_sandbox_profile(
+    run_dir: Path, cwd: Path,
+    extra_read_paths: tuple[str, ...] = (),
+) -> Path:
     """Write a per-run sandbox-exec profile and return its path.
 
     Uses a ``(deny default)`` posture with explicit allowlists, so that
@@ -629,13 +735,16 @@ def _write_sandbox_profile(run_dir: Path, cwd: Path) -> Path:
     - The ``/dev/ttys*`` regex covers pseudo-terminals that subprocess
       pipes may briefly touch.
     """
-    profile = _build_profile(run_dir, cwd, Path.home())
+    profile = _build_profile(run_dir, cwd, Path.home(), extra_read_paths)
     path = run_dir / "sandbox.sb"
     path.write_text(profile)
     return path
 
 
-def _build_profile(run_dir: Path, cwd: Path, home: Path) -> str:
+def _build_profile(
+    run_dir: Path, cwd: Path, home: Path,
+    extra_read_paths: tuple[str, ...] = (),
+) -> str:
     """Construct the SBPL text. Separated so it can be unit-tested
     without filesystem I/O (see ``_sandbox_profile_string``).
     """
@@ -733,6 +842,13 @@ def _build_profile(run_dir: Path, cwd: Path, home: Path) -> str:
         _quote(cwd),
         _quote(run_dir),
     ]
+    # Per-language extras (typically a Python interpreter's sys.prefix
+    # so it can read its own stdlib + site-packages). Only added when
+    # the executor is running a language that needs them; absent for
+    # R / Stata runs.
+    for p in extra_read_paths:
+        if p:
+            read_subpaths.append(_quote(p))
 
     return (
         "(version 1)\n"

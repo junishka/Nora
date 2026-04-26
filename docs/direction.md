@@ -274,13 +274,16 @@ current friction bites:
 
 ### Cumulative-inference / cross-query composition
 
-**Status as of the current pilot:** this is the single biggest
-remaining gap against the full privacy goal. Acceptable for
-self-pilots and colleagues-you-hand-the-dmg-to (adversarial
-Claude and adversarial researchers aren't the threat model for
-a researcher analyzing their own data with their own account).
-Becomes *the* blocker before wider distribution, especially any
-pilot involving someone else's sensitive data.
+**Status as of the current pilot:** named, design-pending, and
+*not* the right thing to spend time on yet. The current and
+intended near-term mode is a researcher running Nora against their
+own data with their own API key — adversarial Claude and
+adversarial researchers aren't part of that threat model. Where
+this becomes load-bearing is wider deployment: shared instances,
+researchers analysing data they don't own, regulated datasets
+where the threat model includes adaptive probing. Acknowledged
+here so it isn't rediscovered as a surprise; deferred until the
+deployment shape that needs it actually exists.
 
 Nora's SDC rules (precision clamping, cell suppression,
 dominance, text-safety) constrain what any **single** sanitized

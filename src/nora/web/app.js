@@ -12,6 +12,9 @@
 
 const landingEl = document.getElementById('landing');
 const chatEl = document.getElementById('chat');
+const authEl = document.getElementById('auth');
+const authStatusEl = document.getElementById('auth-status');
+const authContinueBtn = document.getElementById('auth-continue-btn');
 const dropZone = document.getElementById('drop-zone');
 const chooseFilesBtn = document.getElementById('choose-files-btn');
 const chooseFolderBtn = document.getElementById('choose-folder-btn');
@@ -32,9 +35,10 @@ const DEFAULT_CONTEXT_WINDOW = 1_000_000;
 let contextWindow = DEFAULT_CONTEXT_WINDOW;
 
 // Persisted model choice — survives restarts. Applied on boot after
-// the bridge is ready (loadModels runs `set_model` if the stored
-// value differs from the backend default).
-const MODEL_STORAGE_KEY = 'nora.model';
+// (Model preference used to live in localStorage as a global default.
+// It now lives per-session in ``.nora/session_state.json`` and is
+// restored by the backend on session open — see ``_set_cwd`` /
+// ``_restore_session_model_preference`` in ui.py.)
 
 // ----- theme toggle -------------------------------------------------------
 // Temporary light/dark override. When the user hasn't clicked the
@@ -106,7 +110,169 @@ const DEPTH_TIERS = [
 
 // ----- view routing ------------------------------------------------------
 
+function showAuth(authPayload) {
+  /* Reveal the auth screen and render per-provider rows from the
+   * payload returned by ``ui_ready`` / ``auth_status``. Called on
+   * first launch (no provider configured) and any time the
+   * researcher clicks "back to auth" from the landing screen. */
+  if (!authEl) return;
+  authEl.classList.remove('hidden');
+  if (landingEl) landingEl.classList.add('hidden');
+  if (chatEl) chatEl.classList.add('hidden');
+  if (authStatusEl) {
+    authStatusEl.textContent = '';
+    authStatusEl.className = 'auth-status';
+  }
+  renderAuthScreen(authPayload);
+}
+
+function renderAuthScreen(authPayload) {
+  /* Update each provider row's status badge and Forget button based
+   * on the auth_status payload. Continue button is enabled iff at
+   * least one provider is configured. */
+  if (!authEl) return;
+  const status = (authPayload && authPayload.providers) || {};
+  const rows = authEl.querySelectorAll('.auth-provider');
+  rows.forEach((row) => {
+    const provider = row.dataset.provider;
+    const info = status[provider] || {};
+    const statusEl = row.querySelector('[data-role="status"]');
+    const forgetBtn = row.querySelector('[data-role="forget-btn"]');
+    if (info.configured) {
+      row.classList.add('configured');
+      if (statusEl) {
+        statusEl.classList.add('ok');
+        statusEl.textContent = info.method === 'subscription'
+          ? 'Signed in via Claude CLI'
+          : 'API key stored';
+      }
+    } else {
+      row.classList.remove('configured');
+      if (statusEl) {
+        statusEl.classList.remove('ok');
+        statusEl.textContent = 'Not configured';
+      }
+    }
+    if (forgetBtn) {
+      forgetBtn.disabled = !info.has_keyring_entry;
+    }
+  });
+  if (authContinueBtn) {
+    authContinueBtn.disabled = !(authPayload && authPayload.any_authed);
+  }
+}
+
+function setAuthStatus(text, kind) {
+  if (!authStatusEl) return;
+  authStatusEl.textContent = text || '';
+  authStatusEl.className = 'auth-status' + (kind ? ' ' + kind : '');
+}
+
+async function loadAuthStatus() {
+  if (!window.pywebview || !window.pywebview.api) return null;
+  if (typeof window.pywebview.api.auth_status !== 'function') return null;
+  try {
+    return await window.pywebview.api.auth_status();
+  } catch (err) {
+    console.warn('auth_status failed', err);
+    return null;
+  }
+}
+
+if (authEl) {
+  // Save / Forget per row.
+  authEl.querySelectorAll('.auth-provider').forEach((row) => {
+    const provider = row.dataset.provider;
+    const input = row.querySelector('[data-role="key-input"]');
+    const saveBtn = row.querySelector('[data-role="save-btn"]');
+    const forgetBtn = row.querySelector('[data-role="forget-btn"]');
+
+    if (saveBtn && input) {
+      saveBtn.addEventListener('click', async () => {
+        if (!window.pywebview || !window.pywebview.api) return;
+        const key = (input.value || '').trim();
+        if (!key) {
+          setAuthStatus('Paste an API key first.', 'error');
+          return;
+        }
+        saveBtn.disabled = true;
+        try {
+          const res = await window.pywebview.api.save_credential(provider, key);
+          if (res && res.ok) {
+            input.value = '';
+            setAuthStatus(`${provider} key saved.`, 'ok');
+            renderAuthScreen(res.auth);
+          } else {
+            const reason = (res && res.reason) || 'unknown error';
+            setAuthStatus(`Save failed: ${reason}`, 'error');
+          }
+        } catch (err) {
+          setAuthStatus('Save failed: ' + err, 'error');
+        } finally {
+          saveBtn.disabled = false;
+        }
+      });
+      input.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter') saveBtn.click();
+      });
+    }
+
+    if (forgetBtn) {
+      forgetBtn.addEventListener('click', async () => {
+        if (!window.pywebview || !window.pywebview.api) return;
+        if (typeof window.pywebview.api.delete_credential !== 'function') return;
+        forgetBtn.disabled = true;
+        try {
+          const res = await window.pywebview.api.delete_credential(provider);
+          if (res && res.ok) {
+            setAuthStatus(`${provider} credential removed.`, 'ok');
+            renderAuthScreen(res.auth);
+          } else {
+            setAuthStatus('Forget failed: ' + ((res && res.reason) || ''), 'error');
+          }
+        } catch (err) {
+          setAuthStatus('Forget failed: ' + err, 'error');
+        }
+      });
+    }
+  });
+
+  // Continue → land on the data picker (or chat if cwd already set).
+  if (authContinueBtn) {
+    authContinueBtn.addEventListener('click', async () => {
+      if (!window.pywebview || !window.pywebview.api) return;
+      try {
+        const state = await window.pywebview.api.ui_ready();
+        if (state && state.state === 'ready') {
+          showChat(state);
+        } else {
+          showLanding();
+        }
+      } catch (err) {
+        console.error('ui_ready failed after auth', err);
+        showLanding();
+      }
+    });
+  }
+}
+
+// "Manage providers" link on the landing card — explicit way to
+// reach the auth screen when the researcher's already auto-detected
+// (e.g., signed in via Claude CLI) but wants to add OpenAI too. The
+// auth screen only appears automatically when no provider is
+// configured at all.
+async function openAuthScreen() {
+  const auth = await loadAuthStatus();
+  showAuth(auth || { providers: {}, any_authed: false });
+}
+
+const manageProvidersBtn = document.getElementById('manage-providers-btn');
+if (manageProvidersBtn) {
+  manageProvidersBtn.addEventListener('click', openAuthScreen);
+}
+
 function showLanding() {
+  if (authEl) authEl.classList.add('hidden');
   landingEl.classList.remove('hidden');
   chatEl.classList.add('hidden');
   // Reset landing-side UI so re-entering from "New session" feels
@@ -171,6 +337,7 @@ function showChat(payload) {
    * Called both on initial startup (when the backend already has a
    * cwd) and after a session switch, so it has to reset any prior
    * transcript rather than just updating pieces in place. */
+  if (authEl) authEl.classList.add('hidden');
   landingEl.classList.add('hidden');
   chatEl.classList.remove('hidden');
 
@@ -217,6 +384,29 @@ function showChat(payload) {
 // skips the typewriter animation — past messages should appear all
 // at once, not trickle in for several seconds per bubble.
 let replayMode = false;
+// Turns that yielded no visible reply artifacts. Keep them around
+// just long enough for the researcher to notice the failure, then
+// sweep them the next time a new message is sent so the transcript
+// doesn't fill with dead-end bubbles.
+let activeLiveTurn = null;
+let replayTailTurn = null;
+let staleTranscriptTurns = [];
+
+function dropNodes(nodes) {
+  (nodes || []).forEach((node) => {
+    if (node && typeof node.remove === 'function') node.remove();
+  });
+}
+
+function sweepStaleTranscriptTurns() {
+  staleTranscriptTurns.forEach((turn) => dropNodes(turn));
+  staleTranscriptTurns = [];
+}
+
+function queueDisposableTurn(nodes) {
+  const kept = (nodes || []).filter(Boolean);
+  if (kept.length > 0) staleTranscriptTurns.push(kept);
+}
 
 async function replayHistory() {
   if (!window.pywebview || !window.pywebview.api) return;
@@ -235,6 +425,10 @@ async function replayHistory() {
       events.forEach((evt) => replayEvent(evt));
     } finally {
       replayMode = false;
+      if (replayTailTurn && !replayTailTurn.hasVisibleReply) {
+        queueDisposableTurn(replayTailTurn.nodes);
+      }
+      replayTailTurn = null;
     }
     scrollToBottom();
   } catch (err) {
@@ -249,21 +443,38 @@ function replayEvent(evt) {
    * Named deliberately to avoid shadowing window.dispatchEvent,
    * which is a DOM method and was my first attempt. */
   switch (evt.type) {
-    case 'user_message':
-      appendUser(evt.text || '');
+    case 'user_message': {
+      if (replayTailTurn && !replayTailTurn.hasVisibleReply) {
+        dropNodes(replayTailTurn.nodes);
+      }
+      // ``attachments`` may be a list of script filenames (the
+      // backend persists the names that travelled with this
+      // message) OR a legacy ``int`` count for image attachments.
+      // Only the list form renders chips; the count form is for
+      // older sessions and we just drop it.
+      const att = Array.isArray(evt.attachments) ? evt.attachments : [];
+      const userEl = appendUser(evt.text || '', att);
+      replayTailTurn = { nodes: [userEl], hasVisibleReply: false };
       break;
+    }
     case 'assistant_text':
+      if (replayTailTurn) replayTailTurn.hasVisibleReply = true;
       appendAssistant(evt.text || '');
       break;
     case 'assistant_thinking':
+      if (replayTailTurn) replayTailTurn.hasVisibleReply = true;
       appendThinking(evt.text || '');
       break;
-    case 'tool_call':
-      appendToolCall(evt);
+    case 'tool_call': {
+      const card = appendToolCall(evt);
+      if (card && replayTailTurn) replayTailTurn.hasVisibleReply = true;
       break;
-    case 'tool_result':
-      appendToolResult(evt);
+    }
+    case 'tool_result': {
+      const card = appendToolResult(evt);
+      if (card && replayTailTurn) replayTailTurn.hasVisibleReply = true;
       break;
+    }
   }
 }
 
@@ -363,11 +574,14 @@ landingEl.addEventListener('drop', async (e) => {
   // Only data files we recognize. Anything else gets rejected up-front
   // so researchers see the reason in the UI rather than a confused
   // session with non-data files in it.
-  const accepted = files.filter((f) => /\.(csv|dta|rds)$/i.test(f.name));
+  const accepted = files.filter(
+    (f) => /\.(csv|tsv|dta|rds|parquet|jsonl|ndjson)$/i.test(f.name)
+  );
   const rejected = files.length - accepted.length;
   if (accepted.length === 0) {
     setLandingError(
-      'Drop .csv, .dta, or .rds files. Other types are ignored.'
+      'Drop .csv, .tsv, .dta, .rds, .parquet, or .jsonl files. '
+      + 'Other types are ignored.'
     );
     return;
   }
@@ -458,13 +672,19 @@ function renderAttachments() {
     const thumb = document.createElement('img');
     thumb.src = img.url;
     thumb.alt = 'Staged image ' + (idx + 1);
+    thumb.title = 'Click to view full size';
+    thumb.style.cursor = 'zoom-in';
+    thumb.addEventListener('click', () => showImageLightbox(img.url));
     wrap.appendChild(thumb);
     const rm = document.createElement('button');
     rm.type = 'button';
     rm.className = 'compose-attachment-remove';
     rm.setAttribute('aria-label', 'Remove');
     rm.textContent = '×';
-    rm.addEventListener('click', () => {
+    rm.addEventListener('click', (e) => {
+      // Stop propagation so the underlying thumbnail click
+      // doesn't also fire the lightbox.
+      e.stopPropagation();
       URL.revokeObjectURL(img.url);
       stagedImages.splice(idx, 1);
       renderAttachments();
@@ -473,12 +693,21 @@ function renderAttachments() {
     attachmentsEl.appendChild(wrap);
   });
   // Named-chip notices for data/script files the researcher just
-  // added. These have no payload to send (the file is already on
-  // disk); they're just a visual "yes that landed" receipt.
+  // added. Data files are visual "yes that landed" receipts; script
+  // files (.py / .do / .r / .rmd) ALSO travel with the next message
+  // as a context block (see _pending_script_attachments in ui.py),
+  // so the chip tooltip names that distinction.
   stagedDataNotices.forEach((name, idx) => {
     const chip = document.createElement('div');
     chip.className = 'compose-attachment compose-attachment-file';
-    chip.title = name + ' — copied into the session';
+    const ext = (name.split('.').pop() || '').toLowerCase();
+    const isScript = ['py', 'do', 'r', 'rmd'].includes(ext);
+    if (isScript) {
+      chip.classList.add('compose-attachment-script');
+      chip.title = name + ' — saved in this session and sent with your next message';
+    } else {
+      chip.title = name + ' — copied into the session';
+    }
     const label = document.createElement('span');
     label.className = 'compose-attachment-filename';
     label.textContent = name;
@@ -488,9 +717,27 @@ function renderAttachments() {
     rm.className = 'compose-attachment-remove';
     rm.setAttribute('aria-label', 'Dismiss');
     rm.textContent = '×';
-    rm.addEventListener('click', () => {
-      stagedDataNotices.splice(idx, 1);
+    rm.addEventListener('click', async () => {
+      // Splice the JS-side notice immediately for a responsive UI.
+      const removed = stagedDataNotices.splice(idx, 1)[0];
       renderAttachments();
+      // Scripts ride the next message as inline context (the
+      // backend stages them in _pending_script_attachments). The
+      // chip × must also call the bridge to unstage there —
+      // without this, the file silently rides along after the
+      // researcher dismissed it. The on-disk copy is untouched.
+      if (
+        isScript
+        && window.pywebview
+        && window.pywebview.api
+        && typeof window.pywebview.api.unstage_attachment === 'function'
+      ) {
+        try {
+          await window.pywebview.api.unstage_attachment(removed);
+        } catch (err) {
+          console.warn('unstage_attachment failed', err);
+        }
+      }
     });
     chip.appendChild(rm);
     attachmentsEl.appendChild(chip);
@@ -525,12 +772,12 @@ async function stageImageFile(file) {
 }
 
 // Extensions we accept on composer drop/paste alongside images.
-// Same set the + button's picker accepts — data files, R/Stata
-// scripts, Stata graphs, logs, and R Markdown. All copied into
-// the session cwd so Claude can reference them.
+// Same set the + button's picker accepts — data files, R/Stata/
+// Python scripts, Stata graphs, logs, and R Markdown. All copied
+// into the session cwd so the model can reference them.
 const COMPOSER_DATA_EXTS = new Set([
-  'csv', 'dta', 'rds',
-  'do', 'r',
+  'csv', 'tsv', 'dta', 'rds', 'parquet', 'jsonl', 'ndjson',
+  'do', 'r', 'py', 'ipynb',
   'gph',
   'log', 'smcl',
   'rmd',
@@ -580,6 +827,15 @@ async function stageDataFile(file) {
     }
     if (res.skipped && res.skipped.length > 0) {
       appendError('Skipped: ' + res.skipped.join(', '));
+    }
+    if (res.skipped_existing && res.skipped_existing.length > 0) {
+      // Already-in-session collisions are surfaced as their own line so
+      // it's clear nothing was overwritten. Researcher can rename
+      // upstream and try again.
+      appendError(
+        'Already in this session, not overwritten: '
+        + res.skipped_existing.join(', ')
+      );
     }
     if (res.policy) updatePolicyChip(res.policy);
     if (res.session_title && cwdEl) cwdEl.textContent = res.session_title;
@@ -633,7 +889,7 @@ if (form) {
     if (skipped.length > 0) {
       appendError(
         'Skipped: ' + skipped.map((f) => f.name).join(', ') +
-        ' — only images and data/script files (.csv, .dta, .rds, .do, .r, .log, .smcl, .gph, .rmd) can be dropped here.'
+        ' — only images and data/script files (.csv, .tsv, .dta, .rds, .parquet, .jsonl, .do, .r, .py, .ipynb, .log, .smcl, .gph, .rmd) can be dropped here.'
       );
     }
     for (const file of usable) {
@@ -682,7 +938,30 @@ form.addEventListener('submit', async (e) => {
     appendSystem('backend not ready yet; try again');
     return;
   }
-  appendUser(text || '(image only)');
+  // Snapshot which staged-data notices are travelling with THIS
+  // message (only script files actually ride along as inline context;
+  // pure data files are session-resident and discoverable via
+  // get_schema). Rendered as transcript chips below the user bubble
+  // so the upload stays visible after send instead of disappearing
+  // with the composer chip.
+  const SCRIPT_EXTS_RE = /\.(py|do|r|rmd)$/i;
+  const messageAttachments = stagedDataNotices.filter(
+    (n) => SCRIPT_EXTS_RE.test(n)
+  );
+  // Snapshot image thumbnails for the user bubble. Use base64
+  // data URLs (not blob:), because the form submit immediately
+  // revokes the blob URLs — keeping the blob would leave the
+  // bubble's thumbnails dead. data: URLs are self-contained, so
+  // they survive the blob revoke at the bottom of this handler.
+  const messageImages = images.map((img) => ({
+    url: dataUrlFromBase64(img.data, img.mime),
+    mime: img.mime,
+  }));
+  sweepStaleTranscriptTurns();
+  const userEl = appendUser(
+    text || '(image only)', messageAttachments, messageImages
+  );
+  activeLiveTurn = { nodes: [userEl], hasVisibleReply: false };
   input.value = '';
   autosize();
   rotatePlaceholder();
@@ -702,7 +981,12 @@ form.addEventListener('submit', async (e) => {
       const payload = images.map((img) => ({ data: img.data, mime: img.mime }));
       await window.pywebview.api.send_message_with_images(text, payload);
     } else if (images.length > 0) {
-      appendError('Restart Nora to send images.');
+      const errEl = appendError('Restart Nora to send images.');
+      if (activeLiveTurn && !activeLiveTurn.hasVisibleReply) {
+        activeLiveTurn.nodes.push(errEl);
+        queueDisposableTurn(activeLiveTurn.nodes);
+      }
+      activeLiveTurn = null;
       setSending(false);
       return;
     } else {
@@ -713,7 +997,12 @@ form.addEventListener('submit', async (e) => {
     // The turn_done / turn_error / auth_failure event handler
     // below is what flips the button back on.
   } catch (err) {
-    appendError('send failed: ' + err);
+    const errEl = appendError('send failed: ' + err);
+    if (activeLiveTurn && !activeLiveTurn.hasVisibleReply) {
+      activeLiveTurn.nodes.push(errEl);
+      queueDisposableTurn(activeLiveTurn.nodes);
+    }
+    activeLiveTurn = null;
     setSending(false);
   }
 });
@@ -842,11 +1131,16 @@ function hideLoadingIndicator() {
   if (el) el.remove();
 }
 
-// Stop button — asks the bridge to cancel the in-flight turn. The
-// bridge cancels the asyncio task and tears down the SDK client so
-// no half-finished request leaks into the next turn; a terminal
-// "turn_error: cancelled" event arrives via the normal stream and
-// clears the UI state through setSending(false).
+// Stop button — asks the bridge to cancel the in-flight turn AND
+// always returns the UI to a clean state. The bridge cancels the
+// asyncio task and tears down the SDK client so no half-finished
+// request leaks into the next turn. We used to wait for the
+// turn_error event to clear setSending, but the provider stream can
+// in rare cases close without yielding any terminal event (network
+// blip, SDK internal hiccup); the JS then stayed stuck on "sending"
+// forever and the bridge said "no turn in flight." Hard-resetting
+// here means Stop is always a reliable recovery button: researchers
+// can always get the composer back.
 if (stopBtn) {
   stopBtn.addEventListener('click', async () => {
     if (!window.pywebview || !window.pywebview.api) return;
@@ -854,8 +1148,14 @@ if (stopBtn) {
     try {
       await window.pywebview.api.interrupt_turn();
     } catch (_) {
-      // swallow — the turn_error event below will re-enable things
+      // swallow — the bridge may have nothing to cancel; we still
+      // want to clear the UI state below.
     } finally {
+      // Always restore the composer regardless of what the bridge
+      // said. If a terminal event arrives after this, it's a no-op
+      // (setSending(false) is idempotent); if none arrives, the
+      // researcher isn't trapped.
+      setSending(false);
       stopBtn.disabled = false;
     }
   });
@@ -870,17 +1170,23 @@ window.nora_event = function (evt) {
       showChat(evt);
       break;
     case 'assistant_text':
+      if (activeLiveTurn) activeLiveTurn.hasVisibleReply = true;
       appendAssistant(evt.text);
       break;
     case 'assistant_thinking':
+      if (activeLiveTurn) activeLiveTurn.hasVisibleReply = true;
       appendThinking(evt.text);
       break;
-    case 'tool_call':
-      appendToolCall(evt);
+    case 'tool_call': {
+      const card = appendToolCall(evt);
+      if (card && activeLiveTurn) activeLiveTurn.hasVisibleReply = true;
       break;
-    case 'tool_result':
-      appendToolResult(evt);
+    }
+    case 'tool_result': {
+      const card = appendToolResult(evt);
+      if (card && activeLiveTurn) activeLiveTurn.hasVisibleReply = true;
       break;
+    }
     case 'turn_done':
       // Terminal event: re-enable the composer and update the
       // context-usage chip.
@@ -900,13 +1206,31 @@ window.nora_event = function (evt) {
         (evt.cache_read_input_tokens || 0) +
         (evt.cache_creation_input_tokens || 0);
       updateContextChip(prompt);
+      if (activeLiveTurn && !activeLiveTurn.hasVisibleReply) {
+        queueDisposableTurn(activeLiveTurn.nodes);
+      }
+      activeLiveTurn = null;
       break;
     case 'auth_failure':
-      appendError('Auth failure: ' + (evt.reason || 'unknown'));
+      {
+        const errEl = appendError('Auth failure: ' + (evt.reason || 'unknown'));
+        if (activeLiveTurn && !activeLiveTurn.hasVisibleReply) {
+          activeLiveTurn.nodes.push(errEl);
+          queueDisposableTurn(activeLiveTurn.nodes);
+        }
+        activeLiveTurn = null;
+      }
       setSending(false);
       break;
     case 'turn_error':
-      appendError(evt.message || 'unknown error');
+      {
+        const errEl = appendError(evt.message || 'unknown error');
+        if (activeLiveTurn && !activeLiveTurn.hasVisibleReply) {
+          activeLiveTurn.nodes.push(errEl);
+          queueDisposableTurn(activeLiveTurn.nodes);
+        }
+        activeLiveTurn = null;
+      }
       setSending(false);
       break;
     case 'policy_updated':
@@ -919,8 +1243,14 @@ window.nora_event = function (evt) {
 
 // ----- message rendering --------------------------------------------------
 
-function appendUser(text) {
-  append('user', text);
+function appendUser(text, attachments, images) {
+  /* ``attachments`` is an optional array of filenames that traveled
+   * with this message (e.g. dragged-in .py / .do scripts).
+   * ``images`` is an optional array of ``{url, mime}`` data-URL
+   * thumbnails. Both render in the transcript so the upload event
+   * is visible permanently — not just as ephemeral composer chips
+   * that clear on send. */
+  return append('user', text, /*markdown=*/ false, attachments || [], images || []);
 }
 
 function appendAssistant(text) {
@@ -928,13 +1258,11 @@ function appendAssistant(text) {
   // land instantly so loading a session doesn't take N seconds per
   // assistant bubble.
   if (replayMode) {
-    append('assistant', text || '', /*markdown=*/ true);
-    return;
+    return append('assistant', text || '', /*markdown=*/ true);
   }
   const textSafe = text || '';
   if (textSafe.length > 900) {
-    append('assistant', textSafe, /*markdown=*/ true);
-    return;
+    return append('assistant', textSafe, /*markdown=*/ true);
   }
   // The SDK hands us complete text blocks per turn, not token-by-token
   // deltas, so real streaming isn't available at this layer. To give
@@ -964,6 +1292,7 @@ function appendAssistant(text) {
     }
     scrollToBottom();
   });
+  return wrapper;
 }
 
 // The typewriter currently animating, if any. Tracked globally so
@@ -1053,17 +1382,18 @@ function appendThinking(text) {
   card.appendChild(body);
   messagesEl.appendChild(card);
   scrollToBottom();
+  return card;
 }
 
 function appendSystem(text) {
-  append('system', text);
+  return append('system', text);
 }
 
 function appendError(text) {
-  append('error', text);
+  return append('error', text);
 }
 
-function append(kind, text, markdown) {
+function append(kind, text, markdown, attachments, images) {
   // User / system / error messages appear instantly. Make sure any
   // typewriter from the previous turn lands first, so a fresh user
   // bubble doesn't appear above a still-animating assistant bubble.
@@ -1071,6 +1401,27 @@ function append(kind, text, markdown) {
   finalizeActiveTypewriter();
   const wrapper = document.createElement('div');
   wrapper.className = 'message ' + kind;
+  // Image thumbnails render ABOVE the bubble — same vertical order
+  // they appeared in the composer, easier to scan. Clicking opens
+  // the full-resolution image in a new browser tab so the
+  // researcher can inspect details (axis labels, fine print, etc.)
+  // that don't survive the chat-width thumbnail size.
+  if (images && images.length > 0) {
+    const row = document.createElement('div');
+    row.className = 'message-images';
+    images.forEach((img, idx) => {
+      const thumb = document.createElement('img');
+      thumb.src = img.url || '';
+      thumb.alt = `Attached image ${idx + 1}`;
+      thumb.className = 'message-image-thumb';
+      thumb.title = 'Click to view full size';
+      thumb.addEventListener('click', () => {
+        if (img.url) showImageLightbox(img.url);
+      });
+      row.appendChild(thumb);
+    });
+    wrapper.appendChild(row);
+  }
   const body = document.createElement('div');
   body.className = 'message-body';
   if (markdown && window.NoraMarkdown) {
@@ -1079,8 +1430,25 @@ function append(kind, text, markdown) {
     body.textContent = text;
   }
   wrapper.appendChild(body);
+  // Attachment chips render as a small row beneath the user bubble
+  // (only shown when the caller passes a non-empty list). This is
+  // the "I uploaded a script and Nora can see it" affordance the
+  // composer chip can't be (composer chips clear on send).
+  if (attachments && attachments.length > 0) {
+    const row = document.createElement('div');
+    row.className = 'message-attachments';
+    attachments.forEach((name) => {
+      const chip = document.createElement('span');
+      chip.className = 'message-attachment-chip';
+      chip.textContent = '📎 ' + name;
+      chip.title = name + ' — sent with this message';
+      row.appendChild(chip);
+    });
+    wrapper.appendChild(row);
+  }
   messagesEl.appendChild(wrapper);
   scrollToBottom();
+  return wrapper;
 }
 
 function appendToolCall(evt) {
@@ -1157,6 +1525,7 @@ function appendToolCall(evt) {
   card.appendChild(body);
   messagesEl.appendChild(card);
   scrollToBottom();
+  return card;
 }
 
 function appendToolResult(evt) {
@@ -1179,6 +1548,7 @@ function appendToolResult(evt) {
   // researchers who want it can ask Claude.
   renderScriptResultInline(body, evt);
   scrollToBottom();
+  return existingCard;
 }
 
 // Marker emitted by the Stata preamble in executor.py. Everything
@@ -1232,15 +1602,20 @@ function renderScriptResultInline(body, evt) {
     const actions = document.createElement('div');
     actions.className = 'tool-actions';
 
-    const lang = evt.language;  // "R" | "Stata" | undefined
-    const scriptFile = lang === 'Stata' ? 'script.do' : 'script.R';
+    const lang = evt.language;  // "R" | "Stata" | "Python" | undefined
+    const scriptFile =
+      lang === 'Stata' ? 'script.do'
+        : lang === 'Python' ? 'script.py'
+        : 'script.R';
     const openInLabel =
       lang === 'Stata' ? 'Open in Stata'
         : lang === 'R' ? 'Open in R'
+        : lang === 'Python' ? 'Open in Python'
         : 'Open script';
     const openMode =
       lang === 'Stata' ? 'run_stata'
         : lang === 'R' ? 'run_r'
+        : lang === 'Python' ? 'run_python'
         : null;
 
     const openScriptBtn = document.createElement('button');
@@ -1252,7 +1627,9 @@ function renderScriptResultInline(body, evt) {
         ? 'Launch Stata with the script loaded.'
         : lang === 'R'
         ? 'Launch RStudio with the script loaded.'
-        : 'Open the R or Stata script in its default app.';
+        : lang === 'Python'
+        ? 'Open the Python script in your default .py handler.'
+        : 'Open the script in its default app.';
     openScriptBtn.addEventListener('click', () => {
       const primary = evt.run_dir + '/' + scriptFile;
       const fallback = evt.run_dir + '/' + (scriptFile === 'script.R' ? 'script.do' : 'script.R');
@@ -1381,16 +1758,173 @@ function updateContextChip(inputTokens) {
 function updatePolicyChip(policy) {
   /* Refresh the compact chip label + the per-dataset dropdowns
    * inside the popup. Called on session start and after any policy
-   * mutation. */
+   * mutation. The topbar Files chip is refreshed from a separate
+   * ``list_session_files`` endpoint that includes scripts and
+   * graphs too — the policy payload covers data files only because
+   * the SDC layer's permission tiers are dataset-specific. */
   if (!policy || !policy.datasets || policy.datasets.length === 0) {
     policyChip.classList.add('hidden');
+  } else {
+    policyChip.classList.remove('hidden');
+    policyChipLabel.textContent = compactPolicyLabel(policy);
+    policyPopupBuiltFor = policy;
+    policyPopup.innerHTML = '';
+    policyPopup.appendChild(buildPolicyPopup(policy));
+  }
+  refreshFilesChip();
+}
+
+// ----- topbar files chip ------------------------------------------------
+//
+// "Files" lives in the topbar's centered cluster, next to the
+// session-title pill. Read-only — permission-tier editing stays in
+// the bottom Permission chip. The chip exists so a researcher can
+// answer "did my upload land?" at a glance, including scripts and
+// graphs that don't show up in the data-only Permission panel.
+
+const filesChip = document.getElementById('files-chip');
+const filesChipLabel = document.getElementById('files-chip-label');
+const filesPopup = document.getElementById('files-popup');
+
+const FILES_KIND_LABELS = {
+  data: 'Data',
+  script: 'Scripts',
+  graph: 'Graphs',
+  log: 'Logs',
+};
+
+async function refreshFilesChip() {
+  /* Pull the full session file list from the bridge and re-render
+   * the chip + popup. Called from updatePolicyChip and from any
+   * other event that might have changed cwd contents (drag-drop,
+   * dialog upload, session switch).
+   *
+   * Note: Data files are filtered out of this popup — they're
+   * already shown in the bottom Permission chip with their depth
+   * tier. The Files popup is the surface for the OTHER session
+   * artifacts (scripts, graphs, logs) that have no home elsewhere.
+   */
+  if (!filesChip) return;
+  if (!window.pywebview || !window.pywebview.api) return;
+  if (typeof window.pywebview.api.list_session_files !== 'function') return;
+  let res;
+  try {
+    res = await window.pywebview.api.list_session_files();
+  } catch (err) {
+    console.warn('list_session_files failed', err);
     return;
   }
-  policyChip.classList.remove('hidden');
-  policyChipLabel.textContent = compactPolicyLabel(policy);
-  policyPopupBuiltFor = policy;
-  policyPopup.innerHTML = '';
-  policyPopup.appendChild(buildPolicyPopup(policy));
+  const allFiles = (res && res.files) || [];
+  // Drop the data group — it already shows in the Permission chip
+  // alongside each file's schema-depth tier. Showing the same names
+  // twice (once here, once there) just creates two surfaces that
+  // can drift.
+  const files = allFiles.filter((f) => f.kind !== 'data');
+  if (files.length === 0) {
+    filesChip.classList.add('hidden');
+    if (filesPopup) filesPopup.classList.add('hidden');
+    filesChip.classList.remove('open');
+    return;
+  }
+  filesChip.classList.remove('hidden');
+  if (filesChipLabel) {
+    filesChipLabel.textContent = `Files · ${files.length}`;
+  }
+  if (filesPopup) {
+    filesPopup.innerHTML = '';
+    const wrap = document.createElement('div');
+    const header = document.createElement('div');
+    header.className = 'policy-popup-header';
+    header.innerHTML =
+      '<strong>Files</strong>. Scripts, graphs, and logs uploaded to '
+      + 'this session. Click a script to attach its content to your '
+      + 'next message. Data files are listed in the Permission chip.';
+    wrap.appendChild(header);
+    // Group by kind so scripts / graphs / logs land in their own
+    // sections — same shape the model picker uses for providers.
+    const byKind = new Map();
+    files.forEach((f) => {
+      const k = f.kind || 'script';
+      if (!byKind.has(k)) byKind.set(k, []);
+      byKind.get(k).push(f);
+    });
+    ['script', 'graph', 'log'].forEach((kind) => {
+      const rows = byKind.get(kind);
+      if (!rows || rows.length === 0) return;
+      const groupHeader = document.createElement('div');
+      groupHeader.className = 'model-group-header';
+      groupHeader.textContent = FILES_KIND_LABELS[kind] || kind;
+      wrap.appendChild(groupHeader);
+      rows.forEach((f) => {
+        const row = document.createElement('div');
+        row.className = 'files-row';
+        row.title = f.name;
+        row.textContent = f.name;
+        // Scripts are clickable: clicking attaches the file's
+        // content as inline context for the next message — same
+        // pipeline drag-drop uses, but works for files already
+        // sitting in the session cwd. Other kinds stay read-only
+        // (data files: redundant, model already sees them; logs /
+        // graphs: not source code).
+        if (kind === 'script') {
+          row.classList.add('files-row-clickable');
+          row.addEventListener('click', () => attachSessionFile(f.name));
+        }
+        wrap.appendChild(row);
+      });
+    });
+    filesPopup.appendChild(wrap);
+  }
+}
+
+async function attachSessionFile(name) {
+  /* Stage a session-resident script as inline context for the next
+   * message. The bridge writes into ``_pending_script_attachments``
+   * (same list drag-drop populates) so the message-prefix builder
+   * picks it up automatically on send. JS-side, we mirror what the
+   * drag-drop path does: push the name onto ``stagedDataNotices``
+   * so the composer chip shows up too. */
+  if (!window.pywebview || !window.pywebview.api) return;
+  if (typeof window.pywebview.api.attach_session_file !== 'function') return;
+  try {
+    const res = await window.pywebview.api.attach_session_file(name);
+    if (!res || !res.ok) {
+      const reason = (res && res.reason) || 'unknown';
+      toast('Could not attach: ' + reason, 'error');
+      return;
+    }
+    if (res.already_attached) {
+      toast(name + ' is already attached to your next message.', 'info');
+    } else {
+      // Mirror the drag-drop chip so the researcher sees the same
+      // visual confirmation in both flows.
+      stagedDataNotices.push(name);
+      renderAttachments();
+      toast(name + ' attached to your next message.', 'success');
+    }
+    // Close the popup so the composer becomes the obvious next
+    // surface to interact with.
+    if (filesPopup) filesPopup.classList.add('hidden');
+    if (filesChip) filesChip.classList.remove('open');
+  } catch (err) {
+    console.warn('attach_session_file failed', err);
+    toast('Could not attach: ' + err, 'error');
+  }
+}
+
+if (filesChip && filesPopup) {
+  filesChip.addEventListener('click', (e) => {
+    e.stopPropagation();
+    const isOpen = !filesPopup.classList.contains('hidden');
+    filesPopup.classList.toggle('hidden');
+    filesChip.classList.toggle('open', !isOpen);
+  });
+  document.addEventListener('click', (e) => {
+    if (filesPopup.classList.contains('hidden')) return;
+    if (filesPopup.contains(e.target) || filesChip.contains(e.target)) return;
+    filesPopup.classList.add('hidden');
+    filesChip.classList.remove('open');
+  });
 }
 
 function compactPolicyLabel(policy) {
@@ -1528,8 +2062,14 @@ let availableModels = [];      // cached from list_models
 let currentModelId = null;     // the backend's authoritative selection
 
 async function loadModels() {
-  /* Fetch the model catalog from the backend, render the popup,
-   * and apply any locally-stored preference (from a prior session).
+  /* Fetch the model catalog from the backend and render the popup.
+   *
+   * The backend's ``current`` is authoritative — it reflects the
+   * per-session choice restored from ``.nora/session_state.json`` if
+   * the researcher already used a particular model in this session,
+   * or the global default otherwise. We used to override it with a
+   * localStorage value here, but that turned a per-session feature
+   * into a global one and silently swapped models on session open.
    */
   if (!modelChip || !window.pywebview || !window.pywebview.api) return;
   if (typeof window.pywebview.api.list_models !== 'function') return;
@@ -1538,17 +2078,7 @@ async function loadModels() {
     if (!res || !res.ok) return;
     availableModels = res.models || [];
     currentModelId = res.current;
-
-    // If the researcher picked a model in a prior session, honor it
-    // on this boot — unless it's already the current one.
-    let stored = null;
-    try { stored = localStorage.getItem(MODEL_STORAGE_KEY); } catch (_) {}
-    if (stored && stored !== currentModelId
-        && availableModels.some((m) => m.id === stored)) {
-      await setModel(stored, /*silent=*/true);
-    } else {
-      renderModelChip();
-    }
+    renderModelChip();
   } catch (err) {
     console.warn('list_models failed', err);
   }
@@ -1566,48 +2096,106 @@ function renderModelChip() {
   renderModelPopup();
 }
 
-const PRICING_THRESHOLD = 200_000;
-
 function renderModelPopup() {
   if (!modelPopup) return;
   modelPopup.innerHTML = '';
   const wrap = document.createElement('div');
   const header = document.createElement('div');
   header.className = 'policy-popup-header';
-  header.innerHTML = '<strong>Model</strong> — Claude model Nora uses for this session.';
+  header.innerHTML = '<strong>Model</strong>. The active model for this session.';
   wrap.appendChild(header);
 
+  // Group models by provider so the picker reads as
+  //   Anthropic
+  //     Sonnet 4.6 (1M)
+  //     Opus 4.7 (1M)
+  //     Haiku 4.5
+  //   OpenAI
+  //     GPT-5
+  //     GPT-5 mini
+  // Models for un-authed providers stay in the list but render
+  // disabled with a "Configure auth" hint so the researcher can see
+  // the option exists without being able to silently pick it.
+  const byProvider = new Map();
   availableModels.forEach((m) => {
-    const row = document.createElement('button');
-    row.type = 'button';
-    row.className = 'model-option';
-    if (m.id === currentModelId) row.classList.add('active');
+    const p = m.provider || 'anthropic';
+    if (!byProvider.has(p)) byProvider.set(p, []);
+    byProvider.get(p).push(m);
+  });
 
-    // Short hover tooltip — a punchy pricing note that appears
-    // while the researcher is scanning options, before they click.
-    // Few words each so the tooltip doesn't cover neighbouring
-    // options. Custom ::after on the row avoids the native
-    // `title`'s 500ms delay.
-    if (m.context_window > PRICING_THRESHOLD) {
-      row.dataset.tooltip = '~2× cost past 200k';
-    } else {
-      row.dataset.tooltip = 'Flat rate';
-    }
+  const providerOrder = ['anthropic', 'openai'];
+  providerOrder.forEach((p) => {
+    const models = byProvider.get(p);
+    if (!models || models.length === 0) return;
+    const groupHeader = document.createElement('div');
+    groupHeader.className = 'model-group-header';
+    groupHeader.textContent = p === 'anthropic' ? 'Anthropic' : 'OpenAI';
+    wrap.appendChild(groupHeader);
 
-    const name = document.createElement('span');
-    name.className = 'model-option-name';
-    name.textContent = m.label;
-    row.appendChild(name);
-    const ctx = document.createElement('span');
-    ctx.className = 'model-option-ctx';
-    ctx.textContent = formatContextWindow(m.context_window);
-    row.appendChild(ctx);
-    row.addEventListener('click', () => {
-      modelPopup.classList.add('hidden');
-      modelChip.classList.remove('open');
-      setModel(m.id, /*silent=*/false);
+    models.forEach((m) => {
+      const row = document.createElement('button');
+      row.type = 'button';
+      row.className = 'model-option';
+      if (m.id === currentModelId) row.classList.add('active');
+      const available = m.available !== false;
+      if (!available) {
+        row.classList.add('unconfigured');
+      }
+
+      // Hover tooltip — only for the auth state. Researchers can
+      // open the per-row pricing link for live pricing detail rather
+      // than relying on canned text that goes stale.
+      if (!available) {
+        row.dataset.tooltip = 'Click to configure';
+      } else {
+        delete row.dataset.tooltip;
+      }
+
+      const name = document.createElement('span');
+      name.className = 'model-option-name';
+      name.textContent = m.label;
+      row.appendChild(name);
+
+      // Right-side cluster: context window + per-row pricing link.
+      // Wrapped so the link sits inside the picker row's hover area
+      // but stops click propagation so it doesn't trigger a model
+      // switch on the way out.
+      const right = document.createElement('span');
+      right.className = 'model-option-right';
+
+      const ctx = document.createElement('span');
+      ctx.className = 'model-option-ctx';
+      ctx.textContent = formatContextWindow(m.context_window);
+      right.appendChild(ctx);
+
+      if (m.pricing_url) {
+        const priceLink = document.createElement('button');
+        priceLink.type = 'button';
+        priceLink.className = 'model-option-price';
+        priceLink.title = 'View pricing';
+        priceLink.textContent = '$';
+        priceLink.addEventListener('click', (e) => {
+          e.stopPropagation();
+          openExternal(m.pricing_url);
+        });
+        right.appendChild(priceLink);
+      }
+      row.appendChild(right);
+
+      row.addEventListener('click', () => {
+        modelPopup.classList.add('hidden');
+        modelChip.classList.remove('open');
+        if (available) {
+          setModel(m.id, /*silent=*/false);
+        } else {
+          // Clicking an un-authed model jumps to the auth screen so
+          // the researcher can paste a key for that provider without
+          // having to bounce through landing first.
+          openAuthScreen();
+        }
+      });
+      wrap.appendChild(row);
     });
-    wrap.appendChild(row);
   });
 
   modelPopup.appendChild(wrap);
@@ -1615,8 +2203,60 @@ function renderModelPopup() {
 
 function formatContextWindow(n) {
   if (!n) return '';
-  if (n >= 1_000_000) return (n / 1_000_000) + 'M ctx';
+  if (n >= 1_000_000) {
+    // 1.05M reads better than 1.0500000M; one decimal place is plenty.
+    const m = n / 1_000_000;
+    return (Math.round(m * 100) / 100) + 'M ctx';
+  }
   return (n / 1000) + 'k ctx';
+}
+
+function showImageLightbox(url) {
+  /* Open an in-page overlay showing ``url`` at full resolution.
+   * Used for image attachments — the bridge's ``open_external`` is
+   * allowlisted to specific HTTPS pricing pages and won't accept
+   * blob: URLs anyway. Click anywhere or press Esc to close. */
+  if (!url) return;
+  const overlay = document.createElement('div');
+  overlay.className = 'image-lightbox';
+  overlay.setAttribute('role', 'dialog');
+  overlay.setAttribute('aria-label', 'Enlarged image');
+  overlay.tabIndex = -1;
+  const big = document.createElement('img');
+  big.src = url;
+  big.alt = 'Enlarged image';
+  big.className = 'image-lightbox-img';
+  overlay.appendChild(big);
+  const close = () => {
+    overlay.remove();
+    document.removeEventListener('keydown', onKey);
+  };
+  const onKey = (e) => {
+    if (e.key === 'Escape') close();
+  };
+  overlay.addEventListener('click', close);
+  document.addEventListener('keydown', onKey);
+  document.body.appendChild(overlay);
+  // Focus so Esc works without an extra click first.
+  overlay.focus();
+}
+
+async function openExternal(url) {
+  /* Hand a URL to the OS default browser via the bridge. The bridge
+   * allowlists URLs against the known pricing pages so this can't be
+   * coerced into navigating to attacker-controlled sites by a stray
+   * tool result. */
+  if (!url) return;
+  if (!window.pywebview || !window.pywebview.api) return;
+  if (typeof window.pywebview.api.open_external !== 'function') return;
+  try {
+    const res = await window.pywebview.api.open_external(url);
+    if (res && !res.ok) {
+      console.warn('open_external rejected:', res.reason);
+    }
+  } catch (err) {
+    console.warn('open_external failed', err);
+  }
 }
 
 async function setModel(modelId, silent) {
@@ -1635,7 +2275,6 @@ async function setModel(modelId, silent) {
       return;
     }
     currentModelId = modelId;
-    try { localStorage.setItem(MODEL_STORAGE_KEY, modelId); } catch (_) {}
     renderModelChip();
     if (!silent && !res.unchanged) {
       toast('Model switched to ' + (res.label || modelId) + '. Takes effect on the next message.', 'success', 'model');
@@ -2023,6 +2662,16 @@ if (addFilesBtn) {
       if (skipped.length > 0) {
         toast('Skipped: ' + skipped.join(', '), 'info');
       }
+      const skippedExisting = res.skipped_existing || [];
+      if (skippedExisting.length > 0) {
+        // Distinct toast colour so the researcher sees this is "we
+        // didn't overwrite", not "we couldn't read these".
+        toast(
+          'Already in this session, not overwritten: '
+          + skippedExisting.join(', '),
+          'info'
+        );
+      }
 
       // Refresh permission chip (new data files get default policy)
       // and session title. Sidebar size also updates.
@@ -2184,13 +2833,20 @@ function whenReady(fn) {
 }
 
 whenReady(async () => {
-  // On startup, check whether the backend already has a cwd (launched
-  // with an argv path) or needs one (land on the drop / choose-files
-  // screen). showLanding() itself populates the recent-sessions list,
-  // so researchers can resume a past session directly from boot.
+  // Three-stage state machine on startup:
+  //   needs_auth     → researcher hasn't configured any provider yet.
+  //                    Show the auth screen first so the chat can't
+  //                    silently fail with "no API key" later.
+  //   needs_session  → auth is good but no working directory chosen.
+  //                    Land on the drop / choose-files screen.
+  //   ready          → both done; jump into chat.
+  // Any exception from ui_ready falls back to showLanding() — better
+  // to be too permissive than to wedge the page on a hard error.
   try {
     const state = await window.pywebview.api.ui_ready();
-    if (state && state.state === 'ready') {
+    if (state && state.state === 'needs_auth') {
+      showAuth(state.auth);
+    } else if (state && state.state === 'ready') {
       showChat(state);
     } else {
       showLanding();

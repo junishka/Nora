@@ -249,6 +249,166 @@ kbd {
 
 /* --- landing --- */
 
+.landing,
+.auth {
+  flex: 1 1 auto;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 32px 24px;
+}
+
+/* Auth screen — provider configuration before the data picker.
+ * Card layout mirrors landing-card so the two screens feel like
+ * stages of the same wizard. */
+.auth-card {
+  max-width: 640px;
+  width: 100%;
+  text-align: center;
+}
+
+.auth-lead {
+  margin: 0 0 24px;
+  font-size: 15px;
+  line-height: 1.55;
+  color: var(--text-dim);
+}
+
+.auth h1 {
+  margin: 0 0 12px;
+  font-size: 28px;
+  font-weight: 600;
+  color: var(--text);
+}
+
+.auth-providers {
+  display: flex;
+  flex-direction: column;
+  gap: 18px;
+  margin-bottom: 18px;
+  text-align: left;
+}
+
+.auth-provider {
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 16px;
+  background: var(--bg-surface);
+}
+
+.auth-provider.configured {
+  border-color: var(--accent);
+}
+
+.auth-provider-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  gap: 12px;
+  margin-bottom: 6px;
+}
+
+.auth-provider-name {
+  font-size: 16px;
+  font-weight: 600;
+  color: var(--text);
+}
+
+.auth-provider-status {
+  font-size: 12px;
+  color: var(--text-dim);
+}
+
+.auth-provider-status.ok {
+  color: var(--accent);
+}
+
+.auth-provider-help {
+  font-size: 12px;
+  color: var(--text-dim);
+  line-height: 1.5;
+  margin-bottom: 10px;
+}
+
+.auth-provider-help code {
+  font-family: ui-monospace, "SF Mono", Menlo, monospace;
+  font-size: 11px;
+  background: var(--bg);
+  padding: 1px 5px;
+  border-radius: 4px;
+  border: 1px solid var(--border);
+}
+
+.auth-provider-input {
+  display: flex;
+  gap: 8px;
+  align-items: stretch;
+}
+
+.auth-provider-input input {
+  flex: 1 1 auto;
+  padding: 8px 10px;
+  font-family: ui-monospace, "SF Mono", Menlo, monospace;
+  font-size: 13px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--bg);
+  color: var(--text);
+  min-width: 0; /* allow shrinking inside flex */
+}
+
+.auth-provider-input input:focus {
+  outline: none;
+  border-color: var(--accent);
+}
+
+.auth-btn {
+  padding: 8px 14px;
+  font-size: 13px;
+  font-family: inherit;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--bg-surface);
+  color: var(--text);
+  cursor: pointer;
+  transition: border-color 0.15s, background 0.15s;
+}
+
+.auth-btn:hover:not(:disabled) {
+  border-color: var(--accent);
+}
+
+.auth-btn.primary {
+  background: var(--accent);
+  color: white;
+  border-color: var(--accent);
+}
+
+.auth-btn:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+.auth-status {
+  min-height: 18px;
+  font-size: 13px;
+  color: var(--text-dim);
+  margin-bottom: 12px;
+}
+
+.auth-status.error {
+  color: #c23;
+}
+
+.auth-status.ok {
+  color: var(--accent);
+}
+
+.auth-footer {
+  display: flex;
+  justify-content: center;
+}
+
 .landing {
   flex: 1 1 auto;
   display: flex;
@@ -370,6 +530,32 @@ kbd {
   font-size: 12px;
   color: var(--text-dim);
   line-height: 1.5;
+}
+
+/* Subtle bottom-of-card text link. Used today for "Manage providers"
+ * → opens the auth screen. Visually a button, behaviourally a link. */
+.landing-footer {
+  margin-top: 18px;
+  display: flex;
+  justify-content: center;
+}
+
+.landing-link {
+  background: none;
+  border: none;
+  padding: 4px 8px;
+  font-family: inherit;
+  font-size: 12px;
+  color: var(--text-dim);
+  cursor: pointer;
+  text-decoration: underline;
+  text-underline-offset: 2px;
+  text-decoration-color: var(--border);
+}
+
+.landing-link:hover {
+  color: var(--text);
+  text-decoration-color: var(--text);
 }
 
 .landing-sessions {
@@ -715,14 +901,29 @@ kbd {
   justify-self: end;
 }
 
+/* Right-corner cluster: Files chip + theme toggle. ``justify-self:
+ * end`` puts the whole cluster in the topbar grid's right column,
+ * keeping the centered meta-column untouched. */
+.topbar-right {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  justify-self: end;
+}
+
 .topbar-meta {
-  /* Session title pill — compact, readable, always visible. The
-   * abbreviation happens in JS (formatCwd / session_title); CSS
-   * just styles the chip. Max-width used to be 60% of the middle
-   * grid cell, which clipped short filenames aggressively. A
-   * concrete px cap lets longer names show while still protecting
-   * the bar from a 2-GB dataset's full path.
-   */
+  /* Centered cluster: session title pill + Files chip. The pill
+   * styling moved to ``#cwd-display`` directly so adding sibling
+   * chips (Files) doesn't inherit the rounded background. Flex
+   * row with a small gap so the chip sits naturally beside the
+   * pill without crowding. */
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
+#cwd-display {
   font-size: 12px;
   color: var(--text);
   opacity: 0.85;
@@ -735,6 +936,10 @@ kbd {
   text-overflow: ellipsis;
   white-space: nowrap;
   min-width: 0;
+}
+
+#cwd-display:empty {
+  display: none;  /* don't render the empty pill before cwd is set */
 }
 
 .topbar-toggle {
@@ -758,6 +963,112 @@ kbd {
   align-items: center;
   justify-content: center;
   transition: opacity 0.15s, border-color 0.15s, background 0.15s;
+}
+
+/* Top-bar chip used by the Files panel — same visual language as
+ * the composer chips but anchored at the topbar height. Read-only
+ * popup; permission editing stays in the bottom Permission chip. */
+.topbar-chip {
+  flex-shrink: 0;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  height: 28px;
+  padding: 0 12px;
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  background: var(--bg-surface);
+  color: var(--text);
+  font-family: inherit;
+  font-size: 12.5px;
+  cursor: pointer;
+  transition: border-color 0.15s, background 0.15s;
+}
+
+.topbar-chip:hover {
+  border-color: var(--accent);
+}
+
+.topbar-chip.open {
+  border-color: var(--accent);
+  background: var(--bg);
+}
+
+.topbar-chip.hidden {
+  display: none;
+}
+
+/* When the files popup is anchored to a topbar chip rather than a
+ * composer chip, its parent ``.permission-wrap`` is up at the top
+ * of the screen — flip the popup to drop DOWN from the chip so it
+ * doesn't render off-screen. Left-anchored to the chip (same as
+ * the composer Permission popup), so it reads as a normal dropdown
+ * rather than a right-edge-of-screen panel. Selector targets only
+ * the topbar instance so the composer popups (Permission, Model)
+ * keep dropping up as before. */
+.topbar .policy-popup {
+  bottom: auto;
+  top: calc(100% + 8px);
+  /* Anchored to the chip's right edge — the chip itself sits in
+   * the topbar's right corner, so a left-anchored popup would
+   * extend the popup leftward and look weird. Right-anchored
+   * keeps it tucked under the chip and prevents off-screen
+   * overflow on narrow windows. */
+  right: 0;
+  left: auto;
+}
+
+.files-row {
+  display: block;
+  padding: 6px 8px;
+  border-radius: 6px;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  color: var(--text);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.files-row + .files-row {
+  margin-top: 2px;
+}
+
+/* Clickable script rows — visual cue that this is the "send file
+ * to the model" affordance. Cursor pointer + hover background +
+ * trailing ↑ glyph that fades in on hover so the click target
+ * stays discoverable without crowding read-only data rows. */
+.files-row-clickable {
+  cursor: pointer;
+  position: relative;
+  padding-right: 24px;
+}
+
+.files-row-clickable:hover {
+  background: var(--bg);
+  color: var(--accent);
+}
+
+.files-row-clickable::after {
+  content: "↑";
+  position: absolute;
+  right: 8px;
+  top: 50%;
+  transform: translateY(-50%);
+  color: var(--accent);
+  opacity: 0;
+  transition: opacity 0.15s;
+  font-weight: 600;
+}
+
+.files-row-clickable:hover::after {
+  opacity: 1;
+}
+
+/* Read-only rows (data, graphs, logs) keep a subtle hover for
+ * scannability without implying interactivity. */
+.files-row:not(.files-row-clickable):hover {
+  background: var(--bg);
 }
 
 .topbar-toggle:hover {
@@ -846,8 +1157,16 @@ kbd {
  * still reads naturally; `justify-content: flex-end` pushes it
  * to the right edge of the centered column. */
 .message.user {
+  /* Column flex so images / bubble / attachment chips stack
+   * vertically instead of sitting side-by-side. ``align-items:
+   * flex-end`` keeps the whole stack right-aligned (matching the
+   * old ``justify-content: flex-end`` row layout). The bubble
+   * itself still caps at 75% column width via the rule below — so
+   * the bubble stays compact and the image sits above it at its
+   * own natural size. */
   display: flex;
-  justify-content: flex-end;
+  flex-direction: column;
+  align-items: flex-end;
 }
 
 .message.user .message-body {
@@ -862,11 +1181,40 @@ kbd {
 .message.assistant .message-body {
   /* No bubble — assistant text sits on the page background like a
    * book paragraph. Only the user's own words get a colored chip;
-   * Claude's prose is the page. */
+   * the assistant's prose is the page. */
   background: transparent;
   border: none;
   padding-left: 0;
   padding-right: 40px;
+  /* Drag-select fit: stack children as a flex column with
+   * ``align-items: flex-start`` so each block (paragraph, list,
+   * table) sizes to its own content. Without this, every child is
+   * stretched to the body's full width and a drag-select across
+   * paragraphs picks up empty trailing space. Per-child width:
+   * fit-content alone is not enough — the inter-paragraph
+   * selection bridges still use the parent's width. The flex
+   * stack constrains both. */
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+}
+
+/* Belt-and-braces — keep ``fit-content`` on each text child so
+ * single-line drag-selection inside a paragraph doesn't extend
+ * past the longest line in that paragraph. Tables sit in flex
+ * flow and naturally size to their cells. */
+.message.assistant .message-body > p,
+.message.assistant .message-body > h1,
+.message.assistant .message-body > h2,
+.message.assistant .message-body > h3,
+.message.assistant .message-body > h4,
+.message.assistant .message-body > h5,
+.message.assistant .message-body > h6,
+.message.assistant .message-body > ul,
+.message.assistant .message-body > ol,
+.message.assistant .message-body > blockquote {
+  width: fit-content;
+  max-width: 100%;
 }
 
 .message.thinking .message-body {
@@ -1332,6 +1680,92 @@ kbd {
   max-width: 200px;
 }
 
+/* Script chips ride with the next message as inline context (the
+ * source travels with the prompt so the model can read it). The
+ * accent border + small leading "↑" cue marks them as "will be
+ * sent" rather than the plain "saved to session" data chip. */
+.compose-attachment.compose-attachment-script {
+  border-color: var(--accent);
+}
+
+.compose-attachment.compose-attachment-script
+  .compose-attachment-filename::before {
+  content: "↑ ";
+  color: var(--accent);
+  font-weight: 600;
+}
+
+/* Persistent attachment chips that ride with a user message in the
+ * transcript. Composer chips clear on send; these stay forever, so
+ * the researcher can scroll back and see what was uploaded when. */
+.message-attachments {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin: 6px 0 0;
+  padding: 0 4px;
+  justify-content: flex-end;  /* user messages right-align */
+}
+
+.message-attachment-chip {
+  display: inline-flex;
+  align-items: center;
+  padding: 3px 9px;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: var(--bg-surface);
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  color: var(--text-dim);
+}
+
+/* Image thumbnails in the user-bubble row. Same right-align as
+ * message-attachments so they cluster on the user's side of the
+ * column. Click expands to a lightbox overlay. */
+.message-images {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin: 0 0 6px;
+  justify-content: flex-end;
+}
+
+.message-image-thumb {
+  max-width: 240px;
+  max-height: 180px;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  cursor: zoom-in;
+  transition: transform 0.12s, box-shadow 0.12s;
+}
+
+.message-image-thumb:hover {
+  transform: scale(1.02);
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.18);
+}
+
+/* Lightbox overlay — full-viewport translucent backdrop with the
+ * image at its natural aspect ratio. Click anywhere or press Esc
+ * to close. */
+.image-lightbox {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.82);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 1000;
+  cursor: zoom-out;
+  padding: 24px;
+}
+
+.image-lightbox-img {
+  max-width: 100%;
+  max-height: 100%;
+  border-radius: 6px;
+  box-shadow: 0 12px 40px rgba(0, 0, 0, 0.5);
+}
+
 #compose-form.drop-target {
   /* Visual cue while an image is being dragged over the composer.
    * Pink dashed outline reads as "drop here" without the landing
@@ -1603,10 +2037,67 @@ kbd {
   font-weight: 500;
 }
 
+.model-option-right {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
 .model-option-ctx {
   font-size: 11px;
   color: var(--text-dim);
   font-family: var(--font-mono);
+}
+
+/* Per-row "view pricing" link — a $ sign that lights up on hover.
+ * Opacity is low at rest so it doesn't crowd the model name; fades
+ * in when the cursor enters the row, then becomes fully visible when
+ * the cursor lands on the link itself. */
+.model-option-price {
+  background: none;
+  border: none;
+  padding: 0 4px;
+  font-family: inherit;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-dim);
+  cursor: pointer;
+  opacity: 0;
+  transition: opacity 0.15s, color 0.15s;
+}
+
+.model-option:hover .model-option-price {
+  opacity: 0.6;
+}
+
+.model-option-price:hover {
+  opacity: 1;
+  color: var(--accent);
+}
+
+.model-option.unconfigured {
+  /* Dimmed but still clickable — the click takes the researcher to
+   * the auth screen so they can paste a key for that provider. */
+  opacity: 0.55;
+}
+
+.model-option.unconfigured .model-option-name {
+  font-weight: 400;
+}
+
+/* Per-provider section header inside the model picker popup. */
+.model-group-header {
+  font-size: 10.5px;
+  font-weight: 600;
+  letter-spacing: 0.6px;
+  text-transform: uppercase;
+  color: var(--text-dim);
+  padding: 8px 10px 4px;
+  margin-top: 4px;
+}
+
+.model-group-header:first-child {
+  margin-top: 0;
 }
 
 .context-chip:hover,

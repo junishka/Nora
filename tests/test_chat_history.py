@@ -209,6 +209,20 @@ def test_attachments_counted(tmp_path: Path):
     assert turns[0].attachments == 3
 
 
+def test_script_attachment_names_counted_without_crash(tmp_path: Path):
+    """Web-UI sessions persist attached script filenames as a list so
+    replay can redraw the chips. The turn reader should treat that as
+    a count, not crash when resume logic rebuilds prior context."""
+    cwd = _write_jsonl(tmp_path, [
+        {"type": "user_message", "text": "please inspect this",
+         "attachments": ["analysis.py", "robustness.do"]},
+        {"type": "assistant_text", "text": "I can take a look."},
+    ])
+    turns = read_turns(cwd)
+    assert turns[0].attachments == 2
+    assert turns[0].assistant == "I can take a look."
+
+
 # --- summarize_tool_call ---------------------------------------------------
 
 def test_summarize_tool_call_submit_script():

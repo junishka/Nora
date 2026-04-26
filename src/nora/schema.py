@@ -3,7 +3,7 @@
 Produces a structural summary of a dataset (variable names, types, labels,
 observation count, optionally NA counts / distinct counts) from files on
 the researcher's machine. Supported formats: `.dta` (Stata), `.rds` (R),
-`.csv`.
+`.csv`, `.tsv`, `.parquet`, `.jsonl` / `.ndjson`.
 
 No individual observation values are ever returned. The only potentially
 disclosive pieces of output are:
@@ -50,6 +50,26 @@ _VALID_DEPTHS: frozenset[str] = frozenset(
     ("names_only", "names_types", "names_types_labels", "names_types_labels_summary")
 )
 
+
+# Centralised data-file extension allowlist. Imported by every module
+# that scans a session dir for "the researcher's datasets" (the bridge,
+# session_state, drop-zone hint copy, file dialog filters). Adding a
+# new format means: (a) add the extension here, (b) add a dispatch
+# branch in ``extract()``/``load_data()`` below, (c) make sure any
+# parsing dependency is in pyproject.toml.
+#
+# ``.jsonl`` and ``.ndjson`` are aliases — pandas reads both with
+# ``read_json(lines=True)`` and researchers ship under either name.
+DATA_EXTENSIONS: tuple[str, ...] = (
+    ".csv",
+    ".dta",
+    ".rds",
+    ".parquet",
+    ".jsonl",
+    ".ndjson",
+    ".tsv",
+)
+
 # Our coarse taxonomy. Step 4+ analysis-result schemas consume these; keep
 # the vocabulary small and stable.
 _TYPE_NUMERIC = "numeric"
@@ -93,8 +113,24 @@ def load_data(dataset_path: Path) -> Any:
         return obj
     if suffix == ".csv":
         return pd.read_csv(dataset_path, low_memory=False)
+    if suffix == ".tsv":
+        return pd.read_csv(dataset_path, sep="\t", low_memory=False)
+    if suffix == ".parquet":
+        # pandas dispatches to pyarrow (preferred) or fastparquet —
+        # pyarrow is a declared dep of nora so this works out of
+        # the box. Parquet preserves dtypes so column types come
+        # back exactly as the writer set them.
+        return pd.read_parquet(dataset_path)
+    if suffix in (".jsonl", ".ndjson"):
+        # Line-delimited JSON: one record per line. Top-level JSON
+        # arrays of arbitrary shape are NOT supported (each row
+        # would have to be a flat object for the schema extractor
+        # to make sense of it); researchers can convert with `jq`
+        # if needed.
+        return pd.read_json(dataset_path, lines=True)
     raise ValueError(
-        f"unsupported format: {suffix!r}. Nora reads .dta, .rds, .csv."
+        f"unsupported format: {suffix!r}. Nora reads "
+        ".dta, .rds, .csv, .tsv, .parquet, .jsonl, .ndjson."
     )
 
 
@@ -116,10 +152,16 @@ def extract(dataset_path: Path, depth: str) -> dict[str, Any]:
         return _extract_rds(dataset_path, depth)
     if suffix == ".csv":
         return _extract_csv(dataset_path, depth)
+    if suffix == ".tsv":
+        return _extract_tsv(dataset_path, depth)
+    if suffix == ".parquet":
+        return _extract_parquet(dataset_path, depth)
+    if suffix in (".jsonl", ".ndjson"):
+        return _extract_jsonl(dataset_path, depth)
     raise ValueError(
         f"unsupported format: {suffix!r}. Nora currently reads "
-        ".dta (Stata), .rds (R), and .csv. Other formats (.rda, .xlsx, "
-        ".sav, .parquet) are not supported yet."
+        ".dta (Stata), .rds (R), .csv, .tsv, .parquet, .jsonl, .ndjson. "
+        "Other formats (.rda, .xlsx, .sav, .feather) are not supported yet."
     )
 
 
@@ -253,6 +295,64 @@ def _extract_csv(path: Path, depth: str) -> dict[str, Any]:
     df = pd.read_csv(path, low_memory=False)
     return _extract_from_pandas(
         df, depth=depth, dataset_name=path.name, file_type="csv"
+    )
+
+
+# ---------------------------------------------------------------------------
+# TSV — same as CSV, tab-separated
+# ---------------------------------------------------------------------------
+
+def _extract_tsv(path: Path, depth: str) -> dict[str, Any]:
+    import pandas as pd
+
+    df = pd.read_csv(path, sep="\t", low_memory=False)
+    return _extract_from_pandas(
+        df, depth=depth, dataset_name=path.name, file_type="tsv"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Parquet — pyarrow-backed via pandas
+# ---------------------------------------------------------------------------
+
+def _extract_parquet(path: Path, depth: str) -> dict[str, Any]:
+    """Parquet preserves column dtypes natively (unlike CSV, which the
+    extractor has to infer). Schema extraction is therefore a thin
+    wrapper around ``read_parquet``: pandas hands back a DataFrame
+    whose dtypes already match what the writer set.
+
+    Heavy datasets: pyarrow streams the file rather than reading it
+    whole into memory like the CSV path does, but we still call
+    ``read_parquet`` (no streaming yet). For Parquet files much
+    larger than RAM this will OOM — out of scope for the current
+    pilot, where datasets fit comfortably."""
+    import pandas as pd
+
+    df = pd.read_parquet(path)
+    return _extract_from_pandas(
+        df, depth=depth, dataset_name=path.name, file_type="parquet"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Line-delimited JSON — .jsonl / .ndjson
+# ---------------------------------------------------------------------------
+
+def _extract_jsonl(path: Path, depth: str) -> dict[str, Any]:
+    """One JSON object per line. Each object is treated as a row;
+    pandas infers column types from the union of keys.
+
+    Top-level JSON arrays (a single ``[{...}, {...}]`` document) are
+    NOT supported here. They're shape-arbitrary — a record could
+    contain nested objects or arrays — and don't fit the tabular
+    model the rest of the pipeline assumes. Researchers can convert
+    with ``jq -c '.[]'`` if needed.
+    """
+    import pandas as pd
+
+    df = pd.read_json(path, lines=True)
+    return _extract_from_pandas(
+        df, depth=depth, dataset_name=path.name, file_type="jsonl"
     )
 
 

@@ -104,6 +104,22 @@ def read_turns(cwd: Path | None) -> list[Turn]:
     # Track tool_call call_ids so tool_result can pair by id.
     tools_by_call_id: dict[str, ToolUse] = {}
 
+    def _attachment_count(value: Any) -> int:
+        """Normalize persisted ``attachments`` into a count.
+
+        Older sessions stored an integer image count. Newer web-UI
+        sessions may store a list of attached script filenames so
+        replay can render the same chips on reload. The turn-grouped
+        reader only needs a stable count and should never crash on
+        either shape.
+        """
+        if isinstance(value, list):
+            return len(value)
+        try:
+            return int(value or 0)
+        except (TypeError, ValueError):
+            return 0
+
     def _flush() -> None:
         if current_user is None:
             return
@@ -115,7 +131,7 @@ def read_turns(cwd: Path | None) -> list[Turn]:
             thinking="\n\n".join(p for p in current_thinking if p).strip(),
             tools=list(current_tools),
             result_ids=result_ids,
-            attachments=int(current_user.get("attachments", 0) or 0),
+            attachments=_attachment_count(current_user.get("attachments", 0)),
             timestamp=current_timestamp,
         ))
 

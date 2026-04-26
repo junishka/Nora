@@ -45,7 +45,9 @@ SESSION_STATE_VERSION = 1
 # transcript. Callers who need the full exchange use chat_history.
 _LAST_MESSAGE_CAP = 800
 _RECENT_RESULTS_CAP = 10
-_DATA_EXTS = (".csv", ".dta", ".rds")
+# Imported from nora.schema so the catalog of recognised data files
+# stays in one place — adding .parquet there propagates here.
+from nora.schema import DATA_EXTENSIONS as _DATA_EXTS  # noqa: E402
 
 
 @dataclass

@@ -2,22 +2,22 @@
 
 The memory stack relies on a small state machine on the bridge:
 
-- ``_needs_context_prefix`` gets flipped True whenever a fresh SDK
-  client is opened (first turn, session switch, interrupted turn,
-  app reopen). The next turn consumes the flag by prepending a
+- ``_needs_context_prefix`` gets flipped True whenever a fresh
+  provider session is opened (first turn, session switch, interrupted
+  turn, app reopen). The next turn consumes the flag by prepending a
   warm-start prefix; on cancel / error the flag is restored so the
   prefix isn't lost to a failed first turn.
-- ``_close_client_blocking`` is the canonical teardown entry point
+- ``_close_session_blocking`` is the canonical teardown entry point
   used by session switches, cwd changes, and the Stop button; it
-  must clear ``_client`` reliably so the next turn opens fresh.
-- ``_set_cwd`` must tear down the client when the cwd actually
+  must clear ``_session`` reliably so the next turn opens fresh.
+- ``_set_cwd`` must tear down the session when the cwd actually
   changes, but NOT when the same cwd is re-set.
 - Persisted events must carry an ISO timestamp so the turn reader
   and session_state writer can order and display them honestly.
 
 These tests exercise those behaviors directly on the bridge,
-without running a real turn (which would require a live Claude
-SDK connection).
+without running a real turn (which would require a live provider
+connection).
 """
 
 from __future__ import annotations
@@ -38,11 +38,11 @@ from nora.ui import NoraBridge
 # ---------------------------------------------------------------------------
 
 def test_bridge_starts_with_clean_memory_state(tmp_path: Path):
-    """A freshly-constructed bridge has no client and no pending
-    context prefix — memory injection is opt-in, triggered only
-    when a client is actually opened."""
+    """A freshly-constructed bridge has no provider session and no
+    pending context prefix — memory injection is opt-in, triggered
+    only when a session is actually opened."""
     bridge = NoraBridge(cwd=tmp_path)
-    assert bridge._client is None
+    assert bridge._session is None
     assert bridge._needs_context_prefix is False
 
 
@@ -98,70 +98,109 @@ def test_persist_event_preserves_caller_timestamp(tmp_path: Path):
     assert rec["timestamp"] == "2024-01-01T00:00:00+00:00"
 
 
+def test_record_user_message_replaces_trailing_orphan_turn(tmp_path: Path):
+    """A failed send can leave a lone persisted ``user_message`` at
+    the tail of chat_history. The next real send should replace that
+    stale attempt rather than keep both bubbles forever."""
+    bridge = NoraBridge(cwd=tmp_path)
+    bridge._persist_event({"type": "user_message", "text": "stuck send"})
+
+    bridge._record_user_message("retry")
+
+    log = tmp_path / ".nora" / "chat_history.jsonl"
+    rows = [json.loads(line) for line in log.read_text().splitlines()]
+    assert [row["text"] for row in rows if row.get("type") == "user_message"] == [
+        "retry"
+    ]
+
+
+def test_record_user_message_keeps_completed_prior_turn(tmp_path: Path):
+    """Only orphaned tail user turns are disposable. A completed turn
+    with an assistant reply must stay in the log when the next user
+    message is recorded."""
+    bridge = NoraBridge(cwd=tmp_path)
+    bridge._persist_event({"type": "user_message", "text": "first"})
+    bridge._persist_event({"type": "assistant_text", "text": "reply"})
+
+    bridge._record_user_message("second")
+
+    log = tmp_path / ".nora" / "chat_history.jsonl"
+    rows = [json.loads(line) for line in log.read_text().splitlines()]
+    assert [row["type"] for row in rows] == [
+        "user_message",
+        "assistant_text",
+        "user_message",
+    ]
+    assert [row["text"] for row in rows if row["type"] == "user_message"] == [
+        "first",
+        "second",
+    ]
+
+
 # ---------------------------------------------------------------------------
-# _close_client_blocking — handles all corner cases without raising
+# _close_session_blocking — handles all corner cases without raising
 # ---------------------------------------------------------------------------
 
 def test_close_client_blocking_when_no_client(tmp_path: Path):
-    """No client to close: no-op, no error. Safe to call
-    defensively from Stop / switch / teardown paths."""
+    """No session to close: no-op, no error. Safe to call defensively
+    from Stop / switch / teardown paths."""
     bridge = NoraBridge(cwd=tmp_path)
-    assert bridge._client is None
-    bridge._close_client_blocking()  # must not raise
-    assert bridge._client is None
+    assert bridge._session is None
+    bridge._close_session_blocking()  # must not raise
+    assert bridge._session is None
 
 
 def test_close_client_blocking_without_loop(tmp_path: Path):
-    """Client is set but worker loop isn't running: we can't run
+    """Session is set but worker loop isn't running: we can't run
     the async close, but we still need to drop the reference so the
     next turn opens fresh. Otherwise Stop after a startup failure
-    would leak the half-initialized client."""
+    would leak the half-initialized session."""
     bridge = NoraBridge(cwd=tmp_path)
-    bridge._client = MagicMock()  # pretend there's a client
+    bridge._session = MagicMock()  # pretend there's a session
     bridge._loop = None
 
-    bridge._close_client_blocking()
-    assert bridge._client is None
+    bridge._close_session_blocking()
+    assert bridge._session is None
 
 
 # ---------------------------------------------------------------------------
-# _set_cwd — session switch should tear down client, same-cwd should not
+# _set_cwd — session switch should tear down session, same-cwd should not
 # ---------------------------------------------------------------------------
 
 def test_set_cwd_closes_client_on_cwd_change(tmp_path: Path):
-    """Switching to a different session dir must close the SDK
-    client so the next turn starts a fresh conversation against
+    """Switching to a different session dir must close the provider
+    session so the next turn starts a fresh conversation against
     the new cwd. Without this, conversation state can leak across
     sessions."""
     (tmp_path / "a").mkdir()
     (tmp_path / "b").mkdir()
 
     bridge = NoraBridge(cwd=tmp_path / "a")
-    # Simulate a live client. _close_client_blocking handles the
-    # no-loop case by just clearing the reference, so we don't
-    # need a working event loop here.
-    bridge._client = MagicMock()
+    # Simulate a live session. _close_session_blocking handles the
+    # no-loop case by just clearing the reference, so we don't need
+    # a working event loop here.
+    bridge._session = MagicMock()
 
     bridge._set_cwd(tmp_path / "b")
 
     assert bridge.cwd == tmp_path / "b"
-    assert bridge._client is None, "client must be closed on cwd change"
+    assert bridge._session is None, "session must be closed on cwd change"
 
 
 def test_set_cwd_same_path_keeps_client(tmp_path: Path):
     """Re-setting the same cwd (e.g. after a harmless state refresh)
-    must NOT close the client — otherwise every idempotent _set_cwd
+    must NOT close the session — otherwise every idempotent _set_cwd
     call would waste a conversation."""
     (tmp_path / "a").mkdir()
 
     bridge = NoraBridge(cwd=tmp_path / "a")
     sentinel = MagicMock()
-    bridge._client = sentinel
+    bridge._session = sentinel
 
     bridge._set_cwd(tmp_path / "a")
 
-    assert bridge._client is sentinel, (
-        "same-cwd _set_cwd must not tear down the client"
+    assert bridge._session is sentinel, (
+        "same-cwd _set_cwd must not tear down the session"
     )
 
 
@@ -251,8 +290,8 @@ def test_interrupt_turn_no_running_turn(tmp_path: Path):
 def test_needs_context_prefix_survives_restart_of_bridge(tmp_path: Path):
     """A fresh NoraBridge starts with the flag False. That's
     correct — the flag means 'the NEXT turn must inject a prefix'.
-    On cold boot, the flag flips True inside ``_ensure_client`` when
-    it opens the first client of the process, not at construction.
+    On cold boot, the flag flips True inside ``_ensure_session`` when
+    it opens the first session of the process, not at construction.
 
     This test documents the invariant so a future refactor that
     'helpfully' pre-sets the flag to True in __init__ (and thereby

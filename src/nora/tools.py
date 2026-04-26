@@ -272,7 +272,8 @@ def _as_mcp_text(payload: dict[str, Any]) -> dict[str, Any]:
         "labels, value labels, observation count. Never returns individual "
         "observation values. Use this before writing any analysis script so "
         "you know what variables exist and their types.\n\n"
-        "Supported file types: .dta (Stata), .rds (R), .csv.\n\n"
+        "Supported file types: .dta (Stata), .rds (R), .csv, .tsv, .parquet, "
+        ".jsonl / .ndjson.\n\n"
         "Arguments:\n"
         "  dataset: path to the dataset file, relative to the researcher's "
         "working directory (or absolute path within it).\n"
@@ -463,14 +464,15 @@ async def request_data(args: dict[str, Any]) -> dict[str, Any]:
 @tool(
     "submit_script",
     (
-        "Run an R or Stata analysis script against the researcher's data. "
-        "The script must emit structured results via the nora runtime "
-        "library (nora$result(...) in R, nora_result_* in Stata). Raw "
-        "stdout/stderr is shown to the researcher in their TUI but is not "
-        "returned to you — you receive only the sanitized structured "
-        "payload. Returns a result ID and a one-line label.\n\n"
+        "Run an R, Stata, or Python analysis script against the researcher's "
+        "data. The script must emit structured results via the nora runtime "
+        "library (nora$result(...) in R, nora_result_* in Stata, "
+        "nora.result(...) / nora.from_lm(...) in Python). Raw stdout/stderr "
+        "is shown to the researcher in their TUI but is not returned to you "
+        "— you receive only the sanitized structured payload. Returns a "
+        "result ID and a one-line label.\n\n"
         "Arguments:\n"
-        "  language: 'R' or 'Stata'.\n"
+        "  language: 'R', 'Stata', or 'Python'.\n"
         "  code: the full script source as a single string.\n"
         "  label: short description of what the script is doing (e.g., "
         "'OLS of outcome on predictors').\n"
@@ -497,12 +499,12 @@ async def submit_script(args: dict[str, Any]) -> dict[str, Any]:
     label = args.get("label", "(unlabeled)")
     source_dataset = args.get("source_dataset", "") or ""
 
-    if language not in {"R", "Stata"}:
+    if language not in {"R", "Stata", "Python"}:
         return _as_mcp_text({
             "status": "error",
             "reason": (
                 f"unsupported language: {language!r}. Nora runs R "
-                f"(via Rscript) and Stata only."
+                f"(via Rscript), Stata, and Python (3.x with pandas)."
             ),
         })
     if not code.strip():
@@ -903,6 +905,15 @@ async def recall_conversation(args: dict[str, Any]) -> dict[str, Any]:
 
 SERVER_NAME = "nora"
 
+REGISTERED_TOOLS: tuple[Any, ...] = (
+    get_schema,
+    request_data,
+    submit_script,
+    expand_result,
+    list_results,
+    recall_conversation,
+)
+
 # Tool names Claude will see are prefixed: mcp__<server>__<tool>.
 # Keep this list in sync with the @tool-decorated functions above.
 ALLOWED_TOOL_NAMES: tuple[str, ...] = (
@@ -915,17 +926,22 @@ ALLOWED_TOOL_NAMES: tuple[str, ...] = (
 )
 
 
+# Provider-neutral dispatch table. The Anthropic path goes through the
+# in-process MCP server; the OpenAI path calls the bare async handlers
+# directly from this map. Built from the SDK-decorated tool objects'
+# ``.handler`` attribute so both paths invoke the *same* function — no
+# risk of drift, no duplication of handler bodies.
+#
+# Tool names here are FLAT (``"get_schema"``, not the
+# ``"mcp__nora__get_schema"`` MCP prefix). OpenAI function-tool names
+# are flat by API; the Anthropic path doesn't consult this map.
+HANDLERS: dict[str, Any] = {t.name: t.handler for t in REGISTERED_TOOLS}
+
+
 def build_server() -> dict[str, Any]:
     """Construct the in-process MCP server with all Nora tools registered."""
     return create_sdk_mcp_server(
         name=SERVER_NAME,
         version="0.0.1",
-        tools=[
-            get_schema,
-            request_data,
-            submit_script,
-            expand_result,
-            list_results,
-            recall_conversation,
-        ],
+        tools=list(REGISTERED_TOOLS),
     )

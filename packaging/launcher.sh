@@ -33,15 +33,30 @@ if [[ ! -x "$NORA_BIN" ]]; then
 fi
 
 # Best-effort log file. Per-day rotation keeps the log compact and
-# the previous day's still around for incident triage. ``mkdir -p``
-# is a no-op when the dir exists; redirecting to /dev/null keeps
-# log-write failures from breaking launch.
+# the previous day's still around for incident triage. The whole
+# logging path is wrapped so any failure (unwritable HOME, read-only
+# Library/Logs, full disk, immutable file with the day's name) falls
+# through to /dev/null instead of blowing up launch under ``set -e``.
+# Earlier versions only guarded ``mkdir`` and let the ``exec`` step's
+# ``>>"$LOG_FILE"`` redirection abort the launcher silently — most
+# users would see nothing happen on double-click.
 LOG_DIR="$HOME/Library/Logs/Nora"
-mkdir -p "$LOG_DIR" 2>/dev/null || true
 LOG_FILE="$LOG_DIR/nora-$(date +%Y-%m-%d).log"
+LOG_TARGET="/dev/null"
+
+# Each step in the && chain is part of an ``if`` condition, so
+# ``set -e`` does NOT abort on individual failures here — that's the
+# point. Failure of any link drops us to the /dev/null fallback.
+if mkdir -p "$LOG_DIR" 2>/dev/null \
+        && : >>"$LOG_FILE" 2>/dev/null \
+        && [[ -w "$LOG_FILE" ]]; then
+    LOG_TARGET="$LOG_FILE"
+fi
 
 # exec replaces this shell with the binary so the .app's process
 # tree shows ``nora`` directly (cleaner Activity Monitor entry,
 # Quit/Force-Quit work as expected). Append both streams to the
-# log; users who want live output can ``tail -F`` that file.
-exec "$NORA_BIN" >>"$LOG_FILE" 2>&1
+# resolved log target; users who want live output can ``tail -F``
+# the per-day file under ~/Library/Logs/Nora/ when logging worked,
+# or run from source to debug the no-log fallback.
+exec "$NORA_BIN" >>"$LOG_TARGET" 2>&1

@@ -31,12 +31,28 @@ dependencies = [
     "pyreadstat>=1.2",
     "pyreadr>=0.5",
     "pandas>=2.0",
+    # Parquet support. ``pandas.read_parquet`` dispatches to pyarrow
+    # by default; declaring it explicitly removes the "no engine" error
+    # researchers would otherwise get the first time they upload a
+    # ``.parquet`` file. Also enables ``.feather`` if we add it later.
+    "pyarrow>=15",
     # Web UI shell (`nora-ui` entry point). pywebview wraps a native
     # WKWebView window on macOS — no Chromium bundled, ~25 MB added to
     # the .app rather than ~120 MB for Electron. Terminal UI (`nora`)
     # keeps working without it; pywebview is imported lazily by the UI
     # entry point.
     "pywebview>=5.0",
+    # Multi-provider auth: ``keyring`` brokers credentials through the
+    # OS-native secret store (macOS Keychain). API keys never touch
+    # disk in cleartext — Nora reads via ``auth.get_credential`` and
+    # writes via ``auth.set_credential``. The Claude CLI subscription
+    # path bypasses keyring (uses its own ``~/.claude.json`` token);
+    # only API-key creds (Anthropic, OpenAI) flow through keyring.
+    "keyring>=24",
+    # OpenAI provider. Used only when the researcher picks an OpenAI
+    # model in the picker — ``provider/openai.py`` lazy-imports it so
+    # an Anthropic-only install doesn't pay the dep cost at startup.
+    "openai>=1.50",
 ]
 
 [project.scripts]
