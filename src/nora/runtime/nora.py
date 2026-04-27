@@ -459,3 +459,478 @@ def _safe_int(x: Any) -> int | None:
         return int(f)
     except (TypeError, ValueError):
         return None
+
+
+# ---------------------------------------------------------------------------
+# Plot helpers — model-output visualizations only
+# ---------------------------------------------------------------------------
+#
+# Plots produced via these helpers are surfaced to the model on the
+# next turn as image attachments. Raw-data plots (a histogram of an
+# observed column, a scatter of all rows) are NOT covered on
+# purpose — they would expose the data itself, which is the privacy
+# line Nora is built to keep.
+#
+# Allowlist: only files written via these helpers (and registered
+# in the manifest) are visible. ``plt.savefig(...)`` outside the
+# helpers does NOT cross to the model — the file lands in the run
+# dir for the researcher's eyes only.
+#
+# Mechanism mirrors the R library: write a PNG into
+# ``<run_dir>/_nora_plots/`` and append a JSONL entry to
+# ``manifest.jsonl``. The bridge reads only the manifest.
+
+
+def _plots_dir() -> Any:
+    """Return the ``_nora_plots`` directory beside the result file,
+    creating it on first use. None when ``NORA_RESULT_PATH`` isn't
+    set (caller didn't go through the executor)."""
+    if not _RESULT_PATH:
+        return None
+    from pathlib import Path
+    d = Path(_RESULT_PATH).parent / "_nora_plots"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def _append_plot_manifest(file: str, kind: str, label: str | None) -> None:
+    d = _plots_dir()
+    if d is None:
+        return
+    entry: dict[str, Any] = {"file": file, "kind": kind}
+    if label:
+        entry["label"] = label
+    try:
+        with (d / "manifest.jsonl").open("a", encoding="utf-8") as f:
+            f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+    except OSError:
+        pass
+
+
+def _append_plot_helper_error(helper: str, exc: BaseException) -> None:
+    """Record a structured plot-helper failure so ``submit_script``
+    can surface it in the tool result the MODEL receives. Without
+    this, helper failures (matplotlib missing, etc.) only land in
+    stderr, and the model says "thumbnail should be visible above"
+    while the researcher sees nothing — the loop the user reported.
+
+    The runner reads ``_nora_plots/helper_errors.jsonl`` after the
+    run and includes a summary in the structured tool result so
+    the model can react instead of guessing.
+    """
+    d = _plots_dir()
+    if d is None:
+        return
+    error_kind = type(exc).__name__
+    message = str(exc)
+    fix: str | None = None
+    lower = message.lower()
+    if "matplotlib" in lower or "no module named 'matplotlib'" in lower:
+        fix = "pip install matplotlib"
+    elif "no module named 'scipy'" in lower:
+        fix = "pip install scipy"
+    elif "no module named 'statsmodels'" in lower:
+        fix = "pip install statsmodels"
+    entry: dict[str, Any] = {
+        "helper": helper, "error": error_kind, "message": message,
+    }
+    if fix:
+        entry["fix"] = fix
+    try:
+        with (d / "helper_errors.jsonl").open("a", encoding="utf-8") as f:
+            f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+    except OSError:
+        pass
+
+
+def plot_residuals(fitted: Any, label: str | None = None) -> None:
+    """Write the four standard residual diagnostic panels for a
+    statsmodels fit and register them with the plot manifest.
+
+    Errors inside this helper print to stderr but never raise — a
+    broken plot helper must not break the analysis script.
+    """
+    try:
+        d = _plots_dir()
+        if d is None:
+            return
+        # Force a non-interactive backend before importing pyplot:
+        # the executor runs scripts headless and any default GUI
+        # backend would either crash (no display) or pop a window
+        # the researcher didn't ask for.
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+
+        resid = getattr(fitted, "resid", None)
+        fitted_vals = getattr(fitted, "fittedvalues", None)
+        if resid is None or fitted_vals is None:
+            sys.stderr.write(
+                "nora.plot_residuals: fitted object has no .resid / "
+                ".fittedvalues; skipping\n"
+            )
+            return
+
+        try:
+            import numpy as _np
+            resid_arr = _np.asarray(resid, dtype=float)
+            fitted_arr = _np.asarray(fitted_vals, dtype=float)
+        except ImportError:
+            sys.stderr.write("nora.plot_residuals: numpy missing\n")
+            return
+
+        fig, axes = plt.subplots(2, 2, figsize=(9, 7))
+        # Residuals vs fitted
+        axes[0, 0].scatter(fitted_arr, resid_arr, alpha=0.5, s=12)
+        axes[0, 0].axhline(0, color="gray", lw=0.8)
+        axes[0, 0].set_xlabel("Fitted values")
+        axes[0, 0].set_ylabel("Residuals")
+        axes[0, 0].set_title("Residuals vs Fitted")
+        # Normal Q-Q
+        try:
+            from scipy import stats as _stats
+            _stats.probplot(resid_arr, dist="norm", plot=axes[0, 1])
+            axes[0, 1].set_title("Normal Q-Q")
+        except ImportError:
+            axes[0, 1].text(0.5, 0.5, "scipy not installed",
+                            ha="center", va="center")
+            axes[0, 1].set_title("Normal Q-Q")
+        # Scale-Location
+        sd = float(resid_arr.std() or 1.0)
+        std_resid = (resid_arr - resid_arr.mean()) / sd
+        sqrt_abs = (abs(std_resid)) ** 0.5
+        axes[1, 0].scatter(fitted_arr, sqrt_abs, alpha=0.5, s=12)
+        axes[1, 0].set_xlabel("Fitted values")
+        axes[1, 0].set_ylabel(r"$\sqrt{|standardized\ resid|}$")
+        axes[1, 0].set_title("Scale-Location")
+        # Residual distribution
+        axes[1, 1].hist(resid_arr, bins=20)
+        axes[1, 1].set_xlabel("Residual")
+        axes[1, 1].set_ylabel("Count")
+        axes[1, 1].set_title("Residual distribution")
+        fig.tight_layout()
+
+        fname = "residuals.png"
+        fig.savefig(d / fname, dpi=110)
+        plt.close(fig)
+        _append_plot_manifest(
+            fname, "residuals",
+            label or "Residual diagnostics",
+        )
+    except Exception as e:  # noqa: BLE001 — never let plotting fail the script
+        sys.stderr.write(f"nora.plot_residuals failed: {e}\n")
+        _append_plot_helper_error("plot_residuals", e)
+
+
+def plot_coefficients(fitted: Any, label: str | None = None) -> None:
+    """Forest plot of coefficient point estimates with 95% CIs.
+
+    Operates ONLY on the fit's ``params`` and ``conf_int()`` —
+    pure functions of model output, never the raw data. The
+    helper is the gate; there is no escape-hatch path that
+    accepts an arbitrary file (that would let a histogram of
+    raw rows pose as a coefficient plot — bypassing the
+    privacy line the entire system rests on).
+
+    Errors inside the helper print to stderr but never raise —
+    a broken plot helper must not break the analysis around it.
+    """
+    try:
+        d = _plots_dir()
+        if d is None:
+            return
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+        import numpy as _np
+
+        params = getattr(fitted, "params", None)
+        if params is None:
+            sys.stderr.write(
+                "nora.plot_coefficients: fitted object has no "
+                ".params; need a statsmodels-style fit\n"
+            )
+            return
+        try:
+            ci = fitted.conf_int(alpha=0.05)
+        except Exception as e:  # noqa: BLE001
+            sys.stderr.write(f"nora.plot_coefficients: conf_int failed: {e}\n")
+            return
+
+        # Drop intercept by default — researchers almost never want
+        # it on the same scale as predictors. (If they do, they can
+        # call this on a model fit without an intercept term.)
+        names = list(getattr(params, "index", range(len(params))))
+        ests = _np.asarray(params, dtype=float)
+        try:
+            import pandas as _pd
+            if isinstance(ci, _pd.DataFrame):
+                lows = ci.iloc[:, 0].to_numpy(dtype=float)
+                highs = ci.iloc[:, 1].to_numpy(dtype=float)
+            else:
+                ci_arr = _np.asarray(ci, dtype=float)
+                lows, highs = ci_arr[:, 0], ci_arr[:, 1]
+        except ImportError:
+            ci_arr = _np.asarray(ci, dtype=float)
+            lows, highs = ci_arr[:, 0], ci_arr[:, 1]
+
+        keep = [
+            i for i, n in enumerate(names)
+            if str(n).lower() not in ("intercept", "const", "_cons")
+        ]
+        if not keep:
+            sys.stderr.write(
+                "nora.plot_coefficients: nothing to plot after "
+                "dropping intercept term\n"
+            )
+            return
+        names = [str(names[i]) for i in keep]
+        ests = ests[keep]
+        lows = lows[keep]
+        highs = highs[keep]
+
+        fig, ax = plt.subplots(figsize=(8, max(2.5, 0.4 * len(names) + 1)))
+        y = _np.arange(len(names))
+        ax.hlines(y, lows, highs, lw=2, color="#4C78A8")
+        ax.scatter(ests, y, s=60, color="#4C78A8", zorder=3)
+        ax.axvline(0, color="gray", lw=1, ls="--")
+        ax.set_yticks(y)
+        ax.set_yticklabels(names)
+        ax.invert_yaxis()
+        ax.set_xlabel("Coefficient (95% CI)")
+        ax.set_title("Coefficients")
+        fig.tight_layout()
+
+        fname = "coefficients.png"
+        fig.savefig(d / fname, dpi=110)
+        plt.close(fig)
+        _append_plot_manifest(
+            fname, "coefficients",
+            label or "Coefficient estimates with 95% CIs",
+        )
+    except Exception as e:  # noqa: BLE001
+        sys.stderr.write(f"nora.plot_coefficients failed: {e}\n")
+        _append_plot_helper_error("plot_coefficients", e)
+
+
+def plot_estimate_comparison(
+    models: Any,
+    coef: str,
+    label: str | None = None,
+) -> None:
+    """Forest plot comparing one coefficient across multiple fits.
+
+    ``models`` is a dict mapping label → fitted model (the keys
+    become y-axis labels). Each fit must expose ``params`` and
+    ``cov_params()`` (statsmodels) or ``params``/``bse``. ``coef``
+    is the coefficient name to extract from each.
+
+    Use case: "female gap before/after controls" — two regressions,
+    one plot, no language switching to compose them. Same posture
+    as the other ``plot_*`` helpers: produces a model-output plot
+    only (point estimates + CIs from each fit's covariance), never
+    raw rows.
+    """
+    try:
+        d = _plots_dir()
+        if d is None:
+            return
+        if not isinstance(models, dict) or len(models) < 2:
+            sys.stderr.write(
+                "nora.plot_estimate_comparison: `models` must be a "
+                "dict of at least 2 fits keyed by label\n"
+            )
+            return
+        if not isinstance(coef, str) or not coef:
+            sys.stderr.write(
+                "nora.plot_estimate_comparison: `coef` must be a "
+                "coefficient name string\n"
+            )
+            return
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+        import numpy as _np
+
+        labels: list[str] = []
+        ests: list[float] = []
+        ses: list[float] = []
+        for nm, fit in models.items():
+            params = getattr(fit, "params", None)
+            if params is None:
+                sys.stderr.write(
+                    f"nora.plot_estimate_comparison: model {nm!r} "
+                    f"has no .params; need a statsmodels-style fit\n"
+                )
+                return
+            try:
+                idx = list(params.index)
+            except AttributeError:
+                idx = [str(i) for i in range(len(params))]
+            if coef not in idx:
+                sys.stderr.write(
+                    f"nora.plot_estimate_comparison: coef "
+                    f"{coef!r} not in model {nm!r}\n"
+                )
+                return
+            est = float(params[coef])
+            # SE: prefer .bse[coef]; fall back to sqrt of cov_params
+            # diagonal. statsmodels exposes both.
+            bse = getattr(fit, "bse", None)
+            if bse is not None and coef in list(bse.index):
+                se = float(bse[coef])
+            else:
+                cov = fit.cov_params()
+                se = float(_np.sqrt(cov.loc[coef, coef]))
+            labels.append(str(nm))
+            ests.append(est)
+            ses.append(se)
+
+        ests_arr = _np.asarray(ests, dtype=float)
+        ses_arr = _np.asarray(ses, dtype=float)
+        lows = ests_arr - 1.96 * ses_arr
+        highs = ests_arr + 1.96 * ses_arr
+
+        n = len(labels)
+        fig, ax = plt.subplots(figsize=(8.5, max(2.5, 0.5 * n + 1.5)))
+        y = _np.arange(n)
+        ax.hlines(y, lows, highs, lw=2, color="#4C78A8")
+        ax.scatter(ests_arr, y, s=70, color="#4C78A8", zorder=3)
+        ax.axvline(0, color="gray", lw=1, ls="--")
+        ax.set_yticks(y)
+        ax.set_yticklabels(labels)
+        ax.invert_yaxis()
+        ax.set_xlabel(f"{coef} (95% CI)")
+        ax.set_title(f"Estimate comparison: {coef}")
+        fig.tight_layout()
+
+        fname = "estimate_comparison.png"
+        fig.savefig(d / fname, dpi=110)
+        plt.close(fig)
+        _append_plot_manifest(
+            fname, "coefficients",
+            label or f"Estimate comparison: {coef}",
+        )
+    except Exception as e:  # noqa: BLE001
+        sys.stderr.write(f"nora.plot_estimate_comparison failed: {e}\n")
+        _append_plot_helper_error("plot_estimate_comparison", e)
+
+
+def plot_interaction(
+    fitted: Any,
+    var: str,
+    data: Any | None = None,
+    label: str | None = None,
+    xlab: str | None = None,
+    ylab: str | None = None,
+    title: str | None = None,
+) -> None:
+    """Predicted-response curve across one predictor with the others
+    held at their means (numeric) or first level (categorical).
+    Bands are 1.96 * SE of the predicted mean.
+
+    ``fitted`` is a statsmodels results object. ``data`` is the
+    DataFrame the model was fit on (statsmodels doesn't reliably
+    expose this back through the results object once formulae are
+    involved). Optional ``xlab`` / ``ylab`` / ``title`` override
+    defaults that fall back to the variable name and a generic
+    "Predicted response" label.
+
+    Falls through quietly with a stderr note when shape can't be
+    derived.
+    """
+    try:
+        d = _plots_dir()
+        if d is None:
+            return
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+        import numpy as _np
+        import pandas as _pd
+
+        if data is None:
+            data = getattr(fitted.model, "data", None)
+            data = getattr(data, "frame", None) if data is not None else None
+        if data is None or var not in getattr(data, "columns", []):
+            sys.stderr.write(
+                f"nora.plot_interaction: pass data=... that contains "
+                f"column {var!r}; couldn't derive it from the fit\n"
+            )
+            return
+
+        # Build the prediction grid and the held-at-means template.
+        col = data[var]
+        is_numeric = _pd.api.types.is_numeric_dtype(col)
+        if is_numeric:
+            grid = _np.linspace(float(col.min()), float(col.max()), 100)
+        else:
+            grid = list(col.dropna().unique())
+
+        template = {}
+        for c in data.columns:
+            v = data[c]
+            if _pd.api.types.is_numeric_dtype(v):
+                template[c] = float(v.mean())
+            else:
+                template[c] = v.dropna().iloc[0] if not v.dropna().empty else None
+        new_rows = []
+        for g in grid:
+            row = dict(template)
+            row[var] = g
+            new_rows.append(row)
+        new = _pd.DataFrame(new_rows)
+
+        # Statsmodels' get_prediction returns a PredictionResults
+        # with .summary_frame() including 'mean' and 'mean_ci_lower/upper'.
+        try:
+            pred = fitted.get_prediction(new)
+            sf = pred.summary_frame(alpha=0.05)
+            mean = sf["mean"].to_numpy()
+            lo = sf["mean_ci_lower"].to_numpy()
+            hi = sf["mean_ci_upper"].to_numpy()
+        except Exception:
+            # Fallback: predict() alone (no CI available)
+            mean = _np.asarray(fitted.predict(new))
+            lo = mean
+            hi = mean
+
+        xtitle = xlab if xlab is not None else var
+        ytitle = ylab if ylab is not None else "Predicted response"
+        ptitle = title if title is not None else f"Predicted response by {var}"
+
+        fig, ax = plt.subplots(figsize=(9, 5))
+        if is_numeric:
+            # Filled CI ribbon under a colored line — much more
+            # readable than the prior dashed-line whiskers, which
+            # the user called out as a "really shitty" rendering.
+            ax.fill_between(grid, lo, hi, color="#4C78A8", alpha=0.20)
+            ax.plot(grid, mean, lw=2, color="#1F4E79")
+        else:
+            xs = _np.arange(len(grid))
+            ax.bar(xs, mean, yerr=[mean - lo, hi - mean],
+                   color="#4C78A8", edgecolor="#1F4E79",
+                   capsize=4)
+            ax.set_xticks(xs)
+            ax.set_xticklabels([str(g) for g in grid])
+        ax.set_xlabel(xtitle)
+        ax.set_ylabel(ytitle)
+        ax.set_title(ptitle, fontweight="bold")
+        ax.spines["top"].set_visible(False)
+        ax.spines["right"].set_visible(False)
+        ax.grid(axis="y", alpha=0.25)
+        fig.tight_layout()
+
+        # ``var`` can in principle contain weird chars; sanitize to
+        # something filesystem-safe but still informative.
+        safe_var = "".join(c if c.isalnum() or c in "-_" else "_" for c in var)
+        fname = f"interaction_{safe_var}.png"
+        fig.savefig(d / fname, dpi=110)
+        plt.close(fig)
+        _append_plot_manifest(
+            fname, "interaction",
+            label or f"Predicted response by {var}",
+        )
+    except Exception as e:  # noqa: BLE001
+        sys.stderr.write(f"nora.plot_interaction failed: {e}\n")
+        _append_plot_helper_error("plot_interaction", e)

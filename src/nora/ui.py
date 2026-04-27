@@ -43,7 +43,6 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from nora import chat_service
 from nora.chat_history import Turn, read_turns
 from nora.config import set_cwd
 from nora.env_detect import detect_environment
@@ -57,11 +56,6 @@ from nora.policy import (
     save_policy,
 )
 from nora.provider import (
-    AuthFailure,
-    ProviderSession,
-    TurnDone,
-    TurnError,
-    open_session,
     provider_for_model,
 )
 from nora.provider.catalog import (
@@ -69,8 +63,7 @@ from nora.provider.catalog import (
     PROVIDER_DEFAULTS,
     PROVIDER_PRICING_URLS,
 )
-from nora.system_prompt import build_system_prompt
-from nora.tools import SERVER_NAME
+from nora.runner import SessionRunner
 
 
 # Where uploaded-file sessions live. Chosen for three properties:
@@ -99,67 +92,35 @@ class NoraBridge:
     def __init__(self, cwd: Path | None = None):
         # cwd may be None at construction time — the UI's landing
         # screen lets the researcher pick files or a folder on first
-        # run. `set_cwd` finalizes it.
+        # run. ``self.cwd`` is the *focused* session — what the UI is
+        # currently showing. The actual execution state per session
+        # lives in ``self._runners``, keyed by str(cwd).
         self.cwd: Path | None = cwd
         self._window: Any = None  # set after the window is created
         self._loop: asyncio.AbstractEventLoop | None = None
         self._loop_thread: threading.Thread | None = None
-        # Persistent provider session. Opened lazily on first
-        # send_message; closed on shutdown / cwd switch / model swap
-        # rejection. ProviderSession is a Protocol; the concrete
-        # instance is whatever ``open_session(self._provider, ...)``
-        # returns (AnthropicSession today, OpenAISession when the
-        # researcher's auth chooses OpenAI).
-        self._session: ProviderSession | None = None
-        # A lock to serialize send_message calls. The session client
-        # assumes one turn at a time.
-        self._send_lock: asyncio.Lock | None = None
-        # Handle to the currently-running turn's asyncio Task, so
-        # `interrupt_turn` can cancel it when the researcher clicks
-        # the Stop button. None when no turn is in flight. Captured
-        # on the worker loop, cleared when the turn returns.
-        self._current_turn_task: asyncio.Task[None] | None = None
-        # Which provider + model the researcher has selected. Default
-        # to Anthropic Sonnet 4.6 — the auth screen can override
-        # before the first session opens. Changed via ``set_model``
-        # from the composer chip; takes effect on the next turn
-        # because ``_ensure_session`` reads it when opening a fresh
-        # session.
-        self._provider: str = "anthropic"
-        self._model: str = PROVIDER_DEFAULTS[self._provider]
-        # Memory: whenever we open a fresh SDK client (first turn,
-        # model switch, session switch, app restart) we prepend the
-        # last N turns from chat_history.jsonl to the first user
-        # message so Claude picks up where we left off. The flag is
-        # set when the client is (re)opened and cleared after the
-        # prefix has been emitted exactly once.
-        self._needs_context_prefix: bool = False
-        # Mid-chat script attachments. When the researcher drops a
-        # ``.py`` / ``.do`` / ``.r`` / ``.rmd`` file into the
-        # composer, the bridge copies it into the session cwd AND
-        # stages its content here so the next ``send_message`` can
-        # prepend the source as a context block — same shape as
-        # image attachments, just textual. Cleared on successful
-        # send; restored on cancel/error so the user doesn't lose
-        # the attachment to a transient failure.
-        self._pending_script_attachments: list[dict[str, Any]] = []
-        # Datasets the model has been told about so far. Snapshotted
-        # at session open from the system-prompt's ``datasets_list``
-        # block; mid-chat uploads compare against this set and any
-        # new names get prepended to the next turn as a "researcher
-        # just added X" notice. Without this the system prompt's
-        # listing is frozen at session open and a parquet dropped
-        # ten messages in is invisible to the model until the
-        # session is reopened.
-        self._known_datasets: frozenset[str] = frozenset()
-        # When the launcher hands us a cwd up-front (``nora-ui /path``)
-        # we never go through ``_set_cwd``, so the per-session model
-        # restore there gets skipped. Run it here too: a session with
-        # ``active_model = "claude-opus-4-7[1m]"`` recorded in its
-        # state file should reopen on Opus, not on whatever the
-        # Anthropic default happens to be.
+        # Per-session execution state. Each :class:`SessionRunner`
+        # owns its own provider session, send-lock, current turn
+        # task, warm-start flag, model, and pending attachments. The
+        # bridge holds them by str(cwd) and keeps them alive across
+        # focus switches: a long regression in session A keeps
+        # streaming events even while the UI is showing session B.
+        self._runners: dict[str, SessionRunner] = {}
+        # Defaults applied when a NEW runner is created (i.e., a
+        # session is focused for the first time and has no recorded
+        # active_model). Set by the auth-reconcile flow + the
+        # auth-screen's "Use OpenAI / Use Anthropic" buttons; never
+        # mutated by per-session model swaps (those affect only the
+        # active runner).
+        self._default_provider: str = "anthropic"
+        self._default_model: str = PROVIDER_DEFAULTS[self._default_provider]
         if cwd is not None:
-            self._restore_session_model_preference()
+            # If the launcher handed us a cwd, eagerly create its
+            # runner so per-session model preference is applied
+            # before the page is even loaded. Otherwise the first
+            # ``ui_ready`` would try to read ``active_model`` against
+            # an absent runner and fall back to the default.
+            self._ensure_runner_for_cwd(cwd)
 
     # -------- lifecycle --------
 
@@ -168,9 +129,10 @@ class NoraBridge:
 
     def start_loop(self) -> None:
         """Start the asyncio worker thread. Called once, before the
-        webview starts serving the page."""
+        webview starts serving the page. Per-runner locks are created
+        inside each :class:`SessionRunner`; the bridge no longer holds
+        a global send-lock."""
         self._loop = asyncio.new_event_loop()
-        self._send_lock = asyncio.Lock()
 
         def _run() -> None:
             asyncio.set_event_loop(self._loop)
@@ -182,20 +144,26 @@ class NoraBridge:
         self._loop_thread.start()
 
     def stop_loop(self) -> None:
+        """Tear down all runners and stop the worker loop. Called once
+        on app shutdown — this is the ONLY place runners get closed
+        in normal operation. Session focus changes do NOT close
+        runners (that was the bug — closing under an in-flight stream
+        killed the turn)."""
         if self._loop is None:
             return
-        # Close the provider session if we opened one.
-        async def _close() -> None:
-            if self._session is not None:
+        runners = list(self._runners.values())
+
+        async def _close_all() -> None:
+            for r in runners:
                 try:
-                    await self._session.close()
-                except Exception:
+                    await r.close()
+                except Exception:  # noqa: BLE001
                     pass
 
-        fut = asyncio.run_coroutine_threadsafe(_close(), self._loop)
+        fut = asyncio.run_coroutine_threadsafe(_close_all(), self._loop)
         try:
-            fut.result(timeout=3)
-        except Exception:
+            fut.result(timeout=5)
+        except Exception:  # noqa: BLE001
             pass
         self._loop.call_soon_threadsafe(self._loop.stop)
 
@@ -216,12 +184,11 @@ class NoraBridge:
         deletes a credential in Keychain Access between sessions
         bounces back to the auth screen on next launch.
         """
-        # Make sure the active provider matches what's actually
-        # authed. The bridge defaults to Anthropic at construction;
-        # without this guard, a researcher who configures only
-        # OpenAI would hit the chat with ``self._provider ==
-        # "anthropic"`` and ``_ensure_session`` would fail at first
-        # turn with "no Anthropic credential."
+        # Make sure the bridge default + active runner agree with
+        # what's actually authed. Without this, a researcher who
+        # configured only OpenAI would hit chat with the Anthropic
+        # default still selected and the first turn would fail with
+        # "no Anthropic credential."
         self._reconcile_active_provider_with_auth()
         status = self._auth_status_payload()
         if not status["any_authed"]:
@@ -238,36 +205,40 @@ class NoraBridge:
         return {"state": "ready", **self._ready_payload(), "auth": status}
 
     def _reconcile_active_provider_with_auth(self) -> None:
-        """Ensure ``self._provider`` is one the researcher can
-        actually use right now.
+        """Ensure the bridge's *defaults* (used for new runners) name a
+        provider the researcher can actually use right now. Also
+        promotes the active runner (if any) when its provider is
+        unauthed.
 
         Default at construction is Anthropic. If the researcher
-        configures only OpenAI, the bridge needs to flip to
-        OpenAI before the first turn opens a session — otherwise
-        ``_ensure_session("anthropic", ...)`` runs with no
-        credential and the model picker chip lies about what's
-        active.
+        configures only OpenAI, the bridge flips its defaults to
+        OpenAI before any new session opens.
 
-        Picks deterministically from ``PROVIDER_DEFAULTS`` so the
-        ordering is stable across calls. Closes any open session
-        when the active provider changes (the model is a different
-        family, conversation continuity isn't preserved across
-        provider swaps).
+        Existing runners that aren't currently focused are left
+        alone — they may still hold a session against a now-unauthed
+        provider, but that's a per-session problem and surfaces as
+        an auth_failure on the next send for that runner. We don't
+        force-close idle runners here because that's a side-effect
+        the researcher didn't ask for.
         """
         authed = self._authed_providers()
-        if not authed or self._provider in authed:
+        if not authed:
             return
-        # First authed provider in catalog order — Anthropic when
-        # both are present, OpenAI only when it's the only choice.
-        for candidate in PROVIDER_DEFAULTS:
-            if candidate in authed:
-                self._close_session_blocking()
-                self._provider = candidate
-                self._model = PROVIDER_DEFAULTS[candidate]
-                # Persist the swap so a session reload doesn't
-                # bounce the researcher back to the wrong default.
-                self._persist_active_model()
-                return
+        # Update bridge defaults if unauthed.
+        if self._default_provider not in authed:
+            for candidate in PROVIDER_DEFAULTS:
+                if candidate in authed:
+                    self._default_provider = candidate
+                    self._default_model = PROVIDER_DEFAULTS[candidate]
+                    break
+        # If the active runner is using an unauthed provider, swap
+        # it to the default — and persist so a reload survives.
+        active = self._active_runner()
+        if active is not None and active.provider not in authed:
+            new_provider = self._default_provider
+            new_model = self._default_model
+            self._run_on_loop(active.swap_model(new_model, new_provider))
+            self._persist_active_model()
 
     def choose_files(self) -> dict[str, Any]:
         """Open a native file-picker dialog (multi-select) restricted
@@ -525,51 +496,58 @@ class NoraBridge:
         return {"ok": True, "policy": self._policy_summary()}
 
     def send_message(self, text: str) -> None:
-        """Called from the web form. Runs a single chat turn on the
-        worker loop. Returns immediately; events stream back via
-        `_push_event`."""
+        """Schedule a turn on the active session's runner. Returns
+        immediately; events stream back via ``_dispatch_event``."""
+        self._send_to_active(text, images=None)
+
+    def send_message_with_images(
+        self, text: str, images: list[dict[str, Any]]
+    ) -> None:
+        """Schedule a turn with attached images on the active runner.
+        ``images[i] = {"data": <base64>, "mime": ...}``."""
+        self._send_to_active(text, images=images)
+
+    def _send_to_active(
+        self,
+        text: str,
+        images: list[dict[str, Any]] | None,
+    ) -> None:
+        """Find the active session's runner and start a turn on it.
+
+        Each runner has its own send-lock, so kicking off a turn on
+        runner A while runner B is still streaming does NOT block —
+        they execute concurrently. The runner stamps every event
+        with ``session_cwd`` so the JS side can filter for the
+        active focus, while persistence always lands in the
+        runner's own ``chat_history.jsonl``.
+        """
         if self._loop is None:
-            self._push_event({
+            self._dispatch_event({
                 "type": "turn_error",
                 "message": "worker loop not running",
+                "session_cwd": str(self.cwd) if self.cwd else None,
             })
             return
         if self.cwd is None:
-            self._push_event({
+            self._dispatch_event({
                 "type": "turn_error",
                 "message": (
                     "no working directory set — choose files or a "
                     "folder first"
                 ),
+                "session_cwd": None,
             })
             return
-        self._record_user_message(text)
-        asyncio.run_coroutine_threadsafe(
-            self._run_turn(text), self._loop
+        runner = self._ensure_runner_for_cwd(self.cwd)
+        self._record_user_message(runner, text, image_count=len(images or []))
+        coro = runner.run_turn(
+            text,
+            images=images,
+            on_event=self._dispatch_event,
+            build_context_prefix=_build_context_prefix,
+            build_script_prefix=_build_script_attachment_prefix,
         )
-
-    def send_message_with_images(
-        self, text: str, images: list[dict[str, Any]]
-    ) -> None:
-        """Send a user message with one or more attached images.
-        ``images[i] = {"data": <base64>, "mime": <image/png|jpeg|webp|gif>}``.
-        The SDK's query() takes a string shortcut OR an async
-        iterable of message dicts; for vision we need the latter so
-        we can attach image content blocks alongside the text.
-        """
-        if self._loop is None:
-            self._push_event({"type": "turn_error", "message": "worker loop not running"})
-            return
-        if self.cwd is None:
-            self._push_event({
-                "type": "turn_error",
-                "message": "no working directory set — choose files or a folder first",
-            })
-            return
-        self._record_user_message(text, image_count=len(images))
-        asyncio.run_coroutine_threadsafe(
-            self._run_turn(text, images=images), self._loop
-        )
+        asyncio.run_coroutine_threadsafe(coro, self._loop)
 
     def add_files(self) -> dict[str, Any]:
         """Open a native file picker that accepts both data files
@@ -673,13 +651,15 @@ class NoraBridge:
                 # silently lands in cwd and the researcher's "what
                 # does this do?" hits the model with no context.
                 if ext in _INLINE_SCRIPT_EXTS:
-                    try:
-                        _stage_script_for_next_turn(
-                            self._pending_script_attachments,
-                            src.name, ext, dst.read_bytes(),
-                        )
-                    except OSError:
-                        pass  # script is on disk; just no inline copy
+                    runner = self._active_runner()
+                    if runner is not None:
+                        try:
+                            _stage_script_for_next_turn(
+                                runner.pending_script_attachments,
+                                src.name, ext, dst.read_bytes(),
+                            )
+                        except OSError:
+                            pass  # script is on disk; just no inline copy
             elif ext in _IMAGE_EXTS_MIMES:
                 try:
                     raw = src.read_bytes()
@@ -794,10 +774,12 @@ class NoraBridge:
                 # inline. See ``add_files`` for the docstring on
                 # which extensions qualify and why.
                 if ext in _INLINE_SCRIPT_EXTS:
-                    _stage_script_for_next_turn(
-                        self._pending_script_attachments,
-                        safe_name, ext, blob,
-                    )
+                    runner = self._active_runner()
+                    if runner is not None:
+                        _stage_script_for_next_turn(
+                            runner.pending_script_attachments,
+                            safe_name, ext, blob,
+                        )
             elif ext in _IMAGE_EXTS_MIMES:
                 if len(blob) > _IMAGE_MAX_BYTES:
                     skipped.append(f"{safe_name} (>5 MB)")
@@ -841,10 +823,15 @@ class NoraBridge:
         with a "configure auth" hint rather than hiding them entirely
         — the researcher needs to know what could be there."""
         authed = self._authed_providers()
+        # Surface the focused runner's choice when there is one;
+        # fall back to the bridge defaults for the landing screen.
+        active = self._active_runner()
+        current_model = active.model if active is not None else self._default_model
+        current_provider = active.provider if active is not None else self._default_provider
         return {
             "ok": True,
-            "current": self._model,
-            "current_provider": self._provider,
+            "current": current_model,
+            "current_provider": current_provider,
             "models": [
                 {
                     "id": m.id,
@@ -876,11 +863,25 @@ class NoraBridge:
         Kinds:
           - ``data``   — .csv / .tsv / .dta / .rds / .parquet / .jsonl
           - ``script`` — .py / .do / .r / .rmd / .ipynb
-          - ``graph``  — .gph
+          - ``graph``  — .gph / .png / .jpg / .jpeg / .pdf
           - ``log``    — .log / .smcl
 
-        Top-level scan only (matches every other Nora scanner). Files
-        are sorted by name within their kind.
+        Two locations are scanned (both non-recursively, so we don't
+        walk into deep subtrees):
+
+          1. The session cwd itself — researcher uploads, Stata's
+             ``graph export "fig.png"`` writes (the executor preamble
+             cd's there), and any direct ``ggsave`` / ``plt.savefig``
+             with a bare filename land here.
+          2. Each ``.nora/runs/<id>/_nora_plots/`` — the manifest-
+             allowlisted dir for runtime helpers
+             (``nora$plot_residuals`` / ``nora.plot_coefficients`` /
+             etc.). Listing these here lets the Files panel act as
+             a session-wide gallery of every plot the analysis
+             produced, regardless of which run wrote it.
+
+        Files are sorted by mtime descending (newest first) within
+        each kind so the most recent outputs sit at the top.
         """
         if self.cwd is None:
             return {"ok": True, "files": []}
@@ -894,35 +895,179 @@ class NoraBridge:
             kind_for_ext[ext] = ("data", 0)
         for ext in (".py", ".do", ".r", ".rmd", ".ipynb"):
             kind_for_ext[ext] = ("script", 1)
-        kind_for_ext[".gph"] = ("graph", 2)
+        # Stata's native graph format + raster/vector image outputs.
+        # Researchers iterate on plots a lot; the Files panel is now
+        # the persistent gallery so a researcher can scroll back to
+        # every plot the analysis ever produced.
+        for ext in (".gph", ".png", ".jpg", ".jpeg", ".pdf", ".eps"):
+            kind_for_ext[ext] = ("graph", 2)
         for ext in (".log", ".smcl"):
             kind_for_ext[ext] = ("log", 3)
 
         rows: list[dict[str, Any]] = []
+        seen_paths: set[Path] = set()
+        # Inline-thumbnail cap for image rows. Larger files still
+        # appear in the panel (with a placeholder + click-to-open),
+        # but their bytes don't ride through evaluate_js.
+        _IMAGE_THUMB_CAP = 3 * 1024 * 1024  # 3 MB — matches the chat-thumbnail cap so 1600px Stata PDFs / PNGs render at full res in the panel + lightbox
+        _IMAGE_THUMB_EXTS = {".png", ".jpg", ".jpeg"}
+        _IMAGE_MIME = {
+            ".png": "image/png",
+            ".jpg": "image/jpeg",
+            ".jpeg": "image/jpeg",
+        }
+        import base64 as _base64
+
+        def _add(child: Path) -> None:
+            # Skip generated sidecars from the PDF→PNG conversion
+            # path so the Files panel doesn't list them alongside
+            # the originals.
+            if child.name.endswith(".nora.png"):
+                return
+            ext = child.suffix.lower()
+            kind_pri = kind_for_ext.get(ext)
+            if kind_pri is None:
+                return
+            kind, priority = kind_pri
+            try:
+                stat = child.stat()
+            except OSError:
+                return
+            try:
+                resolved = child.resolve()
+            except OSError:
+                return
+            if resolved in seen_paths:
+                return
+            seen_paths.add(resolved)
+            entry: dict[str, Any] = {
+                "name": child.name,
+                "kind": kind,
+                "priority": priority,
+                "size": stat.st_size,
+                "ext": ext,
+                "mtime": stat.st_mtime,
+                "path": str(child),
+            }
+            if ext in _IMAGE_THUMB_EXTS and stat.st_size <= _IMAGE_THUMB_CAP:
+                try:
+                    entry["data"] = _base64.b64encode(
+                        child.read_bytes()
+                    ).decode("ascii")
+                    entry["mime"] = _IMAGE_MIME.get(ext, "image/png")
+                except OSError:
+                    pass
+            elif ext in (".pdf", ".eps"):
+                # PDFs and EPS are graphs the researcher will want
+                # to preview too. Convert via sips to a sibling PNG
+                # (cached) and ship the rasterized bytes for the
+                # thumbnail tile. Clicking the tile still routes
+                # through the path field to open the original file
+                # in Preview.
+                from nora.plot_convert import png_for
+                sidecar = png_for(child)
+                if sidecar is not None:
+                    try:
+                        sidecar_size = sidecar.stat().st_size
+                    except OSError:
+                        sidecar_size = stat.st_size
+                    if sidecar_size <= _IMAGE_THUMB_CAP:
+                        try:
+                            entry["data"] = _base64.b64encode(
+                                sidecar.read_bytes()
+                            ).decode("ascii")
+                            entry["mime"] = "image/png"
+                        except OSError:
+                            pass
+            rows.append(entry)
+
         try:
             for child in self.cwd.iterdir():
-                if not child.is_file():
-                    continue
-                ext = child.suffix.lower()
-                kind_pri = kind_for_ext.get(ext)
-                if kind_pri is None:
-                    continue
-                kind, priority = kind_pri
-                try:
-                    size = child.stat().st_size
-                except OSError:
-                    size = 0
-                rows.append({
-                    "name": child.name,
-                    "kind": kind,
-                    "priority": priority,
-                    "size": size,
-                    "ext": ext,
-                })
+                if child.is_file() and not child.is_symlink():
+                    _add(child)
         except OSError:
             return {"ok": True, "files": []}
-        rows.sort(key=lambda r: (r["priority"], r["name"].lower()))
+
+        # Walk every run's _nora_plots/ subdir so helper-produced
+        # plots (which live outside the session-cwd top level) show
+        # up alongside session-cwd plots.
+        runs_root = self.cwd / ".nora" / "runs"
+        if runs_root.is_dir():
+            try:
+                for run_dir in runs_root.iterdir():
+                    plots_dir = run_dir / "_nora_plots"
+                    if not plots_dir.is_dir():
+                        continue
+                    try:
+                        for plot in plots_dir.iterdir():
+                            if plot.is_file() and not plot.is_symlink():
+                                _add(plot)
+                    except OSError:
+                        continue
+            except OSError:
+                pass
+
+        # Newest-first within each kind so the most recent plots
+        # bubble to the top of the panel.
+        rows.sort(
+            key=lambda r: (r["priority"], -r.get("mtime", 0), r["name"].lower())
+        )
         return {"ok": True, "files": rows}
+
+    def delete_session_file(self, path: str) -> dict[str, Any]:
+        """Delete a file inside the active session.
+
+        Used by the Files-panel trash icon. Accepts a full path (the
+        listing already has it via ``list_session_files``) so we can
+        delete files in run dirs (helper-produced plots) as well as
+        in the session-cwd top level. Containment in the session
+        cwd is verified before any unlink — outside paths are
+        refused.
+
+        Side effect: if the deleted file was a script staged for
+        attachment, drop it from the runner's pending list so the
+        composer chip vanishes too. Without that, the chip would
+        still show even though the file is gone, and the next send
+        would silently no-op the inline content.
+        """
+        if self.cwd is None:
+            return {"ok": False, "reason": "no active session"}
+        if not path:
+            return {"ok": False, "reason": "no path"}
+        try:
+            target = Path(path).expanduser().resolve()
+        except OSError as e:
+            return {"ok": False, "reason": f"bad path: {e}"}
+        cwd_resolved = self.cwd.resolve()
+        if not _is_within(target, cwd_resolved):
+            return {
+                "ok": False,
+                "reason": "path is outside the session — refused as a precaution",
+            }
+        if not target.is_file():
+            return {"ok": False, "reason": f"not found: {target.name}"}
+        try:
+            target.unlink()
+        except OSError as e:
+            return {"ok": False, "reason": f"delete failed: {e}"}
+        # Drop a matching staged attachment so the composer chip
+        # follows the file's life cycle.
+        runner = self._active_runner()
+        if runner is not None:
+            runner.pending_script_attachments = [
+                a for a in runner.pending_script_attachments
+                if a.get("name") != target.name
+            ]
+        # Best-effort: also remove the cached PDF/EPS → PNG sidecar
+        # if there was one. Otherwise the orphan PNG would keep
+        # showing in the Files panel until the bridge restarted.
+        sidecar = target.with_name(target.stem + ".nora.png")
+        if sidecar.is_file():
+            try:
+                sidecar.unlink()
+            except OSError:
+                pass
+        return {"ok": True, "name": target.name}
 
     def unstage_attachment(self, name: str) -> dict[str, Any]:
         """Remove a previously-staged script from
@@ -943,16 +1088,19 @@ class NoraBridge:
         """
         if not name:
             return {"ok": False, "reason": "no name"}
+        runner = self._active_runner()
+        if runner is None:
+            return {"ok": True, "name": Path(name).name, "removed": 0}
         target = Path(name).name  # basename only
-        before = len(self._pending_script_attachments)
-        self._pending_script_attachments = [
-            a for a in self._pending_script_attachments
+        before = len(runner.pending_script_attachments)
+        runner.pending_script_attachments = [
+            a for a in runner.pending_script_attachments
             if a.get("name") != target
         ]
         return {
             "ok": True,
             "name": target,
-            "removed": before - len(self._pending_script_attachments),
+            "removed": before - len(runner.pending_script_attachments),
         }
 
     def attach_session_file(self, name: str) -> dict[str, Any]:
@@ -998,11 +1146,14 @@ class NoraBridge:
             content = target.read_bytes()
         except OSError as e:
             return {"ok": False, "reason": f"read failed: {e}"}
+        runner = self._active_runner()
+        if runner is None:
+            return {"ok": False, "reason": "no active session"}
         # Idempotent: if the same script is already staged for the
         # next turn, don't add a duplicate. Researchers who click
         # the same row twice expect "already attached" rather than
         # the model seeing two copies of the file.
-        for staged in self._pending_script_attachments:
+        for staged in runner.pending_script_attachments:
             if staged.get("name") == safe_name:
                 return {
                     "ok": True,
@@ -1010,7 +1161,7 @@ class NoraBridge:
                     "already_attached": True,
                 }
         _stage_script_for_next_turn(
-            self._pending_script_attachments, safe_name, ext, content,
+            runner.pending_script_attachments, safe_name, ext, content,
         )
         return {"ok": True, "name": safe_name}
 
@@ -1068,9 +1219,15 @@ class NoraBridge:
         screen (depending on whether anything else is configured)."""
         from nora import auth as _auth
         res = _auth.delete_credential(provider)
-        # Tear down any active session for the now-unauthed provider.
-        if provider == self._provider:
-            self._close_session_blocking()
+        # Close any IDLE runner that's bound to the now-unauthed
+        # provider. We deliberately leave busy runners alone — their
+        # turn will surface an auth_failure on the next request, but
+        # interrupting an in-flight stream is worse than letting it
+        # error out naturally. Closed runners reopen lazily on the
+        # next send (and will see the unauthed provider then too).
+        for runner in list(self._runners.values()):
+            if runner.provider == provider and not runner.is_busy():
+                self._run_on_loop(runner.close())
         # Anthropic specifically: ``_ensure_anthropic_env`` copies the
         # keyring credential into ``ANTHROPIC_API_KEY`` so the SDK
         # picks it up. Without clearing that injected env var here,
@@ -1084,14 +1241,19 @@ class NoraBridge:
         return {**res, "auth": self._auth_status_payload()}
 
     def set_active_provider(self, provider: str) -> dict[str, Any]:
-        """Switch the active provider explicitly (e.g., from the auth
-        screen's "Use Anthropic" / "Use OpenAI" buttons). The model
-        defaults to the provider's catalog default. The current
-        session, if any, is closed so the next turn opens fresh
-        against the new provider."""
+        """Set the bridge's default provider for newly-created runners,
+        and swap the focused runner (if any) to that provider's
+        default model.
+
+        The auth-screen's "Use OpenAI / Use Anthropic" buttons call
+        this. Only the focused runner is swapped; OTHER runners keep
+        their existing provider/model so the user's prior choices
+        for those sessions stick.
+        """
         if provider not in PROVIDER_DEFAULTS:
             return {"ok": False, "reason": f"unknown provider: {provider!r}"}
-        if self._current_turn_task is not None and not self._current_turn_task.done():
+        active = self._active_runner()
+        if active is not None and active.is_busy():
             return {
                 "ok": False,
                 "reason": "a turn is in flight; wait for it to finish",
@@ -1107,14 +1269,17 @@ class NoraBridge:
                     f"add an API key first"
                 ),
             }
-        if provider != self._provider:
-            self._close_session_blocking()
-            self._provider = provider
-            self._model = PROVIDER_DEFAULTS[provider]
+        self._default_provider = provider
+        self._default_model = PROVIDER_DEFAULTS[provider]
+        if active is not None and active.provider != provider:
+            self._run_on_loop(
+                active.swap_model(self._default_model, provider)
+            )
+            self._persist_active_model()
         return {
             "ok": True,
-            "provider": self._provider,
-            "model": self._model,
+            "provider": provider,
+            "model": active.model if active is not None else self._default_model,
             "auth": self._auth_status_payload(),
         }
 
@@ -1150,69 +1315,49 @@ class NoraBridge:
                 # forget (subscription auth has nothing to forget here).
                 "has_keyring_entry": _auth.has_credential(p),
             }
+        # The "active provider" surfaced to the auth screen is the
+        # focused runner's provider, falling back to the bridge
+        # default for sessions not yet created.
+        active = self._active_runner()
+        active_provider = active.provider if active is not None else self._default_provider
         return {
             "providers": providers,
             "any_authed": any(v["configured"] for v in providers.values()),
-            "active_provider": self._provider,
+            "active_provider": active_provider,
         }
 
     def set_model(self, model_id: str) -> dict[str, Any]:
-        """Switch the active model.
+        """Switch the focused session's active model.
 
-        Behaviour depends on whether the new model is from the same
-        provider as the current session:
+        Operates on THIS session's runner only. Other sessions keep
+        whatever model they're using — researcher with two open
+        chats can run Sonnet in one and Opus in the other.
 
-        - Same provider (Anthropic→Anthropic): delegate to
-          ``session.set_model``, which uses the SDK's in-place swap
-          when supported so the conversation is preserved.
-        - Different provider (Anthropic→OpenAI or vice-versa): close
-          the current session; the next ``send_message`` will open a
-          fresh session for the new provider. Conversation context
-          carries forward via the bridge's existing context-prefix
-          injection on first turn.
-        - No session yet: just stash the choice; first
-          ``_ensure_session`` builds with the new selection.
+        Same-provider swaps go through the SDK in-place set_model
+        (preserves conversation). Cross-provider swaps close and
+        reopen the runner's session; conversation continuity flows
+        through the bridge's first-turn context-prefix injection.
 
-        Mid-turn switches are refused so we don't race the streaming
-        response.
+        Refused while THIS runner has a turn in flight (another
+        session being busy is fine — we only check the focused
+        runner). Persists ``active_model`` to the runner's
+        ``.nora/session_state.json`` so a reload restores the
+        choice.
         """
         try:
             new_provider = provider_for_model(model_id)
         except KeyError:
             return {"ok": False, "reason": f"unknown model: {model_id}"}
-        if self._current_turn_task is not None and not self._current_turn_task.done():
-            return {
-                "ok": False,
-                "reason": "a turn is in flight; wait for it to finish",
-            }
         info = next((m for m in ALL_MODELS if m.id == model_id), None)
         if info is None:
             return {"ok": False, "reason": f"unknown model: {model_id}"}
 
-        if model_id == self._model and new_provider == self._provider:
-            return {"ok": True, "model": model_id, "unchanged": True}
-
-        # Snapshot pre-switch state. Every failure path below restores
-        # both fields so a rejected swap doesn't wedge the bridge with
-        # an invalid id — without rollback, the next ``_ensure_session``
-        # would reopen with the rejected id and fail again, while the
-        # JS chip still showed the old name. Researcher sees a chat
-        # that "stopped working" with no way back besides restart.
-        old_model = self._model
-        old_provider = self._provider
-
-        # Provider change: drop the current session entirely. Both the
-        # current session and the new (untested) model id are taken on
-        # faith; if the next turn's session-open fails, the state has
-        # already moved. That's still better than the no-rollback
-        # baseline — the field assignments are atomic from the JS
-        # caller's perspective and the failure surfaces on the next
-        # turn rather than silently.
-        if new_provider != self._provider:
-            self._close_session_blocking()
-            self._provider = new_provider
-            self._model = model_id
-            self._persist_active_model()
+        active = self._active_runner()
+        if active is None:
+            # No focused session yet — update bridge defaults so the
+            # next runner picks up the choice.
+            self._default_provider = new_provider
+            self._default_model = model_id
             return {
                 "ok": True,
                 "model": model_id,
@@ -1220,40 +1365,17 @@ class NoraBridge:
                 "context_window": info.context_window,
                 "provider": new_provider,
             }
+        if active.is_busy():
+            return {
+                "ok": False,
+                "reason": "a turn is in flight; wait for it to finish",
+            }
+        if model_id == active.model and new_provider == active.provider:
+            return {"ok": True, "model": model_id, "unchanged": True}
 
-        # Same provider, model swap. Delegate to the session if open.
-        self._model = model_id
-        if self._loop is not None and self._session is not None:
-            session = self._session
-            async def _swap() -> dict[str, Any]:
-                return await session.set_model(model_id)
-            fut = asyncio.run_coroutine_threadsafe(_swap(), self._loop)
-            try:
-                res = fut.result(timeout=5)
-            except Exception as e:  # noqa: BLE001
-                # Restore so the next turn doesn't reopen with a
-                # rejected id. ``_close_session_blocking`` already
-                # tore the session down, so the next ``_ensure_session``
-                # builds fresh against the restored old model.
-                self._model = old_model
-                self._provider = old_provider
-                self._close_session_blocking()
-                return {
-                    "ok": False,
-                    "reason": f"model switch failed: {e}. Conversation reset.",
-                }
-            if not res.get("ok"):
-                # Same restoration: session refused the swap (unknown
-                # id at the SDK level, model not in the researcher's
-                # plan, …). The session may already have been torn
-                # down inside ``session.set_model``; clearing the
-                # reference forces a fresh open against ``old_model``.
-                self._model = old_model
-                self._provider = old_provider
-                if self._session is not None and self._loop is not None:
-                    self._close_session_blocking()
-                return res
-
+        res = self._run_on_loop(active.swap_model(model_id, new_provider))
+        if res is None or not res.get("ok"):
+            return res or {"ok": False, "reason": "model switch failed"}
         self._persist_active_model()
         return {
             "ok": True,
@@ -1266,18 +1388,15 @@ class NoraBridge:
     def _persist_active_model(self) -> None:
         """Refresh ``.nora/session_state.json`` so a successful
         ``set_model`` survives an app restart even before the
-        researcher sends the first message in this session.
-
-        Without this, the per-turn session-state writer would be the
-        only path that records the new choice — meaning a researcher
-        who swaps to Opus and then closes the app immediately would
-        come back to Sonnet (the prior recorded value), not Opus.
+        researcher sends the first message in this session. Writes
+        the focused runner's current model — per-session memory.
         """
-        if self.cwd is None:
+        active = self._active_runner()
+        if active is None:
             return
         try:
             from nora.session_state import write_session_state
-            write_session_state(self.cwd, model=self._model)
+            write_session_state(active.cwd, model=active.model)
         except Exception:  # noqa: BLE001 — never let state write break a swap
             pass
 
@@ -1349,6 +1468,33 @@ class NoraBridge:
                 "ok": False,
                 "reason": "cannot delete the active session — switch first",
             }
+        # Refuse if the target's runner has a turn in flight. A
+        # rmtree under a live SDK session and subprocess would yank
+        # the cwd / run dirs / results.db out from under whatever's
+        # still running — exactly the cross-session interference
+        # the multi-runner refactor exists to prevent.
+        runner_key = str(target)
+        runner = self._runners.get(runner_key)
+        if runner is not None and runner.is_busy():
+            return {
+                "ok": False,
+                "reason": (
+                    "this session has a turn in flight; wait for "
+                    "it to finish (or interrupt it from the focused "
+                    "session) before deleting"
+                ),
+            }
+        # Idle runner: close its SDK session and drop the entry
+        # before rmtree so we're not holding any handles into the
+        # directory we're about to remove.
+        if runner is not None:
+            self._run_on_loop(runner.close())
+            self._runners.pop(runner_key, None)
+            try:
+                from nora.store import close_store
+                close_store(target)
+            except Exception:  # noqa: BLE001 — store close isn't safety-critical
+                pass
         try:
             shutil.rmtree(target)
         except OSError as e:
@@ -1356,12 +1502,19 @@ class NoraBridge:
         return {"ok": True, "path": str(target)}
 
     def switch_session(self, path: str) -> dict[str, Any]:
-        """Switch the active working directory to an existing Nora
-        session. Closes the current SDK client so the next turn
-        starts a fresh conversation against the new cwd. Chat history
-        from the previous session isn't replayed (persistence is a
-        future feature); the researcher sees a clean slate pointed at
-        the chosen session's data.
+        """Move UI focus to an existing Nora session.
+
+        This is a pure focus change — does NOT close the previous
+        session's runner, does NOT cancel any in-flight turn there.
+        A regression streaming in session A keeps streaming after
+        the researcher clicks B in the sidebar; events continue to
+        be persisted to A's ``chat_history.jsonl`` and will be
+        visible when they click back. (See SessionRunner for the
+        execution model.)
+
+        The new session's runner is lazy-created if it doesn't
+        already exist, applying any per-session model preference
+        recorded in ``.nora/session_state.json``.
         """
         if not path:
             return {"ok": False, "reason": "empty path"}
@@ -1379,115 +1532,201 @@ class NoraBridge:
                 "reason": "path is outside ~/.nora-sessions/",
             }
 
-        # Close the existing session so the new cwd gets a fresh
-        # provider session instead of leaking state across directories.
-        self._close_session_blocking()
-
         return self._set_cwd(target)
 
     def interrupt_turn(self) -> dict[str, Any]:
-        """Cancel the currently-running turn. Called when the
-        researcher clicks the Stop button. Cancellation propagates
-        through the asyncio Task running in ``_run_turn``: the
-        ``async for`` loop over ``session.send()`` raises
-        CancelledError, we surface that as a ``turn_error`` event
-        with a clear message, and the Send button re-enables on the
-        JS side via its normal terminal-event handling.
+        """Cancel the active session's in-flight turn, if any.
 
-        The provider's socket/subprocess may still be mid-write to
-        the upstream service when we cancel; we close the persistent
-        session so the next ``send_message`` opens a fresh one and
-        server-side state doesn't leak across turns.
+        Per-session: only the focused runner is interrupted. Other
+        runners' turns keep running. We do NOT tear down the
+        runner's session on cancel — the session stays open so the
+        next turn reuses it. (Closing on every cancel was the old
+        bug: it killed the whole conversation rather than just the
+        current turn, and SDK retry semantics are robust enough to
+        not need a fresh socket per attempt.)
         """
         if self._loop is None:
             return {"ok": False, "reason": "worker loop not running"}
-        task = self._current_turn_task
-        if task is None or task.done():
+        runner = self._active_runner()
+        if runner is None or not runner.is_busy():
             return {"ok": False, "reason": "no turn in flight"}
         # Cancel on the worker loop; safe from this thread.
-        self._loop.call_soon_threadsafe(task.cancel)
-        # Also tear down the session so any half-finished request
-        # doesn't leak into the next turn. Reopens lazily.
-        session = self._session
-        self._session = None
-
-        async def _close_session() -> None:
-            if session is not None:
-                try:
-                    await session.close()
-                except Exception:  # noqa: BLE001
-                    pass
-
-        asyncio.run_coroutine_threadsafe(_close_session(), self._loop)
+        task = runner._current_turn_task
+        if task is not None:
+            self._loop.call_soon_threadsafe(task.cancel)
         return {"ok": True}
 
     # -------- internals --------
 
     def _set_cwd(self, path: Path) -> dict[str, Any]:
-        """Finalize the working directory and return the ready
-        payload. Builds up the config.get_cwd side-effect at the
-        module level so other code (schema, policy, executor) picks
-        it up via the singleton."""
-        # Session switch safety: if cwd changes, tear down the active
-        # provider session so the next turn starts a fresh conversation
-        # AND drop the cached ResultStore for the old cwd so future
-        # tool calls resolve the new session's DB. Earlier versions
-        # kept a process-wide singleton store that stuck to whichever
-        # cwd asked first — Project A could then see Project B's
-        # stored sanitized results. See nora/store.py :: get_store.
-        old_cwd = self.cwd.resolve() if self.cwd is not None else None
+        """Set the focused session and ensure its runner exists.
+
+        This is the pure UI-focus operation: pick the runner whose
+        cwd matches ``path``, lazy-create it if absent, and return
+        the ready payload so the page can render that session's
+        topbar / policy / chat. We do NOT close any other runner —
+        their turns keep running.
+        """
         new_cwd = path.resolve()
-        if old_cwd is not None and old_cwd != new_cwd:
-            self._close_session_blocking()
-            try:
-                from nora.store import close_store
-                close_store(old_cwd)
-            except Exception:  # noqa: BLE001 — store close isn't safety-critical
-                pass
-        self.cwd = path
-        set_cwd(path)
-        # Per-session model memory: every successful turn writes
-        # ``active_model`` into ``.nora/session_state.json`` (and so
-        # does a successful ``set_model``). On session open, restore
-        # that choice so a researcher who switched to Opus for a
-        # particular project comes back to Opus next time. Falls back
-        # to whatever ``self._model`` already held (set at __init__
-        # time from the catalog default) when the session has no
-        # recorded preference yet.
-        self._restore_session_model_preference()
+        self.cwd = new_cwd
+        # Lazy-create the runner for this cwd, applying any
+        # recorded ``active_model`` preference. Existing runners
+        # (including the one we may be switching AWAY from) are
+        # untouched.
+        self._ensure_runner_for_cwd(new_cwd)
         return {"ok": True, "state": "ready", **self._ready_payload()}
 
-    def _restore_session_model_preference(self) -> None:
-        """Read ``active_model`` from this session's state file and
-        apply it if it's a model we still know about whose provider
-        is currently authed. Silent no-op when there's nothing to
-        restore — leaves ``self._model`` and ``self._provider``
-        untouched in that case."""
-        if self.cwd is None:
-            return
+    def _ensure_runner_for_cwd(self, cwd: Path) -> SessionRunner:
+        """Return the runner for ``cwd``, creating one if absent.
+
+        On first creation, applies the session's recorded
+        ``active_model`` (from ``.nora/session_state.json``) when
+        the model is in the catalog and its provider is authed.
+        Otherwise the bridge defaults are used.
+        """
+        key = str(cwd.resolve())
+        runner = self._runners.get(key)
+        if runner is not None:
+            return runner
+        provider, model = self._initial_model_for_session(cwd)
+        runner = SessionRunner(cwd=cwd, provider=provider, model=model)
+        self._runners[key] = runner
+        return runner
+
+    def _initial_model_for_session(
+        self, cwd: Path,
+    ) -> tuple[str, str]:
+        """Pick (provider, model) for a freshly-created runner.
+
+        Honours per-session memory recorded in
+        ``.nora/session_state.json`` when the recorded model is
+        still in the catalog and its provider is authed. Falls back
+        to the bridge defaults otherwise.
+        """
         try:
             from nora.session_state import read_session_state
-            state = read_session_state(self.cwd)
-        except Exception:  # noqa: BLE001 — never let state read break a session open
-            return
+            state = read_session_state(cwd)
+        except Exception:  # noqa: BLE001
+            state = None
         if state is None or not state.active_model:
-            return
+            return self._default_provider, self._default_model
         try:
             from nora.provider.catalog import get_model
             info = get_model(state.active_model)
         except KeyError:
-            # Stored model was removed from the catalog (e.g., an
-            # OpenAI model id renamed). Drop the preference silently
-            # rather than wedge the session.
-            return
+            return self._default_provider, self._default_model
         if info.provider not in self._authed_providers():
-            # Researcher rotated their key out since the last session
-            # touched this dir; fall back to current selection rather
-            # than try to open a session against a provider with no
-            # credential.
-            return
-        self._provider = info.provider
-        self._model = info.id
+            return self._default_provider, self._default_model
+        return info.provider, info.id
+
+    def _active_runner(self) -> SessionRunner | None:
+        """Convenience accessor: the runner for the focused session."""
+        if self.cwd is None:
+            return None
+        return self._runners.get(str(self.cwd.resolve()))
+
+    # Back-compat read-only views for tests and legacy callers that
+    # treat the bridge as the single-session shape it used to be.
+    # They reflect the FOCUSED runner — falling back to the bridge
+    # default when no runner is created yet (landing screen).
+
+    @property
+    def _model(self) -> str:
+        active = self._active_runner()
+        return active.model if active is not None else self._default_model
+
+    @_model.setter
+    def _model(self, value: str) -> None:
+        active = self._active_runner()
+        if active is not None:
+            active.model = value
+        else:
+            self._default_model = value
+
+    @property
+    def _provider(self) -> str:
+        active = self._active_runner()
+        return active.provider if active is not None else self._default_provider
+
+    @_provider.setter
+    def _provider(self, value: str) -> None:
+        active = self._active_runner()
+        if active is not None:
+            active.provider = value
+        else:
+            self._default_provider = value
+
+    @property
+    def _pending_script_attachments(self) -> list[dict[str, Any]]:
+        """Active runner's pending-attachments list. Returned by
+        reference so legacy callers that ``.append`` to it still
+        affect the runner's state. When no session is focused, a
+        throwaway list is returned (mutations are silently
+        discarded — there's no runner to attach to)."""
+        active = self._active_runner()
+        if active is None:
+            return []
+        return active.pending_script_attachments
+
+    @property
+    def _session(self) -> Any:
+        """Active runner's underlying provider session, or None.
+
+        R/W for back-compat with tests that inject a fake session
+        directly. Setting goes to the active runner; when no session
+        is focused, the assignment is silently discarded."""
+        active = self._active_runner()
+        return active._session if active is not None else None
+
+    @_session.setter
+    def _session(self, value: Any) -> None:
+        active = self._active_runner()
+        if active is not None:
+            active._session = value
+
+    @property
+    def _known_datasets(self) -> frozenset[str]:
+        active = self._active_runner()
+        return active.known_datasets if active is not None else frozenset()
+
+    @_known_datasets.setter
+    def _known_datasets(self, value: frozenset[str]) -> None:
+        active = self._active_runner()
+        if active is not None:
+            active.known_datasets = value
+
+    @property
+    def _needs_context_prefix(self) -> bool:
+        active = self._active_runner()
+        # When no runner exists, the bridge has nothing to prefix
+        # against — return False so legacy callers don't trip.
+        return active.needs_context_prefix if active is not None else False
+
+    @_needs_context_prefix.setter
+    def _needs_context_prefix(self, value: bool) -> None:
+        active = self._active_runner()
+        if active is not None:
+            active.needs_context_prefix = value
+
+    def _run_on_loop(self, coro: Any, timeout: float = 5.0) -> Any:
+        """Drive an awaitable on the worker loop and wait for it.
+
+        Falls back to ``asyncio.run`` when the worker loop isn't
+        started (tests, headless construction). The fallback is only
+        appropriate for short, self-contained coroutines — not for
+        the streaming turn loop, which always needs the worker
+        thread.
+        """
+        if self._loop is None:
+            try:
+                return asyncio.run(coro)
+            except Exception:  # noqa: BLE001
+                return None
+        fut = asyncio.run_coroutine_threadsafe(coro, self._loop)
+        try:
+            return fut.result(timeout=timeout)
+        except Exception:  # noqa: BLE001
+            return None
 
     def _stage_session(self, source_paths: list[str]) -> dict[str, Any]:
         """Copy user-selected files into a fresh session dir. Each
@@ -1556,215 +1795,78 @@ class NoraBridge:
             "policy": self._policy_summary(),
         }
 
-    async def _ensure_session(self) -> ProviderSession:
-        assert self.cwd is not None
-        if self._session is None:
-            # Build the system prompt fresh each open so it always
-            # reflects the current cwd's dataset listing. Both
-            # providers consume the same rendered prompt.
-            system_prompt = build_system_prompt(self.cwd, SERVER_NAME)
-            self._session = open_session(
-                self._provider,
-                cwd=self.cwd,
-                model=self._model,
-                system_prompt=system_prompt,
-                # We don't rely on any provider-side conversation
-                # resume — those features (Claude CLI session store,
-                # OpenAI ``previous_response_id``) are opaque and can
-                # silently miss. Instead we open a fresh conversation
-                # every time and prepend our own condensed history on
-                # the first turn (see the ``_needs_context_prefix``
-                # branch in ``_run_turn``).
-                continue_conversation=False,
-            )
-            await self._session.open()
-            # Fresh session → next turn must carry the prior-turns
-            # prefix so the model picks up memory. Cleared after one
-            # successful emission so mid-session turns stay lean.
-            self._needs_context_prefix = True
-            # Snapshot the datasets that just went into the system
-            # prompt's ``datasets_list``. ``_run_turn`` diffs against
-            # this on every turn and surfaces any new names to the
-            # model so mid-chat uploads don't go unnoticed.
-            from nora.system_prompt import scan_datasets
-            self._known_datasets = frozenset(
-                p.name for p in scan_datasets(self.cwd)
-            )
-        return self._session
-
-    async def _run_turn(
-        self, text: str, images: list[dict[str, Any]] | None = None
+    def _log_dispatch_diag(
+        self, payload: dict[str, Any], plots: list[dict[str, Any]],
     ) -> None:
-        assert self._send_lock is not None
-        # Register this task so interrupt_turn() can cancel it. Using
-        # current_task() (set by the event loop) rather than passing
-        # the Task in from the scheduler — scheduler yields a
-        # concurrent.futures.Future wrapper, which isn't cancellable
-        # in the asyncio sense.
-        self._current_turn_task = asyncio.current_task()
-        async with self._send_lock:
-            try:
-                session = await self._ensure_session()
-            except Exception as e:  # noqa: BLE001
-                self._push_event({
-                    "type": "turn_error",
-                    "message": f"session setup failed: {e}",
-                })
-                return
+        """Emit a one-line diagnostic to stderr for every tool_result
+        dispatch that included plot collection. Visible in the
+        terminal where the researcher ran ``uv run nora-ui`` so we
+        can debug "I don't see thumbnails" claims without screen-
+        sharing — the line tells us run_dir, session_cwd, and which
+        plot files (if any) the collector found."""
+        run_dir = payload.get("run_dir")
+        if not run_dir:
+            return
+        names = [p.get("name", "?") for p in plots]
+        sizes = [p.get("size", 0) for p in plots]
+        has_data = sum(1 for p in plots if p.get("data"))
+        print(
+            f"[nora] tool_result dispatch  "
+            f"run_dir={run_dir}  "
+            f"session_cwd={payload.get('session_cwd')}  "
+            f"plots_found={len(plots)}  "
+            f"with_thumbnail_data={has_data}  "
+            f"names={names}  "
+            f"sizes={sizes}",
+            file=sys.stderr, flush=True,
+        )
 
-            # Memory: on the first turn after a fresh session open,
-            # prepend the condensed prior-turn transcript so the model
-            # picks up where the conversation left off. The prefix is
-            # wrapped in a clearly-marked block so the model treats
-            # it as background rather than as content to respond to.
-            # We clear the flag preemptively but restore it on any
-            # error/cancellation so the researcher never loses
-            # memory injection because the first turn after a reopen
-            # happened to fail.
-            prompt = text
-            carried_prefix = False
-            if self._needs_context_prefix:
-                prefix = _build_context_prefix(self.cwd)
-                if prefix:
-                    prompt = prefix + "\n\n" + text
-                    carried_prefix = True
-                self._needs_context_prefix = False
+    def _dispatch_event(self, payload: dict[str, Any]) -> None:
+        """Route an event from a runner.
 
-            # Mid-chat dataset uploads: the system prompt's
-            # ``datasets_list`` block is frozen at session open, so
-            # a parquet dropped ten turns in is invisible to the
-            # model. Diff what's currently on disk against the
-            # snapshot taken when the session opened (or last
-            # refreshed); any new names get prepended as a one-line
-            # notice so the model can reach them via get_schema
-            # without the researcher having to spell out the path.
-            try:
-                from nora.system_prompt import scan_datasets as _scan
-                current_datasets = frozenset(
-                    p.name for p in _scan(self.cwd)
+        Persistence ALWAYS lands in the runner's own
+        ``chat_history.jsonl`` (keyed off ``payload['session_cwd']``)
+        — this is what makes background sessions safe: a turn streaming
+        in session A persists to A's log even while the UI is showing
+        session B. The frontend is then responsible for filtering
+        which events it renders based on the focused session.
+
+        For tool-result events we enrich the payload with the raw
+        stdout/stderr from the run dir so the JS can render the
+        native R/Stata/Python output panel. The enrichment runs here
+        rather than in the runner because it's a UI concern (the
+        researcher sees raw logs; the model sees only the sanitized
+        payload).
+        """
+        if payload.get("type") == "tool_result":
+            run_dir = payload.get("run_dir")
+            if run_dir:
+                raw_stdout, raw_stderr = _read_raw_logs(run_dir)
+                # Researcher-side plot thumbnails: scan run_dir AND
+                # the originating runner's cwd for .png files the
+                # script produced. Stata's executor preamble ``cd``s
+                # to the session cwd before user code runs, so a
+                # bare ``graph export "fig.png"`` lands in the
+                # session cwd — without scanning there too,
+                # Stata-generated plots never appeared as thumbnails.
+                plots = _collect_run_dir_plots(
+                    run_dir, session_cwd=payload.get("session_cwd"),
                 )
-            except Exception:  # noqa: BLE001 — never let scan break a turn
-                current_datasets = self._known_datasets
-            new_datasets = current_datasets - self._known_datasets
-            carried_dataset_diff: frozenset[str] = frozenset()
-            if new_datasets:
-                added_lines = "\n".join(
-                    f"  - {n}" for n in sorted(new_datasets)
-                )
-                dataset_notice = (
-                    "[The researcher added new datasets to the "
-                    "working directory mid-session. These weren't in "
-                    "the original prompt's listing but are reachable "
-                    "via get_schema / submit_script:\n"
-                    f"{added_lines}\n]\n\n"
-                )
-                prompt = dataset_notice + prompt
-                carried_dataset_diff = new_datasets
-            self._known_datasets = current_datasets
-
-            # Mid-chat script attachments: render the staged ``.py`` /
-            # ``.do`` / ``.r`` / ``.rmd`` files (drag-dropped into the
-            # composer) as a prefix block so the model sees the source
-            # alongside the researcher's question. Same restore-on-
-            # error pattern as the context prefix above — if the turn
-            # fails the attachments come back so a re-send still
-            # carries them.
-            carried_attachments: list[dict[str, Any]] = []
-            if self._pending_script_attachments:
-                attach_block = _build_script_attachment_prefix(
-                    self._pending_script_attachments, self.cwd,
-                )
-                if attach_block:
-                    prompt = attach_block + prompt
-                    carried_attachments = list(self._pending_script_attachments)
-                self._pending_script_attachments = []
-
-            # Track whether the provider stream emitted a terminal
-            # event (turn_done / turn_error / auth_failure). If it
-            # closes WITHOUT one — rare but observed in practice on
-            # SDK glitches and dropped sockets — the JS state machine
-            # would otherwise stay stuck on "sending" forever, with
-            # no terminal event to flip the Send button back. We
-            # synthesise one in that case so the composer always
-            # recovers.
-            saw_terminal = False
-            try:
-                async for evt in session.send(prompt, images=images):
-                    if isinstance(evt, (TurnDone, TurnError, AuthFailure)):
-                        saw_terminal = True
-                    self._push_event(_event_to_dict(evt))
-                if not saw_terminal:
-                    self._push_event({
-                        "type": "turn_error",
-                        "message": (
-                            "the provider stream ended without a "
-                            "result — try again, or use Stop and "
-                            "resend if the chat feels stuck"
-                        ),
-                    })
-                # Refresh the durable session snapshot after a clean
-                # turn. Best-effort — write_session_state swallows
-                # OSError internally so a disk-full or permission
-                # hiccup can't break chat. We skip this on cancel /
-                # error paths so a partial turn doesn't get recorded
-                # as "last activity".
-                try:
-                    from nora.session_state import write_session_state
-                    write_session_state(self.cwd, model=self._model)
-                except Exception:  # noqa: BLE001 — never let state write break a turn
-                    pass
-            except asyncio.CancelledError:
-                # Researcher hit Stop. Surface a terminal event so
-                # the UI re-enables the composer via its standard
-                # event handler. Don't re-raise — cancellation is
-                # expected here, not an error condition.
-                if carried_prefix:
-                    self._needs_context_prefix = True
-                if carried_attachments:
-                    # Front-prepend so any new attachments staged
-                    # during the cancelled turn still come first.
-                    self._pending_script_attachments = (
-                        carried_attachments + self._pending_script_attachments
-                    )
-                if carried_dataset_diff:
-                    # Roll the dataset snapshot back so the next turn
-                    # re-emits the "newly added" notice; otherwise a
-                    # cancelled-during-first-turn parquet would never
-                    # be announced.
-                    self._known_datasets = (
-                        self._known_datasets - carried_dataset_diff
-                    )
-                self._push_event({
-                    "type": "turn_error",
-                    "message": "cancelled",
-                })
-                return
-            except Exception as e:  # noqa: BLE001
-                if carried_prefix:
-                    self._needs_context_prefix = True
-                if carried_attachments:
-                    self._pending_script_attachments = (
-                        carried_attachments + self._pending_script_attachments
-                    )
-                if carried_dataset_diff:
-                    self._known_datasets = (
-                        self._known_datasets - carried_dataset_diff
-                    )
-                self._push_event({
-                    "type": "turn_error",
-                    "message": f"turn failed: {e}",
-                })
-            finally:
-                self._current_turn_task = None
-
-    def _push_event(self, payload: dict[str, Any]) -> None:
-        """Send a JSON event to the web UI. pywebview's evaluate_js
-        takes a string of JS to run in the page's context."""
-        # Persist the event to the session's chat history before
-        # firing it at the UI. Only transcript-forming events get
-        # recorded; transient status (turn_done / auth_failure /
-        # ready / policy_updated) would clutter the log without
-        # helping a future re-open.
+                self._log_dispatch_diag(payload, plots)
+                # Diagnostic: when no plots came back AND the helper
+                # left telltale traces (mkdir of _nora_plots/, stderr
+                # line starting with ``nora.plot_*``), surface a
+                # one-liner so the researcher doesn't stare at a blank
+                # thumbnail row wondering whether the helper ran at all.
+                diagnostic = _detect_plot_helper_diagnostics(run_dir, len(plots))
+                payload = {
+                    **payload,
+                    "raw_stdout": raw_stdout,
+                    "raw_stderr": raw_stderr,
+                    "plots": plots,
+                }
+                if diagnostic:
+                    payload["plot_diagnostic"] = diagnostic
         self._persist_event(payload)
         if self._window is None:
             return
@@ -1785,41 +1887,49 @@ class NoraBridge:
         "user_message",
     })
 
-    def _record_user_message(self, text: str, *, image_count: int = 0) -> None:
+    def _record_user_message(
+        self,
+        runner: SessionRunner,
+        text: str,
+        *,
+        image_count: int = 0,
+    ) -> None:
         """Persist the user-side record for a newly queued turn.
 
-        Before appending the new record, drop any trailing orphaned
-        ``user_message`` from a previously failed / unsent turn. That
-        keeps chat replay and warm-start context from accumulating
-        "I sent this but nothing ever came back" bubbles forever; the
-        next real send replaces the failed attempt.
+        Bound to the *runner's* cwd, not the bridge's focus, so a
+        send issued while another session is being viewed lands in
+        the right session's history. (Today the bridge schedules
+        sends only on the focused runner, but stamping by runner
+        future-proofs against UI changes that allow background
+        sends.)
+
+        Before appending, drops any trailing orphaned ``user_message``
+        from a previous failed / unsent turn so retries replace
+        rather than accumulate stale "no-reply" bubbles.
         """
-        self._drop_trailing_orphan_user_message()
+        self._drop_trailing_orphan_user_message(runner.cwd)
         attached_names = [
-            a["name"] for a in self._pending_script_attachments
+            a["name"] for a in runner.pending_script_attachments
         ]
-        record: dict[str, Any] = {"type": "user_message", "text": text}
+        record: dict[str, Any] = {
+            "type": "user_message",
+            "text": text,
+            "session_cwd": str(runner.cwd),
+        }
         if attached_names:
             record["attachments"] = attached_names
         if image_count > 0:
             record["image_count"] = image_count
         self._persist_event(record)
 
-    def _drop_trailing_orphan_user_message(self) -> None:
+    def _drop_trailing_orphan_user_message(self, cwd: Path) -> None:
         """Remove the last persisted record iff it is a bare
         ``user_message`` with no assistant/tool events after it.
-
-        Nora persists user bubbles immediately when the researcher
-        presses Send so the live transcript and replay stay aligned.
-        If that turn fails before any response artifact is persisted,
-        the log ends with a lone ``user_message``. On the next send we
-        treat that stale attempt as disposable and replace it with the
-        new one, matching the UI behavior of dropping no-reply turns
-        once the researcher retries.
+        Operates on a specific session's history (passed in) rather
+        than the bridge's focus, so concurrent retries on different
+        runners don't clobber each other's logs.
         """
-        if self.cwd is None:
-            return
-        path = self.cwd / ".nora" / "chat_history.jsonl"
+        path = cwd / ".nora" / "chat_history.jsonl"
         if not path.exists():
             return
         try:
@@ -1855,27 +1965,39 @@ class NoraBridge:
             pass
 
     def _persist_event(self, payload: dict[str, Any]) -> None:
-        if self.cwd is None:
-            return
+        """Persist a transcript-forming event to the session's
+        ``chat_history.jsonl``.
+
+        The session is identified by ``payload['session_cwd']``, NOT
+        by the bridge's focus. This is the routing rule that makes
+        concurrent sessions safe: a tool_result from runner A's
+        in-flight turn lands in A's history even while the UI is
+        showing B. Falls back to the bridge focus only if the event
+        carries no session_cwd (legacy paths, defensive).
+        """
         etype = payload.get("type")
         if etype not in self._PERSIST_TYPES:
             return
-        # Stamp the event with a UTC ISO timestamp if the caller
-        # didn't provide one. Readers (chat_history.read_turns,
-        # session_state writer) tolerate missing timestamps for
-        # backwards compat with older logs, but adding one per
-        # event going forward lets us surface "last active" times,
-        # order events from mixed sources, and feed the rolling
-        # session summary. We don't mutate the caller's dict —
-        # a shallow copy is cheap and avoids surprising _push_event
-        # consumers that keep the original reference.
-        record = dict(payload)
+        target_cwd_str = payload.get("session_cwd")
+        if target_cwd_str:
+            target_cwd: Path | None = Path(target_cwd_str)
+        else:
+            target_cwd = self.cwd
+        if target_cwd is None:
+            return
+        # Strip session_cwd before writing — it's a routing
+        # annotation, not part of the persisted record. (Legacy
+        # readers don't expect the field; keeping it would noisily
+        # appear in transcripts.) We don't mutate the caller's
+        # dict — a shallow copy is cheap and avoids surprising
+        # _dispatch_event consumers that keep the original reference.
+        record = {k: v for k, v in payload.items() if k != "session_cwd"}
         record.setdefault(
             "timestamp",
             datetime.now(timezone.utc).isoformat(timespec="seconds"),
         )
         try:
-            history_dir = self.cwd / ".nora"
+            history_dir = target_cwd / ".nora"
             history_dir.mkdir(parents=True, exist_ok=True)
             path = history_dir / "chat_history.jsonl"
             with path.open("a", encoding="utf-8") as f:
@@ -1885,34 +2007,6 @@ class NoraBridge:
             # transcript on screen stays intact; replay just won't
             # include this event.
             pass
-
-    def _close_session_blocking(self) -> None:
-        """Best-effort close of the persistent provider session.
-
-        Safe to call repeatedly. Used by session switches, provider
-        switches, and teardown paths to guarantee the next turn starts
-        with a fresh provider session.
-        """
-        if self._session is None:
-            return
-        if self._loop is None:
-            self._session = None
-            return
-
-        session = self._session
-
-        async def _close() -> None:
-            try:
-                await session.close()
-            except Exception:  # noqa: BLE001
-                pass
-
-        fut = asyncio.run_coroutine_threadsafe(_close(), self._loop)
-        try:
-            fut.result(timeout=3)
-        except Exception:  # noqa: BLE001
-            pass
-        self._session = None
 
     def get_chat_history(self) -> dict[str, Any]:
         """Return the persisted chat log for the active session so
@@ -2289,48 +2383,315 @@ def _read_raw_logs(run_dir: str | None) -> tuple[str, str]:
     return stdout_text, stderr_text
 
 
-def _event_to_dict(evt: Any) -> dict[str, Any]:
-    """Flatten a chat_service.Event dataclass into a JSON-serializable
-    dict with a type tag the JS side switches on."""
-    if isinstance(evt, chat_service.AssistantText):
-        return {"type": "assistant_text", "text": evt.text}
-    if isinstance(evt, chat_service.AssistantThinking):
-        return {"type": "assistant_thinking", "text": evt.text}
-    if isinstance(evt, chat_service.ToolCall):
-        return {
-            "type": "tool_call",
-            "name": evt.name,
-            "input": evt.input,
-            "call_id": evt.call_id,
+def _materialize_cache_busted_index(web_dir: Path, index_path: Path) -> Path:
+    """Write a sibling ``index.bust-<id>.html`` next to the source
+    index whose script/link refs carry a per-launch ``?v=<build-id>``
+    query string. WKWebView caches file:// resources by full URL
+    (including the query string), so a unique build-id per launch
+    forces a fresh fetch of every JS/CSS asset and prevents
+    "I restarted but the new code isn't running" — a real failure
+    mode where users iterate on the frontend, restart the bridge,
+    and still see stale rendering because WKWebView served the
+    cached app.js.
+
+    The build-id hashes the mtimes of every .js / .css / .html file
+    under ``web_dir`` so logically-identical reloads reuse the same
+    cache key, while real code changes invalidate it.
+
+    Falls back to the original index_path on any error — cache busting
+    is a polish feature, not a correctness one.
+    """
+    import hashlib
+    try:
+        stamps: list[str] = []
+        for child in sorted(web_dir.iterdir()):
+            if child.suffix.lower() in {".js", ".css", ".html"}:
+                try:
+                    stamps.append(f"{child.name}:{child.stat().st_mtime_ns}")
+                except OSError:
+                    continue
+        if not stamps:
+            return index_path
+        build_id = hashlib.sha256("\n".join(stamps).encode()).hexdigest()[:12]
+        html = index_path.read_text(encoding="utf-8")
+        # Append ``?v=<build-id>`` to script/link refs. We rewrite
+        # only the local refs (no protocol) so the Google Fonts
+        # preconnects and any future remote CDN loads stay alone.
+        import re
+        def _add_bust(m: re.Match[str]) -> str:
+            attr = m.group(1)
+            url = m.group(2)
+            if "://" in url or url.startswith("//"):
+                return m.group(0)
+            sep = "&" if "?" in url else "?"
+            return f'{attr}="{url}{sep}v={build_id}"'
+        html = re.sub(
+            r'(src|href)="([^"]+\.(?:js|css))"',
+            _add_bust, html,
+        )
+        # Stash the rewritten file beside the original. .gitignore'd
+        # via the leading dot so accidental git status noise stays
+        # out of the working tree.
+        out = web_dir / f".index.bust-{build_id}.html"
+        out.write_text(html, encoding="utf-8")
+        return out
+    except Exception:  # noqa: BLE001 — fall back to source index on any failure
+        return index_path
+
+
+# Researcher-side plot rendering — caps + extensions
+_RESEARCHER_PLOT_MAX_BYTES = 3 * 1024 * 1024  # 3 MB / image inline so 1600px PNGs render sharply on retina; larger get a path-only entry
+_RESEARCHER_PLOT_MAX_PER_RESULT = 6
+# Includes ``.pdf`` so Stata's PDF fallback (when Graph2png is missing)
+# still produces a chat thumbnail. PDFs are converted to PNG sidecars
+# at collect time via macOS ``sips`` — see ``nora.plot_convert``.
+_RESEARCHER_PLOT_EXTS: tuple[str, ...] = (
+    ".png", ".jpg", ".jpeg", ".pdf", ".eps",
+)
+
+
+def _detect_plot_helper_diagnostics(
+    run_dir: str | None, n_plots_found: int,
+) -> str | None:
+    """Look for evidence that a plot helper was CALLED but produced
+    no usable output. Three signals:
+
+    - ``_nora_plots/`` exists in the run dir (a helper ran the
+      mkdir at the top of its body)
+    - The plot file count is 0 (or the manifest is empty)
+    - stderr.log contains a ``nora.plot_*`` / ``nora$plot_*`` line
+
+    When all three line up, we surface a one-line note in the tool
+    result card so the researcher doesn't stare at an empty
+    thumbnail row wondering "did the helper even run?".
+
+    Returns a short human-readable string or None.
+    """
+    if not run_dir:
+        return None
+    base = Path(run_dir)
+    plots_dir = base / "_nora_plots"
+    if not plots_dir.is_dir():
+        return None
+    if n_plots_found > 0:
+        return None
+    # Empty plots dir + helper trace in stderr → matplotlib missing
+    # is the overwhelmingly common cause. Surface that hypothesis
+    # explicitly so the researcher knows what to install.
+    stderr_path = base / "stderr.log"
+    helper_lines: list[str] = []
+    if stderr_path.is_file():
+        try:
+            stderr_text = stderr_path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            stderr_text = ""
+        for line in stderr_text.splitlines():
+            stripped = line.strip()
+            if (
+                stripped.startswith("nora.plot_")
+                or stripped.startswith("nora$plot_")
+                or "nora_plot_" in stripped
+            ):
+                helper_lines.append(stripped)
+    if not helper_lines:
+        return None
+    # Take the first helper-failure line — usually the most
+    # informative; later lines tend to be Python tracebacks the
+    # researcher can find via Show Folder if needed.
+    first = helper_lines[0]
+    if "matplotlib" in first.lower() or "no module named 'matplotlib'" in first.lower():
+        return (
+            "Plot helper called but matplotlib isn't installed in this "
+            "Python environment. Install with `pip install matplotlib` "
+            "and re-run the script."
+        )
+    return f"Plot helper called but produced no output: {first[:160]}"
+
+
+def _collect_run_dir_plots(
+    run_dir: str | None,
+    session_cwd: str | None = None,
+) -> list[dict[str, Any]]:
+    """Find image files produced by a script run and return them as
+    a JSON-friendly list ready to embed in a tool_result event.
+
+    Three locations are scanned, in priority order:
+
+    1. ``<run_dir>/_nora_plots/`` — the manifest-allowlisted
+       location used by ``nora.plot_residuals`` / etc. (model-
+       visible plots; surfaced to the researcher too).
+    2. ``<run_dir>/`` — Python / R scripts whose subprocess cwd is
+       run_dir write direct ``plt.savefig`` / ``ggsave`` outputs
+       here (when bare filenames are used).
+    3. ``<session_cwd>/`` — Stata scripts ``cd`` into the session
+       cwd via the executor preamble (so the batch ``.log`` lands
+       outside the project), so a bare ``graph export "fig.png"``
+       writes the plot file into the session cwd, not the run dir.
+       Without scanning here, Stata-generated plots never appeared
+       as thumbnails — that was the "stata still not working" bug.
+       To avoid surfacing every old PNG in the project, files in
+       this location are kept ONLY if they were modified at or
+       after the run started (script.do / script.py / script.R
+       mtime — written at run start before subprocess exec).
+
+    Files at or below ``_RESEARCHER_PLOT_MAX_BYTES`` carry a
+    ``data`` field (base64); larger files carry only metadata so
+    the JS can render an "Open externally" placeholder without
+    bloating the event payload.
+
+    Most-recent first; capped at ``_RESEARCHER_PLOT_MAX_PER_RESULT``.
+
+    Privacy: this is the RESEARCHER's view. Bytes never reach the
+    model — they're injected only into the tool_result event that
+    the bridge sends to the local pywebview window. The
+    model-vision path is the manifest-gated
+    :meth:`SessionRunner._capture_plots`.
+    """
+    if not run_dir:
+        return []
+    base = Path(run_dir)
+    if not base.is_dir():
+        return []
+
+    # Determine when this run started so we can filter ``session_cwd``
+    # PNGs to only those written by this run (otherwise every prior
+    # plot in the session dir would show up on every tool result).
+    # The script file is written at the very start of the run, before
+    # subprocess execution — its mtime is the canonical start signal.
+    run_start: float | None = None
+    for script_name in ("script.do", "script.py", "script.R"):
+        p = base / script_name
+        if p.is_file():
+            try:
+                run_start = p.stat().st_mtime
+                break
+            except OSError:
+                pass
+
+    candidates: list[Path] = []
+    seen: set[Path] = set()
+
+    def _is_sidecar(p: Path) -> bool:
+        """``png_for`` writes ``<basename>.nora.png`` next to the
+        original PDF. Those sidecars are an internal artifact of
+        the PDF→PNG conversion path; they shouldn't appear as
+        their own thumbnail row alongside the source PDF."""
+        return p.name.endswith(".nora.png")
+
+    # 1 + 2: anywhere inside run_dir.
+    for parent in (base / "_nora_plots", base):
+        try:
+            for p in parent.iterdir():
+                if (
+                    p.is_file()
+                    and not p.is_symlink()
+                    and p.suffix.lower() in _RESEARCHER_PLOT_EXTS
+                    and not _is_sidecar(p)
+                ):
+                    rp = p.resolve()
+                    if rp in seen:
+                        continue
+                    seen.add(rp)
+                    candidates.append(p)
+        except OSError:
+            continue
+
+    # 3: Stata writes plots into session_cwd (the executor's preamble
+    # ``cd``s there before user code runs). Filter by run_start so
+    # we don't surface stale plots from prior runs.
+    if session_cwd and run_start is not None:
+        try:
+            sc = Path(session_cwd)
+        except (OSError, ValueError):
+            sc = None
+        if sc is not None and sc.is_dir():
+            try:
+                for p in sc.iterdir():
+                    if (
+                        p.is_file()
+                        and not p.is_symlink()
+                        and p.suffix.lower() in _RESEARCHER_PLOT_EXTS
+                        and not _is_sidecar(p)
+                    ):
+                        try:
+                            if p.stat().st_mtime + 0.5 < run_start:
+                                # Strictly older than run start (with
+                                # half-second slack for filesystem mtime
+                                # rounding) — predates this run.
+                                continue
+                            rp = p.resolve()
+                            if rp in seen:
+                                continue
+                            seen.add(rp)
+                            candidates.append(p)
+                        except OSError:
+                            continue
+            except OSError:
+                pass
+
+    if not candidates:
+        return []
+    # Most-recent first — the researcher cares about the plots from
+    # the latest run more than any leftover from prior iterations.
+    try:
+        candidates.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+    except OSError:
+        pass
+    candidates = candidates[:_RESEARCHER_PLOT_MAX_PER_RESULT]
+
+    import base64 as _base64
+    from nora.plot_convert import png_for
+    out: list[dict[str, Any]] = []
+    for p in candidates:
+        try:
+            size = p.stat().st_size
+        except OSError:
+            continue
+        # PDFs are surfaced as thumbnails too — convert via sips
+        # to a sibling PNG (cached). The researcher sees a real
+        # raster preview; clicking the tile opens the original
+        # PDF in Preview via the path field.
+        ext = p.suffix.lower()
+        if ext == ".pdf":
+            png_sidecar = png_for(p)
+            if png_sidecar is None:
+                # Conversion failed — keep the row with path-only
+                # so the JS can still offer "Open externally" via
+                # the OS Preview handler.
+                out.append({
+                    "name": p.name,
+                    "path": str(p),
+                    "size": size,
+                    "mime": "application/pdf",
+                })
+                continue
+            display = png_sidecar
+            try:
+                display_size = display.stat().st_size
+            except OSError:
+                display_size = size
+            mime = "image/png"
+        else:
+            display = p
+            display_size = size
+            mime = {
+                ".png": "image/png",
+                ".jpg": "image/jpeg",
+                ".jpeg": "image/jpeg",
+            }.get(ext, "image/png")
+        entry: dict[str, Any] = {
+            "name": p.name,
+            "path": str(p),
+            "size": display_size,
+            "mime": mime,
         }
-    if isinstance(evt, chat_service.ToolCallResult):
-        # Raw stdout/stderr comes from run_dir/stdout.log and
-        # stderr.log — researcher-visible, never reaches Claude.
-        raw_stdout, raw_stderr = _read_raw_logs(evt.run_dir)
-        return {
-            "type": "tool_result",
-            "call_id": evt.call_id,
-            "text": evt.text,
-            "is_error": evt.is_error,
-            "run_dir": evt.run_dir,
-            "language": evt.language,
-            "raw_stdout": raw_stdout,
-            "raw_stderr": raw_stderr,
-        }
-    if isinstance(evt, chat_service.TurnDone):
-        return {
-            "type": "turn_done",
-            "input_tokens": evt.input_tokens,
-            "output_tokens": evt.output_tokens,
-            "cache_read_input_tokens": evt.cache_read_input_tokens,
-            "cache_creation_input_tokens": evt.cache_creation_input_tokens,
-            "cost_usd": evt.cost_usd,
-        }
-    if isinstance(evt, chat_service.AuthFailure):
-        return {"type": "auth_failure", "reason": evt.reason}
-    if isinstance(evt, chat_service.TurnError):
-        return {"type": "turn_error", "message": evt.message}
-    return {"type": "unknown"}
+        if display_size <= _RESEARCHER_PLOT_MAX_BYTES:
+            try:
+                entry["data"] = _base64.b64encode(display.read_bytes()).decode("ascii")
+            except OSError:
+                pass
+        out.append(entry)
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -2430,12 +2791,23 @@ def main() -> None:
         )
         sys.exit(2)
 
+    # WKWebView caches file:// resources persistently. Without a
+    # cache-bust the user has to manually clear ~/Library/Caches to
+    # see code changes. Compute a build-id from the mtimes of the
+    # JS/CSS bundle and rewrite the script/link refs in a temporary
+    # copy of index.html so each launch's URLs are unique.
+    served_index = _materialize_cache_busted_index(web_dir, index_path)
+    print(
+        f"[nora] starting bridge — web build-id={served_index.stem.split('.')[-1]}",
+        file=sys.stderr, flush=True,
+    )
+
     bridge = NoraBridge(cwd=cwd)
     bridge.start_loop()
 
     window = webview.create_window(
         title="Nora",
-        url=str(index_path),
+        url=str(served_index),
         js_api=bridge,
         width=960,
         height=720,

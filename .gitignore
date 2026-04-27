@@ -40,3 +40,9 @@ scratch/
 
 # Hypothesis example database.
 .hypothesis/
+
+# Cache-busted index.html copies the bridge writes at launch
+# (src/nora/ui.py:_materialize_cache_busted_index). Per-launch hash
+# in the filename so WKWebView reloads JS/CSS — runtime artifact,
+# never source.
+src/nora/web/.index.bust-*.html

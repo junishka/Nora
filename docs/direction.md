@@ -1,12 +1,19 @@
 # Nora — architectural direction
 
-Working document. Last substantive update **2026-04-25**, after the
-Builder → Nora rename, the .app-launches-web-UI fix, the memory
-stack (warm-start prefix + recall_conversation tool + durable
-session_state.json), the security-review fixes (env-var allowlist,
-per-cwd store, filename sanitization, OLS coefficient-key
-constraint, CI length, structural size caps), and the product-
-identity prompt rule. The core decision — stay with
+Working document. Last substantive update **2026-04-27**, after
+the concurrent-session refactor (per-cwd `SessionRunner`, per-task
+cwd via `ContextVar`), plot vision (manifest-allowlisted helpers,
+no file-based escape hatch), Stata export reliability
+(PDF / PNG / EPS / .gph fallback, sips-based PDF→PNG conversion),
+runtime-environment probing in the system prompt, and the
+Files-panel polish (graphs first, copy/send/delete row actions,
+longer dropdown). Earlier in the same self-pilot cycle: Builder
+→ Nora rename, .app launches web UI, the memory stack
+(warm-start prefix + recall_conversation tool + durable
+session_state.json), the security-review fixes (env-var
+allowlist, per-cwd store, filename sanitization, OLS coefficient-
+key constraint, CI length, structural size caps), and the
+product-identity prompt rule. The core decision — stay with
 script-submission ("Option A") rather than pivot to plan-submission
 with a bundled local LLM — still stands from 2026-04-20.
 
@@ -95,7 +102,41 @@ As of 2026-04-25, the implementation covers:
   tool for older lookups with neighboring-context expansion;
   durable `.nora/session_state.json` snapshot regenerated after
   each turn (last exchange, recent results, datasets, model).
-- Web UI: pywebview shell, sessions sidebar, theme toggle, model
+- **Concurrent sessions.** Bridge holds `dict[cwd → SessionRunner]`;
+  switching the visible chat is a pure UI focus change. Each
+  runner has its own ProviderSession, asyncio lock, turn task,
+  pending-attachment list, and active model. `run_turn` enters
+  `nora.config.use_cwd(self.cwd)` so tool handlers running on
+  parallel runner tasks see THIS runner's cwd via a ContextVar —
+  sister tasks see their own. Stop cancels only the focused
+  runner. Events are stamped with `session_cwd` so persistence
+  routes correctly even when an in-flight turn outlives the focus
+  switch.
+- **Plot vision.** Runtime helpers in R / Python / Stata produce
+  canonical model-output plots (residuals, predicted-response
+  curves, coefficient forest plots, estimate comparisons) from
+  fitted-model objects. Each writes a PNG/PDF/EPS into
+  `<run_dir>/_nora_plots/` and appends a JSON line to
+  `manifest.jsonl`. The runner reads ONLY the manifest — files
+  in the dir without an entry stay invisible to the model.
+  Stata's PNG export depends on the `Graph2png` translator (often
+  missing), so `_nora_export_plot.ado` tries `as(pdf)` →
+  `as(png)` → `as(eps)` → `graph save .gph`; the bridge
+  rasterizes PDF/EPS to PNG via macOS `sips` for both
+  researcher thumbnails and model-vision attachments. Plot
+  helper failures append to `_nora_plots/helper_errors.jsonl`
+  with a step indicator + fix hint; `submit_script`'s response
+  surfaces succeeded + failed so the model knows when a
+  thumbnail is missing because matplotlib isn't installed.
+- **Runtime environment in the prompt.** `env_detect` probes
+  installed runtimes + optional packages (R: haven, ggplot2;
+  Python: matplotlib + the four required stats packages). The
+  system prompt renders a per-runtime block with `✓` / `✗`
+  marks so the model picks a language by what's actually
+  installed instead of trial-and-error through missing-package
+  failures.
+- Web UI: pywebview shell, sessions sidebar with per-session
+  busy dot, theme toggle, model
   picker, drag-drop file/image upload, typewriter assistant, Lottie
   cat loading indicator, status line, Permission/Model chips with
   popups, image-paste support.
@@ -335,15 +376,33 @@ datasets. Not urgent for pilot-scale public-ish research.
 
 - Claude has no general-purpose tools. SDK built-ins stay
   disabled.
-- Claude's only interface to the machine is the 5 MCP tools.
+- Claude's only interface to the machine is the 6 MCP tools
+  (`get_schema`, `request_data`, `submit_script`, `expand_result`,
+  `list_results`, `recall_conversation`).
 - Every `submit_script` call runs under the sandbox.
 - Every executor output passes through the sanitizer before
-  reaching Claude.
-- Raw stderr / stdout never reach Claude.
+  reaching the model.
+- Raw stderr / stdout never reach the model.
 - Schema exposure is explicit researcher policy, conservative by
   default.
-- Researcher sees raw logs and sanitized output; Claude sees
+- Researcher sees raw logs and sanitized output; the model sees
   sanitized output only.
+- **Plot vision is helper-allowlist gated.** Only files produced
+  by `plot_residuals` / `plot_interaction` / `plot_coefficients` /
+  `plot_estimate_comparison` (each takes a fitted-model object as
+  input) and registered in `<run_dir>/_nora_plots/manifest.jsonl`
+  cross to the model. Bespoke plots saved via `ggsave` /
+  `plt.savefig` / `graph export` stay researcher-only by
+  construction. There is no file-allowlist API where a script
+  self-attests "this is a coefficient plot"; that route was tried
+  and removed because the kind label is unverifiable from a PNG.
+- **Per-task cwd, not process-global.** Tool handlers read cwd
+  through `nora.config.get_cwd()`, which honors the
+  `nora.config._cwd_var` ContextVar that `SessionRunner.run_turn`
+  sets via `use_cwd(self.cwd)`. Any new code path that resolves
+  cwd from a stashed module global, or from `self.cwd` on a
+  different object, breaks concurrent-runner isolation and is a
+  bug.
 
 ## What we're not doing (and why)
 
@@ -381,6 +440,32 @@ datasets. Not urgent for pilot-scale public-ish research.
   writes R/Python).** The premise — that local models are weak on
   Stata — is true, but Option A has Claude writing all three
   languages directly. The hybrid solves a problem we don't have.
+
+- **A `register_plot(file, kind)` API for arbitrary plot files.**
+  Tried in 2026-04-26 and removed days later: the kind label was
+  self-attested by the script, so a histogram of raw observations
+  could pose as a `coefficients` plot and slip past the privacy
+  line. The replacement is the four kind-specific helpers (each
+  takes a fitted-model object); bespoke plots stay
+  researcher-only. Reintroducing a file-based escape hatch
+  reintroduces the privacy hole. If a researcher's workflow needs
+  a plot kind we don't have, the answer is a new opinionated
+  helper with model-output inputs only — not a generic file
+  registrar.
+
+- **Closing a runner's SDK client when the user switches away
+  from its chat.** Doing so was the multi-session bug
+  (`receive_response()` raised mid-stream and surfaced as a
+  fail bubble in the new session). Switching is a pure UI focus
+  change; runners stay alive until the bridge shuts down or the
+  session is explicitly deleted. `test_concurrent_sessions.py`
+  pins this.
+
+- **Carrying script attachments forward across a failed turn on
+  the bridge side.** Tried, removed: the JS chip cleared at send
+  time and the bridge silently held the attachment, producing
+  "X is already attached" toasts for files no chip showed. If a
+  send fails the user re-attaches; simpler model, no drift.
 
 ## Open policy decisions
 

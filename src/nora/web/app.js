@@ -34,6 +34,27 @@ const contextChip = document.getElementById('context-chip');
 const DEFAULT_CONTEXT_WINDOW = 1_000_000;
 let contextWindow = DEFAULT_CONTEXT_WINDOW;
 
+// ---- multi-session focus state -------------------------------------------
+// The bridge runs every session as its own SessionRunner: turns in
+// session A keep streaming after the researcher clicks B in the
+// sidebar. The frontend tracks two pieces of state to render that
+// honestly:
+//
+// - ``currentCwd``: the path of the session the user is currently
+//   looking at. Set by ``showChat`` on first load and by
+//   ``switchSession`` afterwards. Events that don't match this cwd
+//   are background activity: their busy-state still updates the
+//   sidebar dot, but they don't render into the focused
+//   transcript.
+// - ``busySessions``: a Set of cwd paths that have a turn currently
+//   in flight. A focus-matched event flips the composer Send/Stop
+//   icons; a background-matched event flips only the sidebar dot.
+//   We add to the Set when a session's send is queued and remove
+//   when a terminal event (turn_done / turn_error / auth_failure)
+//   arrives for that session.
+let currentCwd = null;
+const busySessions = new Set();
+
 // Persisted model choice — survives restarts. Applied on boot after
 // (Model preference used to live in localStorage as a global default.
 // It now lives per-session in ``.nora/session_state.json`` and is
@@ -367,6 +388,33 @@ function showChat(payload) {
   // is still available on hover via the `title` attribute.
   cwdEl.textContent = payload.session_title || formatCwd(payload.cwd || '');
   cwdEl.title = payload.cwd || '';
+
+  // Mark this session as the focused one. Subsequent
+  // ``window.nora_event`` callbacks compare incoming
+  // ``session_cwd`` against this — events for other sessions are
+  // background activity and don't render into the visible
+  // transcript (but still update the sidebar busy dot).
+  currentCwd = payload.cwd || null;
+  // Drop staged composer state so attachments don't leak across
+  // sessions: an image staged in A but never sent must NOT ride
+  // along with the next message in B. (Without this, the JS
+  // ``stagedImages`` array stays populated through the focus
+  // switch and the next form submit in B would inline A's
+  // attachment into B's prompt.) Also revoke object URLs so the
+  // blobs aren't pinned in memory.
+  if (stagedImages.length > 0) {
+    stagedImages.forEach((img) => {
+      if (img && img.url) URL.revokeObjectURL(img.url);
+    });
+    stagedImages.length = 0;
+  }
+  stagedDataNotices.length = 0;
+  renderAttachments();
+  // Sync the composer state to whether THIS session is currently
+  // busy. Switching to a session that's mid-turn shows Stop +
+  // loading indicator immediately; switching to an idle session
+  // shows Send.
+  syncComposerToFocus();
 
   updatePolicyChip(payload.policy);
   loadSessions();
@@ -821,8 +869,7 @@ async function stageDataFile(file) {
       appendError(friendlyAddFilesError(res && res.reason ? res.reason : 'unknown'));
       return;
     }
-    if (res.added && res.added.length > 0) {
-      stagedDataNotices.push(res.added[0]);
+    if (addStagedDataNotices(res.added || [])) {
       renderAttachments();
     }
     if (res.skipped && res.skipped.length > 0) {
@@ -850,6 +897,21 @@ async function stageDataFile(file) {
 // file is already on disk. Cleared on send or when the researcher
 // removes the chip.
 const stagedDataNotices = [];
+
+function addStagedDataNotices(names) {
+  /* Mirror backend-staged data/script files into the composer's
+   * receipt chips. Deduplicate by basename so the native Add Files
+   * button, drag/drop, and Files-popup attach all keep one visual
+   * chip per staged file.
+   */
+  let changed = false;
+  (names || []).forEach((name) => {
+    if (!name || stagedDataNotices.includes(name)) return;
+    stagedDataNotices.push(name);
+    changed = true;
+  });
+  return changed;
+}
 
 // Drop handling on the compose form. Accepts images (staged as
 // vision attachments) and data/script files (.csv, .dta, .rds,
@@ -1050,7 +1112,17 @@ function rotatePlaceholder() {
 }
 rotatePlaceholder();
 
-function setSending(sending) {
+function setSending(sending, cwd) {
+  // ``cwd`` defaults to the focused session — this is what
+  // happens when send_message is called from the form submit.
+  // Background events (terminal events for non-focused sessions)
+  // pass an explicit cwd so the busy state lands on the right row.
+  const target = cwd || currentCwd;
+  if (target) {
+    setSessionBusy(target, sending);
+  }
+  // Composer state mirrors the FOCUSED session only.
+  if (target && target !== currentCwd) return;
   turnInFlight = sending;
   // Toggle the Send / Stop icons rather than disabling the Send
   // button. During a turn, Stop replaces Send in the same spot so
@@ -1065,6 +1137,36 @@ function setSending(sending) {
     hideLoadingIndicator();
   }
   input.setAttribute('aria-busy', sending ? 'true' : 'false');
+}
+
+function setSessionBusy(cwd, busy) {
+  /* Track which sessions have a turn in flight so the sidebar can
+   * show a small "still working" dot on background sessions. The
+   * dot is purely informational — clicking the row still works as
+   * a normal focus switch and the in-flight turn keeps streaming
+   * regardless. */
+  if (!cwd) return;
+  if (busy) busySessions.add(cwd);
+  else busySessions.delete(cwd);
+  // Update the sidebar row in place. Falls through if the row
+  // isn't currently rendered (e.g., scrolled off in a long list);
+  // the next loadSessions() will re-render with the right state.
+  const rows = document.querySelectorAll('.session-item');
+  rows.forEach((row) => {
+    if (row.dataset && row.dataset.path === cwd) {
+      row.classList.toggle('busy', busy);
+    }
+  });
+}
+
+function syncComposerToFocus() {
+  /* Called on every focus switch. Sets the composer state to match
+   * whether the now-focused session has a turn in flight. Without
+   * this, switching from a busy session to an idle one would leave
+   * Stop on screen, and switching back to a busy session would
+   * show Send (the wrong control). */
+  const focusedBusy = currentCwd && busySessions.has(currentCwd);
+  setSending(!!focusedBusy, currentCwd);
 }
 
 // Rotation of vague, slightly silly labels for the loading indicator.
@@ -1165,54 +1267,79 @@ if (stopBtn) {
 
 window.nora_event = function (evt) {
   // evt is a plain object; {type} + type-specific fields.
+  // Every event from a runner carries ``session_cwd``: the cwd of
+  // the runner that emitted it. ``ready`` and ``policy_updated``
+  // are bridge-level events without a session_cwd — those always
+  // apply to the focused session and pass through.
+  const evtCwd = evt.session_cwd;
+  const isFocused = !evtCwd || (currentCwd && evtCwd === currentCwd);
+
   switch (evt.type) {
     case 'ready':
       showChat(evt);
       break;
     case 'assistant_text':
+      if (!isFocused) return;
       if (activeLiveTurn) activeLiveTurn.hasVisibleReply = true;
       appendAssistant(evt.text);
       break;
     case 'assistant_thinking':
+      if (!isFocused) return;
       if (activeLiveTurn) activeLiveTurn.hasVisibleReply = true;
       appendThinking(evt.text);
       break;
     case 'tool_call': {
+      if (!isFocused) return;
       const card = appendToolCall(evt);
       if (card && activeLiveTurn) activeLiveTurn.hasVisibleReply = true;
       break;
     }
     case 'tool_result': {
+      if (!isFocused) return;
       const card = appendToolResult(evt);
       if (card && activeLiveTurn) activeLiveTurn.hasVisibleReply = true;
+      // A submit_script run can produce new plots that should
+      // accumulate in the topbar Files panel. Refresh after each
+      // tool_result so the right-corner panel stays the
+      // session-wide gallery — researcher scrolls back through
+      // every plot the analysis ever produced without leaving the
+      // chat.
+      if (evt.plots && evt.plots.length > 0) {
+        refreshFilesChip();
+      }
       break;
     }
     case 'turn_done':
-      // Terminal event: re-enable the composer and update the
-      // context-usage chip.
-      //
-      // The chip tracks the *prompt* side only:
+      // Terminal event: clear busy state for THIS session
+      // (whether focused or background) and, if focused, refresh
+      // the composer + context chip. The chip tracks the *prompt*
+      // side only:
       //   input_tokens + cache_read + cache_creation
       // i.e. what the model actually loaded into its window this
       // turn. ``output_tokens`` is deliberately excluded — Claude's
       // fresh response is not in the window on THIS turn; it gets
       // folded into input on the NEXT turn via cache_creation /
-      // input_tokens. Including it here would double-count across
-      // turns and make the chip bounce turn-to-turn based on how
-      // long the response happened to be.
-      setSending(false);
-      const prompt =
-        (evt.input_tokens || 0) +
-        (evt.cache_read_input_tokens || 0) +
-        (evt.cache_creation_input_tokens || 0);
-      updateContextChip(prompt);
-      if (activeLiveTurn && !activeLiveTurn.hasVisibleReply) {
-        queueDisposableTurn(activeLiveTurn.nodes);
+      // input_tokens.
+      setSending(false, evtCwd);
+      if (isFocused) {
+        const prompt =
+          (evt.input_tokens || 0) +
+          (evt.cache_read_input_tokens || 0) +
+          (evt.cache_creation_input_tokens || 0);
+        updateContextChip(prompt);
+        if (activeLiveTurn && !activeLiveTurn.hasVisibleReply) {
+          queueDisposableTurn(activeLiveTurn.nodes);
+        }
+        activeLiveTurn = null;
       }
-      activeLiveTurn = null;
       break;
     case 'auth_failure':
-      {
+      // Auth failures matter cross-session — even a background
+      // turn that hits an auth error should drop its busy dot.
+      // Render the error bubble only into the focused transcript
+      // (the message is in the persisted log; switching to that
+      // session will replay it).
+      if (isFocused) {
         const errEl = appendError('Auth failure: ' + (evt.reason || 'unknown'));
         if (activeLiveTurn && !activeLiveTurn.hasVisibleReply) {
           activeLiveTurn.nodes.push(errEl);
@@ -1220,10 +1347,10 @@ window.nora_event = function (evt) {
         }
         activeLiveTurn = null;
       }
-      setSending(false);
+      setSending(false, evtCwd);
       break;
     case 'turn_error':
-      {
+      if (isFocused) {
         const errEl = appendError(evt.message || 'unknown error');
         if (activeLiveTurn && !activeLiveTurn.hasVisibleReply) {
           activeLiveTurn.nodes.push(errEl);
@@ -1231,7 +1358,7 @@ window.nora_event = function (evt) {
         }
         activeLiveTurn = null;
       }
-      setSending(false);
+      setSending(false, evtCwd);
       break;
     case 'policy_updated':
       updatePolicyChip(evt.policy);
@@ -1598,6 +1725,62 @@ function renderScriptResultInline(body, evt) {
     body.appendChild(pre);
   }
 
+  // Plot-helper diagnostic — surfaced when a helper was clearly
+  // called (the run-dir has a ``_nora_plots/`` subdir + stderr
+  // mentions ``nora.plot_*``) but no plot files actually landed.
+  // Without this note, the researcher sees an empty thumbnail row
+  // and has no signal about why. Most common cause: matplotlib
+  // not installed in the Python environment.
+  if (evt.plot_diagnostic) {
+    const note = document.createElement('div');
+    note.className = 'tool-plot-diagnostic';
+    note.textContent = evt.plot_diagnostic;
+    body.appendChild(note);
+  }
+
+  // Inline plot thumbnails — every .png the script wrote into its
+  // run dir (including those produced by `graph export` in Stata,
+  // `ggsave` in R, `plt.savefig` in Python). These are the
+  // RESEARCHER's view; the model only ever sees plots that came
+  // through the manifest-allowlist gate in the runner.
+  if (evt.plots && Array.isArray(evt.plots) && evt.plots.length > 0) {
+    const grid = document.createElement('div');
+    grid.className = 'tool-plots';
+    evt.plots.forEach((plot) => {
+      const tile = document.createElement('div');
+      tile.className = 'tool-plot-tile';
+      tile.title = plot.name;
+      if (plot.data) {
+        const img = document.createElement('img');
+        img.alt = plot.name;
+        img.src = `data:${plot.mime || 'image/png'};base64,${plot.data}`;
+        img.addEventListener('click', () => showImageLightbox(img.src));
+        tile.appendChild(img);
+      } else {
+        // Above the inline byte cap — render a placeholder with the
+        // file size so the researcher knows it exists, plus an
+        // "Open" button that hands off to the OS image viewer.
+        const placeholder = document.createElement('div');
+        placeholder.className = 'tool-plot-placeholder';
+        placeholder.textContent = formatBytes(plot.size || 0);
+        tile.appendChild(placeholder);
+        if (plot.path && window.pywebview && window.pywebview.api &&
+            typeof window.pywebview.api.open_path === 'function') {
+          tile.style.cursor = 'pointer';
+          tile.addEventListener('click', () => {
+            window.pywebview.api.open_path(plot.path);
+          });
+        }
+      }
+      const caption = document.createElement('div');
+      caption.className = 'tool-plot-caption';
+      caption.textContent = plot.name;
+      tile.appendChild(caption);
+      grid.appendChild(tile);
+    });
+    body.appendChild(grid);
+  }
+
   if (evt.run_dir) {
     const actions = document.createElement('div');
     actions.className = 'tool-actions';
@@ -1848,7 +2031,12 @@ async function refreshFilesChip() {
       if (!byKind.has(k)) byKind.set(k, []);
       byKind.get(k).push(f);
     });
-    ['script', 'graph', 'log'].forEach((kind) => {
+    // Render order: graphs first (the visual outputs the
+    // researcher iterates on), then scripts (sometimes attached
+    // mid-chat), then logs (rarely interacted with). Previously
+    // scripts came first, which buried plots below text-only
+    // rows even though plots are the most-clicked kind.
+    ['graph', 'script', 'log'].forEach((kind) => {
       const rows = byKind.get(kind);
       if (!rows || rows.length === 0) return;
       const groupHeader = document.createElement('div');
@@ -1856,26 +2044,198 @@ async function refreshFilesChip() {
       groupHeader.textContent = FILES_KIND_LABELS[kind] || kind;
       wrap.appendChild(groupHeader);
       rows.forEach((f) => {
-        const row = document.createElement('div');
-        row.className = 'files-row';
-        row.title = f.name;
-        row.textContent = f.name;
-        // Scripts are clickable: clicking attaches the file's
-        // content as inline context for the next message — same
-        // pipeline drag-drop uses, but works for files already
-        // sitting in the session cwd. Other kinds stay read-only
-        // (data files: redundant, model already sees them; logs /
-        // graphs: not source code).
-        if (kind === 'script') {
-          row.classList.add('files-row-clickable');
-          row.addEventListener('click', () => attachSessionFile(f.name));
-        }
-        wrap.appendChild(row);
+        wrap.appendChild(buildFilesRow(kind, f));
       });
     });
     filesPopup.appendChild(wrap);
   }
 }
+
+function buildFilesRow(kind, f) {
+  /* Build one row in the Files popup. Layout: [primary action]
+   * [title / thumbnail] [delete]. The primary action varies by
+   * kind:
+   *   - graph (image with thumbnail data): copy-to-clipboard
+   *   - graph (no thumbnail data, e.g. .gph): open externally
+   *   - script: send (attach to next message)
+   *   - log: no primary action
+   * Delete is always on the right.
+   */
+  const row = document.createElement('div');
+  row.className = 'files-row files-row-actionable';
+  row.dataset.kind = kind;
+  row.dataset.path = f.path || '';
+  row.title = f.path || f.name;
+
+  // Left action (kind-specific).
+  const leftAction = document.createElement('button');
+  leftAction.type = 'button';
+  leftAction.className = 'files-row-action files-row-action-left';
+  let primaryConfigured = false;
+  if (kind === 'graph' && f.data) {
+    leftAction.title = 'Copy image to clipboard';
+    leftAction.setAttribute('aria-label', 'Copy image');
+    leftAction.innerHTML = COPY_ICON_SVG;
+    leftAction.addEventListener('click', (ev) => {
+      ev.stopPropagation();
+      copyImageToClipboard(f.data, f.mime || 'image/png', f.name);
+    });
+    primaryConfigured = true;
+  } else if (kind === 'graph' && f.path) {
+    leftAction.title = 'Open in default viewer';
+    leftAction.setAttribute('aria-label', 'Open');
+    leftAction.innerHTML = OPEN_ICON_SVG;
+    leftAction.addEventListener('click', (ev) => {
+      ev.stopPropagation();
+      if (window.pywebview && window.pywebview.api &&
+          typeof window.pywebview.api.open_path === 'function') {
+        window.pywebview.api.open_path(f.path);
+      }
+    });
+    primaryConfigured = true;
+  } else if (kind === 'script') {
+    leftAction.title = 'Send to next message';
+    leftAction.setAttribute('aria-label', 'Attach to next message');
+    leftAction.innerHTML = SEND_ICON_SVG;
+    leftAction.addEventListener('click', (ev) => {
+      ev.stopPropagation();
+      attachSessionFile(f.name);
+    });
+    primaryConfigured = true;
+  }
+  if (primaryConfigured) {
+    row.appendChild(leftAction);
+  } else {
+    // Spacer keeps the title aligned with rows that DO have a
+    // left action — visual alignment beats squeezing an extra
+    // pixel of horizontal space.
+    const spacer = document.createElement('span');
+    spacer.className = 'files-row-action-spacer';
+    row.appendChild(spacer);
+  }
+
+  // Center: title + (for image rows) the thumbnail.
+  const center = document.createElement('div');
+  center.className = 'files-row-center';
+  if (kind === 'graph' && f.data) {
+    const thumb = document.createElement('img');
+    thumb.className = 'files-row-thumb';
+    thumb.alt = f.name;
+    thumb.src = `data:${f.mime || 'image/png'};base64,${f.data}`;
+    thumb.addEventListener('click', (ev) => {
+      ev.stopPropagation();
+      showImageLightbox(thumb.src);
+    });
+    center.appendChild(thumb);
+  }
+  const caption = document.createElement('div');
+  caption.className = 'files-row-caption';
+  caption.textContent = f.name;
+  center.appendChild(caption);
+  row.appendChild(center);
+
+  // Right action: delete. Always present so every file in the
+  // panel can be removed with one click. Matches the session-list
+  // delete affordance — a plain ``×`` glyph rather than an icon —
+  // so the visual vocabulary stays consistent across delete
+  // surfaces.
+  const deleteBtn = document.createElement('button');
+  deleteBtn.type = 'button';
+  deleteBtn.className = 'files-row-action files-row-action-right files-row-action-danger';
+  deleteBtn.title = 'Delete file';
+  deleteBtn.setAttribute('aria-label', 'Delete file');
+  deleteBtn.textContent = '×';
+  deleteBtn.addEventListener('click', (ev) => {
+    ev.stopPropagation();
+    deleteSessionFile(f.path || f.name, f.name);
+  });
+  row.appendChild(deleteBtn);
+  return row;
+}
+
+
+// Inline SVG icons. Small, monochrome — color is set via CSS so
+// the icon picks up the row's hover/focus colors.
+const COPY_ICON_SVG = (
+  '<svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true">' +
+  '<path fill="none" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round" ' +
+  'd="M5 5V2.5A.5.5 0 0 1 5.5 2h7a.5.5 0 0 1 .5.5v9a.5.5 0 0 1-.5.5H10' +
+  'M3.5 5h7a.5.5 0 0 1 .5.5v9a.5.5 0 0 1-.5.5h-7a.5.5 0 0 1-.5-.5v-9a.5.5 0 0 1 .5-.5z"/>' +
+  '</svg>'
+);
+
+const SEND_ICON_SVG = (
+  '<svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true">' +
+  '<path fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round" ' +
+  'd="M2 8L14 2l-3 12-3-5-6-1z"/>' +
+  '</svg>'
+);
+
+const OPEN_ICON_SVG = (
+  '<svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true">' +
+  '<path fill="none" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round" ' +
+  'd="M9 2h5v5M14 2L7 9M3 4h3M3 4v9h9v-3"/>' +
+  '</svg>'
+);
+
+async function copyImageToClipboard(base64Data, mime, name) {
+  /* Copy a thumbnail image to the system clipboard via the
+   * Clipboard API. WKWebView supports ClipboardItem; if for any
+   * reason it doesn't (older macOS), we fall back to a toast
+   * pointing at "Show folder" so the researcher isn't stuck.
+   */
+  try {
+    if (!navigator.clipboard || typeof ClipboardItem === 'undefined') {
+      toast('Clipboard API unavailable in this WebView; use Show folder.', 'info');
+      return;
+    }
+    const binary = atob(base64Data);
+    const bytes = new Uint8Array(binary.length);
+    for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+    const blob = new Blob([bytes], { type: mime || 'image/png' });
+    await navigator.clipboard.write([
+      new ClipboardItem({ [blob.type]: blob }),
+    ]);
+    toast('Copied ' + (name || 'image') + ' to clipboard.', 'success');
+  } catch (err) {
+    console.warn('copyImageToClipboard failed', err);
+    toast('Copy failed: ' + (err && err.message ? err.message : err), 'error');
+  }
+}
+
+
+async function deleteSessionFile(path, displayName) {
+  /* Delete a file via the bridge. Confirms first because
+   * unlinking is irreversible and the Files panel doesn't have
+   * an undo. Refreshes the panel + composer chips on success
+   * so the row vanishes immediately.
+   */
+  if (!path) return;
+  if (!window.pywebview || !window.pywebview.api) return;
+  if (typeof window.pywebview.api.delete_session_file !== 'function') {
+    toast('Restart Nora to enable file deletion.', 'info');
+    return;
+  }
+  const label = displayName || path;
+  const ok = window.confirm(`Delete ${label}?\n\nThis cannot be undone.`);
+  if (!ok) return;
+  try {
+    const res = await window.pywebview.api.delete_session_file(path);
+    if (!res || !res.ok) {
+      const reason = (res && res.reason) || 'unknown';
+      toast('Could not delete: ' + reason, 'error');
+      return;
+    }
+    toast('Deleted ' + (res.name || label) + '.', 'success');
+    refreshFilesChip();
+    // Composer chips may have referenced the file too; re-render.
+    renderAttachments();
+  } catch (err) {
+    console.warn('delete_session_file failed', err);
+    toast('Could not delete: ' + (err && err.message ? err.message : err), 'error');
+  }
+}
+
 
 async function attachSessionFile(name) {
   /* Stage a session-resident script as inline context for the next
@@ -1898,8 +2258,7 @@ async function attachSessionFile(name) {
     } else {
       // Mirror the drag-drop chip so the researcher sees the same
       // visual confirmation in both flows.
-      stagedDataNotices.push(name);
-      renderAttachments();
+      if (addStagedDataNotices([res.name || name])) renderAttachments();
       toast(name + ' attached to your next message.', 'success');
     }
     // Close the popup so the composer becomes the obvious next
@@ -2429,9 +2788,24 @@ function renderSessions(sessions, currentPath) {
     const btn = document.createElement('button');
     btn.type = 'button';
     btn.className = 'session-item';
+    // ``data-path`` is read by setSessionBusy() to flip the busy
+    // dot on this row when a turn starts/ends — including for
+    // background sessions the user isn't currently looking at.
+    btn.dataset.path = s.path;
+    if (busySessions.has(s.path)) btn.classList.add('busy');
     const when = document.createElement('div');
     when.className = 'session-when';
-    when.textContent = formatSessionWhen(s.timestamp);
+    // Busy dot lives INSIDE the title line so it pulses right
+    // next to the timestamp instead of off in the corner. CSS
+    // hides it by default; ``.busy`` on the parent reveals it.
+    const dot = document.createElement('span');
+    dot.className = 'session-busy-dot';
+    dot.setAttribute('aria-hidden', 'true');
+    when.appendChild(dot);
+    const whenText = document.createElement('span');
+    whenText.className = 'session-when-text';
+    whenText.textContent = formatSessionWhen(s.timestamp);
+    when.appendChild(whenText);
     btn.appendChild(when);
 
     const meta = document.createElement('div');
@@ -2648,12 +3022,13 @@ if (addFilesBtn) {
         const url = dataUrlFromBase64(img.data, img.mime);
         stagedImages.push({ data: img.data, mime: img.mime, url });
       });
-      if (images.length > 0) renderAttachments();
+      const addedNotices = addStagedDataNotices(added);
+      if (images.length > 0 || addedNotices) renderAttachments();
 
       // Summary toast: describe what happened in one line.
       const parts = [];
       if (added.length === 1) parts.push('Added ' + added[0]);
-      else if (added.length > 1) parts.push('Added ' + added.length + ' data files');
+      else if (added.length > 1) parts.push('Added ' + added.length + ' files');
       if (images.length === 1) parts.push('attached 1 image');
       else if (images.length > 1) parts.push('attached ' + images.length + ' images');
       if (parts.length > 0) {

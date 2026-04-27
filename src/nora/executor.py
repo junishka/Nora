@@ -511,11 +511,17 @@ def _stage_runtime(run_dir: Path, language: Language) -> Path:
             (lib_dir / name).write_text(src.read_text(encoding="utf-8"))
     elif language == "Stata":
         stata_ados = (
+            "_nora_export_plot.ado",
             "nora_result_regress.ado",
             "nora_result_ttest.ado",
             "nora_result_sum.ado",
             "nora_result_tab.ado",
             "nora_result_magnitude.ado",
+            "nora_plot_residuals.ado",
+            "nora_plot_coefficients.ado",
+            "nora_plot_interaction.ado",
+            "nora_plot_estimate_comparison.ado",
+            "nora_safe_export.ado",
         )
         for name in stata_ados:
             src = runtime_pkg.joinpath(name)

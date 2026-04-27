@@ -49,6 +49,13 @@ class Tool:
     # for runtimes (Python today) where having the binary isn't enough.
     # Empty tuple means "ready to go." None means "not checked yet."
     missing_packages: tuple[str, ...] = ()
+    # Optional packages whose absence DOES NOT block runs but DOES
+    # disable specific features. ``matplotlib`` is the canonical
+    # case: scripts that don't plot run fine without it, but
+    # ``nora.plot_*`` helpers fail silently on import. The executor
+    # surfaces these in the missing-deps hint so a researcher who
+    # wants plot vision knows exactly what to install.
+    optional_missing_packages: tuple[str, ...] = ()
     # Extra filesystem subpaths the executor's sandbox profile should
     # allow reads from when this interpreter runs. For Python this is
     # ``sys.prefix`` (and ``sys.exec_prefix`` if different) — the
@@ -58,12 +65,67 @@ class Tool:
     extra_read_paths: tuple[str, ...] = ()
 
 
+# R packages we probe at startup. ``haven`` is needed to read .dta
+# files (Stata's native format) — without it, R can't open any of
+# the user's Stata datasets and the model's first attempt to
+# ``library(haven)`` fails. ``ggplot2`` is the most common plotting
+# library; helpers fall back to base graphics, but raw model
+# scripts often reach for it. None of these are HARD requirements
+# — base R can still run analyses without them — but advertising
+# their availability in the system prompt lets the model pick the
+# right path on the first try instead of discovering missing-
+# package errors by failing.
+_R_OPTIONAL_PACKAGES: tuple[str, ...] = (
+    "haven",
+    "ggplot2",
+)
+
+
 def find_r() -> Tool | None:
     """Return the discovered R runtime, or None."""
     path = shutil.which("Rscript")
     if path is None:
         return None
-    return Tool(name="R", binary=path, version=_r_version(path))
+    optional_missing = _r_missing_packages(path, _R_OPTIONAL_PACKAGES)
+    return Tool(
+        name="R", binary=path, version=_r_version(path),
+        optional_missing_packages=optional_missing,
+    )
+
+
+def _r_missing_packages(
+    rscript: str, packages: tuple[str, ...],
+) -> tuple[str, ...]:
+    """Probe an R installation for ``packages``. Returns the names
+    that aren't installed. Done in a single ``Rscript`` invocation
+    (one subprocess per package would inflate startup time on
+    machines with slow R). The probe writes a single boolean per
+    package to stdout, separated by spaces.
+
+    Failures (Rscript missing, weird R version, OS error) return
+    "all missing" rather than the conservative "none missing" so
+    the system prompt is honest about uncertainty.
+    """
+    if not packages:
+        return ()
+    expr = "; ".join(
+        f"cat(requireNamespace(\"{pkg}\", quietly=TRUE), \" \")"
+        for pkg in packages
+    )
+    try:
+        out = subprocess.run(
+            [rscript, "-e", expr],
+            capture_output=True, text=True, timeout=10, check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return tuple(packages)
+    flags = out.stdout.strip().split()
+    if len(flags) != len(packages):
+        return tuple(packages)
+    return tuple(
+        pkg for pkg, present in zip(packages, flags)
+        if present.upper() != "TRUE"
+    )
 
 
 def find_stata() -> Tool | None:
@@ -95,6 +157,16 @@ _PYTHON_REQUIRED_PACKAGES: tuple[str, ...] = (
     "scipy",
 )
 
+# Optional but feature-gating. ``matplotlib`` powers every plot
+# helper; missing it means ``nora.plot_*`` calls fail silently and
+# the model thinks it produced an image while the researcher sees
+# nothing. Probed but NOT required so non-plotting scripts still
+# run; the executor surfaces missing optionals in its hint text so
+# a researcher who wanted plots knows what to install.
+_PYTHON_OPTIONAL_PACKAGES: tuple[str, ...] = (
+    "matplotlib",
+)
+
 
 def find_python() -> Tool | None:
     """Return the discovered Python 3 interpreter, or None.
@@ -118,12 +190,14 @@ def find_python() -> Tool | None:
         if version is None or not version.startswith("Python 3"):
             continue
         missing = _python_missing_packages(path, _PYTHON_REQUIRED_PACKAGES)
+        optional_missing = _python_missing_packages(path, _PYTHON_OPTIONAL_PACKAGES)
         prefixes = _python_prefixes(path)
         return Tool(
             name="Python",
             binary=path,
             version=version,
             missing_packages=missing,
+            optional_missing_packages=optional_missing,
             extra_read_paths=prefixes,
         )
     return None

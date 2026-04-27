@@ -3,6 +3,16 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <!-- WKWebView caches file:// resources persistently across launches
+       on macOS (NSURLCache survives the process). Without these
+       directives, every code change to app.js / style.css required the
+       user to manually clear ~/Library/Caches/com.apple.WebKit.WebContent.
+       The bridge ALSO appends a per-launch ``?v=<build-id>`` query
+       string to the resource references at HTML-load time as a second
+       layer of busting. -->
+  <meta http-equiv="Cache-Control" content="no-store, no-cache, must-revalidate" />
+  <meta http-equiv="Pragma" content="no-cache" />
+  <meta http-equiv="Expires" content="0" />
   <title>Nora</title>
   <!-- Lexend: research-backed, designed for reading proficiency —
        letter shapes are spaced and proportioned to reduce visual

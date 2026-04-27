@@ -170,7 +170,7 @@ def test_run_turn_synthesises_terminal_event_when_stream_silent(
     tmp_path: Path,
 ) -> None:
     """If the provider's send() generator closes without yielding
-    TurnDone / TurnError / AuthFailure, ``_run_turn`` must push a
+    TurnDone / TurnError / AuthFailure, the runner must push a
     synthetic ``turn_error`` so the JS composer flips back to
     enabled. Without this the UI stayed stuck on "sending"
     forever and Stop reported "no turn in flight" because the
@@ -191,13 +191,19 @@ def test_run_turn_synthesises_terminal_event_when_stream_silent(
             yield AssistantText(text="hello")
 
     bridge = NoraBridge(cwd=tmp_path)
-    bridge._send_lock = asyncio.Lock()
-    bridge._session = _SilentSession()
+    runner = bridge._active_runner()
+    assert runner is not None
+    runner._session = _SilentSession()
 
     pushed: list[dict] = []
-    bridge._push_event = pushed.append  # type: ignore[assignment]
 
-    asyncio.run(bridge._run_turn("test"))
+    asyncio.run(runner.run_turn(
+        "test",
+        images=None,
+        on_event=pushed.append,
+        build_context_prefix=lambda cwd: "",
+        build_script_prefix=lambda atts, cwd: "",
+    ))
 
     types = [p.get("type") for p in pushed]
     assert "assistant_text" in types
@@ -205,7 +211,7 @@ def test_run_turn_synthesises_terminal_event_when_stream_silent(
     # state machine treats turn_error as a session-recover signal —
     # any terminal event flips setSending(false)).
     assert "turn_error" in types, (
-        "_run_turn must push a terminal event even when the "
+        "the runner must push a terminal event even when the "
         "provider stream closes silently — otherwise the JS UI "
         "stays stuck on 'sending'"
     )

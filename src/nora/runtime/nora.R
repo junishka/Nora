@@ -461,6 +461,373 @@ nora$from_table <- function(variable, counts, n = NULL, missing_count = 0L, ...)
 
 
 # ---------------------------------------------------------------------------
+# Plot helpers — model-output visualizations only
+# ---------------------------------------------------------------------------
+#
+# Plots produced via these helpers are surfaced to the model on the
+# next turn as image attachments. RAW-DATA plots (a histogram of an
+# observed variable, a scatter of all rows, a density of a column)
+# are NOT covered here on purpose — they would expose the data
+# itself, which is the privacy line Nora is built to keep.
+#
+# What IS covered:
+#   - Residual diagnostics (plot_residuals): residuals vs fitted,
+#     QQ plot, scale-location, histogram of residuals. All
+#     functions of model output, not raw observations.
+#   - Interaction / predicted-value plots (plot_interaction):
+#     model's predicted response across a variable's range, holding
+#     other predictors at their means. Shows model behavior, not
+#     data points.
+#
+# Future helpers (coefficient forest plots, marginal effects)
+# follow the same principle: things the model produced from the fit,
+# not visualizations of the rows.
+#
+# Mechanism: helpers write a PNG into <run_dir>/_nora_plots/ and
+# append a JSONL entry to <run_dir>/_nora_plots/manifest.jsonl. The
+# bridge reads ONLY the manifest — anything else dropped into the
+# directory by ggsave / plain plot() / etc. is invisible to the
+# model regardless. That's the allowlist; mirrors how the sanitizer
+# works for textual results.
+
+nora$.plots_dir <- function() {
+  result_path <- Sys.getenv("NORA_RESULT_PATH")
+  if (!nzchar(result_path)) return(NULL)
+  d <- file.path(dirname(result_path), "_nora_plots")
+  dir.create(d, showWarnings = FALSE, recursive = TRUE)
+  d
+}
+
+nora$.append_plot_manifest <- function(file, kind, label) {
+  d <- nora$.plots_dir()
+  if (is.null(d)) return(invisible(NULL))
+  entry <- list(file = file, kind = kind)
+  if (!is.null(label) && nzchar(label)) entry$label <- label
+  line <- nora$.to_json(entry)
+  con <- file(file.path(d, "manifest.jsonl"), open = "a", encoding = "UTF-8")
+  on.exit(close(con), add = TRUE)
+  writeLines(line, con)
+  invisible(NULL)
+}
+
+# Record a structured plot-helper failure so submit_script can surface
+# it in the tool result the MODEL receives. Without this, helper
+# failures only land in stderr and the model says "thumbnail should be
+# visible above" while the researcher sees nothing.
+nora$.append_plot_helper_error <- function(helper, message) {
+  d <- nora$.plots_dir()
+  if (is.null(d)) return(invisible(NULL))
+  msg <- as.character(message)
+  fix <- NULL
+  lower <- tolower(msg)
+  if (grepl("haven", lower) || grepl("could not find function .*read_dta", lower)) {
+    fix <- "install.packages(\"haven\")"
+  } else if (grepl("ggplot2", lower) || grepl("could not find function .*ggplot", lower)) {
+    fix <- "install.packages(\"ggplot2\")"
+  }
+  entry <- list(helper = helper, error = "R error", message = msg)
+  if (!is.null(fix)) entry$fix <- fix
+  line <- nora$.to_json(entry)
+  con <- file(file.path(d, "helper_errors.jsonl"),
+              open = "a", encoding = "UTF-8")
+  on.exit(close(con), add = TRUE)
+  writeLines(line, con)
+  invisible(NULL)
+}
+
+#' Write the four standard residual-diagnostic panels for an `lm`
+#' (or anything `plot()` accepts as a fit) and register them with
+#' the manifest so the model can see them on the next turn.
+#'
+#' Failures inside the helper are surfaced via `message()` (visible
+#' to the researcher in the raw-log panel) but never raise — a
+#' broken plot helper must not break the analysis script around it.
+nora$plot_residuals <- function(model, label = NULL) {
+  d <- nora$.plots_dir()
+  if (is.null(d)) return(invisible(NULL))
+  fname <- "residuals.png"
+  res <- tryCatch({
+    grDevices::png(file.path(d, fname),
+                   width = 900, height = 700, res = 110)
+    on.exit(grDevices::dev.off(), add = TRUE)
+    op <- graphics::par(mfrow = c(2, 2))
+    on.exit(graphics::par(op), add = TRUE)
+    plot(model)
+    TRUE
+  }, error = function(e) {
+    message("nora$plot_residuals failed: ", conditionMessage(e))
+    nora$.append_plot_helper_error("plot_residuals", conditionMessage(e))
+    FALSE
+  })
+  if (isTRUE(res)) {
+    nora$.append_plot_manifest(
+      fname, "residuals",
+      if (is.null(label)) "Residual diagnostics" else label
+    )
+  }
+  invisible(NULL)
+}
+
+#' Predicted-response curve across a single predictor, with other
+#' predictors held at their means (numeric) or first level (factor).
+#' Confidence bands are 1.96 * SE of the predicted mean.
+#'
+#' Optional ``xlab`` / ``ylab`` / ``title`` override the defaults
+#' (which fall back to the variable name and "Predicted response").
+#' If ``ggplot2`` is available the helper uses it for a cleaner
+#' filled-ribbon CI; otherwise it falls back to base graphics.
+#'
+#' This is a model-output plot — the predicted line and bands come
+#' from the fit's variance / coefficient estimates, not from the
+#' data rows themselves. Same privacy posture as plot_residuals.
+nora$plot_interaction <- function(model, var, label = NULL,
+                                   xlab = NULL, ylab = NULL,
+                                   title = NULL) {
+  d <- nora$.plots_dir()
+  if (is.null(d)) return(invisible(NULL))
+  if (!is.character(var) || length(var) != 1) {
+    message("nora$plot_interaction: `var` must be a single name string")
+    return(invisible(NULL))
+  }
+  fname <- paste0("interaction_", make.names(var), ".png")
+  xtitle <- if (is.null(xlab)) var else xlab
+  ytitle <- if (is.null(ylab)) "Predicted response" else ylab
+  ptitle <- if (is.null(title)) paste0("Predicted response by ", var) else title
+  res <- tryCatch({
+    md <- model$model
+    if (is.null(md) || !var %in% names(md)) {
+      stop("variable '", var, "' is not in the model frame")
+    }
+    template <- md[1, , drop = FALSE]
+    for (col in names(template)) {
+      v <- md[[col]]
+      if (is.numeric(v))      template[[col]] <- mean(v, na.rm = TRUE)
+      else if (is.factor(v))  template[[col]] <- levels(v)[1]
+      else                    template[[col]] <- v[1]
+    }
+    xs <- md[[var]]
+    if (is.numeric(xs)) {
+      grid <- seq(min(xs, na.rm = TRUE), max(xs, na.rm = TRUE), length.out = 100)
+    } else if (is.factor(xs)) {
+      grid <- factor(levels(xs), levels = levels(xs))
+    } else {
+      grid <- unique(xs)
+    }
+    new <- template[rep(1, length(grid)), , drop = FALSE]
+    new[[var]] <- grid
+    pr <- stats::predict(model, newdata = new, se.fit = TRUE)
+    lo <- pr$fit - 1.96 * pr$se.fit
+    hi <- pr$fit + 1.96 * pr$se.fit
+
+    have_gg <- requireNamespace("ggplot2", quietly = TRUE)
+    if (have_gg && is.numeric(grid)) {
+      # ggplot2 path: filled ribbon CI, theme_minimal, decent
+      # default font sizes. Continuous-x only; for factor x we
+      # fall through to a base barplot below.
+      df <- data.frame(x = grid, fit = pr$fit, lo = lo, hi = hi)
+      p <- ggplot2::ggplot(df, ggplot2::aes(x = x, y = fit)) +
+        ggplot2::geom_ribbon(
+          ggplot2::aes(ymin = lo, ymax = hi),
+          fill = "#4C78A8", alpha = 0.20
+        ) +
+        ggplot2::geom_line(color = "#1F4E79", linewidth = 1) +
+        ggplot2::labs(title = ptitle, x = xtitle, y = ytitle) +
+        ggplot2::theme_minimal(base_size = 12) +
+        ggplot2::theme(
+          plot.title = ggplot2::element_text(face = "bold"),
+          panel.grid.minor = ggplot2::element_blank()
+        )
+      ggplot2::ggsave(file.path(d, fname), plot = p,
+                      width = 8, height = 5, dpi = 110)
+    } else {
+      # Base graphics fallback: still cleaner than the previous
+      # default — filled polygon for the CI band, colored line,
+      # margin-aware labels.
+      grDevices::png(file.path(d, fname),
+                     width = 900, height = 560, res = 110)
+      on.exit(grDevices::dev.off(), add = TRUE)
+      op <- graphics::par(mar = c(4.5, 4.5, 2.5, 1.5))
+      on.exit(graphics::par(op), add = TRUE)
+      if (is.numeric(grid)) {
+        ylim <- range(c(lo, hi), na.rm = TRUE)
+        plot(grid, pr$fit, type = "n",
+             xlab = xtitle, ylab = ytitle, main = ptitle,
+             ylim = ylim)
+        graphics::polygon(
+          c(grid, rev(grid)), c(lo, rev(hi)),
+          col = grDevices::adjustcolor("#4C78A8", alpha.f = 0.20),
+          border = NA
+        )
+        graphics::lines(grid, pr$fit, lwd = 2, col = "#1F4E79")
+      } else {
+        labels <- as.character(grid)
+        graphics::barplot(
+          pr$fit, names.arg = labels,
+          ylab = ytitle, main = ptitle, col = "#4C78A8",
+          border = "#1F4E79"
+        )
+      }
+    }
+    TRUE
+  }, error = function(e) {
+    message("nora$plot_interaction failed: ", conditionMessage(e))
+    nora$.append_plot_helper_error("plot_interaction", conditionMessage(e))
+    FALSE
+  })
+  if (isTRUE(res)) {
+    nora$.append_plot_manifest(
+      fname, "interaction",
+      if (is.null(label)) paste0("Predicted response by ", var) else label
+    )
+  }
+  invisible(NULL)
+}
+
+
+#' Forest plot of coefficient estimates with 95% CIs.
+#'
+#' Operates only on `coef(model)` and `confint(model)` — pure
+#' functions of model output, never the raw data. The helper IS
+#' the gate; there is no escape-hatch path that accepts an
+#' arbitrary file. That would let a histogram of raw rows pose
+#' as a coefficient plot — bypassing the privacy line the entire
+#' system rests on.
+nora$plot_coefficients <- function(model, label = NULL) {
+  d <- nora$.plots_dir()
+  if (is.null(d)) return(invisible(NULL))
+  fname <- "coefficients.png"
+  res <- tryCatch({
+    cf <- coef(model)
+    ci <- stats::confint(model)
+    nms <- names(cf)
+    if (is.null(nms)) nms <- as.character(seq_along(cf))
+    # Drop the intercept by default — almost never on the same
+    # scale as predictors. Researchers who want it can call
+    # plot_coefficients on a fit without an intercept term.
+    keep <- !(tolower(nms) %in% c("(intercept)", "intercept", "_cons"))
+    if (!any(keep)) {
+      stop("nothing to plot after dropping the intercept")
+    }
+    cf <- cf[keep]
+    ci <- ci[keep, , drop = FALSE]
+    nms <- nms[keep]
+    # Order top-to-bottom matching the names vector — y axis goes
+    # downward so we plot index 1 at the top.
+    y <- seq_along(cf)
+    grDevices::png(file.path(d, fname),
+                   width = 900,
+                   height = max(220, 60 * length(cf) + 120),
+                   res = 110)
+    on.exit(grDevices::dev.off(), add = TRUE)
+    op <- graphics::par(mar = c(4.5, 7, 2, 2))
+    on.exit(graphics::par(op), add = TRUE)
+    xlim <- range(c(ci[, 1], ci[, 2]), finite = TRUE)
+    plot(NA, xlim = xlim, ylim = c(length(cf) + 0.5, 0.5),
+         yaxt = "n", xlab = "Coefficient (95% CI)", ylab = "",
+         main = "Coefficients")
+    graphics::abline(v = 0, lty = 2, col = "gray60")
+    graphics::segments(ci[, 1], y, ci[, 2], y, lwd = 2, col = "#4C78A8")
+    graphics::points(cf, y, pch = 16, cex = 1.4, col = "#4C78A8")
+    graphics::axis(2, at = y, labels = nms, las = 1)
+    TRUE
+  }, error = function(e) {
+    message("nora$plot_coefficients failed: ", conditionMessage(e))
+    nora$.append_plot_helper_error("plot_coefficients", conditionMessage(e))
+    FALSE
+  })
+  if (isTRUE(res)) {
+    nora$.append_plot_manifest(
+      fname, "coefficients",
+      if (is.null(label)) "Coefficient estimates with 95% CIs" else label
+    )
+  }
+  invisible(NULL)
+}
+
+
+#' Forest plot comparing one coefficient across multiple model fits.
+#'
+#' Use case: "Female gap, before vs after controls" — fit two
+#' models, plot their named coefficient with CIs side-by-side.
+#' ``models`` is a NAMED list of fits (the names become y-axis
+#' labels). ``coef`` is the coefficient to extract from each fit
+#' via ``coef(m)`` + ``vcov(m)``. SEs come from the diagonal of
+#' the variance-covariance matrix.
+#'
+#' Without this helper, comparison plots forced cross-language
+#' workflows: the model would extract estimates from R / Stata,
+#' switch to Python or back to R, and hand-roll a forest plot —
+#' often three attempts before one landed.
+nora$plot_estimate_comparison <- function(models, coef, label = NULL) {
+  d <- nora$.plots_dir()
+  if (is.null(d)) return(invisible(NULL))
+  fname <- "estimate_comparison.png"
+  res <- tryCatch({
+    if (!is.list(models) || length(models) < 2) {
+      stop("`models` must be a list of at least 2 model fits")
+    }
+    if (!is.character(coef) || length(coef) != 1) {
+      stop("`coef` must be a single coefficient name")
+    }
+    nms <- names(models)
+    if (is.null(nms) || any(!nzchar(nms))) {
+      nms <- paste0("Model ", seq_along(models))
+    }
+
+    n_models <- length(models)
+    ests <- numeric(n_models)
+    ses  <- numeric(n_models)
+    for (i in seq_len(n_models)) {
+      m <- models[[i]]
+      cf <- stats::coef(m)
+      if (!coef %in% names(cf)) {
+        stop("coefficient '", coef, "' not in model: ", nms[i])
+      }
+      ests[i] <- cf[[coef]]
+      vc <- stats::vcov(m)
+      if (!coef %in% rownames(vc)) {
+        stop("coefficient '", coef, "' not in vcov of model: ", nms[i])
+      }
+      ses[i] <- sqrt(vc[coef, coef])
+    }
+    los <- ests - 1.96 * ses
+    his <- ests + 1.96 * ses
+
+    grDevices::png(file.path(d, fname),
+                   width = 900,
+                   height = max(220, 80 * n_models + 100),
+                   res = 110)
+    on.exit(grDevices::dev.off(), add = TRUE)
+    op <- graphics::par(mar = c(4.5, 8, 2.5, 2))
+    on.exit(graphics::par(op), add = TRUE)
+    xlim <- range(c(los, his), finite = TRUE)
+    y <- seq_len(n_models)
+    plot(NA, xlim = xlim, ylim = c(n_models + 0.5, 0.5),
+         yaxt = "n", xlab = paste0(coef, " (95% CI)"), ylab = "",
+         main = paste0("Estimate comparison: ", coef))
+    graphics::abline(v = 0, lty = 2, col = "gray60")
+    graphics::segments(los, y, his, y, lwd = 2, col = "#4C78A8")
+    graphics::points(ests, y, pch = 16, cex = 1.4, col = "#4C78A8")
+    graphics::axis(2, at = y, labels = nms, las = 1)
+    TRUE
+  }, error = function(e) {
+    message("nora$plot_estimate_comparison failed: ", conditionMessage(e))
+    nora$.append_plot_helper_error(
+      "plot_estimate_comparison", conditionMessage(e)
+    )
+    FALSE
+  })
+  if (isTRUE(res)) {
+    nora$.append_plot_manifest(
+      fname, "coefficients",
+      if (is.null(label)) paste0("Estimate comparison: ", coef) else label
+    )
+  }
+  invisible(NULL)
+}
+
+
+# ---------------------------------------------------------------------------
 # Smoke test — skipped automatically in production because the env var is
 # expected to be set by the executor. Researchers running `source("nora.R")`
 # manually (e.g., for exploration) can ignore this file — calling result()

@@ -1,10 +1,10 @@
 # Nora — handoff
 
 Single-page entry point for picking this project up. Last
-substantive update **2026-04-26**, after the multi-provider /
-Python-language / new-file-formats expansion. If something here
-disagrees with the code, trust the code and file a patch to this
-doc.
+substantive update **2026-04-27**, after the concurrent-session
+refactor, plot-vision (model-output plots only), Stata export
+reliability, and Files-panel polish. If something here disagrees
+with the code, trust the code and file a patch to this doc.
 
 ## What Nora is (one paragraph)
 
@@ -20,7 +20,13 @@ subpath-allowlist for reads; every output passes through a
 disclosure-control sanitizer (SDC rules from Eurostat / UK ONS
 guidance) before anything reaches the model. The researcher sees raw
 R / Stata / Python output in the UI; the model only ever sees
-sanitized summaries.
+sanitized summaries — including plots, where a small set of opinionated
+helpers (residuals, predicted-response curves, coefficient forest
+plots, estimate comparisons) produce model-output figures that cross
+the boundary; raw-data plots stay researcher-only by construction.
+Multiple sessions run concurrently — switching the visible chat in
+the sidebar is a pure focus change; long jobs in unfocused sessions
+keep streaming.
 
 ## Where it stands
 
@@ -39,10 +45,18 @@ sanitized summaries.
 | **Multi-provider** — Anthropic (subscription or API key) + OpenAI (API key); per-provider sessions behind a `ProviderSession` interface | ✅ done |
 | **Auth screen** — first-launch flow with keyring-backed credential storage; auto-promote to whichever provider is authed | ✅ done |
 | **Mid-chat uploads visible to the model** — script files travel as inline context with the next message; new datasets surface as a per-turn "newly added" notice | ✅ done |
-| **Files chip** — top-right popup listing scripts/graphs/logs in the session; data files surface in the Permission chip | ✅ done |
-| **Image attachments** — saved to cwd, staged for vision, rendered above the user bubble, clickable lightbox | ✅ done |
+| **Concurrent-session execution** — bridge holds `dict[cwd → SessionRunner]`; switching focus is a pure UI change, in-flight turns keep streaming in unfocused sessions, sidebar shows a busy dot per active runner | ✅ done |
+| **Per-task cwd via ContextVar** — `nora.config.use_cwd` makes tool execution sandbox-safe under concurrent runners; sister tasks see their own cwd | ✅ done |
+| **Plot vision (model-output only)** — runtime helpers `plot_residuals` / `plot_interaction` / `plot_coefficients` / `plot_estimate_comparison` for R, Python, Stata. Manifest-allowlisted: only files produced by these helpers cross to the model on the next turn. Raw-data plots stay researcher-only by construction | ✅ done |
+| **Stata export reliability** — `_nora_export_plot` tries PDF → PNG → EPS → `.gph` so a missing `Graph2png` translator doesn't kill the script. Bridge converts PDF/EPS → PNG via `sips` for both researcher thumbnails and model-vision attachments. `nora_safe_export` is the same fallback chain for ad-hoc (non-helper) exports | ✅ done |
+| **Helper-failure visibility** — plot helpers append to `_nora_plots/helper_errors.jsonl` on failure; `submit_script` summarizes succeeded + failed in the response so the model sees "matplotlib not installed; pip install matplotlib" instead of guessing | ✅ done |
+| **Runtime environment in system prompt** — `env_detect` probes R packages (haven, ggplot2) and Python packages (matplotlib + the four required ones); the prompt renders a `(haven: ✓, ggplot2: ✗)` block so the model picks a language by what's actually installed | ✅ done |
+| **Files chip** — top-right popup listing graphs/scripts/logs (graphs first); rows now have `[copy/send/open] [title/thumbnail] [×]`; image rows render PDF/EPS via sips sidecars; click-to-lightbox uses 96vw/96vh for sharp viewing | ✅ done |
+| **delete_session_file** — Files-panel `×` deletes any file inside the session cwd, removes its PDF→PNG sidecar, drops matching pending-attachment chips | ✅ done |
+| **Image attachments** — saved to cwd, staged for vision, rendered above the user bubble, clickable lightbox; persistent chip under the user bubble matches accent styling so a script attachment reads as obviously as an image thumbnail | ✅ done |
+| **Cache-busted JS/CSS** — `_materialize_cache_busted_index` writes a per-launch `index.bust-<hash>.html` so WKWebView reloads frontend assets instead of serving stale cached versions on Python restart | ✅ done |
 | **Terminal UI** (`nora`) — Rich-based chat, `/policy` wizard | ✅ done |
-| **Web UI** (`nora-ui`) — pywebview shell, sessions sidebar, theme toggle, model picker grouped by provider with $ pricing links, drag-drop file/image upload, typewriter, Lottie cat loader, status line, per-message attachment chips | ✅ done |
+| **Web UI** (`nora-ui`) — pywebview shell, sessions sidebar, theme toggle, model picker grouped by provider with $ pricing links, drag-drop file/image upload, typewriter, Lottie cat loader, status line, per-message attachment chips, topbar visually integrated with chat surface | ✅ done |
 | **Packaging** (`.app` + `.dmg`) — bundles the web UI; .app launches pywebview with no Terminal popup; launcher logging now resilient to unwritable log dirs | ✅ done & smoke-tested locally (unsigned) |
 | **Product-identity prompt rule** — model introduces itself as Nora, uses first person ("I noticed…" not "Nora flagged…") | ✅ done |
 | **Real-researcher pilot** | ⏳ self-pilot in progress |
@@ -50,23 +64,31 @@ sanitized summaries.
 | **Apple Developer Program signing + notarization for distributable .dmg** | ⏭ blocked on $99/yr cert |
 | **Stata batch wrapper around `_cons` "omitted" edge case** | ⏭ named, low-priority |
 
-**390 tests passing.** Coverage spans SDK lockdown (Anthropic) +
-OpenAI lockdown (assert tools list never grows beyond the six
-function tools), schema for all six file formats, executor SBPL
-profile (unit + integration gated on Rscript), Python executor
-end-to-end (gated on python3 + pandas + numpy), helper-through-
-sanitizer round-trips for every `from_*` emitter, sanitizer
-property tests, policy, text-safety, row-count audit, stderr
-isolation, per-run token authenticity, env-var allowlist
-(subprocess can't see shell secrets), cross-session store
-isolation, filename prompt-injection, OLS coefficient-key
-constraint, CI-length constraint, structural size caps, the
-memory-stack tests, set_model rollback (failed-swap leaves the
-bridge on the previous id), per-session model memory,
-multi-provider reconcile, Anthropic credential-delete env
-cleanup, raw-log truncation (head + tail with marker), script
-attachment staging + collision refusal, system-prompt-render
-(`{{}}`-escape regression), and the Stop-button hard-recover.
+**477 tests passing.** Coverage spans SDK lockdown (Anthropic) +
+OpenAI lockdown, schema for all six file formats, executor SBPL
+profile, Python executor end-to-end, helper-through-sanitizer
+round-trips for every `from_*` emitter, sanitizer property tests,
+policy, text-safety, row-count audit, stderr isolation, per-run
+token authenticity, env-var allowlist, cross-session store
+isolation, filename prompt-injection, OLS / CI / structural-size
+constraints, memory stack, set_model rollback, per-session model
+memory, multi-provider reconcile, raw-log truncation, script
+attachment staging + collision refusal, system-prompt-render,
+Stop-button hard-recover — plus the new suites for **concurrent
+sessions** (`test_concurrent_sessions.py`: ContextVar isolation
+under concurrent asyncio tasks, two runners observing only their
+own cwd, switch keeps the previous runner alive, persistence
+routes by event `session_cwd`, Stop only cancels the active
+runner), **plot vision** (`test_plot_vision.py`: manifest-only
+allowlist, kind allowlist, path-traversal refusal, byte cap,
+end-to-end capture → next-turn attachment, cancel restores
+pending plots), and **plot rendering / Stata export reliability**
+(`test_run_dir_plots.py`: thumbnail collector, helper diagnostic,
+`png_for` PDF→PNG conversion via `sips`, helper-error
+surfacing in the model-visible tool result, `_nora_export_plot`
+PDF→PNG→EPS→.gph fallback order, `nora_safe_export` doesn't write
+a manifest entry, runtime environment block renders in the prompt
+with `✓`/`✗` package status).
 
 ## Running it
 
@@ -80,7 +102,7 @@ uv run nora                              # opens landing prompt
 uv run nora /path/to/data                # opens straight into chat
 
 # Tests
-uv run pytest -q                         # expect 390 passing
+uv run pytest -q                         # expect 477 passing
 
 # Build the .app + .dmg locally. Bundles the web UI.
 # Distribution to other people is blocked on Apple Developer Program
@@ -160,9 +182,14 @@ break in two at the same time is a privacy incident.
 ### Provider abstraction
 
 `src/nora/provider/` wraps both providers behind a single
-`ProviderSession` Protocol. The web bridge holds one session at a
-time; switching provider closes and reopens. The terminal UI is
-Anthropic-only for now (the multi-provider auth screen is
+`ProviderSession` Protocol. The bridge holds **one runner per
+focused-or-recently-focused session** (`dict[str, SessionRunner]`
+keyed by cwd) — each runner owns its own ProviderSession plus
+its own asyncio lock and turn task, so two researchers' worth
+of in-flight chats can run concurrently without trampling each
+other. Switching provider for a given runner closes and reopens
+that runner's session; OTHER runners are untouched. The terminal
+UI is Anthropic-only for now (the multi-provider auth screen is
 web-specific).
 
 - `provider/base.py` — `ProviderSession` Protocol + Event types
@@ -180,6 +207,56 @@ web-specific).
   loop dispatches via `nora.tools.HANDLERS` so behaviour is
   byte-for-byte identical regardless of which model called the
   tool.
+
+### Concurrent-session execution
+
+`src/nora/runner.py` defines `SessionRunner` — the per-cwd
+execution unit. Each runner holds: its `cwd`, an asyncio
+`_send_lock` (so a second send_message in the same session queues
+behind the first; sends to OTHER sessions proceed in parallel),
+the current `ProviderSession`, the `_current_turn_task` (so
+`Stop` cancels only this runner), `needs_context_prefix`, the
+active `model`/`provider`, and any pending script attachments.
+`run_turn` enters `nora.config.use_cwd(self.cwd)` so tool
+handlers (and any sub-tasks the SDK spawns) read THIS runner's
+cwd via the ContextVar — sister tasks see their own cwd, no
+trampling. Every event is stamped with `session_cwd` so
+persistence routes to the correct `chat_history.jsonl` regardless
+of which session the UI happens to be focused on at emit time.
+
+### Plot vision (model-output only)
+
+Three layers, in priority order:
+
+1. **Allowlisted runtime helpers.** R / Python / Stata each ship
+   `plot_residuals`, `plot_interaction`, `plot_coefficients`,
+   `plot_estimate_comparison`. Each takes a fitted-model object as
+   input and produces a canonical visualization from
+   model outputs (residuals, predictions, coefficients) — never
+   from the raw rows. There is no escape hatch that registers an
+   arbitrary file: that would let a histogram of raw observations
+   pose as a "coefficient plot" via self-attestation. The kind
+   list (`residuals` / `interaction` / `coefficients` /
+   `marginal_effects`) is enforced both by the helpers and by the
+   runner.
+2. **Manifest-gated capture.** Each helper writes its PNG/PDF/EPS
+   into `<run_dir>/_nora_plots/` and appends a JSON line to
+   `_nora_plots/manifest.jsonl`. The runner reads ONLY the manifest
+   after every `submit_script` — files in the dir without a
+   manifest entry stay invisible to the model.
+3. **Format fallback + bridge conversion.** Stata's PNG export
+   needs the `Graph2png` translator (often missing on macOS), so
+   `_nora_export_plot.ado` tries `as(pdf)` → `as(png)` → `as(eps)`
+   → `graph save .gph` and registers whichever wins. The bridge's
+   `nora.plot_convert.png_for` rasterizes PDF/EPS to a sibling
+   `.nora.png` via `sips` (mtime-cached). Same path for both
+   model-vision attachment and researcher chat thumbnails.
+
+Plot helper failures append to `_nora_plots/helper_errors.jsonl`
+with `{helper, step, error, message, fix}` — `submit_script`'s
+response includes a `plots: {succeeded, failed, note}` summary so
+the model SEES "matplotlib not installed; pip install matplotlib"
+and can react instead of guessing "thumbnail should be visible".
 
 ### Mid-chat awareness
 
@@ -287,22 +364,26 @@ them by surprise.
 | `src/nora/provider/catalog.py` | Model registry + pricing URLs |
 | `src/nora/provider/tool_schemas.py` | Provider-neutral tool schema source-of-truth |
 | `src/nora/auth.py` | Keyring-backed credential storage |
+| `src/nora/config.py` | Process default cwd + per-asyncio-task `use_cwd` ContextVar — the gate that makes concurrent runners sandbox-safe |
 | `src/nora/executor.py` | Sandbox profile, R/Stata/Python subprocess plumbing, per-run token |
+| `src/nora/env_detect.py` | Probes installed runtimes + optional packages (haven, ggplot2, matplotlib) so the prompt advertises what's available |
 | `src/nora/sanitizer.py` + `sdc.py` | The SDC allowlist and clamp/suppress primitives |
-| `src/nora/runtime/nora.R` + `nora.py` + `nora_result_*.ado` | Runtime emitters scripts call to surface results |
+| `src/nora/runner.py` | `SessionRunner` — per-cwd execution unit. Owns provider session, lock, turn task, plot-vision capture, helper-error logging |
+| `src/nora/plot_convert.py` | macOS `sips`-based PDF/EPS → PNG conversion with mtime-cached sidecars. Used by both the runner (model vision) and the bridge (researcher thumbnails) |
+| `src/nora/runtime/nora.R` + `nora.py` + `nora_result_*.ado` + `nora_plot_*.ado` + `_nora_export_plot.ado` + `nora_safe_export.ado` | Runtime emitters: result helpers (`from_lm`, `from_t_test`, …) and plot helpers (`plot_residuals`, `plot_interaction`, `plot_coefficients`, `plot_estimate_comparison`). Stata fallback chain in `_nora_export_plot`; Stata ad-hoc safe wrapper in `nora_safe_export` |
 | `src/nora/schema.py` | Schema extractors for all six supported file formats |
-| `src/nora/ui.py` | Web UI bridge: auth, sessions, attachments, model picker, file panel |
+| `src/nora/ui.py` | Web UI bridge: runners dict, focus-only `switch_session`, plot collection + diagnostic, Files panel endpoints, cache-busted index.html, `delete_session_file` |
 | `src/nora/app.py` | Terminal entry point, chat loop, rendering |
 | `src/nora/chat_service.py` | Back-compat re-export shim for the Event types |
 | `src/nora/chat_history.py` | Turn-grouped reader; warm-start prefix renderer |
 | `src/nora/session_state.py` | Atomic writer / reader for `.nora/session_state.json` (carries `active_model` for per-session memory) |
-| `src/nora/web/{index.html,app.js,markdown.js,style.css}` | Web frontend |
+| `src/nora/web/{index.html,app.js,markdown.js,style.css}` | Web frontend; `app.js` holds the per-session focus state + Files-panel rendering |
 | `src/nora/__main_ui__.py` | Bundle entry — calls `nora.ui:main`. The .app launches this, NOT the terminal CLI |
 | `docs/direction.md` | Long-form architectural doc; open questions |
 | `docs/overview.md` | Plain-language description for researchers |
 | `docs/install.md` | Researcher-facing install flow |
 | `docs/verification.md` | Manual smoke-test recipes (incl. Stata, which CI can't) |
-| `tests/` | 390 tests. `test_sanitizer.py` is the property-test backbone; `test_python_runtime_sanitizer.py` covers helper-through-sanitizer for the new Python emitters; `test_openai_lockdown.py` pins the no-built-in-tools invariant on the new provider; `test_bridge_correctness.py` is the regression home for the four reviewer-flagged P1s |
+| `tests/` | 477 tests. `test_sanitizer.py` is the property-test backbone; `test_concurrent_sessions.py` pins the per-task ContextVar isolation + non-trampling invariants; `test_plot_vision.py` pins the manifest-allowlist privacy gate; `test_run_dir_plots.py` covers researcher-thumbnail collection, PDF→PNG conversion, helper-failure diagnostics, and the Stata export fallback chain; `test_openai_lockdown.py` pins the no-built-in-tools invariant; `test_bridge_correctness.py` is the regression home for the four reviewer-flagged P1s |
 
 ## Decisions worth not re-litigating
 
@@ -348,6 +429,47 @@ them by surprise.
   an explicit identity rule telling the model to introduce
   itself as Nora and to use first person ("I noticed…" not
   "Nora flagged…").
+- **Plot vision is helper-allowlist, not file-allowlist.** A
+  `register_plot(file, kind)` API was tried and removed — the
+  kind label was self-attested by the script, so a histogram
+  could pose as a `coefficients` plot and slip past the
+  privacy line. Replacement: the only paths that surface a
+  plot to the model are `plot_residuals`, `plot_interaction`,
+  `plot_coefficients`, `plot_estimate_comparison`, each of which
+  takes a fitted-model object and produces a canonical
+  visualization from model outputs. Bespoke plots stay
+  researcher-only. Don't reintroduce the file-based escape
+  hatch — every gain in flexibility is a privacy-line break.
+- **Switching sessions is a pure UI focus change.** The bridge
+  holds runners by cwd; switching does NOT close any runner's
+  SDK client. Closing on switch was the multi-session bug —
+  the in-flight `receive_response()` raised mid-stream and
+  surfaced as a fail bubble. Don't "helpfully tear down on
+  switch" in a future refactor; the test suite catches that
+  regression.
+- **Per-task cwd via ContextVar, not process-global.** Tool
+  handlers MUST resolve cwd through `nora.config.get_cwd()`,
+  which reads the per-task ContextVar. The process-global default
+  exists only for the terminal CLI / startup. Any new code that
+  reaches around the ContextVar (e.g., reads a stashed cwd
+  from somewhere else) breaks concurrent-runner isolation.
+- **Don't carry forward script attachments on cancel/error.** An
+  earlier version restored `pending_script_attachments` on the
+  bridge after a failed turn, but the JS chip cleared at send
+  time and the two sides drifted (the "X is already attached"
+  toast for files no chip showed). If a turn fails, the user
+  re-attaches. The other carry-forwards (context prefix,
+  dataset diff, captured plots) stay because they don't have a
+  JS chip representation that could disagree.
+- **Stata `as(png)` is unreliable; export fallback chain is
+  mandatory.** macOS Stata installs frequently lack the
+  `Graph2png` translator; bare `graph export "x.png"` aborts the
+  do-file before `nora_result_*` runs, which loses both the plot
+  AND the structured result. Every Nora plot helper goes
+  through `_nora_export_plot` (PDF → PNG → EPS → `.gph`); the
+  `nora_safe_export` wrapper handles ad-hoc exports outside
+  helpers. Don't add a new helper that calls `graph export`
+  directly.
 - **GitHub repo is still named `builder`** (URL:
   github.com/junishka/builder). Renaming a GitHub repo is an
   out-of-band action; URLs in install instructions still point

@@ -809,6 +809,46 @@ kbd {
   cursor: pointer;
 }
 
+/* Busy dot — visible only when a turn is in flight for this
+ * session, including when the researcher is looking at a different
+ * session. Sits inline RIGHT BEFORE the title text so the pulse
+ * reads as "this chat is working" rather than as a corner badge.
+ * Hidden by default; ``.busy`` on the ``.session-item`` parent
+ * reveals it. */
+.session-when {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.session-busy-dot {
+  flex: 0 0 auto;
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--accent);
+  display: none;
+  pointer-events: none;
+}
+
+.session-item.busy .session-busy-dot {
+  display: inline-block;
+  animation: session-busy-pulse 1.4s ease-in-out infinite;
+}
+
+@keyframes session-busy-pulse {
+  0%, 100% { opacity: 1;    transform: scale(1); }
+  50%      { opacity: 0.35; transform: scale(0.65); }
+}
+
+.session-when-text {
+  flex: 0 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .session-item:focus-visible {
   /* Visible focus ring so arrow-key navigation shows the current
    * row clearly. No ring on plain :focus — the item inherits focus
@@ -872,17 +912,20 @@ kbd {
   /* Three-column grid so the middle child (session title pill)
    * sits at the true center of the bar, independent of how wide
    * the "Nora" word-mark on the left or the theme toggle on
-   * the right happen to be. ``space-between`` on a flex row was
-   * centering the middle *between* the siblings, which only
-   * coincides with the bar's center when the siblings are
-   * identical widths. */
+   * the right happen to be.
+   *
+   * Background matches the chat area (``--bg``) and the divider
+   * border is gone so the topbar reads as floating chrome over a
+   * single continuous surface — same posture as the bottom
+   * composer area. The session title pill, Files chip, and theme
+   * toggle still float on top via their own backgrounds; only
+   * the bar substrate is invisible. */
   display: grid;
   grid-template-columns: 1fr auto 1fr;
   align-items: center;
   gap: 16px;
   padding: 10px 20px;
-  background: var(--bg-surface);
-  border-bottom: 1px solid var(--border);
+  background: var(--bg);
   flex-shrink: 0;
   min-width: 0;
 }
@@ -1069,6 +1112,157 @@ kbd {
  * scannability without implying interactivity. */
 .files-row:not(.files-row-clickable):hover {
   background: var(--bg);
+}
+
+/* Image rows in the Files panel — plot thumbnails stack up
+ * here as the analysis produces them. The panel becomes the
+ * session-wide gallery: every plot from every run, in
+ * mtime-descending order. */
+.files-row-image {
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  padding: 6px;
+  gap: 4px;
+}
+
+.files-row-image img {
+  display: block;
+  width: 100%;
+  height: auto;
+  max-height: 220px;
+  object-fit: contain;
+  background: var(--code-bg);
+  border-radius: 6px;
+  cursor: zoom-in;
+  transition: transform 0.12s ease;
+}
+
+.files-row-image img:hover {
+  transform: scale(1.01);
+}
+
+.files-row-image-caption {
+  font-size: 11px;
+  font-family: var(--font-mono);
+  color: var(--text-dim);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* Files popup: dropdown that lists every script / graph / log
+ * the session has produced. Bumped height so a long iteration
+ * (10+ plots) fits at once without inner-scrollbar pogo-stick. */
+.files-popup {
+  max-height: 70vh;
+  overflow-y: auto;
+}
+
+/* --- New row layout: [primary action] [title or thumbnail] [delete]
+ *
+ * Replaces the previous "single clickable line OR full-width image
+ * tile" pattern. Every row now has buttons on both sides so common
+ * actions (copy a graph, send a script, delete anything) are one
+ * click each. Earlier UX put the only clickable target on the row
+ * itself, which conflated "open this" with "attach this" depending
+ * on kind.
+ */
+.files-row-actionable {
+  display: grid;
+  grid-template-columns: 24px 1fr 24px;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 8px;
+  border-radius: 6px;
+}
+
+.files-row-actionable:hover {
+  background: var(--bg);
+}
+
+/* Action buttons: small, ghost-style, inherit color so the
+ * trash icon turns red on hover via .files-row-action-danger. */
+.files-row-action {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 24px;
+  height: 24px;
+  padding: 0;
+  border: none;
+  border-radius: 4px;
+  background: transparent;
+  color: var(--text-dim);
+  cursor: pointer;
+  transition: color 0.12s ease, background 0.12s ease;
+}
+
+.files-row-action:hover {
+  color: var(--accent);
+  background: rgba(0, 0, 0, 0.05);
+}
+
+@media (prefers-color-scheme: dark) {
+  .files-row-action:hover {
+    background: rgba(255, 255, 255, 0.05);
+  }
+}
+
+.files-row-action-danger:hover {
+  color: var(--bg-error, #d73027);
+}
+
+/* The delete glyph (``×``) needs slightly larger type than the
+ * SVG icons so it reads at the same visual weight. Matches the
+ * session-list delete affordance. */
+.files-row-action-right {
+  font-size: 16px;
+  line-height: 1;
+}
+
+/* Spacer keeps the title column aligned when a row has no
+ * primary action (rare — currently only the log kind). */
+.files-row-action-spacer {
+  display: inline-block;
+  width: 24px;
+  height: 24px;
+}
+
+/* Center column: the file name AND, for image rows, the
+ * thumbnail above it. flex-column so the thumbnail floats
+ * above its caption like in the previous layout. */
+.files-row-center {
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  min-width: 0;
+  gap: 4px;
+}
+
+.files-row-thumb {
+  display: block;
+  width: 100%;
+  height: auto;
+  max-height: 220px;
+  object-fit: contain;
+  background: var(--code-bg);
+  border-radius: 6px;
+  cursor: zoom-in;
+  transition: transform 0.12s ease;
+}
+
+.files-row-thumb:hover {
+  transform: scale(1.01);
+}
+
+.files-row-caption {
+  font-size: 11px;
+  font-family: var(--font-mono);
+  color: var(--text-dim);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 .topbar-toggle:hover {
@@ -1444,6 +1638,74 @@ kbd {
   font-family: inherit;
 }
 
+/* Plot-helper diagnostic note — shown when a helper was called
+ * but produced no plot. Distinct from a regular error because
+ * the script itself succeeded; the helper-level failure (typically
+ * "matplotlib not installed") was swallowed and would otherwise
+ * leave the researcher staring at a blank thumbnail row. */
+.tool-card .tool-plot-diagnostic {
+  margin-top: 10px;
+  padding: 8px 12px;
+  border-radius: 6px;
+  background: rgba(245, 133, 24, 0.1);
+  border-left: 3px solid #F58518;
+  color: var(--text);
+  font-size: 12px;
+  line-height: 1.4;
+}
+
+/* Plot thumbnail row inside a submit_script tool card. Renders any
+ * .png the script wrote into its run dir — the researcher's view
+ * of the figures their analysis produced. The bytes never reach
+ * the model; that path is gated separately by the manifest
+ * allowlist in runner._capture_plots. */
+.tool-card .tool-plots {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  margin-top: 10px;
+}
+
+.tool-card .tool-plot-tile {
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  max-width: 320px;
+  border: 1px solid var(--border, rgba(127, 127, 127, 0.25));
+  border-radius: 8px;
+  overflow: hidden;
+  background: var(--code-bg);
+}
+
+.tool-card .tool-plot-tile img {
+  display: block;
+  max-width: 100%;
+  height: auto;
+  cursor: zoom-in;
+}
+
+.tool-card .tool-plot-placeholder {
+  /* Rendered for plots above the inline byte cap — no thumbnail
+   * data sent in the event, so we show a sized placeholder + a
+   * click-to-open affordance. */
+  padding: 32px 12px;
+  text-align: center;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  color: var(--text-dim);
+}
+
+.tool-card .tool-plot-caption {
+  padding: 6px 8px;
+  font-size: 11px;
+  font-family: var(--font-mono);
+  color: var(--text-dim);
+  border-top: 1px solid var(--border, rgba(127, 127, 127, 0.2));
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
 .tool-card .tool-code {
   /* Keep the code block distinctive — monospace, preserve
    * whitespace, scrollable. The language badge in the corner tells
@@ -1682,22 +1944,23 @@ kbd {
 
 /* Script chips ride with the next message as inline context (the
  * source travels with the prompt so the model can read it). The
- * accent border + small leading "↑" cue marks them as "will be
- * sent" rather than the plain "saved to session" data chip. */
+ * accent border alone marks them as "will be sent" — the previous
+ * leading "↑" cue read as a clickable up-arrow more than as a
+ * status glyph, so it's gone. The chat-area staging notice (see
+ * .staging-notice) is the canonical "this is loaded" cue. */
 .compose-attachment.compose-attachment-script {
   border-color: var(--accent);
 }
 
-.compose-attachment.compose-attachment-script
-  .compose-attachment-filename::before {
-  content: "↑ ";
-  color: var(--accent);
-  font-weight: 600;
-}
 
 /* Persistent attachment chips that ride with a user message in the
  * transcript. Composer chips clear on send; these stay forever, so
- * the researcher can scroll back and see what was uploaded when. */
+ * the researcher can scroll back and see what was uploaded when.
+ * Accent-bordered + bolder than the previous neutral styling so
+ * the chip reads as a real "this travelled with the message"
+ * receipt — visually comparable to an image thumbnail attached to
+ * the same bubble (researcher feedback: "I cannot see if it
+ * traveled with the next chat or not, like image"). */
 .message-attachments {
   display: flex;
   flex-wrap: wrap;
@@ -1710,13 +1973,15 @@ kbd {
 .message-attachment-chip {
   display: inline-flex;
   align-items: center;
-  padding: 3px 9px;
-  border: 1px solid var(--border);
-  border-radius: 12px;
-  background: var(--bg-surface);
+  gap: 4px;
+  padding: 5px 12px;
+  border: 1px solid var(--accent);
+  border-radius: 14px;
+  background: var(--accent-soft, rgba(214, 99, 122, 0.10));
   font-family: var(--font-mono);
-  font-size: 11.5px;
-  color: var(--text-dim);
+  font-size: 12.5px;
+  font-weight: 500;
+  color: var(--text);
 }
 
 /* Image thumbnails in the user-bubble row. Same right-align as
@@ -1750,20 +2015,30 @@ kbd {
 .image-lightbox {
   position: fixed;
   inset: 0;
-  background: rgba(0, 0, 0, 0.82);
+  background: rgba(0, 0, 0, 0.88);
   display: flex;
   align-items: center;
   justify-content: center;
   z-index: 1000;
   cursor: zoom-out;
-  padding: 24px;
+  /* Generous padding so the image breathes on widescreen displays
+   * but isn't pinned to the viewport edges on narrow ones. */
+  padding: 16px;
 }
 
 .image-lightbox-img {
-  max-width: 100%;
-  max-height: 100%;
+  /* Fill nearly the full viewport — Stata graphs are exported at
+   * 1600px so we want the lightbox to actually USE that resolution
+   * instead of squashing it down. ``image-rendering`` keeps lines
+   * crisp on retina displays; without it browsers sometimes apply
+   * a soft blur when scaling up. */
+  max-width: 96vw;
+  max-height: 96vh;
+  width: auto;
+  height: auto;
   border-radius: 6px;
-  box-shadow: 0 12px 40px rgba(0, 0, 0, 0.5);
+  box-shadow: 0 16px 50px rgba(0, 0, 0, 0.6);
+  image-rendering: -webkit-optimize-contrast;
 }
 
 #compose-form.drop-target {

@@ -278,3 +278,16 @@ def test_existing_file_collision_does_not_stage(tmp_path: Path) -> None:
     assert (bridge.cwd / "analysis.py").read_text() == "# original\n"
     # ...and nothing was staged for the next message.
     assert bridge._pending_script_attachments == []
+
+
+def test_native_add_files_path_mirrors_added_files_into_composer_chips() -> None:
+    """The native Add Files button and drag/drop must agree on the
+    visual confirmation path. ``add_files()`` already stages script
+    contents on the backend; the JS side must also mirror
+    ``res.added`` into ``stagedDataNotices`` so a freshly added
+    ``.do`` file shows up in the composer immediately instead of
+    looking like the attach failed."""
+    src = (Path(__file__).resolve().parent.parent
+           / "src" / "nora" / "web" / "app.js").read_text(encoding="utf-8")
+    assert "function addStagedDataNotices(names)" in src
+    assert "const addedNotices = addStagedDataNotices(added);" in src

@@ -24,6 +24,7 @@ See also: `project_builder_mcp_surface.md` (user memory) for the full spec.
 from __future__ import annotations
 
 import json
+from pathlib import Path
 from typing import Any
 
 from claude_agent_sdk import create_sdk_mcp_server, tool
@@ -246,6 +247,94 @@ def _summarize(payload: dict[str, Any]) -> str:
             f"{len(cells)} groups ({suppressed} suppressed)"
         )
     return f"result of type {t!r}"
+
+def _summarize_plot_helpers(run_dir: Any) -> dict[str, Any] | None:
+    """Summarize what the script's plot helpers actually did.
+
+    Reads two files the runtime libraries write into
+    ``<run_dir>/_nora_plots/``:
+
+    - ``manifest.jsonl`` — one JSON line per SUCCESSFUL plot, with
+      ``file``, ``kind``, optional ``label``.
+    - ``helper_errors.jsonl`` — one JSON line per FAILED helper
+      call, with ``helper``, ``error``, ``message``, optional ``fix``.
+
+    Returns a dict the tool result includes as ``plots: ...`` so the
+    MODEL sees what actually happened with each helper call.
+    Without this surface, helper failures (matplotlib not installed,
+    ``library(haven)`` error, etc.) only land in stderr — the model
+    confidently says "thumbnail should be visible above" while the
+    researcher sees nothing. Returns ``None`` when no helper calls
+    were made (no ``_nora_plots/`` directory) so the field stays out
+    of the response on plain analysis runs.
+    """
+    if run_dir is None:
+        return None
+    plots_dir = Path(run_dir) / "_nora_plots"
+    if not plots_dir.is_dir():
+        return None
+
+    succeeded: list[dict[str, Any]] = []
+    failed: list[dict[str, Any]] = []
+    manifest = plots_dir / "manifest.jsonl"
+    errors = plots_dir / "helper_errors.jsonl"
+
+    def _read_jsonl(path: Path) -> list[dict[str, Any]]:
+        out: list[dict[str, Any]] = []
+        try:
+            text = path.read_text(encoding="utf-8")
+        except OSError:
+            return out
+        for line in text.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                entry = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(entry, dict):
+                out.append(entry)
+        return out
+
+    if manifest.is_file():
+        for entry in _read_jsonl(manifest):
+            succeeded.append({
+                "file": str(entry.get("file", "?")),
+                "kind": str(entry.get("kind", "?")),
+                "label": str(entry.get("label", "")),
+            })
+    if errors.is_file():
+        for entry in _read_jsonl(errors):
+            row: dict[str, Any] = {
+                "helper": str(entry.get("helper", "?")),
+                "message": str(entry.get("message", "")),
+            }
+            if entry.get("fix"):
+                row["fix"] = str(entry["fix"])
+            failed.append(row)
+
+    if not succeeded and not failed:
+        return None
+    summary: dict[str, Any] = {
+        "succeeded": succeeded,
+        "failed": failed,
+    }
+    if failed and not succeeded:
+        # Make the failure mode obvious in the model's reading of
+        # the response. The model has been observed to say
+        # "thumbnail should be visible above" when no plot landed;
+        # this hint short-circuits that.
+        summary["note"] = (
+            "Plot helpers were called but produced no plots. "
+            "Check failed[].message; common cause is a missing "
+            "package (matplotlib / haven / scipy). The researcher "
+            "won't see anything — interpret with the numerical "
+            "payload only, or ask them to install the missing "
+            "package and re-run."
+        )
+    return summary
+
 
 def _as_mcp_text(payload: dict[str, Any]) -> dict[str, Any]:
     """Wrap a JSON-serializable dict as an MCP text-content response.
@@ -620,7 +709,7 @@ async def submit_script(args: dict[str, Any]) -> dict[str, Any]:
         raw_log_path=exec_result.run_dir,
     )
 
-    return _as_mcp_text({
+    response: dict[str, Any] = {
         "status": "ok",
         "result_id": row.id,
         "label": row.label,
@@ -639,7 +728,11 @@ async def submit_script(args: dict[str, Any]) -> dict[str, Any]:
         # to label the "Open in R / Stata" button and pick the right
         # invocation when launching the native app.
         "_language": language,
-    })
+    }
+    plot_summary = _summarize_plot_helpers(exec_result.run_dir)
+    if plot_summary is not None:
+        response["plots"] = plot_summary
+    return _as_mcp_text(response)
 
 
 # ---------------------------------------------------------------------------

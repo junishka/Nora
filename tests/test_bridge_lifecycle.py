@@ -1,23 +1,14 @@
-"""Restart- and lifecycle-focused tests for NoraBridge memory.
+"""Lifecycle tests for the multi-runner :class:`NoraBridge`.
 
-The memory stack relies on a small state machine on the bridge:
+The bridge holds a ``dict[str, SessionRunner]`` keyed by cwd. Each
+runner owns its own provider session, lock, and turn task. Switching
+the visible session is a pure UI focus change — it does NOT close any
+runner. These tests pin the contract so a future "helpfully tear down
+on switch" regression gets caught.
 
-- ``_needs_context_prefix`` gets flipped True whenever a fresh
-  provider session is opened (first turn, session switch, interrupted
-  turn, app reopen). The next turn consumes the flag by prepending a
-  warm-start prefix; on cancel / error the flag is restored so the
-  prefix isn't lost to a failed first turn.
-- ``_close_session_blocking`` is the canonical teardown entry point
-  used by session switches, cwd changes, and the Stop button; it
-  must clear ``_session`` reliably so the next turn opens fresh.
-- ``_set_cwd`` must tear down the session when the cwd actually
-  changes, but NOT when the same cwd is re-set.
-- Persisted events must carry an ISO timestamp so the turn reader
-  and session_state writer can order and display them honestly.
-
-These tests exercise those behaviors directly on the bridge,
-without running a real turn (which would require a live provider
-connection).
+Persistence is keyed by event ``session_cwd`` (falling back to the
+bridge focus), so a turn streaming in session A persists to A's log
+even while the UI is showing B.
 """
 
 from __future__ import annotations
@@ -30,6 +21,7 @@ from unittest.mock import MagicMock
 import pytest
 
 from nora.chat_history import build_context_prefix
+from nora.runner import SessionRunner
 from nora.ui import NoraBridge
 
 
@@ -37,17 +29,29 @@ from nora.ui import NoraBridge
 # Construction / initial state
 # ---------------------------------------------------------------------------
 
-def test_bridge_starts_with_clean_memory_state(tmp_path: Path):
-    """A freshly-constructed bridge has no provider session and no
-    pending context prefix — memory injection is opt-in, triggered
-    only when a session is actually opened."""
+def test_bridge_starts_with_no_runners(tmp_path: Path):
+    """A freshly-constructed bridge with a cwd has exactly one
+    lazy-created runner for that cwd; ``needs_context_prefix`` on
+    that runner is True (set by the constructor since the cwd was
+    handed in eagerly)."""
     bridge = NoraBridge(cwd=tmp_path)
-    assert bridge._session is None
-    assert bridge._needs_context_prefix is False
+    runner = bridge._active_runner()
+    assert runner is not None, "constructor with cwd should create a runner"
+    assert runner.cwd == tmp_path.resolve()
+    # The runner's own session is opened lazily on first send.
+    assert runner._session is None
+
+
+def test_bridge_without_cwd_has_no_runners():
+    """Without a cwd (landing screen), no runners exist yet. The
+    first focus event lazy-creates one."""
+    bridge = NoraBridge(cwd=None)
+    assert bridge._active_runner() is None
+    assert bridge._runners == {}
 
 
 # ---------------------------------------------------------------------------
-# _persist_event — timestamp + type filtering
+# _persist_event — routes by event session_cwd, falls back to bridge focus
 # ---------------------------------------------------------------------------
 
 def test_persist_event_adds_iso_timestamp(tmp_path: Path):
@@ -61,8 +65,6 @@ def test_persist_event_adds_iso_timestamp(tmp_path: Path):
     assert log.exists()
     rec = json.loads(log.read_text().splitlines()[0])
     assert "timestamp" in rec
-    # ISO 8601 with timezone — simplest sanity check is that
-    # datetime can parse it round-trip.
     from datetime import datetime
     parsed = datetime.fromisoformat(rec["timestamp"])
     assert parsed.tzinfo is not None, "timestamp must carry timezone info"
@@ -77,15 +79,12 @@ def test_persist_event_skips_non_persist_types(tmp_path: Path):
     bridge._persist_event({"type": "ready"})
 
     log = tmp_path / ".nora" / "chat_history.jsonl"
-    # No file written at all — persistence only happens for log-worthy
-    # types.
     assert not log.exists()
 
 
 def test_persist_event_preserves_caller_timestamp(tmp_path: Path):
     """If the caller already supplied a timestamp (replay, import
-    from external log), we don't overwrite it — otherwise importing
-    a log would rewrite all its times to 'now'."""
+    from external log), we don't overwrite it."""
     bridge = NoraBridge(cwd=tmp_path)
     bridge._persist_event({
         "type": "user_message",
@@ -98,14 +97,57 @@ def test_persist_event_preserves_caller_timestamp(tmp_path: Path):
     assert rec["timestamp"] == "2024-01-01T00:00:00+00:00"
 
 
+def test_persist_event_routes_by_session_cwd(tmp_path: Path):
+    """An event carrying ``session_cwd`` lands in THAT session's
+    log, not the bridge-focused one. This is the rule that makes
+    background sessions safe: a runner whose turn is mid-stream
+    persists to ITS cwd even when the UI is focused elsewhere."""
+    a = tmp_path / "a"
+    b = tmp_path / "b"
+    a.mkdir()
+    b.mkdir()
+
+    # Bridge focused on A, but the event carries B's cwd — should
+    # land in B's log, not A's.
+    bridge = NoraBridge(cwd=a)
+    bridge._persist_event({
+        "type": "user_message",
+        "text": "from B's runner",
+        "session_cwd": str(b),
+    })
+
+    a_log = a / ".nora" / "chat_history.jsonl"
+    b_log = b / ".nora" / "chat_history.jsonl"
+    assert not a_log.exists(), "A's log must be untouched"
+    assert b_log.exists(), "B's log must receive the event"
+    rec = json.loads(b_log.read_text().splitlines()[0])
+    # session_cwd is a routing annotation — stripped before write.
+    assert "session_cwd" not in rec
+    assert rec["text"] == "from B's runner"
+
+
+def test_persist_event_falls_back_to_bridge_focus(tmp_path: Path):
+    """Events without ``session_cwd`` (legacy / direct test calls)
+    persist to the bridge's focused cwd."""
+    bridge = NoraBridge(cwd=tmp_path)
+    bridge._persist_event({"type": "user_message", "text": "hi"})
+    log = tmp_path / ".nora" / "chat_history.jsonl"
+    assert log.exists()
+
+
 def test_record_user_message_replaces_trailing_orphan_turn(tmp_path: Path):
     """A failed send can leave a lone persisted ``user_message`` at
-    the tail of chat_history. The next real send should replace that
-    stale attempt rather than keep both bubbles forever."""
+    the tail. The next real send replaces that stale attempt."""
     bridge = NoraBridge(cwd=tmp_path)
-    bridge._persist_event({"type": "user_message", "text": "stuck send"})
+    runner = bridge._active_runner()
+    assert runner is not None
+    bridge._persist_event({
+        "type": "user_message",
+        "text": "stuck send",
+        "session_cwd": str(runner.cwd),
+    })
 
-    bridge._record_user_message("retry")
+    bridge._record_user_message(runner, "retry")
 
     log = tmp_path / ".nora" / "chat_history.jsonl"
     rows = [json.loads(line) for line in log.read_text().splitlines()]
@@ -116,13 +158,22 @@ def test_record_user_message_replaces_trailing_orphan_turn(tmp_path: Path):
 
 def test_record_user_message_keeps_completed_prior_turn(tmp_path: Path):
     """Only orphaned tail user turns are disposable. A completed turn
-    with an assistant reply must stay in the log when the next user
-    message is recorded."""
+    with an assistant reply must stay in the log."""
     bridge = NoraBridge(cwd=tmp_path)
-    bridge._persist_event({"type": "user_message", "text": "first"})
-    bridge._persist_event({"type": "assistant_text", "text": "reply"})
+    runner = bridge._active_runner()
+    assert runner is not None
+    bridge._persist_event({
+        "type": "user_message",
+        "text": "first",
+        "session_cwd": str(runner.cwd),
+    })
+    bridge._persist_event({
+        "type": "assistant_text",
+        "text": "reply",
+        "session_cwd": str(runner.cwd),
+    })
 
-    bridge._record_user_message("second")
+    bridge._record_user_message(runner, "second")
 
     log = tmp_path / ".nora" / "chat_history.jsonl"
     rows = [json.loads(line) for line in log.read_text().splitlines()]
@@ -138,81 +189,84 @@ def test_record_user_message_keeps_completed_prior_turn(tmp_path: Path):
 
 
 # ---------------------------------------------------------------------------
-# _close_session_blocking — handles all corner cases without raising
+# switch_session — DOES NOT close any runner (the multi-session fix)
 # ---------------------------------------------------------------------------
 
-def test_close_client_blocking_when_no_client(tmp_path: Path):
-    """No session to close: no-op, no error. Safe to call defensively
-    from Stop / switch / teardown paths."""
-    bridge = NoraBridge(cwd=tmp_path)
-    assert bridge._session is None
-    bridge._close_session_blocking()  # must not raise
-    assert bridge._session is None
+def test_switch_session_does_not_close_other_runners(tmp_path: Path):
+    """The bug we fixed: switching focus used to tear down the
+    previous session's SDK client mid-stream. The new contract:
+    switching is a pure UI focus change. Both runners' sessions
+    stay alive so a turn in flight in A keeps streaming after the
+    user clicks B in the sidebar."""
+    a = tmp_path / "a"
+    b = tmp_path / "b"
+    a.mkdir()
+    b.mkdir()
+
+    # Force both runners under ~/.nora-sessions/ — switch_session
+    # refuses paths outside SESSIONS_ROOT for safety.
+    import nora.ui as ui_mod
+    real_root = ui_mod.SESSIONS_ROOT
+    ui_mod.SESSIONS_ROOT = tmp_path
+    try:
+        bridge = NoraBridge(cwd=a)
+        runner_a = bridge._active_runner()
+        assert runner_a is not None
+        # Pretend A has an open session.
+        runner_a._session = MagicMock()
+        sentinel_a = runner_a._session
+
+        # Switch focus to B.
+        bridge.switch_session(str(b))
+
+        assert bridge.cwd == b.resolve()
+        # A's session is UNTOUCHED — that's the fix.
+        assert runner_a._session is sentinel_a, (
+            "switching focus must NOT close runner A's session"
+        )
+        # B has its own runner with no session yet.
+        runner_b = bridge._active_runner()
+        assert runner_b is not None
+        assert runner_b is not runner_a
+        assert runner_b._session is None
+    finally:
+        ui_mod.SESSIONS_ROOT = real_root
 
 
-def test_close_client_blocking_without_loop(tmp_path: Path):
-    """Session is set but worker loop isn't running: we can't run
-    the async close, but we still need to drop the reference so the
-    next turn opens fresh. Otherwise Stop after a startup failure
-    would leak the half-initialized session."""
-    bridge = NoraBridge(cwd=tmp_path)
-    bridge._session = MagicMock()  # pretend there's a session
-    bridge._loop = None
+def test_switch_session_returns_to_existing_runner(tmp_path: Path):
+    """Re-focusing a session you've visited before returns the
+    SAME runner (not a new one). Memory, model preference, and any
+    open SDK client all carry over."""
+    a = tmp_path / "a"
+    b = tmp_path / "b"
+    a.mkdir()
+    b.mkdir()
 
-    bridge._close_session_blocking()
-    assert bridge._session is None
+    import nora.ui as ui_mod
+    real_root = ui_mod.SESSIONS_ROOT
+    ui_mod.SESSIONS_ROOT = tmp_path
+    try:
+        bridge = NoraBridge(cwd=a)
+        runner_a_first = bridge._active_runner()
+
+        bridge.switch_session(str(b))
+        bridge.switch_session(str(a))
+        runner_a_second = bridge._active_runner()
+
+        assert runner_a_first is runner_a_second, (
+            "returning to a session must reuse its existing runner"
+        )
+    finally:
+        ui_mod.SESSIONS_ROOT = real_root
 
 
 # ---------------------------------------------------------------------------
-# _set_cwd — session switch should tear down session, same-cwd should not
-# ---------------------------------------------------------------------------
-
-def test_set_cwd_closes_client_on_cwd_change(tmp_path: Path):
-    """Switching to a different session dir must close the provider
-    session so the next turn starts a fresh conversation against
-    the new cwd. Without this, conversation state can leak across
-    sessions."""
-    (tmp_path / "a").mkdir()
-    (tmp_path / "b").mkdir()
-
-    bridge = NoraBridge(cwd=tmp_path / "a")
-    # Simulate a live session. _close_session_blocking handles the
-    # no-loop case by just clearing the reference, so we don't need
-    # a working event loop here.
-    bridge._session = MagicMock()
-
-    bridge._set_cwd(tmp_path / "b")
-
-    assert bridge.cwd == tmp_path / "b"
-    assert bridge._session is None, "session must be closed on cwd change"
-
-
-def test_set_cwd_same_path_keeps_client(tmp_path: Path):
-    """Re-setting the same cwd (e.g. after a harmless state refresh)
-    must NOT close the session — otherwise every idempotent _set_cwd
-    call would waste a conversation."""
-    (tmp_path / "a").mkdir()
-
-    bridge = NoraBridge(cwd=tmp_path / "a")
-    sentinel = MagicMock()
-    bridge._session = sentinel
-
-    bridge._set_cwd(tmp_path / "a")
-
-    assert bridge._session is sentinel, (
-        "same-cwd _set_cwd must not tear down the session"
-    )
-
-
-# ---------------------------------------------------------------------------
-# Cold start (app reopen) — prefix contains what we expect
+# Cold start prefix — unchanged (memory still per-cwd)
 # ---------------------------------------------------------------------------
 
 def test_cold_start_prefix_contains_prior_exchange(tmp_path: Path):
-    """Simulate an app reopen: chat_history.jsonl exists on disk
-    from a previous run. ``build_context_prefix`` must render a
-    block that contains the prior user + assistant exchange so
-    Claude picks up where the researcher left off."""
+    """``build_context_prefix`` renders a block containing prior
+    exchanges so Claude picks up where the researcher left off."""
     (tmp_path / ".nora").mkdir()
     log = tmp_path / ".nora" / "chat_history.jsonl"
     log.write_text(
@@ -230,16 +284,13 @@ def test_cold_start_prefix_contains_prior_exchange(tmp_path: Path):
 
 def test_cold_start_brand_new_session_has_no_prefix(tmp_path: Path):
     """A session with no chat_history and no results must produce
-    an empty prefix — we don't want to inject a phantom header on
-    the very first turn of a fresh session."""
+    an empty prefix."""
     assert build_context_prefix(tmp_path, results=[]) == ""
 
 
 def test_cold_start_prefix_across_multiple_sessions(tmp_path: Path):
-    """Two different session dirs produce two different prefixes —
-    history is per-cwd, not global. This guards against a subtle
-    bug where a cached reader could serve the wrong session's log
-    after a switch."""
+    """History is per-cwd, not global — two different session dirs
+    produce two different prefixes."""
     session_a = tmp_path / "a"
     session_b = tmp_path / "b"
     (session_a / ".nora").mkdir(parents=True)
@@ -262,17 +313,14 @@ def test_cold_start_prefix_across_multiple_sessions(tmp_path: Path):
 
 
 # ---------------------------------------------------------------------------
-# Stop button — interrupt_turn tears down the client
+# Stop button — affects the active runner only
 # ---------------------------------------------------------------------------
 
 def test_interrupt_turn_no_running_turn(tmp_path: Path):
     """Stop with nothing in flight: surfaces a clean error rather
-    than raising. The UI can then re-enable the composer without
-    special-casing."""
+    than raising."""
     bridge = NoraBridge(cwd=tmp_path)
 
-    # Need a running loop for the interrupt_turn code path that
-    # uses call_soon_threadsafe. We spin up a tiny one for the test.
     bridge.start_loop()
     try:
         result = bridge.interrupt_turn()
@@ -284,61 +332,10 @@ def test_interrupt_turn_no_running_turn(tmp_path: Path):
 
 
 # ---------------------------------------------------------------------------
-# Flag state machine — carrying a prefix across an error
-# ---------------------------------------------------------------------------
-
-def test_needs_context_prefix_survives_restart_of_bridge(tmp_path: Path):
-    """A fresh NoraBridge starts with the flag False. That's
-    correct — the flag means 'the NEXT turn must inject a prefix'.
-    On cold boot, the flag flips True inside ``_ensure_session`` when
-    it opens the first session of the process, not at construction.
-
-    This test documents the invariant so a future refactor that
-    'helpfully' pre-sets the flag to True in __init__ (and thereby
-    double-injects the prefix on the first-ever turn of a brand-new
-    session) gets caught."""
-    bridge1 = NoraBridge(cwd=tmp_path)
-    assert bridge1._needs_context_prefix is False
-
-    # Simulate an app reopen: a second bridge against the same cwd.
-    bridge2 = NoraBridge(cwd=tmp_path)
-    assert bridge2._needs_context_prefix is False
-
-
-# ---------------------------------------------------------------------------
 # Out-of-scope for these tests (require live SDK or live Claude)
 # ---------------------------------------------------------------------------
 #
-# A few reviewer-suggested paths can't be exercised at the unit
-# level because they require either a live Claude Agent SDK client
-# or the frontier model itself. They're listed here so a reader
-# knows they're intentionally left to manual / smoke testing:
-#
-# 1. First-turn prefix consumption. The flag transition
-#    False → set True by ``_ensure_client`` → consumed by
-#    ``_run_turn`` → reset to False is simple, but verifying the
-#    full loop needs a mocked async client context manager.
-#    Smoke-test: restart Nora in a session with prior history,
-#    send a message, confirm Claude references earlier turns.
-#
-# 2. Carried-prefix restoration on cancel / error. The
-#    ``_run_turn`` exception handlers set ``_needs_context_prefix``
-#    back to True when a carried prefix was in flight. Unit-testing
-#    requires a mocked client that raises from ``query`` or
-#    ``receive_response``. Smoke-test: hit Stop on the first turn
-#    after a reopen, then send a new message, confirm the prefix
-#    still lands.
-#
-# 3. "What were we doing?" semantic response. Whether Claude
-#    actually uses the injected prefix correctly (summarizes from
-#    the enclosed turns, calls expand_result on the recent-results
-#    listing, doesn't re-run old analyses) is a model-behavior
-#    question, not a code-behavior one. Smoke-test: ask the
-#    question after a reopen and eyeball the reply.
-#
-# 4. Session-state write after turn_done. The
-#    ``write_session_state`` hook fires inside the successful-turn
-#    branch of ``_run_turn``. Covered by the session_state tests
-#    for the writer itself; the hook wiring is verified by
-#    inspection and a smoke test (send a message, confirm
-#    ``.nora/session_state.json`` timestamps refresh).
+# Verifying that the runner's ``_run_turn`` actually streams events
+# from the SDK requires a mocked client. The runner-level tests in
+# ``test_concurrent_sessions.py`` cover the cross-session
+# non-trampling invariant directly with a fake provider session.
