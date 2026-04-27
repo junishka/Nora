@@ -1388,9 +1388,6 @@ function appendAssistant(text) {
     return append('assistant', text || '', /*markdown=*/ true);
   }
   const textSafe = text || '';
-  if (textSafe.length > 900) {
-    return append('assistant', textSafe, /*markdown=*/ true);
-  }
   // The SDK hands us complete text blocks per turn, not token-by-token
   // deltas, so real streaming isn't available at this layer. To give
   // the conversation a "typing" feel anyway, we drop in the bubble
@@ -1398,6 +1395,13 @@ function appendAssistant(text) {
   // rate, then swap to rendered markdown once the animation finishes.
   // Errors / tool calls arriving mid-animation force an instant
   // finish so the transcript order stays honest.
+  //
+  // Long messages were previously dumped instantly via a length
+  // threshold; the time cap inside ``runTypewriter`` (max 2.5 s
+  // regardless of length) already handles "don't make me wait", so
+  // the threshold just stripped the typing rhythm from any
+  // paragraph the model wrote — researchers noticed and wanted it
+  // back.
   finalizeActiveTypewriter();
   setWelcomeOnlyMode(false);
   const wrapper = document.createElement('div');
