@@ -36,6 +36,7 @@ import time
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from functools import lru_cache
 from importlib import resources
 from pathlib import Path
 from typing import Any, Callable, Literal
@@ -187,6 +188,31 @@ def _validate_and_strip_token(
     return cleaned, None
 
 
+@lru_cache(maxsize=1)
+def _cached_environment() -> Environment:
+    """Return a process-local cached runtime probe.
+
+    ``detect_environment()`` spawns multiple subprocesses (R package
+    probe, Python package probe, prefix detection), which is fine at
+    app startup but expensive to repeat on every ``submit_script``.
+    Caching here keeps back-to-back regressions from paying that fixed
+    tax every time.
+
+    Callers with an already-known environment can still pass ``env=``
+    to ``run_script`` and bypass this cache entirely.
+    """
+    return detect_environment()
+
+
+def clear_environment_cache() -> None:
+    """Drop the cached environment probe.
+
+    Test hook today; also useful for a future explicit "refresh local
+    runtimes" UI action if Nora grows one.
+    """
+    _cached_environment.cache_clear()
+
+
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
@@ -235,7 +261,7 @@ def run_script(
     response to Claude. Programmer errors (invalid ``language``, etc.)
     still raise ``ValueError``.
     """
-    env = env or detect_environment()
+    env = env or _cached_environment()
     if language not in ("R", "Stata", "Python"):
         raise ValueError(
             f"unsupported language {language!r}; must be R, Stata, or Python"
