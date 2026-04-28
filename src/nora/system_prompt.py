@@ -739,18 +739,44 @@ def runtime_environment_listing() -> str:
     return "\n".join(lines)
 
 
-def build_system_prompt(cwd: Path, server_name: str) -> str:
+def build_system_prompt(
+    cwd: Path,
+    server_name: str,
+    provider: str = "anthropic",
+) -> str:
     """Render the full system prompt for a session bound to ``cwd``.
 
     ``server_name`` fills the ``mcp__<server>__<tool>`` prefix the
-    template references. For Anthropic this matches the actual
-    in-process MCP server name; for OpenAI the function tools are
-    flat names but the prompt still uses the same string for textual
-    continuity.
+    template references on the Anthropic path. OpenAI's function tools
+    are flat names with no MCP prefix, so the OpenAI-specific
+    rendering substitutes a name-only intro that matches what GPT-5.5
+    actually sees in its tools array.
+
+    The provider split is small (one line in the tool-section intro,
+    plus an optional drop of MCP-naming phrasing) but matters for
+    OpenAI where the prefix sits in the per-call wire payload at a
+    smaller cache discount than Anthropic gets. ``provider`` defaults
+    to ``"anthropic"`` for back-compat with any call site that
+    pre-dates the split.
     """
-    return SYSTEM_PROMPT_TEMPLATE.format(
+    rendered = SYSTEM_PROMPT_TEMPLATE.format(
         cwd=cwd,
         SERVER_NAME=server_name,
         datasets_list=dataset_listing(cwd),
         runtime_environment=runtime_environment_listing(),
     )
+    if provider == "openai":
+        # The template bakes in the Anthropic-style intro because the
+        # in-process MCP server's tool names actually carry the
+        # ``mcp__<server>__`` prefix on the Claude side. OpenAI sees
+        # flat function tool names, so the prefix mention is both
+        # inaccurate (the model never encounters that naming) and a
+        # waste of per-call wire payload. Replace it with a name-only
+        # intro for OpenAI sessions.
+        anthropic_intro = (
+            f"Your tools (all prefixed `mcp__{server_name}__` "
+            "when referenced):"
+        )
+        openai_intro = "Your tools:"
+        rendered = rendered.replace(anthropic_intro, openai_intro, 1)
+    return rendered

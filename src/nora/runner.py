@@ -168,7 +168,9 @@ class SessionRunner:
         disk for THIS session (not whichever cwd was last focused).
         """
         if self._session is None:
-            system_prompt = build_system_prompt(self.cwd, SERVER_NAME)
+            system_prompt = build_system_prompt(
+                self.cwd, SERVER_NAME, provider=self.provider,
+            )
             self._session = open_session(
                 self.provider,
                 cwd=self.cwd,

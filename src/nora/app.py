@@ -73,6 +73,7 @@ from nora.provider.catalog import (
 )
 from nora.system_prompt import (
     SYSTEM_PROMPT_TEMPLATE as _SYSTEM_PROMPT_TEMPLATE_NEW,  # noqa: F401
+    build_system_prompt as _build_system_prompt,
     dataset_listing as _dataset_listing_new,
     scan_datasets as _scan_datasets_new,
 )
@@ -772,11 +773,12 @@ def _build_options(
     continue_conversation: bool = False,
 ) -> ClaudeAgentOptions:
     server = build_server()
-    system_prompt = _SYSTEM_PROMPT_TEMPLATE.format(
-        cwd=cwd,
-        SERVER_NAME=SERVER_NAME,
-        datasets_list=_dataset_listing(cwd),
-    )
+    # Render through the canonical builder so the runtime-environment
+    # placeholder (added in the multi-provider step) is filled. The
+    # raw .format() call here used to omit it and crash on launch with
+    # KeyError: 'runtime_environment'; the terminal entry point is
+    # Anthropic-only by design.
+    system_prompt = _build_system_prompt(cwd, SERVER_NAME, provider="anthropic")
     selected_model = model if model in SUPPORTED_MODELS else DEFAULT_MODEL
     return ClaudeAgentOptions(
         system_prompt=system_prompt,

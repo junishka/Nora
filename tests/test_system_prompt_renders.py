@@ -187,6 +187,48 @@ def test_stata_plot_coefficients_in_stage_runtime_list(tmp_path: Path) -> None:
     assert (lib / "nora_plot_coefficients.ado").is_file()
 
 
+def test_anthropic_prompt_carries_mcp_prefix_intro(tmp_path: Path) -> None:
+    """The Anthropic variant must keep the ``mcp__<server>__`` prefix
+    line — the model actually sees those names on its tool surface
+    via the in-process MCP server, and the prompt's nudge ("when
+    referenced") helps the model understand its tool naming."""
+    rendered = build_system_prompt(tmp_path, "nora", provider="anthropic")
+    assert "mcp__nora__" in rendered
+    assert "(all prefixed `mcp__nora__` when referenced" in rendered
+
+
+def test_openai_prompt_drops_mcp_prefix_intro(tmp_path: Path) -> None:
+    """OpenAI's function tools have flat names — no ``mcp__`` prefix.
+    Telling GPT-5.5 about a name convention it never sees is both
+    inaccurate and wastes tokens on the per-call prefix."""
+    rendered = build_system_prompt(tmp_path, "nora", provider="openai")
+    assert "mcp__nora__" not in rendered
+    # The replacement intro still introduces the tool list so the
+    # numbered enumeration after it has context.
+    assert "Your tools:" in rendered
+
+
+def test_provider_default_is_anthropic_for_back_compat(tmp_path: Path) -> None:
+    """Older call sites (and the terminal CLI which is Anthropic-only)
+    omit the ``provider=`` arg. Default behavior must match the
+    pre-split rendering so nothing silently regresses."""
+    default = build_system_prompt(tmp_path, "nora")
+    explicit = build_system_prompt(tmp_path, "nora", provider="anthropic")
+    assert default == explicit
+
+
+def test_openai_prompt_is_smaller_than_anthropic(tmp_path: Path) -> None:
+    """The OpenAI variant must be at least the Anthropic-prefix-line
+    shorter. If it isn't, the replacement didn't fire — the intro
+    string in build_system_prompt drifted from what the template
+    bakes in. Use a strict-shorter assertion rather than an exact
+    delta so future Anthropic-specific phrasing additions don't
+    flake the test."""
+    a = build_system_prompt(tmp_path, "nora", provider="anthropic")
+    o = build_system_prompt(tmp_path, "nora", provider="openai")
+    assert len(o) < len(a)
+
+
 def test_stata_plot_coefficients_writes_to_run_dir() -> None:
     """The helper resolves run_dir from ``NORA_RESULT_PATH`` and
     writes ``coefficients.png`` + manifest into

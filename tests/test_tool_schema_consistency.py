@@ -86,3 +86,77 @@ def test_handlers_point_at_sdk_handlers():
             f"HANDLERS[{name!r}] is not the same callable as "
             f"REGISTERED_TOOLS[{name!r}].handler — dispatch will diverge"
         )
+
+
+# ---------------------------------------------------------------------------
+# OpenAI lean-description variants
+# ---------------------------------------------------------------------------
+#
+# Tools sent to OpenAI's Responses API land in the ``tools`` array on
+# every ``responses.create()`` call, gated by auto-cache at a 50%
+# discount (vs Anthropic's 90%). A leaner per-tool description on the
+# OpenAI side cuts tokens at 5x the marginal value of the same cut on
+# Anthropic. The mechanism: ToolSpec.openai_description, used by
+# as_openai_tool() when set; absent → falls back to canonical
+# description.
+
+
+def test_openai_description_is_strict_shorter_when_set():
+    """If a tool has an OpenAI-specific lean description, it must be
+    measurably shorter than the canonical one. The whole point is
+    saving per-call tokens; an equally-long variant is just drift
+    waiting to happen."""
+    for spec in build_tool_specs():
+        if spec.openai_description is None:
+            continue
+        assert len(spec.openai_description) < len(spec.description), (
+            f"{spec.name!r}: openai_description is not shorter than "
+            f"description ({len(spec.openai_description)} vs "
+            f"{len(spec.description)} chars). Either drop the OpenAI "
+            f"variant or trim it further."
+        )
+
+
+def test_as_openai_tool_uses_lean_description_when_set():
+    """``as_openai_tool()`` must emit the lean variant in the
+    serialised tool entry. A regression here means OpenAI users
+    silently revert to paying for the full description on every
+    call."""
+    for spec in build_tool_specs():
+        entry = spec.as_openai_tool()
+        if spec.openai_description is not None:
+            assert entry["description"] == spec.openai_description, (
+                f"{spec.name!r}: as_openai_tool() emitted the canonical "
+                f"description instead of the configured lean variant"
+            )
+        else:
+            assert entry["description"] == spec.description
+
+
+def test_openai_lean_descriptions_cover_when_to_call():
+    """The lean OpenAI variants drop the args list and verbose
+    behavior block but must still convey *when to call* the tool —
+    the model uses this to pick between tools, not to learn syntax
+    (the JSON schema covers args).
+
+    For each tool that has a lean variant, pin a behavior keyword
+    that must survive the trim. Keeps the convention enforceable
+    without prescribing exact wording."""
+    expected_keywords = {
+        "get_schema": ("structural", "before"),
+        "submit_script": ("script", "source_dataset"),
+        "recall_conversation": ("older", "auto-loaded"),
+        "read_attached_file": ("scrolled", "Datasets"),
+    }
+    by_name = {s.name: s for s in build_tool_specs()}
+    for tool_name, keywords in expected_keywords.items():
+        spec = by_name[tool_name]
+        if spec.openai_description is None:
+            continue  # tool has no lean variant; nothing to check
+        for kw in keywords:
+            assert kw in spec.openai_description, (
+                f"{tool_name!r}: lean OpenAI description drops the "
+                f"keyword {kw!r} that signals when to call the tool. "
+                f"Re-add it or update this test if the convention "
+                f"changed."
+            )

@@ -27,12 +27,27 @@ class ToolSpec:
     (``parameters`` field on a function tool) and reduced to the
     Anthropic SDK's lighter ``{name: python_type}`` shape via
     ``as_sdk_args()`` for the in-process MCP server.
+
+    ``description`` is the canonical text used by the Anthropic SDK
+    (verified by ``test_tool_descriptions_match`` against the
+    ``@tool`` decorator in ``nora.tools``).
+
+    ``openai_description`` is an optional, leaner variant used only
+    when the spec is rendered for OpenAI. OpenAI's Responses API
+    sends ``tools`` on every ``responses.create()`` call gated by
+    auto-cache at a 50% discount. Anthropic's CLI puts the same tools
+    behind a 90% cache discount, so a 1-token cut on the OpenAI side
+    is worth 5x what the same cut buys on Anthropic. When the OpenAI
+    variant is omitted, ``as_openai_tool()`` falls back to
+    ``description``. Short variants must convey *when to call* the
+    tool; full args list lives in the JSON schema.
     """
 
     name: str
     description: str
     input_schema: dict[str, Any]
     required: tuple[str, ...] = field(default_factory=tuple)
+    openai_description: str | None = None
 
     def as_sdk_args(self) -> dict[str, type]:
         """Return ``{param_name: python_type}`` for ``claude_agent_sdk.tool``.
@@ -57,6 +72,12 @@ class ToolSpec:
         stays off so optional fields work without forcing every caller
         to thread null defaults — the Nora handlers tolerate missing
         keys with explicit error messages.
+
+        Uses ``openai_description`` when set; falls back to the
+        canonical ``description`` otherwise. The leaner variant cuts
+        per-call wire payload at OpenAI's 50% cache discount where
+        each saved token is worth ~5x more than the same cut on
+        Anthropic (90% discount).
         """
         params = dict(self.input_schema)
         # Required list goes inside the parameters schema per JSON Schema.
@@ -69,7 +90,7 @@ class ToolSpec:
         return {
             "type": "function",
             "name": self.name,
-            "description": self.description,
+            "description": self.openai_description or self.description,
             "parameters": params,
             "strict": False,
         }
@@ -250,6 +271,7 @@ def _spec(
     description: str,
     properties: dict[str, dict[str, Any]],
     required: tuple[str, ...],
+    openai_description: str | None = None,
 ) -> ToolSpec:
     return ToolSpec(
         name=name,
@@ -260,7 +282,61 @@ def _spec(
             "additionalProperties": False,
         },
         required=required,
+        openai_description=openai_description,
     )
+
+
+# ---------------------------------------------------------------------------
+# OpenAI-specific lean descriptions
+# ---------------------------------------------------------------------------
+#
+# Sent on every ``responses.create()`` call as part of the ``tools``
+# array. OpenAI auto-caches the array at a 50% discount; trimming
+# tokens here is worth ~5x what the same trim buys on Anthropic
+# (which caches at 90%). Each variant must convey *when to call*;
+# full args are in the JSON schema below it.
+
+_GET_SCHEMA_DESC_OAI = (
+    "Return a dataset's structural summary (variable names, types, "
+    "labels, observation count). Call this before writing any analysis "
+    "script. Supported file types: .dta / .rds / .csv / .tsv / "
+    ".parquet / .jsonl. The 'depth' argument controls detail "
+    "(names_only, names_types, names_types_labels, "
+    "names_types_labels_summary); the researcher's policy sets a "
+    "ceiling and over-ceiling requests are denied."
+)
+
+_SUBMIT_SCRIPT_DESC_OAI = (
+    "Run an R, Stata, or Python script against the researcher's data. "
+    "The script must emit structured results via the nora runtime "
+    "helpers (nora$result(...) / nora$from_lm(...) in R, "
+    "nora_result_* in Stata, nora.result(...) / nora.from_lm(...) in "
+    "Python). Sanitized payload + result ID return to you; raw "
+    "stdout goes to the researcher only. Always pass 'source_dataset' "
+    "when the script reads a known file so silent row drops "
+    "(NA-drops, subset, listwise deletion) are flagged."
+)
+
+_RECALL_CONVERSATION_DESC_OAI = (
+    "Search this session's older archived turns for content that has "
+    "scrolled out of your context. The most recent ~20 turns are "
+    "already in your context (auto-loaded on session open), so use "
+    "this only for DEEPER lookups (older history, or keyword search "
+    "like 'what did I say about X at the start'). Don't call for "
+    "content already visible. Args: query (substring), tail (last N "
+    "turns), context (neighbors per match, default 2), max_chars "
+    "(default ~8000)."
+)
+
+_READ_ATTACHED_FILE_DESC_OAI = (
+    "Re-fetch a file the researcher attached earlier (.py / .do / .r "
+    "/ .rmd as inline text, .png / .jpg / .pdf / .eps as a vision "
+    "content block; PDF/EPS are rasterised). Use when the file's "
+    "content has scrolled out of your context but the file is still "
+    "on disk in the session cwd. Datasets (.csv / .dta / .parquet / "
+    "etc.) are NOT retrievable through this tool; use get_schema or "
+    "write a script. 'name' is treated as a basename."
+)
 
 
 def build_tool_specs() -> tuple[ToolSpec, ...]:
@@ -280,6 +356,7 @@ def build_tool_specs() -> tuple[ToolSpec, ...]:
                 "depth": {"type": "string"},
             },
             required=("dataset",),
+            openai_description=_GET_SCHEMA_DESC_OAI,
         ),
         _spec(
             "request_data",
@@ -301,6 +378,7 @@ def build_tool_specs() -> tuple[ToolSpec, ...]:
                 "source_dataset": {"type": "string"},
             },
             required=("language", "code", "label"),
+            openai_description=_SUBMIT_SCRIPT_DESC_OAI,
         ),
         _spec(
             "expand_result",
@@ -326,6 +404,7 @@ def build_tool_specs() -> tuple[ToolSpec, ...]:
                 "max_chars": {"type": "integer"},
             },
             required=(),
+            openai_description=_RECALL_CONVERSATION_DESC_OAI,
         ),
         _spec(
             "read_attached_file",
@@ -334,6 +413,7 @@ def build_tool_specs() -> tuple[ToolSpec, ...]:
                 "name": {"type": "string"},
             },
             required=("name",),
+            openai_description=_READ_ATTACHED_FILE_DESC_OAI,
         ),
     )
 
