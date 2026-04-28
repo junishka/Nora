@@ -239,3 +239,59 @@ def test_close_store_is_safe_with_no_cached_entry(tmp_path: Path):
     no-op, not an error — the UI calls it defensively on every
     session switch."""
     close_store(tmp_path / "never-opened")  # must not raise
+
+
+def test_store_can_be_used_across_threads(tmp_path: Path) -> None:
+    """The bridge thread opens the store via ``_build_context_prefix``
+    on session resume. The asyncio runner thread reuses the cached
+    store via ``submit_script`` / ``list_results`` / ``expand_result``.
+    Without ``check_same_thread=False`` on the SQLite connection, the
+    second thread blows up with ``ProgrammingError: SQLite objects
+    created in a thread can only be used in that same thread.`` The
+    store's docstring already promises single-writer-single-reader
+    serialization, so SQLite's locking plus the GIL is enough; we
+    don't need Python's thread-affinity check on top.
+    """
+    import threading
+
+    session = tmp_path / "session"
+    session.mkdir()
+
+    store = get_store(session)
+    store.insert(
+        label="opened-on-bridge-thread",
+        analysis_type="ttest",
+        sanitized_payload={"x": 1},
+        language="R",
+        script_code="t.test(1:5)",
+        transformations=[],
+    )
+
+    captured: dict[str, object] = {}
+
+    def _use_from_other_thread() -> None:
+        try:
+            again = get_store(session)
+            captured["count"] = again.count()
+            captured["rows_visible"] = len(again.list_all())
+            again.insert(
+                label="written-on-runner-thread",
+                analysis_type="lm",
+                sanitized_payload={"y": 2},
+                language="Python",
+                script_code="ols(...)",
+                transformations=[],
+            )
+        except Exception as exc:  # pragma: no cover — only fires on regression
+            captured["error"] = exc
+
+    t = threading.Thread(target=_use_from_other_thread)
+    t.start()
+    t.join(timeout=5.0)
+
+    assert "error" not in captured, (
+        f"cross-thread store access raised: {captured.get('error')!r}. "
+        "Restore check_same_thread=False on sqlite3.connect()."
+    )
+    assert captured["count"] == 1, "thread B couldn't read thread A's row"
+    assert len(store.list_all()) == 2, "thread B's write didn't land in shared store"

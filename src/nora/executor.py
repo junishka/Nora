@@ -417,11 +417,15 @@ def run_script(
             raw_stdout = log_contents + (("\n" + raw_stdout) if raw_stdout else "")
 
     # Persist the raw subprocess output to the run dir so the researcher
-    # TUI (and, if needed, later audit) can display what R / Stata
-    # actually said. These files are INTENTIONALLY outside the
-    # sanitization boundary — only the researcher ever sees them; they
-    # never flow back to the frontier model. See
-    # ``test_stderr_isolation.py`` for the regression that locks that in.
+    # TUI (and, if needed, later audit) can display what R / Stata / Python
+    # actually said. The raw .log files NEVER cross to the model; there
+    # is no file-read tool. The model can see a *short debug excerpt* on
+    # script failure (see ``error_summary.extract_debug_excerpt``), which
+    # is anchored on each language's error idiom, capped at 1 KB, and
+    # passes through credential scrub plus path normalisation plus
+    # dumpy-blob truncation. See ``test_error_summary_no_leak.py`` for
+    # the SDC boundary regressions, and ``test_stderr_isolation.py`` for
+    # the broader "no raw log file ever crosses" pin.
     try:
         (run_dir / "stdout.log").write_text(raw_stdout, encoding="utf-8")
         (run_dir / "stderr.log").write_text(raw_stderr, encoding="utf-8")
@@ -770,9 +774,20 @@ def _build_profile(
         return '"' + s.replace("\\", "\\\\").replace('"', '\\"') + '"'
 
     # Per-run write scope: the run's scratch dir (result file, Stata
-    # .log, staged script) plus system temp dirs that R/Stata use.
+    # .log, staged script), the researcher's cwd (so scripts can
+    # ``save "panel.dta", replace`` / ``saveRDS`` / ``df.to_csv``),
+    # plus system temp dirs that R/Stata use.
+    #
+    # The researcher's cwd is the analysis workspace. Every session
+    # gets its own dir under ``~/.nora-sessions/`` so a script writing
+    # there cannot reach personal files. The data-boundary the
+    # sandbox enforces is the *network deny* and the *read* allowlist
+    # (so a script can't slurp ``/etc/passwd`` or POST data to a
+    # remote host); writes within the user-authorized cwd are part of
+    # the normal Stata / R / Python workflow.
     write_subpaths = [
         _quote(run_dir),
+        _quote(cwd),
         _quote("/private/tmp"),
         _quote("/private/var/folders"),
         _quote("/tmp"),

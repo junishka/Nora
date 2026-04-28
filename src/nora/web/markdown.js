@@ -43,8 +43,28 @@
     });
     // Bold before italic so **x** doesn't match as *_x_*.
     s = s.replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>');
-    s = s.replace(/(^|[^*])\*([^*]+)\*/g, '$1<em>$2</em>');
-    s = s.replace(/(^|[^_])_([^_]+)_/g, '$1<em>$2</em>');
+    // Italic with `*`: opening `*` must sit at a word boundary AND
+    // not be followed by whitespace; closing `*` must not be
+    // preceded by whitespace AND not be followed by a word char.
+    // Without this, a bare `*` used as a math / code operator
+    // (e.g. "x * y", "max(charity_age * 0.5)") opens an emphasis
+    // that runs to the next `*` and italicises every sentence
+    // between, a real failure mode when the model writes
+    // pseudo-Stata / pseudo-pandas in prose.
+    s = s.replace(
+      /(^|[^A-Za-z0-9*])\*(?!\s)([^*\n]+?)(?<!\s)\*(?![A-Za-z0-9*])/g,
+      '$1<em>$2</em>'
+    );
+    // Italic with `_`: same word-boundary rule. CommonMark explicitly
+    // forbids intra-word `_` emphasis ("Cat_Dog_" is literal text,
+    // not "Cat<em>Dog</em>"). Without this rule, identifiers like
+    // `fp_dur_resolved` / `age_at_arrival` / `webal_new` get their
+    // middle chunk italicised whenever the model mentions them in
+    // prose.
+    s = s.replace(
+      /(^|[^A-Za-z0-9_])_(?!\s)([^_\n]+?)(?<!\s)_(?![A-Za-z0-9_])/g,
+      '$1<em>$2</em>'
+    );
     // Links — HTTPS only. Anything else falls through as plain text.
     s = s.replace(
       /\[([^\]]+)\]\((https:\/\/[^\s)]+)\)/g,

@@ -1051,11 +1051,21 @@ class NoraBridge:
         except OSError as e:
             return {"ok": False, "reason": f"delete failed: {e}"}
         # Drop a matching staged attachment so the composer chip
-        # follows the file's life cycle.
+        # follows the file's life cycle. Cover every pending list
+        # the file could have landed on (script content inline,
+        # @-mention notice, @-mention vision).
         runner = self._active_runner()
         if runner is not None:
             runner.pending_script_attachments = [
                 a for a in runner.pending_script_attachments
+                if a.get("name") != target.name
+            ]
+            runner.pending_mentioned_files = [
+                n for n in runner.pending_mentioned_files
+                if n != target.name
+            ]
+            runner.pending_mentioned_images = [
+                a for a in runner.pending_mentioned_images
                 if a.get("name") != target.name
             ]
         # Best-effort: also remove the cached PDF/EPS → PNG sidecar
@@ -1092,16 +1102,28 @@ class NoraBridge:
         if runner is None:
             return {"ok": True, "name": Path(name).name, "removed": 0}
         target = Path(name).name  # basename only
-        before = len(runner.pending_script_attachments)
+        before = (
+            len(runner.pending_script_attachments)
+            + len(runner.pending_mentioned_files)
+            + len(runner.pending_mentioned_images)
+        )
         runner.pending_script_attachments = [
             a for a in runner.pending_script_attachments
             if a.get("name") != target
         ]
-        return {
-            "ok": True,
-            "name": target,
-            "removed": before - len(runner.pending_script_attachments),
-        }
+        runner.pending_mentioned_files = [
+            n for n in runner.pending_mentioned_files if n != target
+        ]
+        runner.pending_mentioned_images = [
+            a for a in runner.pending_mentioned_images
+            if a.get("name") != target
+        ]
+        after = (
+            len(runner.pending_script_attachments)
+            + len(runner.pending_mentioned_files)
+            + len(runner.pending_mentioned_images)
+        )
+        return {"ok": True, "name": target, "removed": before - after}
 
     def attach_session_file(self, name: str) -> dict[str, Any]:
         """Stage a file already in the session cwd as inline context
@@ -1124,46 +1146,143 @@ class NoraBridge:
         if not name:
             return {"ok": False, "reason": "no file name"}
         # Basename-only — refuse traversal attempts even though the
-        # JS side only sends filenames from list_session_files.
+        # JS side only sends filenames from list_session_files /
+        # list_mentionable_files.
         safe_name = Path(name).name
-        target = (self.cwd / safe_name).resolve()
-        if not _is_within(target, self.cwd.resolve()):
-            return {"ok": False, "reason": "file is outside the session"}
-        if not target.is_file():
+        cwd_resolved = self.cwd.resolve()
+        candidate = (self.cwd / safe_name).resolve()
+        target: Path | None = None
+        if _is_within(candidate, cwd_resolved) and candidate.is_file():
+            target = candidate
+        else:
+            # Fall through to the helper-plot dirs so an @-mention of
+            # a plot like ``residuals_lm1.png`` (which lives in
+            # ``.nora/runs/<id>/_nora_plots/``) resolves correctly.
+            runs_root = self.cwd / ".nora" / "runs"
+            if runs_root.is_dir():
+                try:
+                    for run_dir in runs_root.iterdir():
+                        plots_dir = run_dir / "_nora_plots"
+                        if not plots_dir.is_dir():
+                            continue
+                        nested = (plots_dir / safe_name).resolve()
+                        if (
+                            _is_within(nested, cwd_resolved)
+                            and nested.is_file()
+                        ):
+                            target = nested
+                            break
+                except OSError:
+                    pass
+        if target is None:
             return {"ok": False, "reason": f"not found: {safe_name}"}
-        ext = target.suffix.lower()
-        if ext not in _INLINE_SCRIPT_EXTS:
-            return {
-                "ok": False,
-                "reason": (
-                    f"only script files (.py/.do/.r/.rmd) can be "
-                    f"attached this way; {safe_name} is a "
-                    f"{ext or 'unknown'} file. Data files are "
-                    f"already visible to the model via get_schema."
-                ),
-            }
-        try:
-            content = target.read_bytes()
-        except OSError as e:
-            return {"ok": False, "reason": f"read failed: {e}"}
         runner = self._active_runner()
         if runner is None:
             return {"ok": False, "reason": "no active session"}
-        # Idempotent: if the same script is already staged for the
-        # next turn, don't add a duplicate. Researchers who click
-        # the same row twice expect "already attached" rather than
-        # the model seeing two copies of the file.
-        for staged in runner.pending_script_attachments:
-            if staged.get("name") == safe_name:
+
+        ext = target.suffix.lower()
+        if ext in _INLINE_SCRIPT_EXTS:
+            try:
+                content = target.read_bytes()
+            except OSError as e:
+                return {"ok": False, "reason": f"read failed: {e}"}
+            for staged in runner.pending_script_attachments:
+                if staged.get("name") == safe_name:
+                    return {
+                        "ok": True,
+                        "name": safe_name,
+                        "kind": "script",
+                        "already_attached": True,
+                    }
+            _stage_script_for_next_turn(
+                runner.pending_script_attachments, safe_name, ext, content,
+            )
+            return {"ok": True, "name": safe_name, "kind": "script"}
+
+        if ext in _MENTION_VISION_EXTS:
+            blob_path = target
+            mime = _MENTION_VISION_MIMES.get(ext)
+            if ext in (".pdf", ".eps"):
+                from nora.plot_convert import png_for
+                sidecar = png_for(target)
+                if sidecar is not None and sidecar.is_file():
+                    blob_path = sidecar
+                    mime = "image/png"
+                else:
+                    return _attach_as_announcement(
+                        runner, safe_name, kind="graph",
+                    )
+            try:
+                blob_size = blob_path.stat().st_size
+            except OSError as e:
+                return {"ok": False, "reason": f"stat failed: {e}"}
+            if blob_size > _MENTION_VISION_MAX_BYTES:
                 return {
-                    "ok": True,
-                    "name": safe_name,
-                    "already_attached": True,
+                    "ok": False,
+                    "reason": (
+                        f"{safe_name} is {blob_size // (1024 * 1024)} MB, "
+                        f"over the 5 MB vision limit. Reference it by "
+                        f"name in your message and the model can read "
+                        f"it from disk if needed."
+                    ),
                 }
-        _stage_script_for_next_turn(
-            runner.pending_script_attachments, safe_name, ext, content,
+            try:
+                blob = blob_path.read_bytes()
+            except OSError as e:
+                return {"ok": False, "reason": f"read failed: {e}"}
+            for staged in runner.pending_mentioned_images:
+                if staged.get("name") == safe_name:
+                    return {
+                        "ok": True,
+                        "name": safe_name,
+                        "kind": "image",
+                        "already_attached": True,
+                    }
+            import base64 as _b64
+            runner.pending_mentioned_images.append({
+                "data": _b64.b64encode(blob).decode("ascii"),
+                "mime": mime or "image/png",
+                "name": safe_name,
+            })
+            if safe_name not in runner.pending_mentioned_files:
+                runner.pending_mentioned_files.append(safe_name)
+            return {"ok": True, "name": safe_name, "kind": "image"}
+
+        # Anything else: data files (.csv, .dta, .parquet, …),
+        # logs (.log, .smcl), Stata graphs (.gph). Announce by name
+        # only. The model already has dataset awareness via the
+        # system prompt's listing (or the mid-session diff notice
+        # for late additions); the mention notice just brings the
+        # file to the foreground for THIS message.
+        return _attach_as_announcement(
+            runner, safe_name, kind=_classify_kind(ext),
         )
-        return {"ok": True, "name": safe_name}
+
+    def list_mentionable_files(self) -> dict[str, Any]:
+        """Return every session-resident file the @-mention dropdown
+        can offer, as a flat list with no thumbnails. Sister of
+        :meth:`list_session_files` but lighter (no base64 image
+        bytes; the dropdown only needs name + kind for filtering and
+        rendering).
+
+        The shape matches what the dropdown's filter/render code
+        wants: ``[{name, kind, ext, mtime, size, path}]`` sorted by
+        kind priority (data first, then scripts, graphs, logs) and
+        mtime within each kind. Files in ``.nora/runs/<id>/_nora_plots/``
+        are included so a researcher can mention helper-produced
+        plots by name (``residuals_lm1.png``) the same way they'd
+        mention a top-level upload.
+        """
+        if self.cwd is None:
+            return {"ok": True, "files": []}
+        listing = self.list_session_files()
+        files: list[dict[str, Any]] = []
+        for entry in listing.get("files", []):
+            files.append({
+                k: v for k, v in entry.items()
+                if k not in ("data", "mime")
+            })
+        return {"ok": True, "files": files}
 
     def open_external(self, url: str) -> dict[str, Any]:
         """Open ``url`` in the OS default browser, NOT inside the
@@ -1669,6 +1788,24 @@ class NoraBridge:
         return active.pending_script_attachments
 
     @property
+    def _pending_mentioned_files(self) -> list[str]:
+        """Active runner's @-mention announcement list. Same semantics
+        as :attr:`_pending_script_attachments`: by-reference proxy
+        for tests and any external introspection."""
+        active = self._active_runner()
+        if active is None:
+            return []
+        return active.pending_mentioned_files
+
+    @property
+    def _pending_mentioned_images(self) -> list[dict[str, Any]]:
+        """Active runner's @-mention vision attachments."""
+        active = self._active_runner()
+        if active is None:
+            return []
+        return active.pending_mentioned_images
+
+    @property
     def _session(self) -> Any:
         """Active runner's underlying provider session, or None.
 
@@ -2088,6 +2225,59 @@ def _build_context_prefix(cwd: Path | None) -> str:
 _INLINE_SCRIPT_EXTS: frozenset[str] = frozenset({
     ".py", ".do", ".r", ".rmd",
 })
+
+# Vision-eligible mention attachments. When the researcher
+# @-mentions one of these, the bytes ride the next turn so the
+# model can actually see the image (and not just be told a file
+# named "residuals.png" exists). PDF / EPS get raster-converted
+# via plot_convert.png_for first.
+_MENTION_VISION_MIMES: dict[str, str] = {
+    ".png": "image/png",
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".pdf": "image/png",   # converted via sips → PNG sidecar
+    ".eps": "image/png",   # ditto
+}
+_MENTION_VISION_EXTS: frozenset[str] = frozenset(_MENTION_VISION_MIMES)
+
+# 5 MB hard cap on a single mentioned image. Matches the composer
+# drop limit. Above this the model would either reject the request
+# (Anthropic) or take a long time to ingest (OpenAI), and the
+# researcher's intent ("look at this plot") is better served by
+# pointing them at a smaller export.
+_MENTION_VISION_MAX_BYTES = 5 * 1024 * 1024
+
+
+def _classify_kind(ext: str) -> str:
+    """Map a file extension to the same ``kind`` string
+    :meth:`Bridge.list_session_files` uses, so the JS chip-renderer
+    only has one vocabulary to track."""
+    if ext in _INLINE_SCRIPT_EXTS or ext == ".ipynb":
+        return "script"
+    if ext in (".gph", ".png", ".jpg", ".jpeg", ".pdf", ".eps"):
+        return "graph"
+    if ext in (".log", ".smcl"):
+        return "log"
+    return "data"
+
+
+def _attach_as_announcement(
+    runner: Any, name: str, kind: str,
+) -> dict[str, Any]:
+    """Append ``name`` to the runner's mention-notice list (idempotent)
+    and return the bridge-shape success payload. The file's bytes
+    don't ride along; the model picks it up from disk on the next
+    turn via ``get_schema`` / ``expand_result`` / direct read."""
+    if name in runner.pending_mentioned_files:
+        return {
+            "ok": True,
+            "name": name,
+            "kind": kind,
+            "already_attached": True,
+        }
+    runner.pending_mentioned_files.append(name)
+    return {"ok": True, "name": name, "kind": kind}
+
 
 # Hint that travels with the script — "this file is Python / Stata /
 # R / R Markdown" — so the model knows what fence to use if it

@@ -193,6 +193,27 @@ def test_run_dir_is_read_and_write_allowed(example_profile: str):
     assert example_profile.count(run_entry) >= 2
 
 
+def test_cwd_is_write_allowed(example_profile: str):
+    """The researcher's cwd must be writable so scripts can
+    ``save "panel.dta", replace`` / ``saveRDS`` / ``df.to_csv``.
+    These are the standard Stata / R / Python output idioms.
+    Without this the sandbox returns ``r(603); file ... could not
+    be opened`` on every save, and analyses can't persist their
+    intermediate panels.
+
+    The data-boundary is preserved by the network deny and the read
+    allowlist (no ``/etc/passwd`` reads, no outbound network); a
+    write to the user-authorized session cwd is part of the normal
+    workflow, not an exfiltration channel.
+    """
+    cwd_entry = '(subpath "/Users/testuser/project")'
+    write_section = example_profile.split("(allow file-write*")[1]
+    assert cwd_entry in write_section, (
+        "researcher cwd must be writable so save / saveRDS / to_csv "
+        "land in the analysis workspace"
+    )
+
+
 # ---------------------------------------------------------------------------
 # Writes — very narrow
 # ---------------------------------------------------------------------------

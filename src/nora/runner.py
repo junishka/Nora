@@ -142,6 +142,16 @@ class SessionRunner:
         # produced via ``nora.plot_residuals`` / ``plot_interaction``
         # cross; raw ``ggsave`` / ``plt.savefig`` stays local.
         self.pending_plot_images: list[dict[str, Any]] = []
+        # @-mention staging: files the researcher pulled in by name
+        # via the composer dropdown (instead of re-uploading). The
+        # bytes are already on disk in this session. These lists
+        # only carry what the next turn needs to know about them.
+        # ``pending_mentioned_files`` becomes a one-line "the
+        # researcher referenced these" notice. ``pending_mentioned_images``
+        # rides the next turn as vision so the model can actually see
+        # any plots / images the researcher pointed at by name.
+        self.pending_mentioned_files: list[str] = []
+        self.pending_mentioned_images: list[dict[str, Any]] = []
 
     # -------- session lifecycle --------
 
@@ -439,6 +449,28 @@ class SessionRunner:
                     carried_dataset_diff = new_datasets
                 self.known_datasets = current_datasets
 
+                # @-mention pull-in: the researcher pointed at one or
+                # more session-resident files by name. The files are
+                # already on disk; surface a short notice so the model
+                # treats them as the focus of THIS message rather than
+                # generic ambient context.
+                carried_mentioned_files: list[str] = []
+                if self.pending_mentioned_files:
+                    mentioned_lines = "\n".join(
+                        f"  - {n}" for n in self.pending_mentioned_files
+                    )
+                    mention_notice = (
+                        "[The researcher referenced these existing "
+                        "session files in their message. Read or use "
+                        "them as appropriate (no re-upload needed):\n"
+                        f"{mentioned_lines}\n]\n\n"
+                    )
+                    prompt = mention_notice + prompt
+                    carried_mentioned_files = list(
+                        self.pending_mentioned_files
+                    )
+                    self.pending_mentioned_files = []
+
                 # Mid-chat script attachments. Consumed unconditionally
                 # — failure of the turn does NOT carry these forward.
                 # Earlier versions did carry forward on cancel/error to
@@ -461,6 +493,13 @@ class SessionRunner:
                 # send returns so each plot is sent exactly once.
                 merged_images: list[dict[str, Any]] = []
                 attached_plots: list[dict[str, Any]] = []
+                attached_mentioned_images: list[dict[str, Any]] = []
+                if self.pending_mentioned_images:
+                    merged_images.extend(self.pending_mentioned_images)
+                    attached_mentioned_images = list(
+                        self.pending_mentioned_images
+                    )
+                    self.pending_mentioned_images = []
                 if self.pending_plot_images:
                     merged_images.extend(self.pending_plot_images)
                     attached_plots = list(self.pending_plot_images)
@@ -527,6 +566,16 @@ class SessionRunner:
                         self.pending_plot_images = (
                             attached_plots + self.pending_plot_images
                         )
+                    if carried_mentioned_files:
+                        self.pending_mentioned_files = (
+                            carried_mentioned_files
+                            + self.pending_mentioned_files
+                        )
+                    if attached_mentioned_images:
+                        self.pending_mentioned_images = (
+                            attached_mentioned_images
+                            + self.pending_mentioned_images
+                        )
                     on_event(_stamp({
                         "type": "turn_error",
                         "message": "cancelled",
@@ -543,6 +592,16 @@ class SessionRunner:
                     if attached_plots:
                         self.pending_plot_images = (
                             attached_plots + self.pending_plot_images
+                        )
+                    if carried_mentioned_files:
+                        self.pending_mentioned_files = (
+                            carried_mentioned_files
+                            + self.pending_mentioned_files
+                        )
+                    if attached_mentioned_images:
+                        self.pending_mentioned_images = (
+                            attached_mentioned_images
+                            + self.pending_mentioned_images
                         )
                     on_event(_stamp({
                         "type": "turn_error",

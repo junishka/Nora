@@ -1,19 +1,19 @@
-"""Regression test: raw stderr / stdout never reaches Claude.
+"""Regression test: raw stderr / stdout never reaches the model on a
+SUCCESSFUL run.
 
-The architecture intentionally separates two sinks for script output:
+The architecture separates two sinks for script output:
 - The researcher's TUI, which sees everything (``raw_stdout``,
   ``raw_stderr``, the scratch dir on disk).
-- Claude, which sees only sanitized structured payloads.
+- The model, which sees only sanitized structured payloads on success
+  and a tightly-bounded ``debug_excerpt`` on failure.
 
-This test codifies that split at the ``submit_script`` tool layer — if
-a future refactor accidentally threads raw subprocess output into the
-MCP tool response, the resulting Claude-visible field becomes an
-injection channel (R / Stata errors can echo data content, e.g.
-``"variable contains invalid UTF-8 near <malicious>"``).
-
-The test runs a script that deliberately prints a recognizable token
-to stdout AND stderr, then asserts that token does not appear anywhere
-in the string representation of the tool's response.
+This test codifies the split for the SUCCESS path. A failure path now
+forwards a 500-1000 char ``debug_excerpt`` of the language's own error
+output. That channel has its own SDC boundary tests in
+``test_error_summary_no_leak.py``. Here we just pin that on a clean
+run, nothing extra crosses: stdout / stderr printed by the script
+(including data prints, debug `cat()`, etc.) must not appear in the
+tool response.
 """
 
 from __future__ import annotations

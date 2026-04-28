@@ -2928,3 +2928,133 @@ kbd {
 :root[data-theme="dark"] .messages *::-webkit-scrollbar-thumb:hover {
   background: rgba(240, 227, 214, 0.45);
 }
+
+/* ----- @-mention dropdown ------------------------------------------------ */
+.mention-popup {
+  position: fixed;
+  z-index: 1000;
+  background: var(--bg-surface);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  box-shadow: 0 10px 28px rgba(0, 0, 0, 0.18);
+  padding: 4px;
+  max-height: 280px;
+  overflow-y: auto;
+  font-size: 13px;
+  color: var(--text);
+}
+
+.mention-popup.hidden { display: none; }
+
+.mention-list {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+}
+
+.mention-row {
+  display: grid;
+  grid-template-columns: 22px 1fr auto;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 8px;
+  border: none;
+  background: transparent;
+  border-radius: 6px;
+  cursor: pointer;
+  text-align: left;
+  color: inherit;
+  font: inherit;
+  width: 100%;
+}
+
+.mention-row:hover,
+.mention-row.selected { background: var(--bg); }
+
+.mention-row.selected {
+  outline: 1px solid var(--accent);
+  outline-offset: -1px;
+}
+
+.mention-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 22px;
+  height: 22px;
+  border-radius: 4px;
+  background: var(--bg);
+  color: var(--text-dim);
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+}
+
+.mention-icon-script { color: var(--accent); }
+.mention-icon-data   { color: var(--text); }
+.mention-icon-graph  { color: var(--accent-soft); }
+.mention-icon-log    { color: var(--text-dim); }
+
+.mention-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-family: var(--font-mono, ui-monospace, SFMono-Regular, Menlo, Consolas, monospace);
+}
+
+.mention-meta {
+  color: var(--text-dim);
+  font-size: 11px;
+  white-space: nowrap;
+}
+
+.mention-empty {
+  padding: 10px 12px;
+  color: var(--text-dim);
+  font-style: italic;
+}
+
+.mention-hint {
+  padding: 6px 10px 4px;
+  margin-top: 2px;
+  border-top: 1px solid var(--border);
+  color: var(--text-dim);
+  font-size: 11px;
+}
+
+/* ----- send-while-busy queue --------------------------------------------- */
+.message.user.queued .message-body,
+.message.user.queued .message-attachment-chip {
+  opacity: 0.65;
+}
+
+.message.user.queued .message-body::after {
+  content: 'queued';
+  display: block;
+  margin-top: 4px;
+  font-size: 10px;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--text-dim);
+  font-weight: 500;
+  opacity: 0.8;
+}
+
+.message.user.not-sent .message-body {
+  opacity: 0.45;
+  text-decoration: line-through;
+  text-decoration-thickness: 1px;
+}
+
+.message.user.not-sent .message-body::after {
+  content: 'not sent, Stop pressed';
+  display: block;
+  margin-top: 4px;
+  font-size: 10px;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--text-dim);
+  font-weight: 500;
+  text-decoration: none;
+  opacity: 0.9;
+}

@@ -163,14 +163,14 @@ def _check_row_count(
             f"ROW COUNT ANOMALY: analysis used n={analysis_n} but source "
             f"dataset {source_dataset!r} has only {source_n} rows. The "
             f"script may have read a different file, merged in another, "
-            f"or bootstrapped — verify the intent."
+            f"or bootstrapped. Verify the intent."
         )
 
     diff = source_n - analysis_n
     pct = diff * 100.0 / source_n if source_n else 0.0
     return (
         f"ROW COUNT CHANGE: analysis used n={analysis_n} rows but source "
-        f"dataset {source_dataset!r} has {source_n} — {diff} row(s) "
+        f"dataset {source_dataset!r} has {source_n}; {diff} row(s) "
         f"excluded ({pct:.1f}%). Common causes: NA-drop by the analysis "
         f"command, an `if` / `subset(...)` / `filter(...)` in the script, "
         f"or a listwise-deletion from complete.cases. Verify the "
@@ -180,7 +180,7 @@ def _check_row_count(
 
 # Text constants returned by mocked tools so it is unambiguous to the
 # researcher (and the frontier model) that this is a placeholder interface.
-_MOCK_NOTE = "MOCKED — step 2 of the build ladder. Returns placeholder data."
+_MOCK_NOTE = "MOCKED. Step 2 of the build ladder. Returns placeholder data."
 
 
 def _summarize(payload: dict[str, Any]) -> str:
@@ -329,7 +329,7 @@ def _summarize_plot_helpers(run_dir: Any) -> dict[str, Any] | None:
             "Plot helpers were called but produced no plots. "
             "Check failed[].message; common cause is a missing "
             "package (matplotlib / haven / scipy). The researcher "
-            "won't see anything — interpret with the numerical "
+            "won't see anything. Interpret with the numerical "
             "payload only, or ask them to install the missing "
             "package and re-run."
         )
@@ -357,7 +357,7 @@ def _as_mcp_text(payload: dict[str, Any]) -> dict[str, Any]:
 @tool(
     "get_schema",
     (
-        "Return the structural summary of a dataset — variable names, types, "
+        "Return the structural summary of a dataset. Variable names, types, "
         "labels, value labels, observation count. Never returns individual "
         "observation values. Use this before writing any analysis script so "
         "you know what variables exist and their types.\n\n"
@@ -374,7 +374,7 @@ def _as_mcp_text(payload: dict[str, Any]) -> dict[str, Any]:
         "for categoricals.\n"
         "  Default: 'names_types_labels_summary'. Each successful response "
         "includes a 'policy_max_depth' field showing the ceiling the "
-        "researcher has set for this dataset — you cannot exceed it. "
+        "researcher has set for this dataset. You cannot exceed it. "
         "Requests above the ceiling are denied with the current ceiling "
         "named in the reason."
     ),
@@ -435,7 +435,7 @@ async def get_schema(args: dict[str, Any]) -> dict[str, Any]:
             "reason": (
                 f"schema depth {depth!r} exceeds the researcher's "
                 f"policy ceiling for {path.name!r} "
-                f"({ceiling!r}{' — explicit' if explicit else ' — default'}"
+                f"({ceiling!r}{'; explicit' if explicit else '; default'}"
                 f"). Ask for a narrower depth, or ask the researcher "
                 f"to raise the ceiling for this dataset in "
                 f".nora/policy.json."
@@ -558,7 +558,7 @@ async def request_data(args: dict[str, Any]) -> dict[str, Any]:
         "library (nora$result(...) in R, nora_result_* in Stata, "
         "nora.result(...) / nora.from_lm(...) in Python). Raw stdout/stderr "
         "is shown to the researcher in their TUI but is not returned to you "
-        "— you receive only the sanitized structured payload. Returns a "
+        ", you receive only the sanitized structured payload. Returns a "
         "result ID and a one-line label.\n\n"
         "Arguments:\n"
         "  language: 'R', 'Stata', or 'Python'.\n"
@@ -570,7 +570,7 @@ async def request_data(args: dict[str, Any]) -> dict[str, Any]:
         "effective N to the dataset's row count and flags silent "
         "filtering (NA-drops, subset conditions, listwise deletion) "
         "in the transformations log. PASS THIS whenever the script "
-        "reads a known file — this is how researchers catch analyses "
+        "reads a known file. This is how researchers catch analyses "
         "that quietly ran on a subset. Empty string is fine if the "
         "script generates its own data or touches multiple files."
     ),
@@ -628,16 +628,41 @@ async def submit_script(args: dict[str, Any]) -> dict[str, Any]:
             transformations=[],
             raw_log_path=exec_result.run_dir,
         )
+        # Build a short human-readable excerpt of the actual error so
+        # the model can debug something more specific than "exit code 1".
+        # ``debug_excerpt`` is the first channel that ever forwards
+        # stdout/stderr bytes to the model. The SDC boundary is
+        # preserved in error_summary.py via tightly-anchored patterns,
+        # length-aware redaction, credential scrub, and a 1 KB hard
+        # cap. See ``test_error_summary_no_leak.py`` for the
+        # regression coverage.
+        from nora.error_summary import extract_debug_excerpt
+        excerpt = extract_debug_excerpt(
+            exec_result.raw_stdout,
+            exec_result.raw_stderr,
+            exec_result.exit_code,
+            language,
+        )
+        if not excerpt:
+            excerpt = (
+                f"script failed (exit code {exec_result.exit_code}); "
+                f"inspect raw log in UI (result_id={diag_row.id})"
+            )
         return _as_mcp_text({
             "status": "execution_failed",
             "reason": exec_result.error,
             "exit_code": exec_result.exit_code,
             "result_id": diag_row.id,
             "duration_seconds": round(exec_result.duration_seconds, 3),
+            # Bounded excerpt of the language's own error output.
+            # Read it before re-trying. It usually points straight
+            # at the typo / missing column / wrong dtype.
+            "debug_excerpt": excerpt,
             "hint": (
-                "The raw stdout/stderr is preserved in the run directory "
-                "(see result via expand_result). Adjust the script and "
-                "resubmit."
+                "The full raw stdout/stderr stays in the run directory "
+                "for the researcher (no model-side file-read tool). "
+                "The debug_excerpt above is a short slice of the "
+                "language's error output. Read it before resubmitting."
             ),
             "_run_dir": str(exec_result.run_dir),
             # Language hint must travel on error paths too: the UI
@@ -744,7 +769,7 @@ async def submit_script(args: dict[str, Any]) -> dict[str, Any]:
     (
         "Retrieve the full sanitized payload for a previously stored result "
         "by its ID. Use this when you need to reference details of an "
-        "earlier result — e.g., coefficients from a prior regression — "
+        "earlier result. E.g., coefficients from a prior regression; "
         "without carrying the whole payload in context.\n\n"
         "Arguments:\n"
         "  result_id: the ID returned by a previous submit_script call."
@@ -837,13 +862,13 @@ async def list_results(args: dict[str, Any]) -> dict[str, Any]:
         "earlier in a long session that's no longer in your context "
         "window (\"the regression we ran at the start\", \"what did "
         "I ask yesterday about the gate variable\").\n"
-        "- You need the exact wording of something older — quote it "
+        "- You need the exact wording of something older. Quote it "
         "back verbatim rather than paraphrasing.\n"
         "- The auto-injected history starts with "
         "\"N earlier turns omitted\" and the researcher's question "
         "clearly points at those omitted turns.\n\n"
         "Do NOT call this for content already visible to you in the "
-        "current conversation — answer from context. The tool is a "
+        "current conversation. Answer from context. The tool is a "
         "disk read; use it when context genuinely can't answer the "
         "question.\n\n"
         "Arguments (all optional):\n"
@@ -858,7 +883,7 @@ async def list_results(args: dict[str, Any]) -> dict[str, Any]:
         "Returns {turn_count (total in archive), turns (list of "
         "{index, user, assistant, tools: [{name,label,result_id?}], "
         "result_ids, timestamp?})}. Thinking traces and raw tool-"
-        "result bodies are excluded — use list_results / expand_result "
+        "result bodies are excluded. Use list_results / expand_result "
         "for stored sanitized payloads."
     ),
     {"query": str, "tail": int, "context": int, "max_chars": int},
@@ -993,6 +1018,240 @@ async def recall_conversation(args: dict[str, Any]) -> dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
+# Tool: read_attached_file
+# ---------------------------------------------------------------------------
+
+# Files the model may recall on demand. Scripts are returned inline as
+# text; images are returned as an MCP image content block plus a text
+# metadata sibling so non-vision providers degrade gracefully.
+_RECALL_SCRIPT_EXTS: frozenset[str] = frozenset({
+    ".py", ".do", ".r", ".rmd",
+})
+_RECALL_IMAGE_MIMES: dict[str, str] = {
+    ".png": "image/png",
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+}
+# PDF / EPS are graphs the researcher might mention. We rasterise via
+# the existing sips-backed sidecar (same path the Files panel uses)
+# rather than shipping the original PDF — vision wants raster.
+_RECALL_RASTERIZE_EXTS: frozenset[str] = frozenset({".pdf", ".eps"})
+# Per-file caps. Scripts: same 64 KB cap the @-mention inline path
+# uses, so behavior is consistent regardless of how the model first
+# saw the file. Images: 5 MB matches the Anthropic vision ballpark
+# and the composer's drop limit.
+_RECALL_SCRIPT_MAX_BYTES = 64 * 1024
+_RECALL_IMAGE_MAX_BYTES = 5 * 1024 * 1024
+
+
+@tool(
+    "read_attached_file",
+    (
+        "Re-read a file the researcher attached to this session. "
+        "Scripts (.py / .do / .r / .rmd) and images (.png / .jpg / "
+        ".jpeg / .pdf / .eps). Use this when a file's content was in "
+        "your context earlier (because the researcher @-mentioned or "
+        "uploaded it) but has since scrolled out as the conversation "
+        "grew. The bytes are still on disk in the session cwd; this "
+        "tool fetches them again on demand so you don't have to ask "
+        "the researcher to re-attach.\n\n"
+        "Behaviour:\n"
+        "  - Scripts: full text returned inline (capped at 64 KB; "
+        "longer files are head-truncated with a marker). Use this to "
+        "recall a previously-attached do-file / .py before resubmitting "
+        "or proposing edits.\n"
+        "  - Images: returned as an MCP image content block so you can "
+        "see the plot. PDF / EPS are rasterised first.\n\n"
+        "Datasets (.csv / .dta / .parquet / .tsv / .jsonl / .ndjson / "
+        ".rds) are NOT retrievable through this tool. That boundary "
+        "is the SDC line. Use get_schema for column names / dtypes, "
+        "or write a script that reads the dataset.\n\n"
+        "Path safety: ``name`` is treated as a basename. Any directory "
+        "component is stripped before resolving against cwd. Paths "
+        "outside cwd are refused.\n\n"
+        "Arguments:\n"
+        "  name: basename of the file (e.g., 'reg_v9.do', "
+        "'residuals.png'). Must exist in the session cwd or one of "
+        "its plot subdirectories."
+    ),
+    {"name": str},
+)
+async def read_attached_file(args: dict[str, Any]) -> dict[str, Any]:
+    """Return the file's contents as inline text (scripts) or an MCP
+    image content block (images). See the tool description above for
+    the why; here we focus on the path resolution + safety dance.
+    """
+    raw_name = args.get("name", "")
+    if not raw_name or not isinstance(raw_name, str):
+        return _as_mcp_text({
+            "status": "error",
+            "reason": "name argument is required (basename of an attached file)",
+        })
+    cwd = get_cwd()
+    safe_name = Path(raw_name).name
+    if not safe_name:
+        return _as_mcp_text({
+            "status": "error",
+            "reason": f"could not parse a basename from {raw_name!r}",
+        })
+
+    try:
+        target = resolve_in_cwd(safe_name)
+    except (PathEscapeError, OSError):
+        target = None
+    if target is None or not target.is_file():
+        target = None
+        runs_root = cwd / ".nora" / "runs"
+        if runs_root.is_dir():
+            try:
+                for run_dir in runs_root.iterdir():
+                    plots_dir = run_dir / "_nora_plots"
+                    if not plots_dir.is_dir():
+                        continue
+                    candidate = plots_dir / safe_name
+                    if candidate.is_file():
+                        try:
+                            resolved = candidate.resolve()
+                            cwd_resolved = cwd.resolve()
+                            if str(resolved).startswith(str(cwd_resolved)):
+                                target = candidate
+                                break
+                        except OSError:
+                            continue
+            except OSError:
+                pass
+    if target is None or not target.is_file():
+        return _as_mcp_text({
+            "status": "not_found",
+            "reason": f"no file named {safe_name!r} in this session",
+        })
+
+    ext = target.suffix.lower()
+
+    # ----- script branch -----------------------------------------------
+    if ext in _RECALL_SCRIPT_EXTS:
+        try:
+            blob = target.read_bytes()
+        except OSError as e:
+            return _as_mcp_text({
+                "status": "error",
+                "reason": f"could not read {safe_name}: {e}",
+            })
+        original_size = len(blob)
+        truncated = False
+        if original_size > _RECALL_SCRIPT_MAX_BYTES:
+            blob = blob[:_RECALL_SCRIPT_MAX_BYTES]
+            truncated = True
+        try:
+            text = blob.decode("utf-8")
+        except UnicodeDecodeError:
+            text = blob.decode("utf-8", errors="replace")
+        return _as_mcp_text({
+            "status": "ok",
+            "name": safe_name,
+            "kind": "script",
+            "ext": ext,
+            "language": _ext_to_language(ext),
+            "size": original_size,
+            "truncated": truncated,
+            "content": text,
+        })
+
+    # ----- image branch ------------------------------------------------
+    if ext in _RECALL_IMAGE_MIMES or ext in _RECALL_RASTERIZE_EXTS:
+        blob_path = target
+        mime = _RECALL_IMAGE_MIMES.get(ext)
+        if ext in _RECALL_RASTERIZE_EXTS:
+            try:
+                from nora.plot_convert import png_for
+                sidecar = png_for(target)
+            except Exception:  # noqa: BLE001 — conversion is best-effort
+                sidecar = None
+            if sidecar is None or not sidecar.is_file():
+                return _as_mcp_text({
+                    "status": "error",
+                    "reason": (
+                        f"could not rasterise {safe_name} for vision; "
+                        f"open it directly in the UI instead"
+                    ),
+                })
+            blob_path = sidecar
+            mime = "image/png"
+        try:
+            size = blob_path.stat().st_size
+        except OSError as e:
+            return _as_mcp_text({
+                "status": "error",
+                "reason": f"stat failed: {e}",
+            })
+        if size > _RECALL_IMAGE_MAX_BYTES:
+            return _as_mcp_text({
+                "status": "error",
+                "reason": (
+                    f"{safe_name} is {size // (1024 * 1024)} MB, over "
+                    f"the 5 MB vision limit. Ask the researcher to "
+                    f"export a smaller version or open it themselves."
+                ),
+            })
+        try:
+            data_bytes = blob_path.read_bytes()
+        except OSError as e:
+            return _as_mcp_text({
+                "status": "error",
+                "reason": f"could not read {safe_name}: {e}",
+            })
+        import base64 as _b64
+        data_b64 = _b64.b64encode(data_bytes).decode("ascii")
+        descriptor = json.dumps({
+            "status": "ok",
+            "name": safe_name,
+            "kind": "image",
+            "ext": ext,
+            "mime": mime or "image/png",
+            "size": size,
+            "note": (
+                "The image is attached as an inline content block. "
+                "If your provider doesn't support image tool results, "
+                "ask the researcher to re-@mention the file in their "
+                "next message."
+            ),
+        }, indent=2, ensure_ascii=False)
+        return {
+            "content": [
+                {
+                    "type": "image",
+                    "data": data_b64,
+                    "mimeType": mime or "image/png",
+                },
+                {"type": "text", "text": descriptor},
+            ]
+        }
+
+    # ----- other extensions: refused with a clear hint ------------------
+    return _as_mcp_text({
+        "status": "rejected",
+        "reason": (
+            f"{safe_name} is a {ext or 'unknown'} file; only scripts "
+            f"(.py / .do / .r / .rmd) and images (.png / .jpg / .jpeg / "
+            f".pdf / .eps) can be recalled through this tool. For "
+            f"datasets use get_schema; for stored results use "
+            f"expand_result."
+        ),
+    })
+
+
+def _ext_to_language(ext: str) -> str:
+    """Map a script extension to the corresponding submit_script
+    language label so the model knows which interpreter to ask for."""
+    return {
+        ".py": "Python",
+        ".do": "Stata",
+        ".r": "R",
+        ".rmd": "R Markdown",
+    }.get(ext, "unknown")
+
+
+# ---------------------------------------------------------------------------
 # Server registration
 # ---------------------------------------------------------------------------
 
@@ -1005,6 +1264,7 @@ REGISTERED_TOOLS: tuple[Any, ...] = (
     expand_result,
     list_results,
     recall_conversation,
+    read_attached_file,
 )
 
 # Tool names Claude will see are prefixed: mcp__<server>__<tool>.
@@ -1016,6 +1276,7 @@ ALLOWED_TOOL_NAMES: tuple[str, ...] = (
     f"mcp__{SERVER_NAME}__expand_result",
     f"mcp__{SERVER_NAME}__list_results",
     f"mcp__{SERVER_NAME}__recall_conversation",
+    f"mcp__{SERVER_NAME}__read_attached_file",
 )
 
 

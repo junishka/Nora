@@ -95,7 +95,7 @@ _JSON_TO_PY: dict[str, type] = {
 # fail loudly otherwise).
 
 _GET_SCHEMA_DESC = (
-    "Return the structural summary of a dataset — variable names, types, "
+    "Return the structural summary of a dataset. Variable names, types, "
     "labels, value labels, observation count. Never returns individual "
     "observation values. Use this before writing any analysis script so "
     "you know what variables exist and their types.\n\n"
@@ -112,7 +112,7 @@ _GET_SCHEMA_DESC = (
     "for categoricals.\n"
     "  Default: 'names_types_labels_summary'. Each successful response "
     "includes a 'policy_max_depth' field showing the ceiling the "
-    "researcher has set for this dataset — you cannot exceed it. "
+    "researcher has set for this dataset. You cannot exceed it. "
     "Requests above the ceiling are denied with the current ceiling "
     "named in the reason."
 )
@@ -142,7 +142,7 @@ _SUBMIT_SCRIPT_DESC = (
     "library (nora$result(...) in R, nora_result_* in Stata, "
     "nora.result(...) / nora.from_lm(...) in Python). Raw stdout/stderr "
     "is shown to the researcher in their TUI but is not returned to you "
-    "— you receive only the sanitized structured payload. Returns a "
+    ", you receive only the sanitized structured payload. Returns a "
     "result ID and a one-line label.\n\n"
     "Arguments:\n"
     "  language: 'R', 'Stata', or 'Python'.\n"
@@ -154,7 +154,7 @@ _SUBMIT_SCRIPT_DESC = (
     "effective N to the dataset's row count and flags silent "
     "filtering (NA-drops, subset conditions, listwise deletion) "
     "in the transformations log. PASS THIS whenever the script "
-    "reads a known file — this is how researchers catch analyses "
+    "reads a known file. This is how researchers catch analyses "
     "that quietly ran on a subset. Empty string is fine if the "
     "script generates its own data or touches multiple files."
 )
@@ -162,7 +162,7 @@ _SUBMIT_SCRIPT_DESC = (
 _EXPAND_RESULT_DESC = (
     "Retrieve the full sanitized payload for a previously stored result "
     "by its ID. Use this when you need to reference details of an "
-    "earlier result — e.g., coefficients from a prior regression — "
+    "earlier result. E.g., coefficients from a prior regression; "
     "without carrying the whole payload in context.\n\n"
     "Arguments:\n"
     "  result_id: the ID returned by a previous submit_script call."
@@ -184,13 +184,13 @@ _RECALL_CONVERSATION_DESC = (
     "earlier in a long session that's no longer in your context "
     "window (\"the regression we ran at the start\", \"what did "
     "I ask yesterday about the gate variable\").\n"
-    "- You need the exact wording of something older — quote it "
+    "- You need the exact wording of something older. Quote it "
     "back verbatim rather than paraphrasing.\n"
     "- The auto-injected history starts with "
     "\"N earlier turns omitted\" and the researcher's question "
     "clearly points at those omitted turns.\n\n"
     "Do NOT call this for content already visible to you in the "
-    "current conversation — answer from context. The tool is a "
+    "current conversation. Answer from context. The tool is a "
     "disk read; use it when context genuinely can't answer the "
     "question.\n\n"
     "Arguments (all optional):\n"
@@ -205,13 +205,42 @@ _RECALL_CONVERSATION_DESC = (
     "Returns {turn_count (total in archive), turns (list of "
     "{index, user, assistant, tools: [{name,label,result_id?}], "
     "result_ids, timestamp?})}. Thinking traces and raw tool-"
-    "result bodies are excluded — use list_results / expand_result "
+    "result bodies are excluded. Use list_results / expand_result "
     "for stored sanitized payloads."
+)
+
+_READ_ATTACHED_FILE_DESC = (
+    "Re-read a file the researcher attached to this session. "
+    "Scripts (.py / .do / .r / .rmd) and images (.png / .jpg / "
+    ".jpeg / .pdf / .eps). Use this when a file's content was in "
+    "your context earlier (because the researcher @-mentioned or "
+    "uploaded it) but has since scrolled out as the conversation "
+    "grew. The bytes are still on disk in the session cwd; this "
+    "tool fetches them again on demand so you don't have to ask "
+    "the researcher to re-attach.\n\n"
+    "Behaviour:\n"
+    "  - Scripts: full text returned inline (capped at 64 KB; "
+    "longer files are head-truncated with a marker). Use this to "
+    "recall a previously-attached do-file / .py before resubmitting "
+    "or proposing edits.\n"
+    "  - Images: returned as an MCP image content block so you can "
+    "see the plot. PDF / EPS are rasterised first.\n\n"
+    "Datasets (.csv / .dta / .parquet / .tsv / .jsonl / .ndjson / "
+    ".rds) are NOT retrievable through this tool. That boundary "
+    "is the SDC line. Use get_schema for column names / dtypes, "
+    "or write a script that reads the dataset.\n\n"
+    "Path safety: ``name`` is treated as a basename. Any directory "
+    "component is stripped before resolving against cwd. Paths "
+    "outside cwd are refused.\n\n"
+    "Arguments:\n"
+    "  name: basename of the file (e.g., 'reg_v9.do', "
+    "'residuals.png'). Must exist in the session cwd or one of "
+    "its plot subdirectories."
 )
 
 
 # ---------------------------------------------------------------------------
-# The six tools.
+# The seven tools.
 # ---------------------------------------------------------------------------
 # Order matches the order in which they appear to the model in the
 # system-prompt enumeration in ``app.py``.
@@ -297,6 +326,14 @@ def build_tool_specs() -> tuple[ToolSpec, ...]:
                 "max_chars": {"type": "integer"},
             },
             required=(),
+        ),
+        _spec(
+            "read_attached_file",
+            _READ_ATTACHED_FILE_DESC,
+            properties={
+                "name": {"type": "string"},
+            },
+            required=("name",),
         ),
     )
 

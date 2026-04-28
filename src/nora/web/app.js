@@ -410,6 +410,10 @@ function showChat(payload) {
   }
   stagedDataNotices.length = 0;
   renderAttachments();
+  // Each session has its own files; bust the cache so the next
+  // "@" doesn't offer rows from the previous session.
+  invalidateMentionCache();
+  if (typeof closeMentionPopup === 'function') closeMentionPopup();
   // Sync the composer state to whether THIS session is currently
   // busy. Switching to a session that's mid-turn shows Stop +
   // loading indicator immediately; switching to an idle session
@@ -990,9 +994,363 @@ if (input) {
   });
 }
 
+// ---- @-mention dropdown for session files --------------------------------
+//
+// When the researcher types "@" the composer offers a filtered list of
+// every file already in this session: scripts, datasets, plots, logs.
+// Selecting a row stages the file via attach_session_file (the same
+// bridge endpoint the Files panel uses) and inserts "@<filename>" at
+// the caret. The transcript chip + composer chip then track the file
+// the same way a drag/drop attachment would.
+let mentionFiles = null;
+let mentionFilesFresh = false;
+const mentionPopup = document.createElement('div');
+mentionPopup.id = 'mention-popup';
+mentionPopup.className = 'mention-popup hidden';
+document.body.appendChild(mentionPopup);
+let mentionState = null;
+
+function invalidateMentionCache() {
+  mentionFilesFresh = false;
+}
+
+async function ensureMentionFiles() {
+  if (mentionFilesFresh && Array.isArray(mentionFiles)) return mentionFiles;
+  if (!window.pywebview || !window.pywebview.api) return [];
+  if (typeof window.pywebview.api.list_mentionable_files !== 'function') return [];
+  try {
+    const res = await window.pywebview.api.list_mentionable_files();
+    if (res && res.ok && Array.isArray(res.files)) {
+      mentionFiles = res.files;
+      mentionFilesFresh = true;
+      return mentionFiles;
+    }
+  } catch (err) {
+    console.warn('list_mentionable_files failed', err);
+  }
+  mentionFiles = [];
+  mentionFilesFresh = true;
+  return mentionFiles;
+}
+
+function detectMentionTrigger() {
+  if (!input) return null;
+  const value = input.value;
+  const caret = input.selectionStart;
+  if (caret == null || caret !== input.selectionEnd) return null;
+  let i = caret - 1;
+  let scanned = 0;
+  while (i >= 0) {
+    const c = value[i];
+    if (c === '@') {
+      if (i === 0 || /\s/.test(value[i - 1])) {
+        return {
+          startIdx: i,
+          endIdx: caret,
+          query: value.slice(i + 1, caret).toLowerCase(),
+        };
+      }
+      return null;
+    }
+    if (/\s/.test(c)) return null;
+    scanned += 1;
+    if (scanned > 64) return null;
+    i -= 1;
+  }
+  return null;
+}
+
+function filterMentionFiles(files, query) {
+  if (!query) return files.slice(0, 20);
+  const scored = [];
+  for (const f of files) {
+    const lname = (f.name || '').toLowerCase();
+    const idx = lname.indexOf(query);
+    if (idx === -1) continue;
+    let score = 10;
+    if (idx === 0) score = 100;
+    else {
+      const prev = lname[idx - 1];
+      if (prev === '.' || prev === '_' || prev === '-') score = 50;
+    }
+    score -= idx;
+    scored.push({ score, f });
+  }
+  scored.sort((a, b) => b.score - a.score);
+  return scored.slice(0, 20).map((s) => s.f);
+}
+
+function mentionKindIcon(kind) {
+  switch (kind) {
+    case 'script': return 'S';
+    case 'data':   return 'D';
+    case 'graph':  return 'G';
+    case 'log':    return 'L';
+    default:       return '·';
+  }
+}
+
+function mentionFormatBytes(n) {
+  if (n == null) return '';
+  if (n < 1024) return n + ' B';
+  if (n < 1024 * 1024) return Math.round(n / 1024) + ' KB';
+  return (n / (1024 * 1024)).toFixed(1) + ' MB';
+}
+
+function escapeMentionHtml(s) {
+  return String(s == null ? '' : s).replace(/[&<>"']/g, (c) => (
+    c === '&' ? '&amp;' :
+    c === '<' ? '&lt;' :
+    c === '>' ? '&gt;' :
+    c === '"' ? '&quot;' : '&#39;'
+  ));
+}
+
+function renderMentionPopup() {
+  if (!mentionState) {
+    mentionPopup.classList.add('hidden');
+    return;
+  }
+  const { items, selected } = mentionState;
+  mentionPopup.innerHTML = '';
+  if (!items || items.length === 0) {
+    const empty = document.createElement('div');
+    empty.className = 'mention-empty';
+    empty.textContent = 'No matching files in this session.';
+    mentionPopup.appendChild(empty);
+  } else {
+    const list = document.createElement('div');
+    list.className = 'mention-list';
+    items.forEach((f, idx) => {
+      const row = document.createElement('button');
+      row.type = 'button';
+      row.className = 'mention-row' + (idx === selected ? ' selected' : '');
+      row.dataset.idx = String(idx);
+      row.innerHTML = (
+        '<span class="mention-icon mention-icon-' + escapeMentionHtml(f.kind || '') + '" '
+          + 'aria-hidden="true">' + escapeMentionHtml(mentionKindIcon(f.kind)) + '</span>'
+        + '<span class="mention-name">' + escapeMentionHtml(f.name) + '</span>'
+        + '<span class="mention-meta">' + escapeMentionHtml(f.kind || '')
+          + (f.size != null ? ' · ' + escapeMentionHtml(mentionFormatBytes(f.size)) : '')
+          + '</span>'
+      );
+      row.addEventListener('mousedown', (e) => {
+        e.preventDefault();
+        selectMention(idx);
+      });
+      row.addEventListener('mouseenter', () => {
+        if (!mentionState) return;
+        mentionState.selected = idx;
+        list.querySelectorAll('.mention-row').forEach((el, i) => {
+          el.classList.toggle('selected', i === idx);
+        });
+      });
+      list.appendChild(row);
+    });
+    mentionPopup.appendChild(list);
+    const hint = document.createElement('div');
+    hint.className = 'mention-hint';
+    hint.textContent = '↑↓ navigate · ↵ insert · esc dismiss';
+    mentionPopup.appendChild(hint);
+  }
+  mentionPopup.classList.remove('hidden');
+  positionMentionPopup();
+}
+
+function positionMentionPopup() {
+  if (!input) return;
+  const rect = input.getBoundingClientRect();
+  const width = Math.min(Math.max(rect.width, 320), 480);
+  mentionPopup.style.width = width + 'px';
+  mentionPopup.style.left = rect.left + 'px';
+  requestAnimationFrame(() => {
+    const popupH = mentionPopup.offsetHeight;
+    const top = Math.max(8, rect.top - popupH - 6);
+    mentionPopup.style.top = top + 'px';
+  });
+}
+
+function closeMentionPopup() {
+  mentionState = null;
+  mentionPopup.classList.add('hidden');
+}
+
+async function refreshMentionState() {
+  const trigger = detectMentionTrigger();
+  if (!trigger) {
+    closeMentionPopup();
+    return;
+  }
+  const files = await ensureMentionFiles();
+  if (files.length === 0) {
+    closeMentionPopup();
+    return;
+  }
+  const items = filterMentionFiles(files, trigger.query);
+  mentionState = {
+    startIdx: trigger.startIdx,
+    endIdx: trigger.endIdx,
+    query: trigger.query,
+    items,
+    selected: 0,
+  };
+  renderMentionPopup();
+}
+
+async function selectMention(idx) {
+  if (!mentionState) return;
+  const item = mentionState.items[idx];
+  if (!item) return;
+  const before = input.value.slice(0, mentionState.startIdx);
+  const after = input.value.slice(mentionState.endIdx);
+  const token = '@' + item.name;
+  input.value = before + token + after;
+  const caret = before.length + token.length;
+  input.selectionStart = input.selectionEnd = caret;
+  autosize();
+  closeMentionPopup();
+  await stageMentionedFile(item.name);
+  input.focus();
+}
+
+async function stageMentionedFile(name) {
+  if (!window.pywebview || !window.pywebview.api) return;
+  if (typeof window.pywebview.api.attach_session_file !== 'function') return;
+  try {
+    const res = await window.pywebview.api.attach_session_file(name);
+    if (!res || !res.ok) {
+      const reason = (res && res.reason) || 'unknown';
+      toast('Could not attach: ' + reason, 'error');
+      return;
+    }
+    if (!res.already_attached) {
+      if (addStagedDataNotices([res.name || name])) renderAttachments();
+    }
+  } catch (err) {
+    console.warn('attach_session_file failed', err);
+  }
+}
+
+if (input) {
+  input.addEventListener('input', () => { refreshMentionState(); });
+  input.addEventListener('click', () => { refreshMentionState(); });
+  input.addEventListener('keyup', (e) => {
+    if (e.key === 'ArrowLeft' || e.key === 'ArrowRight'
+        || e.key === 'Home' || e.key === 'End') {
+      refreshMentionState();
+    }
+  });
+  input.addEventListener('keydown', (e) => {
+    if (!mentionState || mentionPopup.classList.contains('hidden')) return;
+    const items = mentionState.items || [];
+    const len = Math.max(items.length, 1);
+    if (e.key === 'ArrowDown') {
+      e.preventDefault();
+      mentionState.selected = (mentionState.selected + 1) % len;
+      renderMentionPopup();
+    } else if (e.key === 'ArrowUp') {
+      e.preventDefault();
+      mentionState.selected = (mentionState.selected - 1 + len) % len;
+      renderMentionPopup();
+    } else if (e.key === 'Enter' || e.key === 'Tab') {
+      if (items.length > 0) {
+        e.preventDefault();
+        e.stopImmediatePropagation();
+        selectMention(mentionState.selected);
+      } else {
+        closeMentionPopup();
+      }
+    } else if (e.key === 'Escape') {
+      e.preventDefault();
+      e.stopImmediatePropagation();
+      closeMentionPopup();
+    }
+  });
+  input.addEventListener('blur', () => {
+    setTimeout(closeMentionPopup, 120);
+  });
+}
+window.addEventListener('resize', () => {
+  if (mentionState) positionMentionPopup();
+});
+
+// ---- send-while-busy queue -----------------------------------------------
+//
+// When a turn is already in flight, the user can still type and Send.
+// We render the user bubble immediately with a "queued" pill, snapshot
+// the staged attachments, and fire the actual ``send_message`` only
+// when the current turn's terminal event arrives. The runner's
+// per-session ``_send_lock`` already serialises sends on the Python
+// side; this queue is purely about (a) capturing the right
+// attachments / images at submit time (so they go with the right
+// message rather than getting folded into whichever turn is running)
+// and (b) giving the researcher visible feedback that their follow-up
+// landed.
+//
+// Stop drains the queue: cancelled queued bubbles get marked
+// ``.not-sent`` and stay visible (with reduced opacity) so the
+// researcher can see what they asked but didn't ship.
+const pendingByCwd = new Map();
+
+function pendingFor(cwd) {
+  let q = pendingByCwd.get(cwd);
+  if (!q) { q = []; pendingByCwd.set(cwd, q); }
+  return q;
+}
+
+async function fireQueuedMessage(cwd, item) {
+  item.userEl.classList.remove('queued');
+  activeLiveTurn = { nodes: [item.userEl], hasVisibleReply: false };
+  try {
+    if (item.images.length > 0 && typeof window.pywebview.api.send_message_with_images === 'function') {
+      const payload = item.images.map((img) => ({ data: img.data, mime: img.mime }));
+      await window.pywebview.api.send_message_with_images(item.text, payload);
+    } else if (item.images.length > 0) {
+      const errEl = appendError('Restart Nora to send images.');
+      if (activeLiveTurn) {
+        activeLiveTurn.nodes.push(errEl);
+        queueDisposableTurn(activeLiveTurn.nodes);
+      }
+      activeLiveTurn = null;
+      setSending(false, cwd);
+    } else {
+      await window.pywebview.api.send_message(item.text);
+    }
+  } catch (err) {
+    const errEl = appendError('send failed: ' + err);
+    if (activeLiveTurn) {
+      activeLiveTurn.nodes.push(errEl);
+      queueDisposableTurn(activeLiveTurn.nodes);
+    }
+    activeLiveTurn = null;
+    setSending(false, cwd);
+  }
+}
+
+function flushPendingFor(cwd) {
+  const q = pendingByCwd.get(cwd);
+  if (!q || q.length === 0) return false;
+  const next = q.shift();
+  setSending(true, cwd);
+  Promise.resolve().then(() => fireQueuedMessage(cwd, next));
+  return true;
+}
+
+function drainPendingFor(cwd) {
+  const q = pendingByCwd.get(cwd);
+  if (!q || q.length === 0) return 0;
+  const drained = q.length;
+  for (const item of q) {
+    item.userEl.classList.remove('queued');
+    item.userEl.classList.add('not-sent');
+    item.userEl.title = 'Stopped before this message could send.';
+  }
+  q.length = 0;
+  return drained;
+}
+
 form.addEventListener('submit', async (e) => {
   e.preventDefault();
-  if (turnInFlight) return;
   const text = input.value.trim();
   const images = stagedImages.slice();  // snapshot
   if (!text && images.length === 0) return;
@@ -1023,8 +1381,8 @@ form.addEventListener('submit', async (e) => {
   const userEl = appendUser(
     text || '(image only)', messageAttachments, messageImages
   );
-  activeLiveTurn = { nodes: [userEl], hasVisibleReply: false };
   input.value = '';
+  closeMentionPopup();
   autosize();
   rotatePlaceholder();
   // Clear staged images from the UI immediately — the snapshot
@@ -1035,6 +1393,27 @@ form.addEventListener('submit', async (e) => {
   stagedImages.length = 0;
   stagedDataNotices.length = 0;
   renderAttachments();
+
+  // If a turn is already running on this session, queue the new
+  // message instead of firing it. The terminal-event handler
+  // (turn_done / turn_error / auth_failure) drains the queue, so
+  // by the time the running turn finishes the next one fires
+  // automatically. The user bubble is already in the transcript;
+  // we tag it ``.queued`` so the researcher can see what's
+  // pending.
+  if (turnInFlight) {
+    userEl.classList.add('queued');
+    userEl.title = 'Queued — will send when the current turn finishes.';
+    pendingFor(currentCwd).push({
+      text,
+      images: images.map((img) => ({ data: img.data, mime: img.mime })),
+      attachments: messageAttachments,
+      userEl,
+    });
+    return;
+  }
+
+  activeLiveTurn = { nodes: [userEl], hasVisibleReply: false };
   setSending(true);
   try {
     // If images are attached, use the richer send method. The
@@ -1069,13 +1448,12 @@ form.addEventListener('submit', async (e) => {
   }
 });
 
-// Shift-Enter inserts a newline; plain Enter sends (but only when
-// a turn isn't already in flight — avoids queuing multiple prompts
-// by mashing Enter while Claude is thinking).
+// Shift-Enter inserts a newline; plain Enter sends. Sending while a
+// turn is already in flight is allowed: the submit handler queues
+// the new message and the terminal-event handler drains the queue.
 input.addEventListener('keydown', (e) => {
   if (e.key === 'Enter' && !e.shiftKey) {
     e.preventDefault();
-    if (turnInFlight) return;
     form.dispatchEvent(new Event('submit'));
   }
 });
@@ -1247,10 +1625,16 @@ if (stopBtn) {
   stopBtn.addEventListener('click', async () => {
     if (!window.pywebview || !window.pywebview.api) return;
     stopBtn.disabled = true;
+    // Stop = "stop everything for this session": cancel the
+    // running turn AND drain any queued follow-ups. Cancelled
+    // queued messages get marked ``.not-sent`` so the researcher
+    // can see what they typed but didn't ship; silently removing
+    // their text would be hostile UX.
+    drainPendingFor(currentCwd);
     try {
       await window.pywebview.api.interrupt_turn();
     } catch (_) {
-      // swallow — the bridge may have nothing to cancel; we still
+      // swallow: the bridge may have nothing to cancel; we still
       // want to clear the UI state below.
     } finally {
       // Always restore the composer regardless of what the bridge
@@ -1320,7 +1704,6 @@ window.nora_event = function (evt) {
       // fresh response is not in the window on THIS turn; it gets
       // folded into input on the NEXT turn via cache_creation /
       // input_tokens.
-      setSending(false, evtCwd);
       if (isFocused) {
         const prompt =
           (evt.input_tokens || 0) +
@@ -1332,13 +1715,22 @@ window.nora_event = function (evt) {
         }
         activeLiveTurn = null;
       }
+      // ``flushPendingFor`` returns true iff a queued message just
+      // fired. In that case ``setSending(true, evtCwd)`` was
+      // re-asserted inside, so we leave the composer in the busy
+      // state and DON'T flip back to Send.
+      if (!flushPendingFor(evtCwd)) {
+        setSending(false, evtCwd);
+      }
       break;
     case 'auth_failure':
-      // Auth failures matter cross-session — even a background
+      // Auth failures matter cross-session: even a background
       // turn that hits an auth error should drop its busy dot.
       // Render the error bubble only into the focused transcript
       // (the message is in the persisted log; switching to that
-      // session will replay it).
+      // session will replay it). Drain any queued follow-ups for
+      // this session: if auth is broken, queueing them up to fail
+      // one after another is just noise.
       if (isFocused) {
         const errEl = appendError('Auth failure: ' + (evt.reason || 'unknown'));
         if (activeLiveTurn && !activeLiveTurn.hasVisibleReply) {
@@ -1347,6 +1739,7 @@ window.nora_event = function (evt) {
         }
         activeLiveTurn = null;
       }
+      drainPendingFor(evtCwd);
       setSending(false, evtCwd);
       break;
     case 'turn_error':
@@ -1358,6 +1751,12 @@ window.nora_event = function (evt) {
         }
         activeLiveTurn = null;
       }
+      // For ordinary turn errors (e.g., model returned a tool-use
+      // error), drain the queue: the researcher's follow-ups were
+      // probably reasoning-conditioned on the previous turn
+      // succeeding, so firing them blindly is worse than asking
+      // them to retry.
+      drainPendingFor(evtCwd);
       setSending(false, evtCwd);
       break;
     case 'policy_updated':
@@ -1442,12 +1841,12 @@ function runTypewriter(bodyEl, fullText, onComplete) {
     onComplete();
     return;
   }
-  // Adaptive speed: short messages land in ~500 ms; longer ones
-  // cap at ~2.5 s so the "typing" cue reads clearly without making
-  // the researcher wait through a crawl. Per-char pacing is ~12 ms
-  // (~80 chars/sec) — slow enough to feel like typing, fast enough
-  // that a full paragraph doesn't turn into a coffee break.
-  const targetMs = Math.min(2500, Math.max(500, len * 12));
+  // Adaptive speed: short messages land in ~700 ms; longer ones
+  // cap at ~4 s so the "typing" cue reads clearly without making
+  // the researcher wait through a crawl. Per-char pacing is ~22 ms
+  // (~45 chars/sec), closer to a thoughtful typing rhythm than the
+  // earlier ~80 cps which read more like a stream than typing.
+  const targetMs = Math.min(4000, Math.max(700, len * 22));
   const charsPerMs = len / targetMs;
   let typed = 0;
   let lastTime = performance.now();
@@ -1991,6 +2390,11 @@ async function refreshFilesChip() {
    * tier. The Files popup is the surface for the OTHER session
    * artifacts (scripts, graphs, logs) that have no home elsewhere.
    */
+  // The Files panel and the @-mention dropdown share the same
+  // source of truth (session-resident files). Whenever this chip
+  // refreshes, bust the mention cache so the next "@" pull
+  // re-fetches.
+  invalidateMentionCache();
   if (!filesChip) return;
   if (!window.pywebview || !window.pywebview.api) return;
   if (typeof window.pywebview.api.list_session_files !== 'function') return;

@@ -87,7 +87,20 @@ class ResultStore:
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         # isolation_level=None → autocommit; we manage transactions with
         # explicit BEGIN/COMMIT blocks.
-        self._conn = sqlite3.connect(str(db_path), isolation_level=None)
+        #
+        # check_same_thread=False: Nora's bridge runs in pywebview's
+        # webview thread while tool calls (submit_script, list_results,
+        # expand_result) run on the asyncio runner thread. Whichever
+        # thread first calls ``get_store`` opens the connection; the
+        # other thread reusing the cached store would otherwise get
+        # ``ProgrammingError: SQLite objects created in a thread can
+        # only be used in that same thread``. Single-writer-single-
+        # reader serialization (this class's docstring) plus SQLite's
+        # own locking and the GIL is enough; we don't need Python's
+        # default thread-affinity check on top.
+        self._conn = sqlite3.connect(
+            str(db_path), isolation_level=None, check_same_thread=False,
+        )
         self._conn.row_factory = sqlite3.Row
         self._conn.executescript(self.SCHEMA)
 

@@ -122,17 +122,19 @@ def test_attach_session_file_is_idempotent(tmp_path: Path) -> None:
     assert len(bridge._pending_script_attachments) == 1
 
 
-def test_attach_session_file_refuses_data_extensions(tmp_path: Path) -> None:
-    """Data files reach the model via get_schema; inlining a
-    multi-MB CSV would just blow up the prompt. The endpoint
-    refuses anything outside the script allowlist with a clear
-    message."""
+def test_attach_session_file_announces_data_extensions(tmp_path: Path) -> None:
+    """Data files don't get inlined as text. That would blow up the
+    prompt for a multi-MB CSV. They DO get added to the @-mention
+    notice for the next turn, so the model knows the researcher is
+    pointing at this specific file (vs the generic dataset listing
+    in the system prompt)."""
     bridge = _bridge_with_files(tmp_path, ["panel.parquet"])
 
     res = bridge.attach_session_file("panel.parquet")
-    assert res["ok"] is False
-    assert "script files" in res["reason"]
+    assert res["ok"] is True
+    assert res["kind"] == "data"
     assert bridge._pending_script_attachments == []
+    assert "panel.parquet" in bridge._pending_mentioned_files
 
 
 def test_attach_session_file_refuses_path_traversal(tmp_path: Path) -> None:

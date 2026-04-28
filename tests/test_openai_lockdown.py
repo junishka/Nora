@@ -32,9 +32,16 @@ from nora.provider.tool_schemas import build_tool_specs
 # Static checks on the tool list
 # ---------------------------------------------------------------------------
 
-def test_tool_list_contains_only_six_function_tools():
+def test_tool_list_contains_only_function_tools():
     tools = build_openai_tools()
-    assert len(tools) == 6
+    # Sanity floor: drop-out below this would mean the schema list
+    # got truncated. We don't pin an exact count any more because
+    # new tools land here naturally as the surface grows.
+    assert len(tools) >= 6
+    # Match the canonical specs exactly. That's the real invariant
+    # (covered separately by test_tool_list_names_match_canonical_specs)
+    # and stops a stray duplicate from sneaking in.
+    assert len(tools) == len(build_tool_specs())
     assert all(t.get("type") == "function" for t in tools), (
         "every Nora tool sent to OpenAI must be a function tool"
     )
@@ -142,13 +149,14 @@ class _FakeAsyncOpenAI:
         return None
 
 
-def test_send_only_passes_the_six_function_tools(
+def test_send_only_passes_function_tools(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
 ) -> None:
     """Drive a real send() against a fake OpenAI client and assert
-    the ``tools`` kwarg contains exactly the six function tools and
+    the ``tools`` kwarg contains exactly Nora's function tools, and
     nothing else. This is the test that catches a future PR adding
-    a built-in to the request."""
+    a built-in (web_search, code_interpreter, file_search,
+    image_generation, MCP) to the request."""
     import asyncio
 
     # Stub out the keyring resolver so we don't need a real OpenAI key.
@@ -175,9 +183,13 @@ def test_send_only_passes_the_six_function_tools(
     assert len(api.calls) == 1, "expected exactly one Responses-API call"
     call = api.calls[0]
 
-    # Lockdown assertions.
+    # Lockdown assertions. Floor of 6 (the original locked surface)
+    # plus exact match against the canonical spec count, so a future
+    # PR adding a tool flows through naturally but a duplicate or a
+    # stray built-in does not.
     tools = call.get("tools")
-    assert tools is not None and len(tools) == 6
+    assert tools is not None and len(tools) >= 6
+    assert len(tools) == len(build_tool_specs())
     assert all(t.get("type") == "function" for t in tools)
     sent_names = {t["name"] for t in tools}
     expected = {s.name for s in build_tool_specs()}
