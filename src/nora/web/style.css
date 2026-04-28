@@ -140,7 +140,7 @@ body {
   padding: 0 8px;
   text-align: center;
   color: var(--text-dim);
-  font-size: 12px;
+  font-size: 13px;
   line-height: 1.4;
   white-space: nowrap;
   overflow: hidden;
@@ -2217,9 +2217,9 @@ kbd {
   padding: 0 4px;
   display: flex;
   align-items: center;
-  font-size: 12px;
+  font-size: 13px;
   color: var(--text-dim);
-  gap: 8px;
+  gap: 10px;
   position: relative;  /* anchors the absolutely-positioned #status-line */
 }
 
@@ -2405,14 +2405,14 @@ kbd {
 .composer-chip {
   display: inline-flex;
   align-items: center;
-  gap: 4px;
-  padding: 2px 6px;
-  font-size: 12px;
+  gap: 5px;
+  padding: 4px 8px;
+  font-size: 13px;
   font-family: inherit;
   background: transparent;
   color: var(--text-dim);
   border: none;
-  border-radius: 4px;
+  border-radius: 6px;
   cursor: pointer;
   white-space: nowrap;
   transition: color 0.15s, background 0.15s;
@@ -2425,7 +2425,7 @@ kbd {
 }
 
 .chip-arrow {
-  font-size: 9px;
+  font-size: 10px;
   color: var(--text-dim);
 }
 

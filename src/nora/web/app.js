@@ -2721,11 +2721,11 @@ function buildPolicyPopup(policy) {
   header.className = 'policy-popup-header';
   // Compact but informative: names the control, the unit it acts on,
   // and the one-way semantic (ceiling, not target). Drops the
-  // "default: …" crutch — the active tier is visible in the row
+  // "default: …" crutch. The active tier is visible in the row
   // selection itself.
   header.innerHTML =
-    '<strong>Permission</strong> — ceiling on variable details ' +
-    'Claude sees, per dataset. It can ask for less, never more.';
+    '<strong>Permission</strong>: ceiling on variable details ' +
+    'Nora sees per dataset. It can ask for less, never more.';
   wrapper.appendChild(header);
 
   policy.datasets.forEach((d) => {
