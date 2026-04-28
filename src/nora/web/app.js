@@ -1631,6 +1631,12 @@ if (stopBtn) {
     // can see what they typed but didn't ship; silently removing
     // their text would be hostile UX.
     drainPendingFor(currentCwd);
+    // Visible acknowledgement: the cancellation cascades through
+    // the SDK + the subprocess kill, which can take a beat. Without
+    // this toast, a researcher who pressed Stop and immediately
+    // resent the same prompt would see the new turn queue behind
+    // the cancellation cleanup and assume "Stop did nothing".
+    toast('Stopping…', 'info');
     try {
       await window.pywebview.api.interrupt_turn();
     } catch (_) {

@@ -604,7 +604,38 @@ async def submit_script(args: dict[str, Any]) -> dict[str, Any]:
 
     # --- Execution ---------------------------------------------------------
     cwd = get_cwd()
-    exec_result = executor.run_script(language, code, cwd)
+    # Run the executor in a worker thread (it uses synchronous Popen)
+    # while keeping a handle to the spawned process. If the asyncio
+    # task is cancelled mid-run (researcher pressed Stop), kill the
+    # subprocess explicitly so the script actually halts. Without
+    # this, the subprocess kept running to completion or to the
+    # 120s timeout while the cancellation was waiting in the
+    # asyncio queue, and "Stop" felt like a no-op.
+    import asyncio as _asyncio
+    import subprocess as _subprocess
+    proc_box: list[_subprocess.Popen[str] | None] = [None]
+
+    def _register(p: _subprocess.Popen[str]) -> None:
+        proc_box[0] = p
+
+    try:
+        exec_result = await _asyncio.to_thread(
+            executor.run_script,
+            language, code, cwd,
+            proc_register=_register,
+        )
+    except _asyncio.CancelledError:
+        p = proc_box[0]
+        if p is not None and p.poll() is None:
+            try:
+                p.kill()
+            except Exception:  # noqa: BLE001 — best-effort cleanup
+                pass
+            try:
+                p.wait(timeout=2)
+            except Exception:  # noqa: BLE001
+                pass
+        raise
 
     # Execution-level failures (interpreter missing, timeout, no structured
     # output, bad JSON) come back to Claude as policy-shaped errors. The

@@ -38,7 +38,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from importlib import resources
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Callable, Literal
 
 from nora.env_detect import Environment, detect_environment
 
@@ -225,6 +225,7 @@ def run_script(
     *,
     env: Environment | None = None,
     timeout_seconds: int = DEFAULT_TIMEOUT_SECONDS,
+    proc_register: "Callable[[subprocess.Popen[str]], None] | None" = None,
 ) -> ExecutionResult:
     """Stage + run + capture the researcher's script.
 
@@ -374,28 +375,22 @@ def run_script(
     }
 
     start = time.monotonic()
+    # Popen + communicate (instead of subprocess.run) so the async
+    # caller can register the proc handle and ``proc.kill()`` it
+    # when the asyncio task is cancelled. Without this, pressing
+    # Stop while a long Stata regression / R fit / Python pipeline
+    # is mid-run only cancels the Python coroutine; the subprocess
+    # keeps running to completion (or to the 120s timeout). From
+    # the researcher's seat that looks identical to "Stop did
+    # nothing".
     try:
-        proc = subprocess.run(
+        proc = subprocess.Popen(
             cmd,
             cwd=str(subprocess_cwd),
             env=subprocess_env,
-            capture_output=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
             text=True,
-            timeout=timeout_seconds,
-            check=False,
-        )
-    except subprocess.TimeoutExpired as te:
-        duration = time.monotonic() - start
-        return ExecutionResult(
-            ok=False, language=language,
-            raw_stdout=(te.stdout or b"").decode("utf-8", errors="replace")
-                if isinstance(te.stdout, bytes) else (te.stdout or ""),
-            raw_stderr=(te.stderr or b"").decode("utf-8", errors="replace")
-                if isinstance(te.stderr, bytes) else (te.stderr or ""),
-            exit_code=None, result_payload=None,
-            error=f"script timed out after {timeout_seconds}s",
-            run_dir=run_dir, script_path=script_path,
-            duration_seconds=duration,
         )
     except FileNotFoundError as e:
         return ExecutionResult(
@@ -404,13 +399,43 @@ def run_script(
             error=f"interpreter not found: {e}",
             run_dir=run_dir, script_path=script_path, duration_seconds=0.0,
         )
+    if proc_register is not None:
+        try:
+            proc_register(proc)
+        except Exception:  # noqa: BLE001 — register is advisory, never fatal
+            pass
+
+    try:
+        stdout, stderr = proc.communicate(timeout=timeout_seconds)
+    except subprocess.TimeoutExpired:
+        # Same recovery as ``subprocess.run`` does: kill, drain,
+        # report partial output. Without the second communicate(),
+        # the .stdout/.stderr buffers stay attached to the killed
+        # proc and the file descriptors leak into the run dir's
+        # parent process.
+        proc.kill()
+        try:
+            stdout, stderr = proc.communicate(timeout=2)
+        except subprocess.TimeoutExpired:
+            stdout, stderr = "", ""
+        duration = time.monotonic() - start
+        return ExecutionResult(
+            ok=False, language=language,
+            raw_stdout=stdout or "",
+            raw_stderr=stderr or "",
+            exit_code=None, result_payload=None,
+            error=f"script timed out after {timeout_seconds}s",
+            run_dir=run_dir, script_path=script_path,
+            duration_seconds=duration,
+        )
 
     duration = time.monotonic() - start
+    exit_code = proc.returncode
 
     # 5. Collect output. For Stata batch mode, real output lives in a
     # .log file next to the .do script rather than stdout.
-    raw_stdout = proc.stdout or ""
-    raw_stderr = proc.stderr or ""
+    raw_stdout = stdout or ""
+    raw_stderr = stderr or ""
     if language == "Stata":
         log_contents = _read_stata_log(script_path)
         if log_contents:
@@ -470,7 +495,6 @@ def run_script(
             else:
                 payload = cleaned
 
-    exit_code = proc.returncode
     ok = (exit_code == 0) and (payload is not None) and (error is None)
     if not ok and error is None:
         error = f"interpreter exited with non-zero code {exit_code}"
