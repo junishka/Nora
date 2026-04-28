@@ -203,3 +203,218 @@ def test_send_only_passes_function_tools(
     # doesn't change OpenAI's data-retention posture (that's set
     # independently in the account's data-handling settings).
     assert call.get("store") is True
+
+
+# ---------------------------------------------------------------------------
+# previous_response_id chaining (the token-saving refactor)
+# ---------------------------------------------------------------------------
+#
+# The session must thread ``previous_response_id`` through every
+# round-trip after the first. Without this the server holds the
+# conversation but we keep paying full re-replay cost on every turn.
+# The test below pins:
+#   - Turn 1, round 1: no previous_response_id, input is just the user msg.
+#   - Turn 1, round 2 (after a tool call): previous_response_id is the
+#     id from round 1, input is just the function_call_output.
+#   - Turn 2, round 1: previous_response_id is the id from the last
+#     round of turn 1, input is just the new user msg (no replay).
+
+
+class _ScriptedResponse:
+    """Drop-in for ``_FakeResponse`` that lets the test specify the
+    response id and whether the round emits a function_call (loop
+    continues) vs. a plain message (loop exits)."""
+
+    def __init__(self, response_id: str, *, with_tool_call: bool) -> None:
+        self.id = response_id
+        self.usage = _FakeUsage()
+        if with_tool_call:
+            class _Call:
+                type = "function_call"
+                name = "list_results"
+                call_id = "call_xyz"
+                arguments = "{}"
+
+                def model_dump(self) -> dict[str, Any]:
+                    return {
+                        "type": "function_call",
+                        "name": "list_results",
+                        "call_id": "call_xyz",
+                        "arguments": "{}",
+                    }
+
+            self.output = [_Call()]
+        else:
+            class _Block:
+                type = "output_text"
+                text = "ok"
+
+            class _Msg:
+                type = "message"
+                content = [_Block()]
+
+                def model_dump(self) -> dict[str, Any]:
+                    return {
+                        "type": "message",
+                        "content": [{"type": "output_text", "text": "ok"}],
+                    }
+
+            self.output = [_Msg()]
+
+
+class _ScriptedResponsesAPI:
+    """Returns a queue of pre-built responses in order, capturing the
+    kwargs of each call for assertions."""
+
+    def __init__(self, responses: list[_ScriptedResponse]) -> None:
+        self._queue = list(responses)
+        self.calls: list[dict[str, Any]] = []
+
+    async def create(self, **kwargs: Any) -> _ScriptedResponse:
+        self.calls.append(kwargs)
+        if not self._queue:
+            raise RuntimeError("test queue exhausted")
+        return self._queue.pop(0)
+
+
+class _ScriptedAsyncOpenAI:
+    def __init__(
+        self, api_key: str | None = None, *, responses: list[_ScriptedResponse],
+    ) -> None:
+        self.api_key = api_key
+        self.responses = _ScriptedResponsesAPI(responses)
+
+    async def close(self) -> None:
+        return None
+
+
+def test_previous_response_id_chains_across_rounds_and_turns(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """Two turns with one tool-loop iteration each in turn 1.
+
+    Expected request sequence:
+      call 1: turn 1 round 1 — user msg only, no previous_response_id
+      call 2: turn 1 round 2 — function_call_output, prev=resp_1
+      call 3: turn 2 round 1 — user msg only, prev=resp_2
+
+    The server holds prior assistant / tool / reasoning content via
+    the chain, so each request input shrinks to just the new content.
+    """
+    import asyncio
+
+    from nora.provider import openai as openai_provider
+    monkeypatch.setattr(openai_provider, "_resolve_api_key", lambda: "sk-test")
+
+    # Three scripted responses driving two turns:
+    scripted = [
+        _ScriptedResponse("resp_1", with_tool_call=True),    # turn 1 r1
+        _ScriptedResponse("resp_2", with_tool_call=False),   # turn 1 r2
+        _ScriptedResponse("resp_3", with_tool_call=False),   # turn 2 r1
+    ]
+
+    import openai as openai_pkg
+    monkeypatch.setattr(
+        openai_pkg, "AsyncOpenAI",
+        lambda api_key=None: _ScriptedAsyncOpenAI(api_key, responses=scripted),
+        raising=True,
+    )
+
+    sess = OpenAISession(
+        cwd=tmp_path,
+        model="gpt-5.5",
+        system_prompt="you are nora",
+    )
+
+    async def _drive() -> None:
+        async for _ in sess.send("turn one"):
+            pass
+        async for _ in sess.send("turn two"):
+            pass
+
+    asyncio.run(_drive())
+
+    api = sess._client.responses  # type: ignore[union-attr]
+    assert len(api.calls) == 3, (
+        f"expected 3 round-trips (2 in turn 1, 1 in turn 2); got {len(api.calls)}"
+    )
+
+    c1, c2, c3 = api.calls
+
+    # Call 1: fresh chain, no prior id.
+    assert "previous_response_id" not in c1, (
+        "first call of a fresh session must NOT carry previous_response_id"
+    )
+    assert len(c1["input"]) == 1
+    assert c1["input"][0]["role"] == "user"
+
+    # Call 2: chained to resp_1, body is ONLY the function_call_output —
+    # no replay of the prior assistant / function_call items.
+    assert c2.get("previous_response_id") == "resp_1"
+    assert len(c2["input"]) == 1
+    assert c2["input"][0]["type"] == "function_call_output"
+    assert c2["input"][0]["call_id"] == "call_xyz"
+
+    # Call 3 (turn 2): chained to the LAST id of turn 1 (resp_2),
+    # body is ONLY the new user message.
+    assert c3.get("previous_response_id") == "resp_2"
+    assert len(c3["input"]) == 1
+    assert c3["input"][0]["role"] == "user"
+
+
+def test_request_failure_does_not_advance_committed_response_id(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """If a turn fails mid-flight, ``_last_response_id`` must stay at
+    the last committed turn's id so the next user message threads onto
+    a coherent point in the chain rather than a half-done response."""
+    import asyncio
+
+    from nora.provider import openai as openai_provider
+    monkeypatch.setattr(openai_provider, "_resolve_api_key", lambda: "sk-test")
+
+    class _FailingResponsesAPI:
+        def __init__(self) -> None:
+            self.calls: list[dict[str, Any]] = []
+            self._call_count = 0
+            self._first_response = _ScriptedResponse("resp_good", with_tool_call=False)
+
+        async def create(self, **kwargs: Any) -> Any:
+            self.calls.append(kwargs)
+            self._call_count += 1
+            if self._call_count == 1:
+                return self._first_response
+            # Second turn: fail. _last_response_id should remain
+            # ``resp_good`` for any subsequent turn to chain on.
+            raise RuntimeError("server returned 500: simulated failure")
+
+    class _FlakyAsyncOpenAI:
+        def __init__(self, api_key: str | None = None) -> None:
+            self.api_key = api_key
+            self.responses = _FailingResponsesAPI()
+
+        async def close(self) -> None:
+            return None
+
+    import openai as openai_pkg
+    monkeypatch.setattr(openai_pkg, "AsyncOpenAI", _FlakyAsyncOpenAI, raising=True)
+
+    sess = OpenAISession(
+        cwd=tmp_path,
+        model="gpt-5.5",
+        system_prompt="you are nora",
+    )
+
+    async def _drive() -> None:
+        async for _ in sess.send("first"):
+            pass
+        # Second send fails; just drain the events.
+        async for _ in sess.send("second"):
+            pass
+
+    asyncio.run(_drive())
+
+    # The committed pointer is the id from the successful first turn.
+    assert sess._last_response_id == "resp_good", (
+        "a failed turn must not overwrite the committed response id"
+    )

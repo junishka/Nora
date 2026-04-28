@@ -24,11 +24,20 @@ Lockdown discipline is the headline guarantee:
   ``OPENAI_API_KEY`` is also honored as a fallback for power users
   who'd rather export their own.
 
-Conversation state: the bridge prepends its own context prefix on
-the first turn after open (same pattern as Anthropic), so
-``previous_response_id`` is not used. A persistent ``_input`` list
-on the session accumulates messages across turns within the
-session's lifetime. New session = new conversation.
+Conversation state: each ``responses.create()`` call passes
+``previous_response_id`` so the OpenAI server holds the prior
+turns of the conversation; the bridge only sends the new content
+for the current round (the user message on a fresh turn, the
+function-call outputs between tool-loop rounds). The first turn
+after open carries the bridge's warm-start context prefix as the
+user message body — same pattern as Anthropic. New session =
+new ``previous_response_id`` chain (the bridge does not resume
+across opens; the warm-start prefix re-establishes context).
+
+Token effect: on a long session this avoids re-sending the entire
+conversation array on every turn. On the wire, each turn carries
+one new user message plus per-round function-call outputs, not
+the full N-turn replay.
 """
 
 from __future__ import annotations
@@ -170,10 +179,11 @@ class OpenAISession:
         # store); accepted for interface symmetry but ignored here.
         del continue_conversation
         self._client: Any = None
-        # Accumulated conversation in Responses-API ``input`` shape.
-        # Each turn appends one user message + the assistant's text/
-        # function_call / function_call_output items.
-        self._input: list[dict[str, Any]] = []
+        # Server-side conversation chain pointer. Updated only after a
+        # turn completes cleanly (no pending tool calls); within a turn
+        # we walk a local pointer through each round so a mid-turn
+        # failure leaves the committed pointer at the last good turn.
+        self._last_response_id: str | None = None
         # Cached tool list — same six function tools for every call.
         # Built once at open() rather than per-send so the lockdown
         # check has a stable reference.
@@ -209,7 +219,7 @@ class OpenAISession:
     async def close(self) -> None:
         client = self._client
         self._client = None
-        self._input = []
+        self._last_response_id = None
         self._tools = []
         if client is not None:
             try:
@@ -274,9 +284,23 @@ class OpenAISession:
         client = self._client
         assert client is not None
 
-        # Append the new user message.
+        # Round-1 input is just the new user message. Subsequent
+        # rounds inside this turn carry only the function-call outputs
+        # we produce locally — the prior assistant / function_call /
+        # reasoning items already live on the server, reachable via
+        # the response-id chain.
         user_content = _build_user_content(prompt, images)
-        self._input.append({"role": "user", "content": user_content})
+        pending_input: list[dict[str, Any]] = [
+            {"role": "user", "content": user_content},
+        ]
+
+        # Walk a local pointer through each round of the tool loop.
+        # Initialised from the last committed turn so the new turn
+        # threads onto the prior conversation. Only promoted to
+        # ``self._last_response_id`` after a clean turn end so a
+        # mid-turn failure doesn't strand the chain on a half-done
+        # response.
+        turn_response_id: str | None = self._last_response_id
 
         # Bound the tool-loop iterations so a runaway model can't pin
         # the loop forever. 16 is generous — most analyses use 1–4.
@@ -287,26 +311,26 @@ class OpenAISession:
         try:
             for _round in range(MAX_TOOL_ROUNDS):
                 _verify_lockdown(self._tools)
+                request_kwargs: dict[str, Any] = {
+                    "model": self.model,
+                    "instructions": self._system_prompt,
+                    "input": pending_input,
+                    "tools": self._tools,
+                    "tool_choice": "auto",
+                    # store=True is required for reasoning models AND
+                    # for ``previous_response_id`` chaining: the
+                    # server has to retain the prior response object
+                    # for the next call to reference it. Server-side
+                    # persistence of response objects is just
+                    # retrievability; it doesn't change OpenAI's
+                    # data-retention posture (governed separately by
+                    # the account's API data-handling settings).
+                    "store": True,
+                }
+                if turn_response_id is not None:
+                    request_kwargs["previous_response_id"] = turn_response_id
                 try:
-                    resp = await client.responses.create(
-                        model=self.model,
-                        instructions=self._system_prompt,
-                        input=self._input,
-                        tools=self._tools,
-                        tool_choice="auto",
-                        # store=True (the default) is required for
-                        # reasoning models: they emit ``reasoning``
-                        # items with ids like ``rs_…`` that the next
-                        # round-trip in the tool loop references by
-                        # id. With ``store=False`` OpenAI throws
-                        # ``Item with id 'rs_…' not found`` on the
-                        # second round. Server-side persistence of
-                        # response objects is just retrievability;
-                        # it doesn't change OpenAI's data-retention
-                        # posture, which is governed separately by
-                        # the account's API data-handling settings.
-                        store=True,
-                    )
+                    resp = await client.responses.create(**request_kwargs)
                 except Exception as e:  # noqa: BLE001 — translate to event
                     msg = str(e)
                     lower = msg.lower()
@@ -316,10 +340,20 @@ class OpenAISession:
                     yield TurnError(message=f"OpenAI request failed: {msg}")
                     return
 
+                # Advance the in-turn pointer immediately so the next
+                # round's request chains onto THIS response, not the
+                # prior turn's tail.
+                new_id = getattr(resp, "id", None)
+                if isinstance(new_id, str) and new_id:
+                    turn_response_id = new_id
+
                 # Track usage. Only the LAST round's output_tokens
                 # counts as the user-visible "this turn produced N
                 # output tokens", but input_tokens accumulates across
-                # rounds.
+                # rounds. With ``previous_response_id`` the per-round
+                # input shrinks to just the new content — the bulk of
+                # the token cost moves to the server-side cached
+                # prefix, which OpenAI bills at the cached-input rate.
                 usage = getattr(resp, "usage", None)
                 if usage is not None:
                     total_input_tokens += getattr(usage, "input_tokens", 0) or 0
@@ -327,6 +361,8 @@ class OpenAISession:
 
                 output = list(getattr(resp, "output", []) or [])
                 # Translate items + decide whether to keep looping.
+                # We do NOT accumulate output items locally — the
+                # server already holds them via the response-id chain.
                 pending_calls: list[tuple[str, str, str]] = []  # (call_id, name, args_json)
                 for item in output:
                     itype = getattr(item, "type", None)
@@ -334,9 +370,6 @@ class OpenAISession:
                         text = _extract_message_text(item)
                         if text and text.strip():
                             yield AssistantText(text=text)
-                        # Append the assistant message to the
-                        # conversation so subsequent turns see it.
-                        self._input.append(_serialize_item(item))
                     elif itype == "function_call":
                         name = getattr(item, "name", "")
                         call_id = getattr(item, "call_id", "") or getattr(item, "id", "")
@@ -347,17 +380,10 @@ class OpenAISession:
                             input=_safe_json(args_json),
                             call_id=call_id,
                         )
-                        self._input.append(_serialize_item(item))
-                    elif itype in ("reasoning", "reasoning_summary"):
-                        # OpenAI reasoning is opaque text; don't
-                        # surface as AssistantThinking (which Anthropic
-                        # uses for visible chain-of-thought). Append
-                        # to input so subsequent rounds see it.
-                        self._input.append(_serialize_item(item))
-                    else:
-                        # Unknown item type — preserve to keep the
-                        # conversation coherent.
-                        self._input.append(_serialize_item(item))
+                    # ``reasoning`` / ``reasoning_summary`` and any
+                    # other item types are held server-side and
+                    # carried forward implicitly by the chain — no
+                    # local tracking needed.
 
                 if not pending_calls:
                     break  # no more tool calls; turn is done
@@ -365,6 +391,10 @@ class OpenAISession:
                 # Dispatch every function_call in this round (parallel-
                 # friendly but executed serially here; the underlying
                 # handlers aren't expected to be concurrency-safe yet).
+                # The next round's request will carry these outputs as
+                # ``input`` plus ``previous_response_id`` pointing at
+                # the response we just received.
+                next_input: list[dict[str, Any]] = []
                 for call_id, name, args_json in pending_calls:
                     handler = HANDLERS.get(name)
                     if handler is None:
@@ -375,7 +405,7 @@ class OpenAISession:
                         yield ToolCallResult(
                             call_id=call_id, text=out_text, is_error=True,
                         )
-                        self._input.append({
+                        next_input.append({
                             "type": "function_call_output",
                             "call_id": call_id,
                             "output": out_text,
@@ -400,11 +430,20 @@ class OpenAISession:
                         run_dir=run_dir,
                         language=language,
                     )
-                    self._input.append({
+                    next_input.append({
                         "type": "function_call_output",
                         "call_id": call_id,
                         "output": out_text,
                     })
+                pending_input = next_input
+
+            # Promote the in-turn pointer to the durable session
+            # field only after the whole turn settled. A turn that
+            # fell through MAX_TOOL_ROUNDS without exiting via the
+            # ``break`` above still committed something coherent on
+            # the server side; preserve it so the next user message
+            # threads on cleanly.
+            self._last_response_id = turn_response_id
 
             yield TurnDone(
                 input_tokens=total_input_tokens,
@@ -464,42 +503,6 @@ def _extract_message_text(item: Any) -> str:
             if t:
                 parts.append(t)
     return "".join(parts)
-
-
-# Fields the Responses API includes on OUTPUT items but rejects when
-# the same items are sent back as INPUT. Server-only metadata —
-# ``status`` is the headline offender; pydantic ``model_dump()``
-# emits it on every message / function_call / reasoning item, so
-# round-tripping a turn back into the next request triggers a 400
-# "Unknown parameter: 'input[N].status'" without this strip.
-_INPUT_FORBIDDEN_FIELDS: frozenset[str] = frozenset({"status"})
-
-
-def _serialize_item(item: Any) -> dict[str, Any]:
-    """Convert a Responses-API output item back to a dict shape the
-    next ``responses.create()`` call accepts as ``input``.
-
-    The SDK's pydantic models support ``model_dump()`` which emits
-    the full server-side shape, including fields like ``status`` that
-    the input schema rejects. We dump, then strip the server-only
-    fields and drop any None defaults (which the input schema also
-    refuses for some types).
-    """
-    raw: dict[str, Any] = {}
-    for attr in ("model_dump", "to_dict", "dict"):
-        fn = getattr(item, attr, None)
-        if callable(fn):
-            try:
-                raw = fn()
-                break
-            except Exception:  # noqa: BLE001
-                pass
-    if not raw:
-        raw = {"type": getattr(item, "type", "unknown")}
-    return {
-        k: v for k, v in raw.items()
-        if k not in _INPUT_FORBIDDEN_FIELDS and v is not None
-    }
 
 
 def _safe_json(s: str) -> dict[str, Any]:

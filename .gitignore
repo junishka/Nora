@@ -35,7 +35,10 @@ scratch/
 # allowlist and machine-specific paths; worktrees/ is session scratch).
 .claude/
 
-# Builder per-run state inside researcher project dirs.
+# Nora per-run state inside researcher project dirs (session cwd's
+# .nora/ holds results.db, chat_history.jsonl, runs/, etc.). Older
+# checkouts may also have .builder/ from before the rename.
+.nora/
 .builder/
 
 # Hypothesis example database.

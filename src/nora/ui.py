@@ -2013,14 +2013,19 @@ class NoraBridge:
         except Exception:  # noqa: BLE001 — webview may be closing
             pass
 
-    # Event types we keep in the chat log. Everything else is either
-    # transient (turn_done, auth_failure) or reconstructible from
-    # session state (ready, policy_updated).
+    # Event types we keep in the chat log. ``turn_done`` is included
+    # so post-hoc diagnostics (cache hit rate, per-turn input/output
+    # tokens, cost) can be inspected from the persisted log; the
+    # turn-grouped reader in ``chat_history.read_turns`` ignores
+    # unknown types so this is additive. Everything else is either
+    # transient (auth_failure) or reconstructible from session state
+    # (ready, policy_updated).
     _PERSIST_TYPES = frozenset({
         "assistant_text",
         "assistant_thinking",
         "tool_call",
         "tool_result",
+        "turn_done",
         "user_message",
     })
 

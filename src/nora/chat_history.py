@@ -264,8 +264,19 @@ def build_context_prefix(
 
     MAX_TURNS = 20
     MAX_RESULTS = 10
-    PER_FIELD_CAP = 1500
-    TOTAL_CAP = 20_000
+    # Per-side per-turn density cap. Lowered from 1500 → 1000 after
+    # observing that real sessions hit TOTAL_CAP after ~8 turns at the
+    # higher density; tighter per-turn truncation lets more turns fit
+    # in the same budget. The model has list_results / expand_result
+    # for full payloads, so a truncation marker on a long assistant
+    # turn is recoverable rather than lossy.
+    PER_FIELD_CAP = 1000
+    # Total prefix budget, in characters. Lowered from 20_000 → 12_000.
+    # At ~4 chars/token this is roughly 3,000 tokens on session resume
+    # (down from ~5,000), recovered exactly once per resume. The cap
+    # drops oldest turns when the budget runs out (newest-first
+    # rendering); MAX_TURNS continues to be a hard ceiling.
+    TOTAL_CAP = 12_000
 
     total_turns = len(turns)
     picked = turns[-MAX_TURNS:]

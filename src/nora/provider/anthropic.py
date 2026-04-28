@@ -268,6 +268,19 @@ class AnthropicSession:
             # Don't load CLAUDE.md / settings / project-local config.
             # Those can introduce hooks and tools we don't control.
             setting_sources=[],
+            # Extend the prompt-cache TTL from the 5-minute default to
+            # 1 hour. The Claude CLI auto-places a cache breakpoint at
+            # the end of the tools section, covering Nora's ~14k-token
+            # cached prefix (system prompt + tool schemas). With the
+            # 5-minute TTL, any researcher idle gap longer than 5
+            # minutes forces a full rewrite at the +25% surcharge; with
+            # 1h TTL, the rewrite is deferred 12x longer at a one-time
+            # write surcharge of +75% over 5min (still way under the
+            # cost of repeated rewrites in a long, intermittent
+            # research session). The CLI checks the env var
+            # ``ENABLE_PROMPT_CACHING_1H``; ``ClaudeAgentOptions.env``
+            # is forwarded to the CLI subprocess.
+            env={"ENABLE_PROMPT_CACHING_1H": "1"},
         )
 
     async def open(self) -> None:

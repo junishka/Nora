@@ -71,15 +71,38 @@ def test_persist_event_adds_iso_timestamp(tmp_path: Path):
 
 
 def test_persist_event_skips_non_persist_types(tmp_path: Path):
-    """Transient events (turn_done, auth_failure, ready, etc.) must
-    not pollute the chat log — otherwise replay reconstructs phantom
-    turns."""
+    """Lifecycle events (``ready``, ``auth_failure``, …) must not
+    pollute the chat log — replay would reconstruct phantom turns
+    or surface stale auth banners."""
     bridge = NoraBridge(cwd=tmp_path)
-    bridge._persist_event({"type": "turn_done", "input_tokens": 100})
     bridge._persist_event({"type": "ready"})
+    bridge._persist_event({"type": "auth_failure", "reason": "stale token"})
 
     log = tmp_path / ".nora" / "chat_history.jsonl"
     assert not log.exists()
+
+
+def test_persist_event_keeps_turn_done_for_diagnostics(tmp_path: Path):
+    """``turn_done`` carries the per-turn token usage (input, output,
+    cache_read, cache_creation, cost) and is persisted so post-hoc
+    inspection of cache hit rate / cost trends is possible. The
+    transcript readers (``read_turns``, ``replayEvent``) ignore
+    unknown event types, so persisting it does not introduce phantom
+    turns."""
+    bridge = NoraBridge(cwd=tmp_path)
+    bridge._persist_event({
+        "type": "turn_done",
+        "input_tokens": 100,
+        "output_tokens": 50,
+        "cache_read_input_tokens": 0,
+        "cache_creation_input_tokens": 0,
+    })
+
+    log = tmp_path / ".nora" / "chat_history.jsonl"
+    assert log.exists()
+    rec = json.loads(log.read_text().splitlines()[0])
+    assert rec["type"] == "turn_done"
+    assert rec["input_tokens"] == 100
 
 
 def test_persist_event_preserves_caller_timestamp(tmp_path: Path):

@@ -342,10 +342,19 @@ def _as_mcp_text(payload: dict[str, Any]) -> dict[str, Any]:
     MCP content is a list of typed blocks; our convention is a single text
     block containing JSON. Keeping the payload structured (not prose) makes
     the downstream sanitizer job clean and keeps the contract testable.
+
+    JSON is emitted minified (no indentation, tight separators) because
+    the model consuming this is the only audience: the UI never renders
+    the JSON body to the researcher, and the persisted log is a
+    diagnostic artifact, not a human-reading surface. Minifying saves
+    roughly 25-35% on every tool result, which compounds fast on
+    sessions with wide-dataset get_schema calls.
     """
     return {
         "content": [
-            {"type": "text", "text": json.dumps(payload, indent=2, ensure_ascii=False)}
+            {"type": "text", "text": json.dumps(
+                payload, separators=(",", ":"), ensure_ascii=False,
+            )}
         ]
     }
 
@@ -1246,7 +1255,7 @@ async def read_attached_file(args: dict[str, Any]) -> dict[str, Any]:
                 "ask the researcher to re-@mention the file in their "
                 "next message."
             ),
-        }, indent=2, ensure_ascii=False)
+        }, separators=(",", ":"), ensure_ascii=False)
         return {
             "content": [
                 {
