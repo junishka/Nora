@@ -1564,10 +1564,19 @@ class NoraBridge:
 
     def delete_session(self, path: str) -> dict[str, Any]:
         """Delete a session directory and everything under it: data
-        copies, run dirs, results.db, chat_history.jsonl. Refuses to
-        delete the currently-active session (which would leave the
-        backend pointing at a vanished cwd). Only paths inside
-        ``~/.nora-sessions/`` are allowed.
+        copies, run dirs, results.db, chat_history.jsonl. Only paths
+        inside ``~/.nora-sessions/`` are allowed.
+
+        Deleting the currently-focused session is supported: the
+        bridge closes the active runner, drops ``self.cwd`` to
+        ``None``, and returns ``was_active=True`` so the page can
+        navigate back to the landing screen. (Without resetting
+        ``self.cwd`` the bridge would keep handing out a path that
+        no longer exists on disk, and the next ``ui_ready`` /
+        ``policy_summary`` call would crash.)
+
+        Refuses to delete a session whose runner has an in-flight
+        turn — wait or interrupt first.
         """
         if not path:
             return {"ok": False, "reason": "empty path"}
@@ -1582,11 +1591,7 @@ class NoraBridge:
             }
         if not target.exists():
             return {"ok": False, "reason": "already gone"}
-        if self.cwd and target == self.cwd.resolve():
-            return {
-                "ok": False,
-                "reason": "cannot delete the active session — switch first",
-            }
+        was_active = bool(self.cwd) and target == self.cwd.resolve()
         # Refuse if the target's runner has a turn in flight. A
         # rmtree under a live SDK session and subprocess would yank
         # the cwd / run dirs / results.db out from under whatever's
@@ -1618,7 +1623,14 @@ class NoraBridge:
             shutil.rmtree(target)
         except OSError as e:
             return {"ok": False, "reason": f"delete failed: {e}"}
-        return {"ok": True, "path": str(target)}
+        # If we just deleted the focused session, drop the bridge's
+        # reference to it. The page is responsible for navigating to
+        # the landing screen on ``was_active=True``; until it does,
+        # any policy / dataset query would otherwise read a
+        # phantom path.
+        if was_active:
+            self.cwd = None
+        return {"ok": True, "path": str(target), "was_active": was_active}
 
     def switch_session(self, path: str) -> dict[str, Any]:
         """Move UI focus to an existing Nora session.

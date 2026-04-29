@@ -3261,10 +3261,6 @@ function formatBytes(n) {
 }
 
 async function deleteSession(s, isCurrent) {
-  if (isCurrent) {
-    toast('Cannot delete the active session. Switch to another first.', 'error');
-    return;
-  }
   if (!window.pywebview || !window.pywebview.api) return;
   if (typeof window.pywebview.api.delete_session !== 'function') {
     toast('Restart Nora to enable session deletion.', 'error');
@@ -3272,8 +3268,16 @@ async function deleteSession(s, isCurrent) {
   }
   const when = formatSessionWhen(s.timestamp);
   const sizeText = typeof s.size === 'number' ? ' (' + formatBytes(s.size) + ')' : '';
+  // Active-session deletes get a more explicit prompt — the
+  // researcher is wiping the chat they're currently looking at,
+  // not a stale one in the sidebar. The default prompt covers
+  // the data-loss content; the prefix makes the "you're in this
+  // one right now" angle unambiguous.
+  const headline = isCurrent
+    ? `Delete the session you're currently in (from ${when})${sizeText}?`
+    : `Delete session from ${when}${sizeText}?`;
   const ok = window.confirm(
-    `Delete session from ${when}${sizeText}?\n\nThis removes the data copies, run logs, results.db, and chat history. Cannot be undone.`
+    `${headline}\n\nThis removes the data copies, run logs, results.db, and chat history. Cannot be undone.`
   );
   if (!ok) return;
   try {
@@ -3284,7 +3288,15 @@ async function deleteSession(s, isCurrent) {
       return;
     }
     toast('Session deleted.', 'success');
-    loadSessions();
+    // Active-session delete: bridge dropped self.cwd; the page
+    // must navigate to the landing screen to match. Without this
+    // the chat surface still shows the (now stale) transcript and
+    // the next send_message would crash on a missing cwd.
+    if (res.was_active) {
+      showLanding();
+    } else {
+      loadSessions();
+    }
   } catch (err) {
     console.warn('delete_session failed', err);
     toast('Delete failed: ' + err, 'error');

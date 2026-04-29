@@ -355,6 +355,85 @@ def test_interrupt_turn_no_running_turn(tmp_path: Path):
 
 
 # ---------------------------------------------------------------------------
+# delete_session on the currently-active session
+# ---------------------------------------------------------------------------
+
+def test_delete_session_on_active_clears_cwd_and_signals_landing(tmp_path: Path):
+    """Deleting the focused session must:
+       1. rmtree the session directory
+       2. close the active runner and drop it from ``_runners``
+       3. set ``self.cwd = None`` so subsequent bridge calls don't
+          read from a vanished path
+       4. return ``was_active=True`` so the page knows to navigate
+          to the landing screen.
+
+    Without (3) the bridge would keep handing back a stale Path to
+    ``policy_summary``, ``get_chat_history``, etc. — every subsequent
+    call would crash on a missing directory."""
+    import nora.ui as ui_mod
+    from nora.ui import NoraBridge
+
+    session = tmp_path / "active_session"
+    session.mkdir()
+
+    real_root = ui_mod.SESSIONS_ROOT
+    ui_mod.SESSIONS_ROOT = tmp_path
+    try:
+        bridge = NoraBridge(cwd=session)
+        # Sanity: bridge is focused on this session.
+        assert bridge.cwd == session.resolve()
+        assert str(session.resolve()) in bridge._runners
+
+        res = bridge.delete_session(str(session))
+
+        assert res["ok"] is True
+        assert res.get("was_active") is True
+        assert res["path"] == str(session.resolve())
+        assert not session.exists(), "the session directory must be gone"
+        assert bridge.cwd is None, "active cwd must be cleared after delete"
+        assert str(session.resolve()) not in bridge._runners, (
+            "the runner must be dropped along with the directory"
+        )
+    finally:
+        ui_mod.SESSIONS_ROOT = real_root
+
+
+def test_delete_session_on_inactive_keeps_focus(tmp_path: Path):
+    """Deleting a non-focused session does NOT clear the bridge's
+    active cwd — only the targeted runner is removed. ``was_active``
+    is False so the page stays on the current chat."""
+    import nora.ui as ui_mod
+    from nora.ui import NoraBridge
+
+    active = tmp_path / "active"
+    other = tmp_path / "other"
+    active.mkdir()
+    other.mkdir()
+
+    real_root = ui_mod.SESSIONS_ROOT
+    ui_mod.SESSIONS_ROOT = tmp_path
+    try:
+        bridge = NoraBridge(cwd=active)
+        # Touch ``other`` enough that it has a runner entry so we can
+        # confirm only that one gets popped (not the active one).
+        bridge._ensure_runner_for_cwd(other)
+        assert str(other.resolve()) in bridge._runners
+        assert str(active.resolve()) in bridge._runners
+
+        res = bridge.delete_session(str(other))
+
+        assert res["ok"] is True
+        assert res.get("was_active") is False
+        assert not other.exists()
+        assert active.exists(), "the focused session must be untouched"
+        assert bridge.cwd == active.resolve()
+        assert str(active.resolve()) in bridge._runners
+        assert str(other.resolve()) not in bridge._runners
+    finally:
+        ui_mod.SESSIONS_ROOT = real_root
+
+
+# ---------------------------------------------------------------------------
 # Out-of-scope for these tests (require live SDK or live Claude)
 # ---------------------------------------------------------------------------
 #
