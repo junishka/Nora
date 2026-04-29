@@ -1379,7 +1379,11 @@ kbd {
   background: transparent;
   border: none;
   padding-left: 0;
-  padding-right: 40px;
+  /* Right padding kept minimal so drag-selection doesn't extend
+   * far past the visible text into empty side space. Was 40px;
+   * 8px keeps the column from kissing the chat-pane edge while
+   * not adding visible empty highlight on selection. */
+  padding-right: 8px;
   /* Drag-select fit: stack children as a flex column with
    * ``align-items: flex-start`` so each block (paragraph, list,
    * table) sizes to its own content. Without this, every child is
@@ -2627,7 +2631,14 @@ kbd {
 
 .message.assistant .message-body code {
   background: rgba(0, 0, 0, 0.08);
-  padding: 1px 5px;
+  /* Horizontal-only padding. A vertical pad (even 1px) makes the
+   * inline-code line-box taller than surrounding prose, which the
+   * browser then paints as a separate selection rectangle on
+   * drag-select — chunky, gappy highlighting at every backtick
+   * boundary. With ``padding: 0 5px`` the line-box matches the
+   * prose's, and selection flows across code spans as one
+   * continuous rectangle per visual line. */
+  padding: 0 5px;
   border-radius: 4px;
   font-family: var(--font-mono);
   font-size: 0.92em;

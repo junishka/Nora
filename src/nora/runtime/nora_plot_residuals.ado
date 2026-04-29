@@ -48,6 +48,21 @@ program define nora_plot_residuals
 
     local _step "init"
     capture noisily {
+        * Sample for the plot if the dataset is large. The PDF / EPS
+        * export embeds every point as a vector path, so scaling is
+        * linear in N: 200k rows of residuals takes ~8 s to export.
+        * Residual patterns are fully visible at far fewer points;
+        * 5000 is the conventional threshold. ``preserve / sample /
+        * restore`` keeps the original dataset intact for any code
+        * that runs after the helper. ``e()`` is unaffected so the
+        * downstream ``nora_result_regress`` call still sees the
+        * full-N regression.
+        preserve
+        local _step "sample"
+        if _N > 5000 {
+            sample 5000, count
+        }
+
         local _step "rvfplot"
         rvfplot, ytitle("Residuals") xtitle("Fitted values") ///
             title("Residuals vs Fitted")
@@ -55,6 +70,7 @@ program define nora_plot_residuals
         local _step "export"
         _nora_export_plot using "`rundir'/_nora_plots", ///
             basename("residuals") width(1600)
+        restore
         local _file = "`r(file)'"
         local _fmt  = "`r(format)'"
         if "`_file'" == "" {
