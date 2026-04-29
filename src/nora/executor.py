@@ -568,6 +568,7 @@ def _stage_runtime(run_dir: Path, language: Language) -> Path:
             "_nora_export_plot.ado",
             "nora_result_regress.ado",
             "nora_result_ttest.ado",
+            "nora_ttest.ado",
             "nora_result_sum.ado",
             "nora_result_tab.ado",
             "nora_result_magnitude.ado",

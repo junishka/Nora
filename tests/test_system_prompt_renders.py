@@ -187,6 +187,29 @@ def test_stata_plot_coefficients_in_stage_runtime_list(tmp_path: Path) -> None:
     assert (lib / "nora_plot_coefficients.ado").is_file()
 
 
+def test_stata_self_contained_ttest_helper_is_staged(tmp_path: Path) -> None:
+    """``nora_ttest`` is the self-contained ttest helper that runs
+    the appropriate ``ttest`` form itself, eliminating the r()-
+    clobbering foot-gun the legacy ``nora_result_ttest`` had. It
+    must reach Stata's adopath at runtime; without staging the
+    .ado file the helper isn't found and scripts get a confusing
+    "command not found" instead of the expected ttest table."""
+    from nora.executor import _stage_runtime
+    run = tmp_path / "run"
+    run.mkdir()
+    lib = _stage_runtime(run, "Stata")
+    assert (lib / "nora_ttest.ado").is_file()
+    body = (lib / "nora_ttest.ado").read_text(encoding="utf-8")
+    # Pin behavioural keywords so a future trim doesn't silently
+    # drop the self-contained property: each shape's ttest call,
+    # the r() capture before any subsequent r-class operation, and
+    # the mutually-exclusive validation.
+    assert "ttest `vname' == `paired'" in body
+    assert "ttest `vname' `if', by(`by') unequal" in body
+    assert "ttest `vname' `if' == `against'" in body
+    assert "only one of against(...), paired(...), or by(...)" in body
+
+
 def test_anthropic_prompt_carries_mcp_prefix_intro(tmp_path: Path) -> None:
     """The Anthropic variant must keep the ``mcp__<server>__`` prefix
     line — the model actually sees those names on its tool surface

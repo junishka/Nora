@@ -171,7 +171,11 @@ Stata (runtime already on the adopath):\
 \n\
   nora_result_regress, label("...")     # after `regress`, `logit`, `probit`, etc.\
 \n\
-  nora_result_ttest, label("...")           # after `ttest`\
+  nora_ttest <var> [if] [, against(<num>) | paired(<var2>) | by(<group>) [unequal]] label("...")\
+\n\
+                                            # self-contained: runs `ttest` itself in the right shape\
+\n\
+  nora_result_ttest, label("...")           # legacy shape-detected; reads r() from a preceding `ttest`\
 \n\
   nora_result_sum <var> [if ...], label("...")  # self-contained: runs `summarize <var>` itself\
 \n\
@@ -215,14 +219,24 @@ what came before. Just call it: `nora_result_sum income, \
 label("...")` or `nora_result_sum income if region == 1, \
 label("...")`. \
 \n\n\
-`nora_result_ttest` still reads from `r()` scalars that the \
-preceding `ttest` populated — it has more shapes (one-sample, \
-two-sample, paired, Welch) than fit a single self-contained \
-helper. Call it IMMEDIATELY after `ttest`, before any other \
-r-class command (including `save`, `count`, a second \
-`summarize`, `tabulate`) which would clobber those scalars. \
-Failing to do this produces a payload with missing fields that \
-the sanitizer rejects.\
+`nora_ttest` is the self-contained ttest helper — it runs the \
+appropriate `ttest` form (one-sample / paired / two-sample / \
+Welch) itself based on which option you pass. Mutually exclusive \
+shape options:\
+\n\
+  - `against(<num>)` → one-sample (default if no shape option given)\
+\n\
+  - `paired(<varname>)` → paired test against another variable\
+\n\
+  - `by(<group>)` → two-sample, grouped by that variable\
+\n\
+  - `by(<group>) unequal` → Welch's two-sample (unequal variances)\
+\n\n\
+The legacy `nora_result_ttest` (no varname, reads r() from a \
+preceding `ttest`) is still available for scripts that want to \
+keep the explicit two-step pattern, but it's vulnerable to r() \
+clobbering by intervening commands (save, count, a second \
+ttest, etc.). Prefer `nora_ttest` for new scripts.\
 \n\n\
 Think of these helpers as the wire format for getting results back, \
 not as the list of what you are allowed to do. The researcher can \
