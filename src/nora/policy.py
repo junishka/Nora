@@ -93,9 +93,19 @@ class DatasetPolicy:
     ``set_at`` is an ISO-8601 UTC string marking when the researcher
     wrote this entry. Empty means the entry is inherited (default)
     rather than explicitly set.
+
+    ``non_disclosive_variables`` is the per-variable opt-in list:
+    variables the researcher has explicitly judged safe to expose
+    raw min / max / median for in descriptive results. Default empty
+    — the conservative posture is "every variable's min/max could
+    identify outlier individuals". Researchers add a variable here
+    only after checking that its extremes don't single anyone out
+    (e.g., ``age`` in years, ``year_of_birth``, ``education_years``;
+    NOT ``salary`` or ``rare_diagnosis_code``).
     """
     max_depth: str = DEFAULT_MAX_DEPTH
     set_at: str = ""
+    non_disclosive_variables: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -158,7 +168,18 @@ def load_policy(cwd: Path) -> NoraPolicy:
             set_at = entry.get("set_at", "")
             if not isinstance(set_at, str):
                 set_at = ""
-            datasets[name] = DatasetPolicy(max_depth=max_depth, set_at=set_at)
+            ndv_raw = entry.get("non_disclosive_variables", [])
+            if isinstance(ndv_raw, list):
+                non_disclosive = tuple(
+                    str(v) for v in ndv_raw if isinstance(v, str) and v
+                )
+            else:
+                non_disclosive = ()
+            datasets[name] = DatasetPolicy(
+                max_depth=max_depth,
+                set_at=set_at,
+                non_disclosive_variables=non_disclosive,
+            )
 
     return NoraPolicy(
         version=1, default_max_depth=default_max, datasets=datasets
@@ -176,7 +197,17 @@ def save_policy(cwd: Path, policy: NoraPolicy) -> None:
         "version": policy.version,
         "default_max_depth": policy.default_max_depth,
         "datasets": {
-            name: {"max_depth": dp.max_depth, "set_at": dp.set_at}
+            name: {
+                "max_depth": dp.max_depth,
+                "set_at": dp.set_at,
+                # Only emit the field when populated — keeps the
+                # default policy file tidy for datasets that don't
+                # use the opt-in.
+                **(
+                    {"non_disclosive_variables": list(dp.non_disclosive_variables)}
+                    if dp.non_disclosive_variables else {}
+                ),
+            }
             for name, dp in policy.datasets.items()
         },
     }
@@ -219,3 +250,18 @@ def has_explicit_policy(policy: NoraPolicy, dataset_name: str) -> bool:
     dataset (not inherited from ``default_max_depth``).
     """
     return dataset_name in policy.datasets
+
+
+def non_disclosive_for(
+    policy: NoraPolicy, dataset_name: str
+) -> frozenset[str]:
+    """Return the set of variable names the researcher has explicitly
+    marked as non-disclosive for ``dataset_name``.
+
+    Empty set when the dataset has no explicit entry — the default
+    posture is "no variable is opted-in to min/max disclosure".
+    """
+    entry = policy.datasets.get(dataset_name)
+    if entry is None:
+        return frozenset()
+    return frozenset(entry.non_disclosive_variables)

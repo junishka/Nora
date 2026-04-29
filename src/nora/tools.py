@@ -39,6 +39,7 @@ from nora.policy import (
     has_explicit_policy,
     load_policy,
 )
+from nora import sanitizer
 from nora.sanitizer import sanitize
 from nora.store import get_store
 
@@ -732,7 +733,28 @@ async def submit_script(args: dict[str, Any]) -> dict[str, Any]:
 
     # --- Sanitizer ---------------------------------------------------------
     raw_payload = exec_result.result_payload or {}
-    sanitized = sanitize(raw_payload)
+    # Per-variable opt-in: when source_dataset names a real file in
+    # this session's policy, surface the dataset's
+    # ``non_disclosive_variables`` list to the descriptive sanitizer
+    # so min_value / max_value pass through for variables the
+    # researcher has explicitly judged safe to expose. Default empty
+    # ⇒ behaves exactly as before.
+    sdc_cfg = sanitizer.DEFAULT_CONFIG
+    if source_dataset:
+        try:
+            policy_obj = policy_module.load_policy(cwd)
+            non_disclosive = policy_module.non_disclosive_for(
+                policy_obj, source_dataset,
+            )
+        except Exception:  # noqa: BLE001 — policy load must never block sanitization
+            non_disclosive = frozenset()
+        if non_disclosive:
+            from dataclasses import replace
+            sdc_cfg = replace(
+                sanitizer.DEFAULT_CONFIG,
+                non_disclosive_variables=non_disclosive,
+            )
+    sanitized = sanitize(raw_payload, sdc_cfg)
     if not sanitized.ok:
         # The script produced a result, but SDC rules / schema mismatch
         # bounced it. Still store it so the researcher can audit.

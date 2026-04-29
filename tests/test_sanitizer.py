@@ -833,6 +833,87 @@ def test_correlation_matrix_too_many_variables_rejected():
     assert "structural cap" in (r.rejection_reason or "")
 
 
+def test_descriptive_drops_min_max_by_default():
+    """Default config has no opt-in — min_value / max_value are
+    silently dropped from the payload, matching the historical
+    posture that extremes can identify outlier individuals."""
+    payload = {
+        "type": "descriptive",
+        "variable": "income",
+        "n": 1000,
+        "mean": 50000.0,
+        "sd": 12000.0,
+        "missing_count": 5,
+        "min_value": 1.0,
+        "max_value": 1500000.0,
+    }
+    r = sanitize(payload)
+    assert r.ok
+    assert "min_value" not in r.sanitized
+    assert "max_value" not in r.sanitized
+
+
+def test_descriptive_passes_min_max_when_variable_opted_in():
+    """Variables on ``SDCConfig.non_disclosive_variables`` get
+    min_value / max_value through the sanitizer (precision-
+    clamped). The opt-in is per-variable, not per-payload — only
+    the matching variable's extremes are released."""
+    from nora.sanitizer import DEFAULT_CONFIG, SDCConfig
+    from dataclasses import replace as dc_replace
+
+    cfg = dc_replace(
+        DEFAULT_CONFIG,
+        non_disclosive_variables=frozenset({"age", "education_years"}),
+    )
+    payload = {
+        "type": "descriptive",
+        "variable": "age",
+        "n": 1000,
+        "mean": 42.5,
+        "sd": 12.3,
+        "missing_count": 0,
+        "min_value": 18,
+        "max_value": 89,
+    }
+    r = sanitize(payload, cfg)
+    assert r.ok
+    assert "min_value" in r.sanitized
+    assert "max_value" in r.sanitized
+    # Per-variable opt-in: a DIFFERENT variable's payload still
+    # gets min/max stripped under the same config.
+    payload2 = dict(payload, variable="salary")
+    r2 = sanitize(payload2, cfg)
+    assert r2.ok
+    assert "min_value" not in r2.sanitized
+    assert "max_value" not in r2.sanitized
+
+
+def test_descriptive_min_max_precision_clamped():
+    """Opted-in min/max go through the same precision-clamp pipeline
+    as other numeric fields — sigfigs scale with N."""
+    from nora.sanitizer import DEFAULT_CONFIG
+    from dataclasses import replace as dc_replace
+
+    cfg = dc_replace(
+        DEFAULT_CONFIG, non_disclosive_variables=frozenset({"age"}),
+    )
+    payload = {
+        "type": "descriptive",
+        "variable": "age",
+        "n": 1000,
+        "mean": 42.0,
+        "sd": 12.0,
+        "missing_count": 0,
+        "min_value": 18.123456789,
+        "max_value": 89.987654321,
+    }
+    r = sanitize(payload, cfg)
+    assert r.ok
+    # sigfigs_for_n(1000) == 4
+    assert r.sanitized["min_value"] == 18.12
+    assert r.sanitized["max_value"] == 89.99
+
+
 def test_ttest_ci_length_2_is_accepted():
     """A well-formed CI with exactly [lower, upper] passes through
     (subject to precision clamping)."""

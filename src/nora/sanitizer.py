@@ -125,6 +125,17 @@ class SDCConfig:
     # in a group accounts for more than this fraction of the cell's
     # total, the cell's value is suppressed. See sdc.py.
     dominance_threshold: float = DOMINANCE_THRESHOLD_DEFAULT
+    # Per-variable opt-in for min / max in descriptive payloads.
+    # Default empty: every variable's min/max is suppressed because
+    # extremes can identify outlier individuals (one $1.5M salary,
+    # one rare-disease respondent). The researcher can populate this
+    # set via the per-dataset policy file (
+    # ``.nora/policy.json`` ``non_disclosive_variables``) for
+    # variables they've judged safe to expose raw — typical
+    # examples: ``age`` in years, ``year_of_birth``, ``education_years``.
+    non_disclosive_variables: frozenset[str] = field(
+        default_factory=frozenset,
+    )
 
 
 DEFAULT_CONFIG = SDCConfig()
@@ -228,10 +239,18 @@ _DESC_REQUIRED: frozenset[str] = frozenset(
     ("type", "variable", "n", "mean", "sd", "missing_count")
 )
 
-# Intentionally forbidden at v0: min, max, median, quartiles — individual
-# observation values. Available via a (future) request_data type with
-# explicit SDC controls (rounded to 1-sig-fig bounds, e.g.).
+# Default-allowed numerics: mean and sd — pure aggregates, never
+# disclosive at row level. min / max are individual observations and
+# are gated by ``SDCConfig.non_disclosive_variables`` (researcher-side
+# per-variable opt-in via ``.nora/policy.json``); when the variable
+# is in that set, ``min_value`` and ``max_value`` are also accepted.
+# Median / quartiles remain forbidden in this payload type — use
+# ``request_data`` ``quartiles`` (which omits the median exactly
+# because at odd N it IS an individual observation).
 _DESC_ALLOWED_NUMERIC_FIELDS: frozenset[str] = frozenset(("mean", "sd"))
+_DESC_OPTIONAL_NUMERIC_FIELDS: frozenset[str] = frozenset(
+    ("min_value", "max_value")
+)
 _DESC_ALLOWED_INT_FIELDS: frozenset[str] = frozenset(
     ("n", "missing_count", "distinct_count")
 )
@@ -770,20 +789,41 @@ def _sanitize_descriptive(
         )
 
     transformations: list[str] = []
+    # Per-variable opt-in for min / max. When the researcher has
+    # added this variable to the dataset's ``non_disclosive_variables``
+    # list (via .nora/policy.json), ``min_value`` and ``max_value``
+    # join the numeric allowlist for THIS payload only. Default
+    # empty set → behaves exactly as before.
+    variable_name = raw.get("variable")
+    extra_numeric: frozenset[str] = frozenset()
+    if (
+        isinstance(variable_name, str)
+        and variable_name in config.non_disclosive_variables
+    ):
+        extra_numeric = _DESC_OPTIONAL_NUMERIC_FIELDS
+
+    numeric_allowlist = _DESC_ALLOWED_NUMERIC_FIELDS | extra_numeric
     out = _collect_allowed(
         raw,
-        numeric=_DESC_ALLOWED_NUMERIC_FIELDS,
+        numeric=numeric_allowlist,
         integer=_DESC_ALLOWED_INT_FIELDS,
         string=_DESC_ALLOWED_STRING_FIELDS,
         transformations=transformations,
     )
 
     n = out["n"]
-    for key in _DESC_ALLOWED_NUMERIC_FIELDS:
+    for key in numeric_allowlist:
         if key in out:
             out[key] = clamp_precision(out[key], n)
+    if extra_numeric and any(k in out for k in extra_numeric):
+        transformations.append(
+            f"min_value / max_value passed through (variable "
+            f"{variable_name!r} is on the dataset's "
+            f"non_disclosive_variables opt-in list)"
+        )
     transformations.append(
-        f"clamped mean/sd to {sigfigs_for_n(n)} significant figures (n={n})"
+        f"clamped numeric fields to {sigfigs_for_n(n)} significant "
+        f"figures (n={n})"
     )
 
     return SanitizerResult(

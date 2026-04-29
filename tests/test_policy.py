@@ -207,6 +207,85 @@ def test_depth_allowed_unknown_rejected():
     assert not depth_allowed("names_types", "bogus")
 
 
+def test_non_disclosive_for_default_empty():
+    """A dataset with no explicit entry has no opted-in variables."""
+    from nora.policy import non_disclosive_for
+    policy = NoraPolicy()
+    assert non_disclosive_for(policy, "missing.csv") == frozenset()
+
+
+def test_non_disclosive_for_explicit_set():
+    """When a dataset's policy lists ``non_disclosive_variables``,
+    the helper returns them as a frozenset for direct membership
+    checks."""
+    from nora.policy import non_disclosive_for
+    policy = NoraPolicy(datasets={
+        "study.csv": DatasetPolicy(
+            max_depth="names_types_labels",
+            non_disclosive_variables=("age", "year_of_birth"),
+        ),
+    })
+    assert non_disclosive_for(policy, "study.csv") == frozenset(
+        {"age", "year_of_birth"}
+    )
+    # Other datasets still have empty opt-in.
+    assert non_disclosive_for(policy, "salary.csv") == frozenset()
+
+
+def test_round_trip_with_non_disclosive_variables(tmp_path: Path):
+    """Persist + load round-trips the per-variable opt-in list."""
+    original = NoraPolicy(datasets={
+        "study.csv": DatasetPolicy(
+            max_depth="names_types_labels",
+            set_at="2026-04-29T00:00:00+00:00",
+            non_disclosive_variables=("age", "education_years"),
+        ),
+    })
+    save_policy(tmp_path, original)
+    loaded = load_policy(tmp_path)
+    assert loaded.datasets["study.csv"].non_disclosive_variables == (
+        "age", "education_years"
+    )
+
+
+def test_save_omits_empty_non_disclosive_variables(tmp_path: Path):
+    """When the opt-in list is empty (the default), don't write
+    the field. Keeps the policy file tidy for datasets that don't
+    use the feature."""
+    import json
+    policy = NoraPolicy(datasets={
+        "a.csv": DatasetPolicy(max_depth="names_types_labels", set_at="t"),
+    })
+    save_policy(tmp_path, policy)
+    raw = json.loads(policy_path(tmp_path).read_text())
+    assert "non_disclosive_variables" not in raw["datasets"]["a.csv"]
+
+
+def test_load_tolerates_malformed_non_disclosive_variables(tmp_path: Path):
+    """A malformed entry (string instead of list, mixed types)
+    falls back to empty rather than raising."""
+    import json
+    policy_path(tmp_path).parent.mkdir(parents=True, exist_ok=True)
+    policy_path(tmp_path).write_text(json.dumps({
+        "version": 1,
+        "default_max_depth": "names_types",
+        "datasets": {
+            "a.csv": {
+                "max_depth": "names_types_labels",
+                "non_disclosive_variables": "not_a_list",
+            },
+            "b.csv": {
+                "max_depth": "names_types_labels",
+                "non_disclosive_variables": ["age", 42, "", None, "year"],
+            },
+        },
+    }))
+    policy = load_policy(tmp_path)
+    assert policy.datasets["a.csv"].non_disclosive_variables == ()
+    # Non-string / empty entries are filtered out; valid strings remain.
+    assert policy.datasets["b.csv"].non_disclosive_variables == ("age", "year")
+
+
 def test_all_valid_depths_orderable():
     """Every depth in VALID_DEPTHS must compare correctly against
     every other. Lock in the total ordering."""

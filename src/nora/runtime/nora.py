@@ -454,16 +454,33 @@ def from_t_test(res: Any, *, n1: int, n2: int | None = None,
 
 
 def from_summarize(variable: str, *, n: int, mean: float, sd: float,
-                   missing_count: int = 0, **extra: Any) -> None:
+                   missing_count: int = 0,
+                   min_value: float | None = None,
+                   max_value: float | None = None,
+                   **extra: Any) -> None:
     """Emit a ``descriptive`` payload for a single numeric variable.
-    Mirrors ``nora$from_summarize`` in the R library."""
-    fields = {
+    Mirrors ``nora$from_summarize`` in the R library.
+
+    ``min_value`` / ``max_value`` are passed through ONLY when the
+    variable is on the dataset's ``non_disclosive_variables`` opt-in
+    list in ``.nora/policy.json``. The sanitizer drops them silently
+    for any variable not on that list — same posture as residuals /
+    fitted values, gated by an explicit per-variable researcher
+    judgment instead of a blanket ban. Pass them when you have them;
+    they cost nothing and surface automatically if the researcher
+    has opted the variable in.
+    """
+    fields: dict[str, Any] = {
         "variable": variable,
         "n": int(n),
         "mean": _safe_float(mean),
         "sd": _safe_float(sd),
         "missing_count": int(missing_count),
     }
+    if min_value is not None:
+        fields["min_value"] = _safe_float(min_value)
+    if max_value is not None:
+        fields["max_value"] = _safe_float(max_value)
     fields.update(extra)
     result(type="descriptive", **fields)
 

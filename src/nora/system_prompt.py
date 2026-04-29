@@ -262,8 +262,16 @@ rest the researcher reads off their screen.\
 On success: raw stdout/stderr is shown to the researcher but NOT \
 returned to you. You receive the sanitized structured payload plus \
 a result ID. Values are precision-clamped based on sample size; \
-forbidden fields (residuals, fitted values, min/max/median) are \
-dropped. The tool result also carries a ``transformations`` list \
+forbidden fields (residuals, fitted values, median) are dropped. \
+``min_value`` and ``max_value`` on a descriptive payload pass \
+through ONLY when the researcher has explicitly opted the variable \
+in via ``.nora/policy.json``'s ``non_disclosive_variables`` list \
+(typical opt-ins: age in years, year_of_birth, education_years; \
+NOT salary or rare-disease codes). Always pass min/max to \
+``from_summarize`` when you have them — they cost nothing and \
+surface automatically if the researcher has opted the variable \
+in; otherwise the sanitizer drops them silently. The tool result \
+also carries a ``transformations`` list \
 (strings like ``dropped unknown/forbidden field 'label'`` or \
 ``coefficient SEs precision-clamped to 2 sig figs at N=12``) — \
 read it whenever you used the generic ``nora$result(type=...)`` / \

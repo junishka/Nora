@@ -343,7 +343,10 @@ nora$from_t_test <- function(res, ...) {
 #' sees "variable: n=X, mean=Y, sd=Z, missing=M" in the raw log
 #' panel. The caller provides the numbers; we don't recompute.
 nora$from_summarize <- function(variable, n, mean, sd, missing_count,
-                                   distinct_count = NULL, ...) {
+                                   distinct_count = NULL,
+                                   min_value = NULL,
+                                   max_value = NULL,
+                                   ...) {
   cat(sprintf(
     "%s: n=%d, mean=%.6g, sd=%.6g, missing=%d",
     variable, as.integer(n), mean, sd, as.integer(missing_count)
@@ -352,16 +355,24 @@ nora$from_summarize <- function(variable, n, mean, sd, missing_count,
     cat(sprintf(", distinct=%d", as.integer(distinct_count)))
   }
   cat("\n")
-  nora$result(
+  # min_value / max_value pass through ONLY when the dataset's
+  # `.nora/policy.json` lists this variable in
+  # ``non_disclosive_variables``; the sanitizer drops them silently
+  # for any variable not on that list. Pass them when you have them
+  # — they cost nothing and surface automatically when the
+  # researcher has opted the variable in.
+  args <- list(
     type = "descriptive",
     variable = variable,
     n = as.integer(n),
     mean = mean,
     sd = sd,
     missing_count = as.integer(missing_count),
-    distinct_count = if (is.null(distinct_count)) NULL else as.integer(distinct_count),
-    ...
+    distinct_count = if (is.null(distinct_count)) NULL else as.integer(distinct_count)
   )
+  if (!is.null(min_value)) args$min_value <- as.numeric(min_value)
+  if (!is.null(max_value)) args$max_value <- as.numeric(max_value)
+  do.call(nora$result, c(args, list(...)))
 }
 
 
