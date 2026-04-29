@@ -494,9 +494,17 @@ async def get_schema(args: dict[str, Any]) -> dict[str, Any]:
         "Arguments:\n"
         "  dataset: identifier for the dataset.\n"
         f"  request_type: one of {_REQUEST_TYPE_LIST_STR}.\n"
-        "  variable: name of the variable the request is about."
+        "  variable: name of the (first) variable the request is about.\n"
+        "  variable2: optional second variable, only used by "
+        "multi-variable types (correlation_pair). Single-variable "
+        "types ignore it."
     ),
-    {"dataset": str, "request_type": str, "variable": str},
+    {
+        "dataset": str,
+        "request_type": str,
+        "variable": str,
+        "variable2": str,
+    },
 )
 async def request_data(args: dict[str, Any]) -> dict[str, Any]:
     """Step-5 implementation: real, SDC-gated bounded data queries.
@@ -508,6 +516,10 @@ async def request_data(args: dict[str, Any]) -> dict[str, Any]:
     dataset = args.get("dataset", "")
     request_type = args.get("request_type", "")
     variable = args.get("variable", "")
+    # Optional second variable used by multi-variable types (e.g.,
+    # correlation_pair). Single-variable types ignore it; passing it
+    # to one is silently OK.
+    variable2 = args.get("variable2") or None
 
     if not dataset:
         return _as_mcp_text({
@@ -541,13 +553,17 @@ async def request_data(args: dict[str, Any]) -> dict[str, Any]:
             "dataset": dataset,
         })
 
-    result = data_request.handle(path, request_type, variable)
+    result = data_request.handle(
+        path, request_type, variable, variable2=variable2,
+    )
     payload: dict[str, Any] = {
         "status": result.status,
         "dataset": dataset,
         "request_type": request_type,
         "variable": variable,
     }
+    if variable2:
+        payload["variable2"] = variable2
     if result.answer is not None:
         payload["answer"] = result.answer
     if result.reason is not None:

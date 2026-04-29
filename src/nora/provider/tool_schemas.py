@@ -154,7 +154,10 @@ def _request_data_desc() -> str:
         "Arguments:\n"
         "  dataset: identifier for the dataset.\n"
         f"  request_type: one of {types_str}.\n"
-        "  variable: name of the variable the request is about."
+        "  variable: name of the (first) variable the request is about.\n"
+        "  variable2: optional second variable, only used by "
+        "multi-variable types (correlation_pair). Single-variable "
+        "types ignore it."
     )
 
 _SUBMIT_SCRIPT_DESC = (
@@ -365,6 +368,7 @@ def build_tool_specs() -> tuple[ToolSpec, ...]:
                 "dataset": {"type": "string"},
                 "request_type": {"type": "string"},
                 "variable": {"type": "string"},
+                "variable2": {"type": "string"},
             },
             required=("dataset", "request_type", "variable"),
         ),

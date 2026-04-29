@@ -168,7 +168,111 @@ def test_supported_request_types_are_expected():
         "categorical_levels",
         "numeric_bounds",
         "na_count",
+        "quartiles",
+        "correlation_pair",
     }
+
+
+# ---------------------------------------------------------------------------
+# quartiles
+# ---------------------------------------------------------------------------
+
+def test_quartiles_returns_p25_p75_iqr(sample_csv: Path):
+    """Returns 25th + 75th + IQR. Median is deliberately omitted —
+    for any odd-N variable it is exactly an individual observation."""
+    r = handle(sample_csv, "quartiles", "income")
+    assert r.status == "granted", r.reason
+    assert "percentile_25" in r.answer
+    assert "percentile_75" in r.answer
+    assert "iqr" in r.answer
+    # Median is the disclosive single-observation field at row level.
+    assert "percentile_50" not in r.answer
+    assert "median" not in r.answer
+    # IQR is consistent with the percentiles modulo precision-clamp
+    # rounding (both rounded independently).
+    assert r.answer["percentile_25"] <= r.answer["percentile_75"]
+
+
+def test_quartiles_rejects_non_numeric(sample_csv: Path):
+    r = handle(sample_csv, "quartiles", "category")
+    assert r.status == "denied"
+    assert "numeric" in r.reason.lower()
+
+
+def test_quartiles_denies_small_sample(sample_csv: Path, tmp_path: Path):
+    """Same minimum-N gate as numeric_bounds — fewer than 10
+    observations risks identifying individuals at the quartiles."""
+    df = pd.DataFrame({"v": [1.0, 2.0, 3.0, 4.0, np.nan, np.nan]})
+    p = tmp_path / "tiny.csv"
+    df.to_csv(p, index=False)
+    r = handle(p, "quartiles", "v")
+    assert r.status == "denied"
+    assert "too few" in r.reason.lower()
+
+
+# ---------------------------------------------------------------------------
+# correlation_pair
+# ---------------------------------------------------------------------------
+
+def test_correlation_pair_returns_pearson_r(sample_csv: Path):
+    """Pearson r between two numeric variables, computed on
+    complete-case rows. Returns the correlation, n_complete, and
+    missing_count."""
+    r = handle(
+        sample_csv, "correlation_pair", "income", variable2="age",
+    )
+    assert r.status == "granted", r.reason
+    a = r.answer
+    assert a["variable"] == "income"
+    assert a["variable2"] == "age"
+    assert -1.0 <= a["correlation"] <= 1.0
+    assert a["method"] == "pearson"
+    assert a["n_complete"] >= 10
+
+
+def test_correlation_pair_requires_variable2(sample_csv: Path):
+    """Missing variable2 is denied loudly so the model knows the
+    request is structurally incomplete (rather than silently
+    coercing into something else)."""
+    r = handle(sample_csv, "correlation_pair", "income")
+    assert r.status == "denied"
+    assert "variable2" in r.reason.lower()
+
+
+def test_correlation_pair_rejects_self_pair(sample_csv: Path):
+    """A variable's correlation with itself is always 1; the request
+    is structurally redundant. Reject so the model doesn't burn a
+    round-trip on it."""
+    r = handle(
+        sample_csv, "correlation_pair", "income", variable2="income",
+    )
+    assert r.status == "denied"
+    assert "must differ" in r.reason.lower()
+
+
+def test_correlation_pair_rejects_non_numeric_variable2(sample_csv: Path):
+    r = handle(
+        sample_csv, "correlation_pair", "income", variable2="category",
+    )
+    assert r.status == "denied"
+    assert "numeric" in r.reason.lower()
+
+
+def test_correlation_pair_denies_few_complete_pairs(
+    tmp_path: Path,
+):
+    """Two columns with <10 jointly-observed rows should be denied
+    — at small N a near-perfect correlation could imply individual
+    coordinates."""
+    df = pd.DataFrame({
+        "a": [1.0, 2.0, 3.0, 4.0, np.nan, np.nan, np.nan, np.nan],
+        "b": [1.0, np.nan, 3.0, np.nan, 5.0, 6.0, 7.0, 8.0],
+    })
+    p = tmp_path / "thin.csv"
+    df.to_csv(p, index=False)
+    r = handle(p, "correlation_pair", "a", variable2="b")
+    assert r.status == "denied"
+    assert "too few" in r.reason.lower()
 
 
 def test_tool_help_request_types_match_runtime_allowlist():

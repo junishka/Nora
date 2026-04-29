@@ -115,9 +115,9 @@ Your tools (all prefixed `mcp__{SERVER_NAME}__` when referenced):
 Call this before writing any script. See your tool definition for \
 the four `depth` values and the per-dataset ceiling.
 
-2. `request_data(dataset, request_type, variable)`. Ask the layer for \
-a specific, bounded piece of information about a variable. Supported \
-request types:\n\
+2. `request_data(dataset, request_type, variable [, variable2])`. \
+Ask the layer for a specific, bounded piece of information. \
+Supported request types:\n\
   - `categorical_levels`: list of level names whose counts meet the \
 SDC threshold. Rare levels are hidden entirely (names AND counts). \
 Response includes a count of hidden levels.\n\
@@ -126,8 +126,17 @@ figs. NOT min / max (those are individual observations and are \
 never exposed).\n\
   - `na_count`: number of missing values. Denied if the non-missing \
 subgroup is below the cell-suppression threshold.\n\
+  - `quartiles`: 25th and 75th percentile + IQR, rounded to 2 sig \
+figs. Pairs with `numeric_bounds` for an IQR-style sense of the \
+distribution's middle. The 50th (median) is omitted as a row-level \
+forbidden field.\n\
+  - `correlation_pair`: Pearson correlation between two numeric \
+variables. Pass both `variable` and `variable2`; the correlation is \
+computed on rows where both are observed. Use this for "is X \
+correlated with Y" questions; for an N-by-N matrix use \
+`submit_script` + `from_correlation`.\n\
 Use this instead of writing a probe script when you need targeted \
-information about a variable.
+information about one or two variables.
 
 3. `submit_script(language, code, label, source_dataset)`. Run an R, \
 Stata, or Python script against the researcher's data. Inside the \

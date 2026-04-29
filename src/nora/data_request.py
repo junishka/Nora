@@ -61,12 +61,16 @@ RequestType = Literal[
     "categorical_levels",
     "numeric_bounds",
     "na_count",
+    "quartiles",
+    "correlation_pair",
 ]
 
 SUPPORTED_REQUEST_TYPES: tuple[str, ...] = (
     "categorical_levels",
     "numeric_bounds",
     "na_count",
+    "quartiles",
+    "correlation_pair",
 )
 
 
@@ -87,6 +91,8 @@ def handle(
     request_type: str,
     variable: str,
     config: SDCConfig = DEFAULT_CONFIG,
+    *,
+    variable2: str | None = None,
 ) -> RequestResult:
     """Compute the requested fact on real data and apply SDC rules.
 
@@ -94,6 +100,12 @@ def handle(
     raises for normal failure modes (missing variable, unsupported
     type, etc.) — those become ``status=denied`` or ``status=error``
     with a ``reason`` the caller can forward to Claude.
+
+    ``variable2`` is consumed only by the multi-variable request types
+    (``correlation_pair``); single-variable types ignore it. Passing it
+    to a single-variable type is silently OK rather than rejected so a
+    caller composing requests dynamically doesn't need per-type
+    branching just to set the field.
     """
     if request_type not in SUPPORTED_REQUEST_TYPES:
         return RequestResult(
@@ -143,6 +155,10 @@ def handle(
         return _numeric_bounds(series, n_total)
     if request_type == "na_count":
         return _na_count(series, n_total, config)
+    if request_type == "quartiles":
+        return _quartiles(series, n_total)
+    if request_type == "correlation_pair":
+        return _correlation_pair(df, variable, variable2)
     # Unreachable — allowlist checked above.
     return RequestResult(status="error", reason="internal: unreachable")
 
@@ -293,5 +309,170 @@ def _na_count(series: Any, n_total: int, config: SDCConfig) -> RequestResult:
             "na_count": na_count,
             "non_na_count": non_na_count,
             "total": n_total,
+        },
+    )
+
+
+# ---------------------------------------------------------------------------
+# quartiles
+# ---------------------------------------------------------------------------
+
+def _quartiles(series: Any, n_total: int) -> RequestResult:
+    """Return rounded 25th and 75th percentiles of a numeric variable.
+
+    Pairs with ``numeric_bounds`` (5th / 95th) to give the model an IQR-
+    style sense of the distribution's middle. The 50th percentile
+    (median) is deliberately NOT returned — for any odd-N variable it
+    is exactly an individual observation, and the system prompt's
+    forbidden-fields rule already names ``min/max/median`` as
+    disclosive at the row level. Rounding to 2 sig figs is the same
+    posture as ``numeric_bounds``.
+    """
+    import pandas as pd
+
+    if not pd.api.types.is_numeric_dtype(series):
+        return RequestResult(
+            status="denied",
+            reason=(
+                "quartiles requires a numeric variable; "
+                f"this variable has dtype {safe_key(str(series.dtype))!r}"
+            ),
+        )
+
+    non_na = series.dropna()
+    n_effective = int(len(non_na))
+    if n_effective < 10:
+        return RequestResult(
+            status="denied",
+            reason=(
+                f"variable has only {n_effective} non-missing observations "
+                f"— too few to publish quartiles without identifying "
+                f"individuals."
+            ),
+        )
+
+    q25 = float(non_na.quantile(0.25))
+    q75 = float(non_na.quantile(0.75))
+    return RequestResult(
+        status="granted",
+        answer={
+            "percentile_25": round_to_sigfigs(q25, 2),
+            "percentile_75": round_to_sigfigs(q75, 2),
+            "iqr": round_to_sigfigs(q75 - q25, 2),
+            "precision": "2 significant figures",
+            "n_nonmissing": n_effective,
+            "note": (
+                "25th and 75th percentiles are returned. The 50th "
+                "(median) is deliberately omitted: for any odd-N "
+                "variable it is exactly an individual observation, "
+                "which the SDC rules forbid at the row level."
+            ),
+        },
+    )
+
+
+# ---------------------------------------------------------------------------
+# correlation_pair
+# ---------------------------------------------------------------------------
+
+def _correlation_pair(
+    df: Any, var1: str, var2: str | None,
+) -> RequestResult:
+    """Pearson correlation between two numeric variables.
+
+    Multi-variable correlation matrices have their own sanitizer type
+    (``correlation_matrix`` via ``submit_script``) — this fast path is
+    for the common "is X correlated with Y" question that doesn't
+    warrant a full script.
+
+    Returns the correlation coefficient (rounded), the complete-case N
+    (rows with both variables observed), and the missing count. The
+    correlation is a pure aggregate over sums-of-products; no per-row
+    leak. We still gate on the same minimum N as ``numeric_bounds`` —
+    at low N a near-perfect correlation is just "the three points are
+    collinear" and could imply individual coordinates.
+    """
+    import pandas as pd
+
+    if not var2:
+        return RequestResult(
+            status="denied",
+            reason=(
+                "correlation_pair requires both ``variable`` (the "
+                "first variable) and ``variable2`` (the second). "
+                "Pass both."
+            ),
+        )
+
+    if var2 not in df.columns:
+        safe_requested = safe_key(str(var2))
+        safe_columns = [safe_key(str(c)) for c in df.columns]
+        return RequestResult(
+            status="denied",
+            reason=(
+                f"variable2 {safe_requested!r} not found in dataset. "
+                f"Available columns: {safe_columns!r}"
+            ),
+        )
+
+    if var1 == var2:
+        return RequestResult(
+            status="denied",
+            reason=(
+                "correlation_pair: variable and variable2 must differ. "
+                "A variable's correlation with itself is always 1; "
+                "the request is structurally redundant."
+            ),
+        )
+
+    s1 = df[var1]
+    s2 = df[var2]
+    if not pd.api.types.is_numeric_dtype(s1):
+        return RequestResult(
+            status="denied",
+            reason=(
+                f"correlation_pair: ``variable`` ({safe_key(str(var1))!r}) "
+                f"has dtype {safe_key(str(s1.dtype))!r}, not numeric"
+            ),
+        )
+    if not pd.api.types.is_numeric_dtype(s2):
+        return RequestResult(
+            status="denied",
+            reason=(
+                f"correlation_pair: ``variable2`` ({safe_key(str(var2))!r}) "
+                f"has dtype {safe_key(str(s2.dtype))!r}, not numeric"
+            ),
+        )
+
+    pair = pd.concat([s1, s2], axis=1).dropna()
+    n_complete = int(len(pair))
+    if n_complete < 10:
+        return RequestResult(
+            status="denied",
+            reason=(
+                f"only {n_complete} row(s) with both variables observed "
+                f"— too few to publish a correlation without identifying "
+                f"individuals (a near-perfect r at small N usually just "
+                f"says 'these three points are collinear')."
+            ),
+        )
+
+    r = float(pair[var1].corr(pair[var2]))
+    sigfigs = sigfigs_for_n(n_complete)
+    return RequestResult(
+        status="granted",
+        answer={
+            "variable": safe_key(str(var1)),
+            "variable2": safe_key(str(var2)),
+            "correlation": round_to_sigfigs(r, sigfigs),
+            "method": "pearson",
+            "n_complete": n_complete,
+            "missing_count": int(len(s1) - n_complete),
+            "note": (
+                "Pearson correlation between the two variables on rows "
+                "where BOTH are observed. For a multi-variable matrix "
+                "use submit_script + nora$from_correlation / "
+                "nora.from_correlation."
+            ),
         },
     )
