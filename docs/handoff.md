@@ -1,10 +1,17 @@
 # Nora — handoff
 
 Single-page entry point for picking this project up. Last
-substantive update **2026-04-27**, after the concurrent-session
-refactor, plot-vision (model-output plots only), Stata export
-reliability, and Files-panel polish. If something here disagrees
-with the code, trust the code and file a patch to this doc.
+substantive update **2026-04-29**, after the token-budget pass
+(OpenAI `previous_response_id`, 1h Anthropic cache TTL, minified
+tool JSON, leaner system prompt), per-provider system prompt +
+lean OpenAI tool descriptions, regression diagnostics (vif /
+condition_number / full vcov), self-contained Stata helpers
+(`nora_result_sum`, `nora_ttest`), correlation_matrix sanitizer
+type, two new `request_data` types (quartiles, correlation_pair),
+env-gated cross-session result recall, per-variable min/max opt-in
+via dataset policy, and the Stata residual-plot scaling fix. If
+something here disagrees with the code, trust the code and file a
+patch to this doc.
 
 ## What Nora is (one paragraph)
 
@@ -59,12 +66,23 @@ keep streaming.
 | **Web UI** (`nora-ui`) — pywebview shell, sessions sidebar, theme toggle, model picker grouped by provider with $ pricing links, drag-drop file/image upload, typewriter, Lottie cat loader, status line, per-message attachment chips, topbar visually integrated with chat surface | ✅ done |
 | **Packaging** (`.app` + `.dmg`) — bundles the web UI; .app launches pywebview with no Terminal popup; launcher logging now resilient to unwritable log dirs | ✅ done & smoke-tested locally (unsigned) |
 | **Product-identity prompt rule** — model introduces itself as Nora, uses first person ("I noticed…" not "Nora flagged…") | ✅ done |
+| **Token-budget pass** — Anthropic 1h prompt-cache TTL via `ENABLE_PROMPT_CACHING_1H`; OpenAI uses `previous_response_id` so per-turn input is just the new content; tool-result JSON minified (~25-35% off every payload); warm-start prefix tightened (5k → 2.7k tokens on resume); `turn_done` events now persisted for cache-rate diagnostics; system-prompt content trim + STAGE NOTE deletion + em-dash dedupes | ✅ done |
+| **Per-provider system prompt + lean OpenAI tool descriptions** — `build_system_prompt(cwd, server_name, provider)`; OpenAI gets a name-only tool intro instead of the Anthropic `mcp__nora__` mention; `ToolSpec.openai_description` field for the four biggest tools (recall_conversation, read_attached_file, submit_script, get_schema) cuts tool-array tokens by ~46% on the OpenAI path. Saves ~818 tokens/call, biggest wins compound across 100+ turn sessions | ✅ done |
+| **Regression diagnostics** — `vif`, `condition_number`, full `vcov` (variance-covariance matrix) emitted by `from_lm` in R + Python when the design matrix is reachable. Pure aggregates from sigma² · (X'X)⁻¹; cross-field key validation mirrors the existing coefficient defense. Plus a long-standing bug fix: `Intercept` and `const` were silently dropped from statsmodels formula-fit payloads (only `(Intercept)` / `_cons` / `intercept` were in the alias list); now in | ✅ done |
+| **Self-contained Stata helpers** — `nora_result_sum varname [if]` runs `summarize` itself instead of reading whatever's in `r()`. Eliminates the silent foot-gun where a second `summarize <other>` between intent and helper produced a payload labeled "age" carrying income's mean. Same for new `nora_ttest <var> [if] [, against(num) \| paired(var2) \| by(group) [unequal]]` which runs the appropriate `ttest` form itself based on mutually-exclusive shape options. Legacy `nora_result_ttest` kept for back-compat | ✅ done |
+| **`correlation_matrix` sanitizer type** — pairwise correlation matrix as a first-class payload (Pearson / Spearman / Kendall), with min-N gate and per-pair value-key validation. R `nora$from_correlation` and Python `nora.from_correlation` helpers; computes complete-case N (not pairwise N) so off-diagonals draw on the same sample | ✅ done |
+| **`request_data` types** — added `quartiles` (25th + 75th + IQR; median omitted as a row-level forbidden field) and `correlation_pair` (Pearson r between two variables, complete-case N). Tool schema gained an optional `variable2` field for multi-variable types | ✅ done |
+| **Cross-session result recall** — `list_results_global(query?)` and `expand_result(result_id, session_path?)`. Env-gated via `NORA_ALLOW_CROSS_SESSION_RECALL=1` (default off — researcher-side project separation, NOT a privacy property; stored payloads are pre-sanitized either way). Path-confined to `~/.nora-sessions/` so prompt-injected lookups can't direct the store loader at arbitrary paths | ✅ done |
+| **Per-variable min/max opt-in** — `DatasetPolicy.non_disclosive_variables` list in `.nora/policy.json`. Variables on the list (typical: `age`, `year_of_birth`, `education_years`) get `min_value` / `max_value` through descriptive payloads. Default empty: every variable's extremes still suppressed unless explicitly opted in | ✅ done |
+| **Stata residual-plot scaling fix** — `nora_plot_residuals` now samples to 5000 points before `rvfplot + graph export ... as(pdf)`. PDF embeds every point as a vector path, so unsampled rendering scaled linearly with N: 200k rows took ~8s, almost entirely PDF rendering. Sampled output reduces that to ~750ms with no loss of pattern visibility. `e()` is unaffected so the downstream `nora_result_regress` still sees the full-N regression | ✅ done |
+| **Allow deleting the active session** — sidebar × on the focused row now works; the bridge clears `self.cwd`, returns `was_active=True`, and the page navigates back to the landing screen. Confirm dialog adapts ("Delete the session you're currently in") | ✅ done |
+| **`debug_excerpt` on script failure** — system prompt now tells the model to read it; long-standing feature was effectively invisible because the prompt didn't acknowledge it | ✅ done |
 | **Real-researcher pilot** | ⏳ self-pilot in progress |
 | **Cross-query composition / release ledger** | ⏭ named, future-deployment scope |
 | **Apple Developer Program signing + notarization for distributable .dmg** | ⏭ blocked on $99/yr cert |
 | **Stata batch wrapper around `_cons` "omitted" edge case** | ⏭ named, low-priority |
 
-**477 tests passing.** Coverage spans SDK lockdown (Anthropic) +
+**610 tests passing.** Coverage spans SDK lockdown (Anthropic) +
 OpenAI lockdown, schema for all six file formats, executor SBPL
 profile, Python executor end-to-end, helper-through-sanitizer
 round-trips for every `from_*` emitter, sanitizer property tests,
@@ -383,7 +401,7 @@ them by surprise.
 | `docs/overview.md` | Plain-language description for researchers |
 | `docs/install.md` | Researcher-facing install flow |
 | `docs/verification.md` | Manual smoke-test recipes (incl. Stata, which CI can't) |
-| `tests/` | 477 tests. `test_sanitizer.py` is the property-test backbone; `test_concurrent_sessions.py` pins the per-task ContextVar isolation + non-trampling invariants; `test_plot_vision.py` pins the manifest-allowlist privacy gate; `test_run_dir_plots.py` covers researcher-thumbnail collection, PDF→PNG conversion, helper-failure diagnostics, and the Stata export fallback chain; `test_openai_lockdown.py` pins the no-built-in-tools invariant; `test_bridge_correctness.py` is the regression home for the four reviewer-flagged P1s |
+| `tests/` | 610 tests. `test_sanitizer.py` is the property-test backbone (now also covers vif / condition_number / vcov + correlation_matrix); `test_concurrent_sessions.py` pins the per-task ContextVar isolation; `test_plot_vision.py` pins the manifest-allowlist privacy gate; `test_run_dir_plots.py` covers thumbnail collection + PDF→PNG conversion + Stata export fallback chain; `test_openai_lockdown.py` pins the no-built-in-tools invariant; `test_cross_session_recall.py` pins the env-gated cross-session lookup + path-confinement defense; `test_bridge_lifecycle.py` covers active-session delete + landing-page navigation |
 
 ## Decisions worth not re-litigating
 
