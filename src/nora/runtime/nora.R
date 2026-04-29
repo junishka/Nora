@@ -515,6 +515,75 @@ nora$from_table <- function(variable, counts, n = NULL, missing_count = 0L, ...)
 }
 
 
+#' Pairwise correlation matrix from a data frame.
+#'
+#' By default correlates every numeric column; pass `variables` to
+#' restrict to a named subset. `method` is `"pearson"` (default),
+#' `"spearman"`, or `"kendall"`. Sample size N is the number of
+#' COMPLETE rows over the chosen variables — emitting pairwise N
+#' would let off-diagonals draw on different samples and make joint
+#' inference dishonest.
+#'
+#' Also prints the matrix to stdout for the researcher's raw log.
+nora$from_correlation <- function(df, variables = NULL,
+                                   method = "pearson", ...) {
+  valid_methods <- c("pearson", "spearman", "kendall")
+  if (!(method %in% valid_methods)) {
+    stop('nora$from_correlation: method must be one of ',
+         paste(shQuote(valid_methods), collapse = ", "), ", got ",
+         shQuote(method))
+  }
+  if (!is.data.frame(df)) {
+    stop("nora$from_correlation: expected a data.frame, got ",
+         class(df)[1])
+  }
+  if (is.null(variables)) {
+    # Pick numeric / logical columns. Match the Python helper's
+    # default: skip character / factor / Date.
+    is_num_col <- vapply(df, function(col) {
+      is.numeric(col) || is.logical(col)
+    }, logical(1))
+    variables <- names(df)[is_num_col]
+  }
+  if (length(variables) == 0) {
+    stop("nora$from_correlation: no numeric columns found and no ",
+         "`variables` provided")
+  }
+  missing_cols <- setdiff(variables, names(df))
+  if (length(missing_cols) > 0) {
+    stop("nora$from_correlation: variables not in df: ",
+         paste(missing_cols, collapse = ", "))
+  }
+  sub <- df[, variables, drop = FALSE]
+  complete <- stats::complete.cases(sub)
+  n_complete <- sum(complete)
+  missing_count <- nrow(sub) - n_complete
+  cm <- stats::cor(sub[complete, , drop = FALSE], method = method)
+  print(cm)
+  # Build nested list-of-lists in declared variable order so the
+  # JSON output is symmetric and stable regardless of `cor()`'s
+  # internal column ordering.
+  correlations <- list()
+  for (rv in variables) {
+    inner <- list()
+    for (cv in variables) {
+      v <- cm[rv, cv]
+      if (is.finite(v)) inner[[cv]] <- as.numeric(v)
+    }
+    if (length(inner) > 0) correlations[[rv]] <- inner
+  }
+  nora$result(
+    type = "correlation_matrix",
+    n = as.integer(n_complete),
+    variables = as.list(variables),
+    method = method,
+    correlations = correlations,
+    missing_count = as.integer(missing_count),
+    ...
+  )
+}
+
+
 # ---------------------------------------------------------------------------
 # Plot helpers — model-output visualizations only
 # ---------------------------------------------------------------------------

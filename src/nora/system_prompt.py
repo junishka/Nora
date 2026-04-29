@@ -161,6 +161,10 @@ R:\
 \n\
      # sum/mean of a numeric variable by group, (1, 85%)-dominance suppressed.\
 \n\
+  nora$from_correlation(df, variables=NULL, method="pearson")\
+\n\
+     # pairwise correlations among numeric columns; method ∈ pearson/spearman/kendall.\
+\n\
   nora$result(type, ...)               # generic escape hatch for the same types\
 \n\n\
 Stata (runtime already on the adopath):\
@@ -169,7 +173,7 @@ Stata (runtime already on the adopath):\
 \n\
   nora_result_ttest, label("...")           # after `ttest`\
 \n\
-  nora_result_sum <var>, label("...")       # after `summarize <var>`\
+  nora_result_sum <var> [if ...], label("...")  # self-contained: runs `summarize <var>` itself\
 \n\
   nora_result_tab <var>, label("...")       # 1-way frequency_table on <var>\
 \n\
@@ -194,6 +198,8 @@ scipy for t-tests):\
 \n\
   nora.from_magnitude_table(df, group_var, value_var, aggregation="sum")\
 \n\
+  nora.from_correlation(df, variables=None, method="pearson")  # NxN correlation matrix\
+\n\
   nora.result(type="...", **fields)    # generic escape hatch\
 \n\n\
 Python gotcha: `from_lm` reads statsmodels conventions \
@@ -202,15 +208,21 @@ Sklearn models don't expose those. For sklearn or anything custom \
 use `nora.result(type="linear_regression", coefficients={{...}}, ...)` \
 directly. Same generic-escape-hatch pattern as R's `nora$result()`.\
 \n\n\
-Stata gotcha: `nora_result_sum` and `nora_result_ttest` read \
-from `r()` scalars that `summarize` and `ttest` populate. Any \
-intervening r-class command (including `save`, `count`, a second \
-`summarize`, `tabulate`) clobbers those scalars. Call the helper \
-IMMEDIATELY after its source command, before `save` or any other \
-step, or re-run the source command right before the helper. Failing \
-to do this produces a payload with missing fields that the sanitizer \
-rejects, so you would see an empty result with no obvious error in \
-stdout.\
+Stata gotcha: `nora_result_sum` is self-contained — it runs \
+`summarize <var> [if ...]` itself, so the variable name and \
+optional filter you pass are what gets summarized regardless of \
+what came before. Just call it: `nora_result_sum income, \
+label("...")` or `nora_result_sum income if region == 1, \
+label("...")`. \
+\n\n\
+`nora_result_ttest` still reads from `r()` scalars that the \
+preceding `ttest` populated — it has more shapes (one-sample, \
+two-sample, paired, Welch) than fit a single self-contained \
+helper. Call it IMMEDIATELY after `ttest`, before any other \
+r-class command (including `save`, `count`, a second \
+`summarize`, `tabulate`) which would clobber those scalars. \
+Failing to do this produces a payload with missing fields that \
+the sanitizer rejects.\
 \n\n\
 Think of these helpers as the wire format for getting results back, \
 not as the list of what you are allowed to do. The researcher can \

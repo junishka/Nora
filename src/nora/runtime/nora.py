@@ -514,6 +514,87 @@ def from_magnitude_table(df: Any, group_var: str, value_var: str, *,
     result(type="magnitude_table", **fields)
 
 
+def from_correlation(
+    df: Any,
+    *,
+    variables: list[str] | None = None,
+    method: str = "pearson",
+    **extra: Any,
+) -> None:
+    """Emit a ``correlation_matrix`` payload from a pandas DataFrame.
+
+    By default correlates every numeric column; pass ``variables`` to
+    restrict to a named subset. ``method`` is one of ``'pearson'``,
+    ``'spearman'``, ``'kendall'`` — anything else is rejected by the
+    sanitizer.
+
+    Sample size N is the number of *complete* rows over the chosen
+    variables (pandas ``.dropna()`` semantics). Sub-threshold N is
+    rejected by the sanitizer with a clear reason — at very low N a
+    correlation of 0.99 between two columns is just "the three points
+    are collinear" and could imply individual coordinates.
+
+    Also prints the correlation matrix to stdout so the researcher
+    sees the conventional view in the raw log panel.
+    """
+    if method not in ("pearson", "spearman", "kendall"):
+        raise ValueError(
+            f"method must be 'pearson' / 'spearman' / 'kendall', "
+            f"got {method!r}"
+        )
+    # Pick columns. Default to numeric columns if no list given;
+    # respect the order the caller passed when they did.
+    if variables is None:
+        # Lazy: keep numeric + boolean (booleans correlate fine).
+        try:
+            import numpy as _np  # noqa: F401
+        except ImportError:
+            pass
+        variables = [
+            c for c in df.columns
+            if str(df[c].dtype) not in ("object", "string", "category")
+        ]
+    if not variables:
+        raise ValueError(
+            "from_correlation: no numeric columns found and no "
+            "``variables`` provided"
+        )
+    sub = df[variables]
+    # Correlation matrix on rows where ALL chosen variables are
+    # observed. Emitting N as `len(complete_rows)` is the honest
+    # number — pairwise N-by-pair would be deceptive (each off-
+    # diagonal would be a different sample).
+    complete = sub.dropna()
+    n = int(len(complete))
+    missing_count = int(len(df) - n)
+    corr = complete.corr(method=method)
+    try:
+        print(corr)
+    except Exception:  # noqa: BLE001 — never let print block emit
+        pass
+    correlations: dict[str, dict[str, float]] = {}
+    for row_var in variables:
+        row_dict: dict[str, float] = {}
+        for col_var in variables:
+            try:
+                v = float(corr.at[row_var, col_var])
+                if math.isfinite(v):
+                    row_dict[col_var] = v
+            except Exception:  # noqa: BLE001
+                continue
+        if row_dict:
+            correlations[row_var] = row_dict
+    fields: dict[str, Any] = {
+        "n": n,
+        "variables": list(variables),
+        "method": method,
+        "correlations": correlations,
+        "missing_count": missing_count,
+    }
+    fields.update(extra)
+    result(type="correlation_matrix", **fields)
+
+
 # ---------------------------------------------------------------------------
 # Internal helpers
 # ---------------------------------------------------------------------------

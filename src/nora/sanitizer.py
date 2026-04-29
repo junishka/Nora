@@ -278,6 +278,29 @@ _OLS_MAX_PREDICTORS = 50
 _FREQ_MAX_CELLS = 200
 _XTAB_MAX_CELLS = 2500          # allows up to ~50 × 50
 _MAGTAB_MAX_CELLS = 200
+_CORR_MAX_VARIABLES = 30        # NxN ⇒ up to 900 entries before clamping
+
+
+# --- Correlation matrix ----------------------------------------------------
+
+# Pairwise correlations among a list of numeric variables. Pure
+# aggregate (sums of products / N), no per-row leak — but reject at
+# low N where a near-perfect correlation is just "the three points
+# are collinear" rather than a population property.
+_CORR_REQUIRED: frozenset[str] = frozenset(
+    ("type", "n", "variables", "correlations")
+)
+_CORR_ALLOWED_INT_FIELDS: frozenset[str] = frozenset(("n", "missing_count"))
+_CORR_ALLOWED_STRING_FIELDS: frozenset[str] = frozenset(
+    ("type", "method", "label")
+)
+_CORR_ALLOWED_LIST_STRING: frozenset[str] = frozenset(("variables",))
+# Allowed correlation types — Pearson is the linear default; Spearman /
+# Kendall handle rank-based and ordinal data. Anything else is
+# rejected as a schema violation rather than silently coerced.
+_CORR_VALID_METHODS: frozenset[str] = frozenset(
+    ("pearson", "spearman", "kendall")
+)
 
 
 # --- Crosstab (2D frequency table, no margins emitted) ---------------------
@@ -1169,6 +1192,146 @@ def _sanitize_magnitude_table(
 
 
 # ---------------------------------------------------------------------------
+# Correlation matrix sanitizer
+# ---------------------------------------------------------------------------
+
+
+def _sanitize_correlation_matrix(
+    raw: dict[str, Any], config: SDCConfig
+) -> SanitizerResult:
+    """Pairwise correlation matrix (Pearson / Spearman / Kendall).
+
+    Privacy rationale: the matrix is a sums-of-products aggregate, so
+    no per-row data crosses back. Three guardrails on top:
+
+    1. Minimum N (``min_n_descriptive``) — at very low N a near-perfect
+       correlation is just "the three points are collinear" and could
+       imply individual coordinates, so reject below threshold.
+    2. Variable-count cap — limits how much can be smuggled through
+       even-well-formed payloads, mirroring the OLS predictor cap.
+    3. Cross-field key validation — every row/column key in the
+       correlations dict must be a declared variable. Without this,
+       a prompt-injected script could smuggle channels via spurious
+       keys like ``leak_bit_0`` carrying engineered values.
+
+    Each correlation is precision-clamped (sigfigs scale with N), then
+    clipped to [-1, 1] in case rounding pushed it past the boundary.
+    """
+    missing_reason = _require_fields(raw, _CORR_REQUIRED, "correlation_matrix")
+    if missing_reason:
+        return SanitizerResult(
+            ok=False, analysis_type="correlation_matrix",
+            rejection_reason=missing_reason,
+        )
+
+    n_raw = raw.get("n")
+    if not isinstance(n_raw, int) or isinstance(n_raw, bool) or n_raw < 0:
+        return SanitizerResult(
+            ok=False, analysis_type="correlation_matrix",
+            rejection_reason=f"n must be a non-negative int, got {n_raw!r}",
+        )
+
+    try:
+        require_minimum_n(n_raw, config.min_n_descriptive, "n")
+    except MinimumNViolation as e:
+        return SanitizerResult(
+            ok=False, analysis_type="correlation_matrix",
+            rejection_reason=str(e),
+        )
+
+    raw_vars = raw.get("variables")
+    if not isinstance(raw_vars, list) or not raw_vars:
+        return SanitizerResult(
+            ok=False, analysis_type="correlation_matrix",
+            rejection_reason="variables must be a non-empty list of strings",
+        )
+    if len(raw_vars) > _CORR_MAX_VARIABLES:
+        return SanitizerResult(
+            ok=False, analysis_type="correlation_matrix",
+            rejection_reason=(
+                f"variables has {len(raw_vars)} entries; the structural cap "
+                f"is {_CORR_MAX_VARIABLES}. A correlation matrix that wide "
+                f"isn't interpretable output — rejected as probable "
+                f"adversarial payload."
+            ),
+        )
+
+    # Method, if provided, must be one we recognise.
+    method = raw.get("method")
+    if method is not None and method not in _CORR_VALID_METHODS:
+        return SanitizerResult(
+            ok=False, analysis_type="correlation_matrix",
+            rejection_reason=(
+                f"method must be one of {sorted(_CORR_VALID_METHODS)} or "
+                f"omitted, got {method!r}"
+            ),
+        )
+
+    correlations = raw.get("correlations")
+    if not isinstance(correlations, dict) or not correlations:
+        return SanitizerResult(
+            ok=False, analysis_type="correlation_matrix",
+            rejection_reason="correlations must be a non-empty dict of dicts",
+        )
+
+    transformations: list[str] = []
+    out = _collect_allowed(
+        raw,
+        integer=_CORR_ALLOWED_INT_FIELDS,
+        string=_CORR_ALLOWED_STRING_FIELDS,
+        list_string=_CORR_ALLOWED_LIST_STRING,
+        transformations=transformations,
+    )
+
+    declared = set(out.get("variables") or [])
+
+    # Walk the matrix, drop any keys not in the declared variable list.
+    # Symmetric layout means we'd see ``corr[a][b]`` and ``corr[b][a]``;
+    # if either reference an alien name, drop just that entry.
+    sanitized_corr: dict[str, dict[str, float]] = {}
+    dropped: list[str] = []
+    n = out["n"]
+    for row_key, row_value in correlations.items():
+        if row_key not in declared:
+            dropped.append(f"row {row_key!r}")
+            continue
+        if not isinstance(row_value, dict):
+            dropped.append(f"row {row_key!r} (non-dict)")
+            continue
+        kept_row: dict[str, float] = {}
+        for col_key, val in row_value.items():
+            if col_key not in declared:
+                dropped.append(f"{row_key}.{col_key}")
+                continue
+            if not _is_finite_number(val):
+                continue
+            clamped = clamp_precision(float(val), n)
+            # Clip to [-1, 1] in case precision-clamping nudged a near-
+            # boundary value past it.
+            clamped = max(-1.0, min(1.0, clamped))
+            kept_row[col_key] = clamped
+        if kept_row:
+            sanitized_corr[row_key] = kept_row
+    if dropped:
+        transformations.append(
+            f"dropped {len(dropped)} undeclared key(s) from "
+            f"correlations: {sorted(dropped)[:5]}"
+            + (" …" if len(dropped) > 5 else "")
+        )
+    out["correlations"] = sanitized_corr
+
+    sigfigs = sigfigs_for_n(n)
+    transformations.append(
+        f"clamped correlation values to {sigfigs} significant figures (n={n})"
+    )
+
+    return SanitizerResult(
+        ok=True, analysis_type="correlation_matrix",
+        sanitized=out, transformations=transformations,
+    )
+
+
+# ---------------------------------------------------------------------------
 # Handler registry
 # ---------------------------------------------------------------------------
 
@@ -1181,6 +1344,7 @@ _HANDLERS: dict[str, _HANDlerFn] = {
     "frequency_table": _sanitize_frequency_table,
     "crosstab": _sanitize_crosstab,
     "magnitude_table": _sanitize_magnitude_table,
+    "correlation_matrix": _sanitize_correlation_matrix,
 }
 
 

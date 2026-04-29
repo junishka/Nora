@@ -1,36 +1,37 @@
-*! version 0.0.3  Nora runtime: emit a descriptive payload from r().
+*! version 0.1.0  Nora runtime: emit a descriptive payload from r().
 *!
-*! Call after Stata's `summarize` command. Reads r(N), r(mean), r(sd) and
-*! computes `missing_count` as the count of missing values for the
-*! variable across the full dataset — NOT as `_N - r(N)`, which would
-*! mask `summarize if ...` filtering from the row-count audit (a
-*! filtered sample would pass `n + missing_count == schema.n` even
-*! though the script silently dropped rows).
+*! Self-contained: the helper runs ``summarize`` internally on the
+*! named variable (with the optional [if] you pass), captures the
+*! r() scalars before any other r-class operation, and emits the
+*! sanitizer-shaped payload. The summarize output is also printed
+*! to stdout so the researcher sees the conventional table.
+*!
+*! Old pattern (still works, helper just re-summarizes):
+*!     summarize income
+*!     nora_result_sum income, label("Income descriptives")
+*!
+*! Recommended pattern (one line, no foot-gun):
+*!     nora_result_sum income, label("Income descriptives")
+*!     nora_result_sum income if region == 1, label("Income, region 1")
+*!
+*! Why this changed: previously the helper read r() from whatever
+*! summarize the script ran most recently. That had two failure
+*! modes — (a) any intervening r-class command (save, count, tab,
+*! a second summarize) wiped the scalars and the helper either
+*! errored or, worse, picked up the wrong variable's r(mean), so
+*! a payload labeled "age" silently carried income's mean; (b) the
+*! defensive r(mean)-empty guard caught (a)'s loud version but not
+*! (a)'s silent one. By summarizing the named variable itself, the
+*! helper is correct by construction regardless of what the script
+*! ran before it.
 *!
 *! The Nora sanitizer's `descriptive` schema does NOT accept min /
-*! max / median / quartiles — those are individual observations and
-*! get dropped even if emitted. This helper doesn't emit them.
-*!
-*! Usage:
-*!   summarize income
-*!   nora_result_sum income, label("Income descriptives")
-*!
-*! Note: Stata's r() after `summarize` doesn't carry the variable name,
-*! so the researcher passes it as a positional argument. Callers can
-*! still override `missing_count` with the `missing(<int>)` option.
-*!
-*! IMPORTANT: call this helper IMMEDIATELY after `summarize`. Most
-*! intervening r-class commands (save, count, tab, sum scalar, ...)
-*! overwrite r() and will wipe the mean/sd/etc. this helper needs.
-*! In particular, `save` sets its own r(N) but wipes r(mean)/r(sd),
-*! which used to slip past an r(N)-only guard and silently produce
-*! a payload missing the mean and SD — sanitizer would reject it
-*! and the researcher would see "no result" despite Stata's exit 0.
-*! The guard below checks r(mean) specifically to catch that case.
+*! max / median / quartiles — those are individual observations
+*! and get dropped even if emitted. This helper doesn't emit them.
 
 program define nora_result_sum
     version 13
-    syntax varname [, label(string) missing(integer -1) ]
+    syntax varname [if] [, label(string) missing(integer -1) ]
 
     * JSON-escape `label` (Claude-controllable free text). See
     * nora_result_regress for the full explanation of this pattern.
@@ -39,19 +40,6 @@ program define nora_result_sum
     local label : subinstr local label "`=char(10)'" " ", all
     local label : subinstr local label "`=char(13)'" " ", all
     local label : subinstr local label "`=char(9)'" " ", all
-
-    * Guard on r(mean), not r(N). r(N) is set by many r-class commands
-    * (save, count, etc.), so an r(N)-only check silently passes when
-    * an intervening command wiped summarize's scalars. r(mean) is
-    * specific to summarize (and a handful of others that leave the
-    * right shape in place, like mean/total). If it's empty, either
-    * summarize wasn't run, or a subsequent r-class command clobbered
-    * the result — both are recoverable by re-running summarize
-    * immediately before this helper.
-    if "`r(mean)'" == "" {
-        display as error "nora_result_sum: summarize results not in r(). Either `summarize' wasn't run, or an intervening r-class command (e.g., save, count) wiped the scalars. Call `nora_result_sum' immediately after `summarize'."
-        exit 198
-    }
 
     local path : env NORA_RESULT_PATH
     if "`path'" == "" {
@@ -67,26 +55,37 @@ program define nora_result_sum
         exit 198
     }
 
-    * Variable name from the positional argument. `syntax varname` is a
-    * real-variable-in-data reference; the name lands in the `varlist`
-    * macro (Stata's naming quirk).
+    * Variable name from the positional argument. `syntax varname` is
+    * a real-variable-in-data reference; the name lands in the
+    * `varlist` macro (Stata's naming quirk).
     local vname "`varlist'"
 
-    * Capture summarize's r() values into locals BEFORE running any
-    * other r-class command (like `count` below, which clobbers r()).
+    * Run summarize ourselves so r() definitely holds THIS variable's
+    * scalars regardless of what came before. Noisy (no `quietly`)
+    * so the researcher still sees the conventional table — that's
+    * the value of `summarize` for them, not just for our payload.
+    summarize `vname' `if'
+
+    * Capture into locals BEFORE the missing-count `count if`, which
+    * is r-class and would clobber r(N)/r(mean)/r(sd).
     local rN "`r(N)'"
     local rmean "`r(mean)'"
     local rsd "`r(sd)'"
 
+    * Defensive: if even our own summarize didn't populate r(mean)
+    * (vname has no observations under the if-clause, the variable
+    * has no non-missing values, etc.), surface it loudly rather
+    * than write a half-empty payload the sanitizer would reject.
+    if "`rmean'" == "" {
+        display as error "nora_result_sum: summarize on `vname' produced no mean — variable may be all-missing or empty under the if-clause."
+        exit 459
+    }
+
     * Missing count. If the caller supplied `missing(...)`, honor it.
-    * Otherwise compute it as the count of missing values for `vname`
-    * across the full dataset. Using `_N - r(N)` here would be wrong
-    * when summarize ran under an `if` condition: `_N` stays at the
-    * full dataset size while r(N) drops, so the computed "missing"
-    * would include every filtered-out row. That silently satisfies
-    * the Nora row-count audit's invariant (`n + missing_count ==
-    * schema.n`) even when the script dropped rows — exactly the
-    * drift the audit is supposed to catch.
+    * Otherwise compute as the count of missing values for `vname`
+    * across the full dataset (NOT `_N - rN`, which would mask
+    * summarize-with-if filtering from the row-count audit's invariant
+    * `n + missing_count == schema.n`).
     if `missing' < 0 {
         quietly count if missing(`vname')
         local missing = r(N)

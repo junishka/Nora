@@ -310,6 +310,75 @@ def test_from_magnitude_table_through_sanitizer(runtime) -> None:
 
 
 # ---------------------------------------------------------------------------
+# from_correlation
+# ---------------------------------------------------------------------------
+
+def test_from_correlation_through_sanitizer(runtime) -> None:
+    """A pandas DataFrame correlated via the helper must produce a
+    correlation_matrix payload the sanitizer accepts. Validates the
+    shape contract end-to-end: top-level fields (n / variables /
+    method / correlations / missing_count), inner dict keys are
+    declared variable names, all values are in [-1, 1]."""
+    mod, path = runtime
+    rng = np.random.default_rng(42)
+    n = 200
+    age = rng.normal(40, 12, n)
+    # Build income correlated with age plus noise, education weakly
+    # correlated with both.
+    income = age * 1500 + rng.normal(0, 5000, n)
+    edu = age * 0.05 + rng.normal(0, 1.5, n)
+    df = pd.DataFrame({"age": age, "income": income, "education": edu})
+    mod.from_correlation(df, method="pearson")
+    payload = _read_payload_strip_token(path)
+    res = sanitize(payload)
+    assert res.ok, (
+        f"sanitizer rejected from_correlation: {res.rejection_reason}"
+    )
+    assert res.analysis_type == "correlation_matrix"
+    assert res.sanitized["n"] == n
+    assert sorted(res.sanitized["variables"]) == ["age", "education", "income"]
+    assert res.sanitized["method"] == "pearson"
+    # Diagonal is exactly 1.0 (after clamp + clip).
+    for v in res.sanitized["variables"]:
+        assert res.sanitized["correlations"][v][v] == 1.0
+    # All off-diagonal values within [-1, 1].
+    for row in res.sanitized["correlations"].values():
+        for val in row.values():
+            assert -1.0 <= val <= 1.0
+
+
+def test_from_correlation_drops_complete_case_rows(runtime) -> None:
+    """Helper computes correlation on rows complete over the chosen
+    variables. ``n`` must reflect the COMPLETE sample size, not the
+    raw row count — pairwise N would make off-diagonals draw from
+    different samples and joint inference dishonest."""
+    mod, path = runtime
+    df = pd.DataFrame({
+        "age": [20, 25, 30, 35, 40, 45, 50, 55, 60, 65,
+                70, 75, 80, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan],
+        "income": [30, 35, 40, 50, 55, 60, 70, 80, 85, 90,
+                   95, 100, 110, 50, 55, 60, 65, 70, 75, 80],
+    })
+    mod.from_correlation(df)
+    payload = _read_payload_strip_token(path)
+    res = sanitize(payload)
+    assert res.ok
+    assert res.sanitized["n"] == 13
+    assert res.sanitized["missing_count"] == 7
+
+
+def test_from_correlation_invalid_method_raises(runtime) -> None:
+    """Unsupported method names raise inside the helper rather than
+    emitting a payload the sanitizer would reject. The helper is the
+    point where method names should be validated; surfacing here is
+    closer to the bug than the sanitizer rejection."""
+    mod, _ = runtime
+    df = pd.DataFrame({"a": [1.0, 2.0, 3.0], "b": [1.0, 2.0, 4.0]})
+    with pytest.raises(ValueError, match="method must be"):
+        mod.from_correlation(df, method="bogus")
+
+
+# ---------------------------------------------------------------------------
 # Generic result() escape hatch
 # ---------------------------------------------------------------------------
 

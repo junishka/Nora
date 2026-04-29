@@ -672,6 +672,110 @@ def _ttest_base(ci=None) -> dict:
     return p
 
 
+def _correlation_payload(
+    n: int = 200,
+    *,
+    variables: list[str] | None = None,
+    correlations: dict[str, dict[str, float]] | None = None,
+    method: str | None = "pearson",
+    extra: dict | None = None,
+) -> dict:
+    """Minimal well-formed correlation_matrix payload."""
+    if variables is None:
+        variables = ["age", "income"]
+    if correlations is None:
+        correlations = {
+            "age": {"age": 1.0, "income": 0.42},
+            "income": {"age": 0.42, "income": 1.0},
+        }
+    p = {
+        "type": "correlation_matrix",
+        "n": n,
+        "variables": variables,
+        "correlations": correlations,
+    }
+    if method is not None:
+        p["method"] = method
+    if extra:
+        p.update(extra)
+    return p
+
+
+def test_correlation_matrix_well_formed_payload_passes_through():
+    p = _correlation_payload()
+    r = sanitize(p)
+    assert r.ok, r.rejection_reason
+    assert r.analysis_type == "correlation_matrix"
+    assert r.sanitized["n"] == 200
+    assert sorted(r.sanitized["variables"]) == ["age", "income"]
+    assert r.sanitized["correlations"]["age"]["income"] == r.sanitized[
+        "correlations"]["income"]["age"]
+
+
+def test_correlation_matrix_below_min_n_rejected():
+    p = _correlation_payload(n=3)
+    r = sanitize(p)
+    assert not r.ok
+
+
+def test_correlation_matrix_invalid_method_rejected():
+    p = _correlation_payload(method="bogus")
+    r = sanitize(p)
+    assert not r.ok
+    assert "method must be one of" in (r.rejection_reason or "")
+
+
+def test_correlation_matrix_drops_undeclared_variable_keys():
+    """A correlations entry whose row/column key isn't in the
+    declared variables list gets dropped — same cross-field defense
+    as ``coefficients`` in linear_regression."""
+    p = _correlation_payload(
+        variables=["age", "income"],
+        correlations={
+            "age": {"age": 1.0, "income": 0.4, "leak": 99.9},
+            "income": {"age": 0.4, "income": 1.0},
+            "leak_row": {"age": 0.0, "income": 0.0},
+        },
+    )
+    r = sanitize(p)
+    assert r.ok
+    keys = sorted(r.sanitized["correlations"].keys())
+    assert keys == ["age", "income"]
+    assert "leak" not in r.sanitized["correlations"]["age"]
+
+
+def test_correlation_matrix_clips_to_minus_one_to_one():
+    """Precision-clamp followed by clip ensures no value escapes
+    [-1, 1] even at boundary precision."""
+    p = _correlation_payload(
+        correlations={
+            "age": {"age": 1.0, "income": 0.999999},
+            "income": {"age": -1.0001, "income": 1.0},
+        },
+    )
+    r = sanitize(p)
+    assert r.ok
+    for row in r.sanitized["correlations"].values():
+        for v in row.values():
+            assert -1.0 <= v <= 1.0
+
+
+def test_correlation_matrix_too_many_variables_rejected():
+    """Structural cap mirrors the OLS predictor cap — beyond ~30
+    variables a correlation matrix isn't interpretable output, and
+    accepting it would widen the smuggling channel."""
+    too_many = [f"v{i}" for i in range(35)]
+    correlations = {
+        v: {w: 0.1 for w in too_many} for v in too_many
+    }
+    for v in too_many:
+        correlations[v][v] = 1.0
+    p = _correlation_payload(variables=too_many, correlations=correlations)
+    r = sanitize(p)
+    assert not r.ok
+    assert "structural cap" in (r.rejection_reason or "")
+
+
 def test_ttest_ci_length_2_is_accepted():
     """A well-formed CI with exactly [lower, upper] passes through
     (subject to precision clamping)."""
