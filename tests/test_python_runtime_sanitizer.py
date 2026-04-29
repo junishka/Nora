@@ -195,6 +195,68 @@ def test_from_lm_through_sanitizer(runtime) -> None:
     assert "treatment" in res.sanitized.get("predictor_variables", [])
 
 
+def test_from_lm_emits_vif_and_condition_number_when_design_available(runtime) -> None:
+    """When the fitted result exposes ``model.exog`` (the design
+    matrix), the helper computes VIF and condition number natively
+    and the sanitizer accepts them.
+
+    ``_FakeFit`` historically didn't carry ``exog`` so the diagnostic
+    fields were silently omitted. This test extends the fake to a
+    real numpy design and pins that VIF lands keyed on declared
+    predictors only, condition_number is a finite scalar."""
+    rng = np.random.default_rng(7)
+    n = 200
+    treatment = rng.integers(0, 2, size=n).astype(float)
+    age = rng.normal(40, 12, size=n)
+    intercept = np.ones(n)
+    exog = np.column_stack([intercept, treatment, age])
+
+    class _ModelWithDesign:
+        endog_names = "outcome"
+        exog_names = ("Intercept", "treatment", "age")
+
+    _ModelWithDesign.exog = exog  # set at outer scope so the closure resolves
+
+    class _FitWithDesign(_FakeFit):
+        model = _ModelWithDesign()
+
+    mod, path = runtime
+    mod.from_lm(_FitWithDesign())
+    payload = _read_payload_strip_token(path)
+    res = sanitize(payload)
+    assert res.ok, (
+        f"sanitizer rejected diagnostic-extended from_lm: "
+        f"{res.rejection_reason}"
+    )
+    sanitized = res.sanitized
+    # VIF must be present, keyed on declared predictors (intercept
+    # excluded by construction in the helper).
+    assert "vif" in sanitized
+    assert sorted(sanitized["vif"].keys()) == ["age", "treatment"]
+    for v in sanitized["vif"].values():
+        assert isinstance(v, (int, float)) and v >= 1.0
+    # Condition number is a finite positive scalar.
+    assert "condition_number" in sanitized
+    cond = sanitized["condition_number"]
+    assert isinstance(cond, (int, float)) and cond > 0
+
+
+def test_from_lm_omits_diagnostics_when_design_missing(runtime) -> None:
+    """When the result doesn't expose a design matrix (the legacy
+    ``_FakeFit`` shape), the helper omits VIF / condition_number
+    rather than emitting null or crashing the run. This pins the
+    backward-compat path for sklearn-shaped results that go through
+    the helper before the user switches to ``nora.result(...)``
+    directly."""
+    mod, path = runtime
+    mod.from_lm(_FakeFit())  # no exog
+    payload = _read_payload_strip_token(path)
+    res = sanitize(payload)
+    assert res.ok
+    assert "vif" not in res.sanitized
+    assert "condition_number" not in res.sanitized
+
+
 # ---------------------------------------------------------------------------
 # from_crosstab
 # ---------------------------------------------------------------------------

@@ -174,6 +174,12 @@ _OLS_REQUIRED: frozenset[str] = frozenset(
 _OLS_ALLOWED_NUMERIC_FIELDS: frozenset[str] = frozenset((
     "r_squared", "adj_r_squared", "f_statistic", "f_p_value",
     "residual_std_error",
+    # Aggregate diagnostics. All scalars derived from the design
+    # matrix or residual sum-of-squares — no per-observation leak.
+    # ``condition_number`` is kappa(X), the ratio of largest to
+    # smallest singular value of the design; high values flag
+    # numerical instability and hidden collinearity.
+    "condition_number",
 ))
 _OLS_ALLOWED_INT_FIELDS: frozenset[str] = frozenset((
     "n", "degrees_of_freedom",
@@ -183,6 +189,12 @@ _OLS_ALLOWED_STRING_FIELDS: frozenset[str] = frozenset((
 ))
 _OLS_ALLOWED_DICT_NUMERIC: frozenset[str] = frozenset((
     "coefficients", "standard_errors", "t_statistics", "p_values",
+    # Variance-inflation factors, one per predictor. Cross-field
+    # key validation (further down in _sanitize_linear_regression)
+    # restricts the keys to declared predictor names + the
+    # intercept aliases, so this dict can't be used to smuggle
+    # arbitrary numeric channels.
+    "vif",
 ))
 _OLS_ALLOWED_LIST_STRING: frozenset[str] = frozenset((
     "predictor_variables",

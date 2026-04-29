@@ -594,6 +594,48 @@ def test_ols_accepts_lowercase_intercept():
     assert "intercept" in r.sanitized["coefficients"]
 
 
+def test_ols_vif_passes_through_with_declared_predictor_keys():
+    """VIF is a per-predictor aggregate (R^2_aux on others). Each
+    key must name a declared predictor; alien keys get dropped by
+    the same cross-field validation used for ``coefficients``."""
+    payload = {
+        "type": "linear_regression",
+        "n": 1000,
+        "response_variable": "y",
+        "predictor_variables": ["x1", "x2"],
+        "coefficients": {"(Intercept)": 1.0, "x1": 2.0, "x2": 3.0},
+        "standard_errors": {"(Intercept)": 0.1, "x1": 0.1, "x2": 0.1},
+        "r_squared": 0.5,
+        "vif": {"x1": 1.5, "x2": 2.0, "leak": 9999.0},
+    }
+    r = sanitize(payload)
+    assert r.ok
+    assert "vif" in r.sanitized
+    assert sorted(r.sanitized["vif"].keys()) == ["x1", "x2"]
+    assert "leak" not in r.sanitized["vif"]
+
+
+def test_ols_condition_number_passes_through():
+    """``condition_number`` is a scalar derived from the design
+    matrix's singular values — pure aggregate. Must survive the
+    sanitizer (precision-clamped like other numerics)."""
+    payload = {
+        "type": "linear_regression",
+        "n": 1000,
+        "response_variable": "y",
+        "predictor_variables": ["x"],
+        "coefficients": {"(Intercept)": 1.0, "x": 2.0},
+        "standard_errors": {"(Intercept)": 0.1, "x": 0.1},
+        "r_squared": 0.5,
+        "condition_number": 12.3456789,
+    }
+    r = sanitize(payload)
+    assert r.ok
+    assert "condition_number" in r.sanitized
+    # Precision-clamped to sigfigs_for_n(1000) = 4.
+    assert r.sanitized["condition_number"] == 12.35
+
+
 def test_ols_empty_predictor_list_keeps_only_intercept_aliases():
     """A model with no predictors declared (edge case: intercept-only
     regression) should retain the intercept and drop everything else."""

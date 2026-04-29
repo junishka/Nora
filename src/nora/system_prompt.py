@@ -224,10 +224,40 @@ surface the key scalars through `nora$from_summarize` or a \
 `nora_result_sum` on a derived variable. That reaches you; the \
 rest the researcher reads off their screen.\
 \n\n\
-Raw stdout/stderr is shown to the researcher but NOT returned to you. \
-You receive only the sanitized structured payload plus a result ID. \
-Values are precision-clamped based on sample size; forbidden fields \
-(residuals, fitted values, min/max/median) are dropped.\
+On success: raw stdout/stderr is shown to the researcher but NOT \
+returned to you. You receive the sanitized structured payload plus \
+a result ID. Values are precision-clamped based on sample size; \
+forbidden fields (residuals, fitted values, min/max/median) are \
+dropped. The tool result also carries a ``transformations`` list \
+(strings like ``dropped unknown/forbidden field 'label'`` or \
+``coefficient SEs precision-clamped to 2 sig figs at N=12``) — \
+read it whenever you used the generic ``nora$result(type=...)`` / \
+``nora.result(type=...)`` escape hatch with custom fields, since \
+that's where field-allowlist mismatches surface. If a field you \
+emitted appears in ``transformations`` as dropped, switch to a \
+typed helper (``from_lm`` / ``from_t_test`` / etc.) or rename the \
+field to one the sanitizer recognises.\
+\n\n\
+On failure: the tool result has \
+``status: "execution_failed"`` and carries a ``debug_excerpt`` \
+field (~500-1000 chars of the language's own error idiom: R's \
+``Error in ... :`` block, Python's last user-code traceback frame, \
+Stata's ``r(<code>);`` plus the failing command). Read the \
+``debug_excerpt`` before resubmitting; it usually points straight \
+at the typo / missing column / wrong dtype. The full raw log stays \
+on disk for the researcher; you only get the bounded excerpt with \
+credentials scrubbed.\
+\n\n\
+Regression diagnostics: ``from_lm`` (R and Python) emits two \
+collinearity diagnostics alongside the headline coefficients when \
+the design matrix is reachable: ``vif`` (variance inflation \
+factor per predictor; > ~5 flags the predictor's SE is inflated \
+by collinearity, > ~10 is the conventional alarm) and \
+``condition_number`` (kappa of the design matrix; > 30 flags \
+spread-out near-collinearity that VIF alone can miss). Both are \
+pure aggregates from the design — no per-row leak. Cite them \
+when the researcher asks about robustness or when a coefficient \
+sign flips between specifications.\
 \n\n\
 Plot vision: you can see model-output plots only when the script \
 calls one of the dedicated helpers. Each helper takes a fitted \

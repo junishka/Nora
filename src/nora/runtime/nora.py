@@ -235,8 +235,99 @@ def from_lm(model: Any, **extra: Any) -> None:
         "degrees_of_freedom": df_resid,
         "residual_std_error": sigma,
     }
+    # Aggregate diagnostics. These derive from the design matrix and
+    # residual sums — pure aggregates, no per-observation leak. Add
+    # only when computable; if numpy is missing or the model object
+    # doesn't expose its design, omit silently rather than failing
+    # the whole emit.
+    vif = _compute_vif(model, predictors)
+    if vif:
+        fields["vif"] = vif
+    cond = _compute_condition_number(model)
+    if cond is not None:
+        fields["condition_number"] = cond
     fields.update(extra)
     result(type="linear_regression", **fields)
+
+
+def _compute_vif(model: Any, predictors: list[str]) -> dict[str, float] | None:
+    """Variance inflation factor per predictor.
+
+    For each predictor x_i, fit an auxiliary OLS of x_i on the OTHER
+    predictors (intercept handled by the design matrix). Return
+    1 / (1 - R^2_aux). Pure aggregate over the design columns; no
+    per-row data crosses back.
+
+    Skipped silently if numpy isn't installed, the model lacks an
+    accessible design matrix, or any predictor is perfectly collinear
+    with the rest (R^2_aux >= 1) — the caller treats absence as
+    "diagnostic unavailable" rather than "no collinearity".
+    """
+    try:
+        import numpy as np
+    except Exception:  # noqa: BLE001 — numpy missing → quietly omit
+        return None
+    inner = getattr(model, "model", None)
+    X = getattr(inner, "exog", None) if inner is not None else None
+    if X is None:
+        return None
+    try:
+        X = np.asarray(X, dtype=float)
+    except Exception:  # noqa: BLE001
+        return None
+    if X.ndim != 2 or X.shape[0] < 2 or X.shape[1] < 2:
+        return None
+    exog_names = list(getattr(inner, "exog_names", []) or [])
+    if len(exog_names) != X.shape[1]:
+        return None
+
+    out: dict[str, float] = {}
+    for i, name in enumerate(exog_names):
+        if name in ("const", "Intercept", "(Intercept)"):
+            continue
+        if predictors and name not in predictors:
+            # Only emit VIF for declared predictors so the sanitizer's
+            # cross-field key validation accepts the result.
+            continue
+        xi = X[:, i]
+        X_others = np.delete(X, i, axis=1)
+        try:
+            beta, *_ = np.linalg.lstsq(X_others, xi, rcond=None)
+            xi_hat = X_others @ beta
+            ss_res = float(np.sum((xi - xi_hat) ** 2))
+            ss_tot = float(np.sum((xi - np.mean(xi)) ** 2))
+        except Exception:  # noqa: BLE001
+            continue
+        if ss_tot <= 0 or ss_res < 0:
+            continue
+        r2_aux = 1.0 - ss_res / ss_tot
+        if r2_aux >= 1.0 or r2_aux < 0.0:
+            continue
+        out[name] = 1.0 / (1.0 - r2_aux)
+    return out or None
+
+
+def _compute_condition_number(model: Any) -> float | None:
+    """``kappa(X)`` — ratio of the largest to smallest singular
+    value of the design matrix. High values flag near-collinearity
+    that VIF can miss when it's spread across many predictors.
+
+    Returns ``None`` if numpy is missing or the design isn't
+    reachable; the caller drops the field rather than emitting a
+    confusing ``null``.
+    """
+    try:
+        import numpy as np
+    except Exception:  # noqa: BLE001
+        return None
+    inner = getattr(model, "model", None)
+    X = getattr(inner, "exog", None) if inner is not None else None
+    if X is None:
+        return None
+    try:
+        return float(np.linalg.cond(np.asarray(X, dtype=float)))
+    except Exception:  # noqa: BLE001
+        return None
 
 
 def from_t_test(res: Any, *, n1: int, n2: int | None = None,

@@ -178,7 +178,16 @@ nora$from_lm <- function(model, ...) {
   } else NULL
   if (!is.null(f_pvalue)) f_pvalue <- unname(f_pvalue)
 
-  nora$result(
+  # Aggregate diagnostics — collinearity / numerical stability.
+  # Pure aggregates over the design matrix, no per-row leak.
+  # Computed natively in base R (no `car`, no `lmtest` dep) so the
+  # helper stays usable on minimal R installs. Failures are silent
+  # — the field is omitted rather than blowing up the emit.
+  vif_list <- tryCatch(nora$.compute_vif(model), error = function(e) NULL)
+  cond_num <- tryCatch(nora$.compute_condition_number(model),
+                       error = function(e) NULL)
+
+  args <- list(
     type = "linear_regression",
     n = as.integer(nobs(model)),
     response_variable = response,
@@ -192,9 +201,55 @@ nora$from_lm <- function(model, ...) {
     f_statistic = f_value,
     f_p_value = f_pvalue,
     degrees_of_freedom = as.integer(s$df[2]),
-    residual_std_error = s$sigma,
-    ...
+    residual_std_error = s$sigma
   )
+  if (!is.null(vif_list) && length(vif_list) > 0) args$vif <- vif_list
+  if (!is.null(cond_num)) args$condition_number <- cond_num
+  do.call(nora$result, c(args, list(...)))
+}
+
+
+# VIF per predictor: regress each predictor on the others, return
+# 1 / (1 - R^2_aux). The intercept is excluded; perfectly collinear
+# predictors are omitted (R^2_aux >= 1) so the caller treats their
+# absence as "VIF undefined" rather than emitting Inf.
+nora$.compute_vif <- function(model) {
+  X <- tryCatch(model.matrix(model), error = function(e) NULL)
+  if (is.null(X) || ncol(X) < 2 || nrow(X) < 2) return(NULL)
+  cols <- colnames(X)
+  intercept_alias <- c("(Intercept)", "intercept", "const")
+  drop_intercept <- cols %in% intercept_alias
+  out <- list()
+  for (i in seq_along(cols)) {
+    if (drop_intercept[i]) next
+    name <- cols[i]
+    xi <- X[, i]
+    X_others <- X[, -i, drop = FALSE]
+    if (ncol(X_others) == 0) next
+    fit_aux <- tryCatch(
+      stats::lm.fit(X_others, xi),
+      error = function(e) NULL
+    )
+    if (is.null(fit_aux)) next
+    ss_tot <- sum((xi - mean(xi))^2)
+    ss_res <- sum(fit_aux$residuals^2)
+    if (ss_tot <= 0 || ss_res < 0) next
+    r2_aux <- 1 - ss_res / ss_tot
+    if (r2_aux >= 1 || r2_aux < 0) next
+    out[[name]] <- 1 / (1 - r2_aux)
+  }
+  if (length(out) == 0) NULL else out
+}
+
+
+# kappa(X): condition number of the design matrix. Higher values flag
+# numerical instability that VIF (single-column at a time) can miss
+# when collinearity is spread across many predictors.
+nora$.compute_condition_number <- function(model) {
+  X <- tryCatch(model.matrix(model), error = function(e) NULL)
+  if (is.null(X)) return(NULL)
+  k <- tryCatch(kappa(X, exact = TRUE), error = function(e) NULL)
+  if (is.null(k) || !is.finite(k)) NULL else as.numeric(k)
 }
 
 
