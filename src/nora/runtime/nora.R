@@ -186,6 +186,7 @@ nora$from_lm <- function(model, ...) {
   vif_list <- tryCatch(nora$.compute_vif(model), error = function(e) NULL)
   cond_num <- tryCatch(nora$.compute_condition_number(model),
                        error = function(e) NULL)
+  vcov_nested <- tryCatch(nora$.compute_vcov(model), error = function(e) NULL)
 
   args <- list(
     type = "linear_regression",
@@ -205,7 +206,33 @@ nora$from_lm <- function(model, ...) {
   )
   if (!is.null(vif_list) && length(vif_list) > 0) args$vif <- vif_list
   if (!is.null(cond_num)) args$condition_number <- cond_num
+  if (!is.null(vcov_nested) && length(vcov_nested) > 0) {
+    args$vcov <- vcov_nested
+  }
   do.call(nora$result, c(args, list(...)))
+}
+
+
+# vcov(model): full variance-covariance matrix of the coefficient
+# estimates. Diagonals equal SE^2; off-diagonals enable Wald tests
+# / joint significance / linear-combination CIs. Pure aggregate
+# from sigma^2 * (X'X)^-1 with no per-row leak. Returns a nested
+# named list keyed by coefficient name; ``NULL`` on any error.
+nora$.compute_vcov <- function(model) {
+  v <- tryCatch(stats::vcov(model), error = function(e) NULL)
+  if (is.null(v) || !is.matrix(v)) return(NULL)
+  rn <- rownames(v); cn <- colnames(v)
+  if (is.null(rn) || is.null(cn)) return(NULL)
+  out <- list()
+  for (i in seq_along(rn)) {
+    inner <- list()
+    for (j in seq_along(cn)) {
+      val <- v[i, j]
+      if (is.finite(val)) inner[[cn[j]]] <- as.numeric(val)
+    }
+    if (length(inner) > 0) out[[rn[i]]] <- inner
+  }
+  if (length(out) == 0) NULL else out
 }
 
 

@@ -266,10 +266,14 @@ the design matrix is reachable: ``vif`` (variance inflation \
 factor per predictor; > ~5 flags the predictor's SE is inflated \
 by collinearity, > ~10 is the conventional alarm) and \
 ``condition_number`` (kappa of the design matrix; > 30 flags \
-spread-out near-collinearity that VIF alone can miss). Both are \
-pure aggregates from the design — no per-row leak. Cite them \
-when the researcher asks about robustness or when a coefficient \
-sign flips between specifications.\
+spread-out near-collinearity that VIF alone can miss). It also \
+emits the full variance-covariance matrix as ``vcov`` (a \
+dict-of-dict keyed on coefficient names; diagonals are SE^2, \
+off-diagonals enable Wald tests, joint significance, and CIs on \
+linear combinations of coefficients you can compute yourself). \
+All three are pure aggregates from the design — no per-row leak. \
+Cite them when the researcher asks about robustness or when a \
+coefficient sign flips between specifications.\
 \n\n\
 Plot vision: you can see model-output plots only when the script \
 calls one of the dedicated helpers. Each helper takes a fitted \

@@ -241,6 +241,72 @@ def test_from_lm_emits_vif_and_condition_number_when_design_available(runtime) -
     assert isinstance(cond, (int, float)) and cond > 0
 
 
+def test_from_lm_emits_vcov_when_cov_params_available(runtime) -> None:
+    """When the fit exposes ``cov_params()``, the helper emits the
+    full variance-covariance matrix (dict-of-dict keyed on
+    coefficient names). Diagonals must equal SE^2 to within
+    precision-clamp; off-diagonals carry the covariances Wald
+    tests need."""
+    rng = np.random.default_rng(11)
+    n = 200
+    treatment = rng.integers(0, 2, size=n).astype(float)
+    age = rng.normal(40, 12, size=n)
+    intercept = np.ones(n)
+    exog = np.column_stack([intercept, treatment, age])
+
+    cov_df = pd.DataFrame(
+        [[0.50, 0.02, 0.01], [0.02, 0.30, 0.005], [0.01, 0.005, 0.10]],
+        index=["Intercept", "treatment", "age"],
+        columns=["Intercept", "treatment", "age"],
+    )
+
+    class _ModelWithDesign:
+        endog_names = "outcome"
+        exog_names = ("Intercept", "treatment", "age")
+
+    _ModelWithDesign.exog = exog
+
+    class _FitWithVcov(_FakeFit):
+        model = _ModelWithDesign()
+
+        def cov_params(self) -> pd.DataFrame:
+            return cov_df
+
+    mod, path = runtime
+    mod.from_lm(_FitWithVcov())
+    payload = _read_payload_strip_token(path)
+    res = sanitize(payload)
+    assert res.ok, (
+        f"sanitizer rejected vcov-bearing payload: {res.rejection_reason}"
+    )
+    sanitized = res.sanitized
+    assert "vcov" in sanitized
+    # All declared predictors plus the intercept survive.
+    assert sorted(sanitized["vcov"].keys()) == [
+        "Intercept", "age", "treatment",
+    ]
+    # Diagonal exists and matches the input within sigfig clamp.
+    treatment_var = sanitized["vcov"]["treatment"]["treatment"]
+    assert 0.29 <= treatment_var <= 0.31
+    # Off-diagonal symmetry preserved.
+    cov_age_treat = sanitized["vcov"]["age"]["treatment"]
+    cov_treat_age = sanitized["vcov"]["treatment"]["age"]
+    assert abs(cov_age_treat - cov_treat_age) < 1e-9
+
+
+def test_from_lm_omits_vcov_when_cov_params_missing(runtime) -> None:
+    """A fit object that doesn't expose ``cov_params`` (sklearn-
+    shaped, custom estimator) shouldn't emit vcov. The helper omits
+    the field rather than crashing or writing null — caller drops
+    the diagnostic gracefully."""
+    mod, path = runtime
+    mod.from_lm(_FakeFit())  # no cov_params attribute
+    payload = _read_payload_strip_token(path)
+    res = sanitize(payload)
+    assert res.ok
+    assert "vcov" not in res.sanitized
+
+
 def test_from_lm_omits_diagnostics_when_design_missing(runtime) -> None:
     """When the result doesn't expose a design matrix (the legacy
     ``_FakeFit`` shape), the helper omits VIF / condition_number

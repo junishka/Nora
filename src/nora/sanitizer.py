@@ -540,8 +540,13 @@ def _sanitize_linear_regression(
     # ``predictor_variables`` is dropped with a transformation log
     # entry so the researcher can see what got stripped.
     declared_predictors = set(out.get("predictor_variables") or [])
+    # Intercept aliases each runtime emits. R's lm() reports
+    # "(Intercept)"; statsmodels formula fits report "Intercept";
+    # statsmodels ``add_constant(X)`` reports "const"; Stata reports
+    # "_cons". The lowercase "intercept" form is a permissive fallback
+    # in case a future runtime normalizes naming.
     allowed_coefficient_keys = declared_predictors | {
-        "(Intercept)", "_cons", "intercept",
+        "(Intercept)", "_cons", "intercept", "Intercept", "const",
     }
     for dict_field in _OLS_ALLOWED_DICT_NUMERIC:
         if dict_field not in out:
@@ -564,6 +569,44 @@ def _sanitize_linear_regression(
             )
         out[dict_field] = kept
 
+    # Variance-covariance matrix (vcov). Optional, dict-of-dict-of-
+    # numeric keyed on the same coefficient names. Pure aggregate from
+    # the design (sigma^2 * (X'X)^-1); the diagonals are SE^2 and the
+    # off-diagonals enable Wald tests / joint hypothesis testing /
+    # linear-combination CIs the model can compute itself. Each row
+    # AND column key must reference a declared predictor (or
+    # intercept alias); alien keys are dropped with the same defense
+    # used on coefficients above.
+    raw_vcov = raw.get("vcov")
+    if isinstance(raw_vcov, dict):
+        sanitized_vcov: dict[str, dict[str, float]] = {}
+        dropped_vcov: list[str] = []
+        for row_key, row_value in raw_vcov.items():
+            if row_key not in allowed_coefficient_keys:
+                dropped_vcov.append(f"row {row_key!r}")
+                continue
+            if not isinstance(row_value, dict):
+                dropped_vcov.append(f"row {row_key!r} (non-dict)")
+                continue
+            sanitized_row: dict[str, float] = {}
+            for col_key, val in row_value.items():
+                if col_key not in allowed_coefficient_keys:
+                    dropped_vcov.append(f"{row_key}.{col_key}")
+                    continue
+                if not _is_finite_number(val):
+                    continue
+                sanitized_row[col_key] = float(val)
+            if sanitized_row:
+                sanitized_vcov[row_key] = sanitized_row
+        if dropped_vcov:
+            transformations.append(
+                f"dropped {len(dropped_vcov)} undeclared key(s) from "
+                f"'vcov': {sorted(dropped_vcov)[:5]}"
+                + (" …" if len(dropped_vcov) > 5 else "")
+            )
+        if sanitized_vcov:
+            out["vcov"] = sanitized_vcov
+
     # Precision clamp every numeric field and every dict-of-numeric
     # field. Clamp AFTER the cross-field key filter above so we only
     # pay the rounding cost on keys that survive the filter.
@@ -575,6 +618,12 @@ def _sanitize_linear_regression(
     for key in _OLS_ALLOWED_DICT_NUMERIC:
         if key in out:
             out[key] = clamp_precision_dict(out[key], n)
+    # vcov is dict-of-dict; clamp each inner dict's values.
+    if "vcov" in out:
+        out["vcov"] = {
+            row: clamp_precision_dict(inner, n)
+            for row, inner in out["vcov"].items()
+        }
     transformations.append(
         f"clamped all numeric fields to {sigfigs} significant figures (n={n})"
     )

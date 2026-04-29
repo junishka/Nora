@@ -615,6 +615,63 @@ def test_ols_vif_passes_through_with_declared_predictor_keys():
     assert "leak" not in r.sanitized["vif"]
 
 
+def test_ols_vcov_passes_through_with_declared_keys():
+    """The full variance-covariance matrix passes through. Each row
+    AND column key must reference a declared predictor or intercept
+    alias; alien keys are dropped with the same defense used on
+    `coefficients`."""
+    payload = {
+        "type": "linear_regression",
+        "n": 1000,
+        "response_variable": "y",
+        "predictor_variables": ["x1", "x2"],
+        "coefficients": {"(Intercept)": 1.0, "x1": 2.0, "x2": 3.0},
+        "standard_errors": {"(Intercept)": 0.1, "x1": 0.1, "x2": 0.1},
+        "r_squared": 0.5,
+        "vcov": {
+            "(Intercept)": {"(Intercept)": 0.01, "x1": 0.001, "x2": 0.002},
+            "x1": {"(Intercept)": 0.001, "x1": 0.01, "x2": 0.005, "leak": 9.9},
+            "x2": {"(Intercept)": 0.002, "x1": 0.005, "x2": 0.01},
+            "leak_row": {"x1": 0.0},
+        },
+    }
+    r = sanitize(payload)
+    assert r.ok, r.rejection_reason
+    assert "vcov" in r.sanitized
+    # Outer keys: only declared coefficient names + intercept aliases
+    # survive; "leak_row" is dropped.
+    assert sorted(r.sanitized["vcov"].keys()) == ["(Intercept)", "x1", "x2"]
+    # Inner keys: x1's row had a "leak" column that gets dropped.
+    assert "leak" not in r.sanitized["vcov"]["x1"]
+    assert sorted(r.sanitized["vcov"]["x1"].keys()) == ["(Intercept)", "x1", "x2"]
+    # Diagonals match the original (precision-clamped); off-diagonals
+    # are present and finite.
+    assert r.sanitized["vcov"]["x1"]["x1"] > 0
+    assert r.sanitized["vcov"]["x1"]["x2"] != 0
+
+
+def test_ols_vcov_clamped_to_sigfigs_for_n():
+    """vcov values pass through clamp_precision_dict, same as the
+    other dict-of-numeric fields."""
+    payload = {
+        "type": "linear_regression",
+        "n": 1000,
+        "response_variable": "y",
+        "predictor_variables": ["x"],
+        "coefficients": {"(Intercept)": 1.0, "x": 2.0},
+        "standard_errors": {"(Intercept)": 0.1, "x": 0.1},
+        "r_squared": 0.5,
+        "vcov": {
+            "(Intercept)": {"(Intercept)": 0.0123456789},
+            "x": {"x": 0.987654321},
+        },
+    }
+    r = sanitize(payload)
+    assert r.ok
+    # sigfigs_for_n(1000) == 4
+    assert r.sanitized["vcov"]["x"]["x"] == 0.9877
+
+
 def test_ols_condition_number_passes_through():
     """``condition_number`` is a scalar derived from the design
     matrix's singular values — pure aggregate. Must survive the

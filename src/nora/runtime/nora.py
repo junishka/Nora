@@ -246,8 +246,83 @@ def from_lm(model: Any, **extra: Any) -> None:
     cond = _compute_condition_number(model)
     if cond is not None:
         fields["condition_number"] = cond
+    vcov = _compute_vcov(model)
+    if vcov:
+        fields["vcov"] = vcov
     fields.update(extra)
     result(type="linear_regression", **fields)
+
+
+def _compute_vcov(model: Any) -> dict[str, dict[str, float]] | None:
+    """Variance-covariance matrix of the coefficient estimates.
+
+    statsmodels exposes ``model.cov_params()`` returning a labelled
+    DataFrame whose row + column index are the coefficient names.
+    Diagonals are the squared SEs (so ``standard_errors[name]`` =
+    ``sqrt(vcov[name][name])``); off-diagonals carry the
+    coefficient covariances that drive Wald tests, joint
+    significance, and linear-combination CIs the model can compute
+    on its own.
+
+    Pure aggregate from sigma^2 * (X'X)^-1 — no per-observation
+    information. Returns None when the model object doesn't expose
+    a parameter covariance (sklearn-shaped, custom estimators,
+    etc.); the caller drops the field rather than emitting null.
+    """
+    fn = getattr(model, "cov_params", None)
+    if fn is None or not callable(fn):
+        return None
+    try:
+        cov = fn()
+    except Exception:  # noqa: BLE001
+        return None
+    # statsmodels returns a pandas DataFrame for formula fits and a
+    # numpy array for raw OLS(y, X). Handle both.
+    to_dict = getattr(cov, "to_dict", None)
+    if callable(to_dict):
+        try:
+            raw = to_dict()
+        except Exception:  # noqa: BLE001
+            return None
+        out: dict[str, dict[str, float]] = {}
+        for row_key, row_dict in raw.items():
+            if not isinstance(row_dict, dict):
+                continue
+            inner: dict[str, float] = {}
+            for col_key, val in row_dict.items():
+                try:
+                    fval = float(val)
+                except (TypeError, ValueError):
+                    continue
+                if math.isfinite(fval):
+                    inner[str(col_key)] = fval
+            if inner:
+                out[str(row_key)] = inner
+        return out or None
+    # numpy array path: pair with exog_names from the inner model.
+    try:
+        import numpy as np
+    except Exception:  # noqa: BLE001
+        return None
+    arr = np.asarray(cov, dtype=float)
+    if arr.ndim != 2 or arr.shape[0] != arr.shape[1]:
+        return None
+    inner_model = getattr(model, "model", None)
+    names = list(
+        getattr(inner_model, "exog_names", []) or []
+    ) if inner_model is not None else []
+    if len(names) != arr.shape[0]:
+        return None
+    out_arr: dict[str, dict[str, float]] = {}
+    for i, row_name in enumerate(names):
+        inner: dict[str, float] = {}
+        for j, col_name in enumerate(names):
+            v = float(arr[i, j])
+            if math.isfinite(v):
+                inner[col_name] = v
+        if inner:
+            out_arr[row_name] = inner
+    return out_arr or None
 
 
 def _compute_vif(model: Any, predictors: list[str]) -> dict[str, float] | None:
