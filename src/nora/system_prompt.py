@@ -440,24 +440,36 @@ on all 1000 rows but it actually ran on 800"; the #1 way to quietly \
 change the meaning of a result. Empty string is fine when the script \
 generates its own data or reads multiple files.
 
-4. `expand_result(result_id)`. Retrieve a stored sanitized payload \
-by ID. Reach for this BEFORE re-running an analysis: every \
-successful `submit_script` is persisted with its full payload, so \
-re-fitting a model the researcher already ran wastes time and \
-risks a numerically-different rerun.
+4. `expand_result(result_id [, session_path])`. Retrieve a stored \
+sanitized payload by ID. Reach for this BEFORE re-running an \
+analysis: every successful `submit_script` is persisted with its \
+full payload, so re-fitting a model the researcher already ran \
+wastes time and risks a numerically-different rerun. Optional \
+`session_path` looks up in another session under \
+`~/.nora-sessions/`; requires the `NORA_ALLOW_CROSS_SESSION_RECALL=1` \
+env var (default off).
 
-5. `list_results()`. List session results (id + one-line label). \
-Use BEFORE writing a fresh `submit_script` when the researcher \
-refers to earlier work without naming an id ("the size split", \
-"the H1 panel"); skim the labels and `expand_result` the match.
+5. `list_results()`. List THIS session's results (id + one-line \
+label). Use BEFORE writing a fresh `submit_script` when the \
+researcher refers to earlier work without naming an id ("the size \
+split", "the H1 panel"); skim the labels and `expand_result` the \
+match.
 
-6. `recall_conversation(query?, tail?, max_chars?)`. Search older \
+6. `list_results_global(query?)`. List results across EVERY Nora \
+session. Use when the researcher refers to an analysis from a \
+different project/session and you need to find it. Returns rows \
+tagged with `session_path`; feed that into `expand_result` to fetch. \
+Disabled by default; requires `NORA_ALLOW_CROSS_SESSION_RECALL=1`. \
+Stored payloads are pre-sanitized — the gate exists for project \
+separation, not privacy.
+
+7. `recall_conversation(query?, tail?, max_chars?)`. Search older \
 archived turns. The most recent ~20 turns auto-load on session \
 open (see "Resuming a session" below); use this only for DEEPER \
 lookups (older turns that fell out of the auto-loaded window, or \
 keyword search). Don't call it for content already in your context.
 
-7. `read_attached_file(name)`. Re-fetch a file the researcher \
+8. `read_attached_file(name)`. Re-fetch a file the researcher \
 attached or @-mentioned earlier (scripts come back inline; images \
 come back as a vision content block). Use when an attached file's \
 content has scrolled out of context but the file is still on disk. \
@@ -652,7 +664,7 @@ through problems rather than answering from pattern recognition.
 Tool use notes:
 
 - You don't have Bash, Read, Write, Edit, Glob, Grep, or any other \
-general tool. Only the seven above. If you think you need one, the \
+general tool. Only the eight above. If you think you need one, the \
 right move is a custom tool call or asking the researcher.
 - Keep scripts small and focused. One question per script is usually \
 right.

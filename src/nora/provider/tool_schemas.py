@@ -189,7 +189,27 @@ _EXPAND_RESULT_DESC = (
     "earlier result. E.g., coefficients from a prior regression; "
     "without carrying the whole payload in context.\n\n"
     "Arguments:\n"
-    "  result_id: the ID returned by a previous submit_script call."
+    "  result_id: the ID returned by a previous submit_script call.\n"
+    "  session_path: optional path to ANOTHER session under "
+    "~/.nora-sessions/ to expand a result from. Requires the "
+    "NORA_ALLOW_CROSS_SESSION_RECALL=1 env var to be set; otherwise "
+    "returns 'cross-session disabled'."
+)
+
+_LIST_RESULTS_GLOBAL_DESC = (
+    "List stored sanitized results from EVERY Nora session under "
+    "~/.nora-sessions/. Use when the researcher refers to an analysis "
+    "from a different project/session and you need to find it. "
+    "Returns rows tagged with their session_path; pair with "
+    "expand_result(result_id, session_path=...) to fetch the full "
+    "payload.\n\n"
+    "Requires the NORA_ALLOW_CROSS_SESSION_RECALL=1 env var to be set "
+    "(default OFF — researchers may want explicit project "
+    "separation regardless of payload safety). When disabled, "
+    "returns 'cross-session disabled' with no results.\n\n"
+    "Arguments:\n"
+    "  query: optional case-insensitive substring filter on "
+    "label / analysis_type. Omit to list everything."
 )
 
 _LIST_RESULTS_DESC = (
@@ -389,6 +409,7 @@ def build_tool_specs() -> tuple[ToolSpec, ...]:
             _EXPAND_RESULT_DESC,
             properties={
                 "result_id": {"type": "string"},
+                "session_path": {"type": "string"},
             },
             required=("result_id",),
         ),
@@ -396,6 +417,14 @@ def build_tool_specs() -> tuple[ToolSpec, ...]:
             "list_results",
             _LIST_RESULTS_DESC,
             properties={},
+            required=(),
+        ),
+        _spec(
+            "list_results_global",
+            _LIST_RESULTS_GLOBAL_DESC,
+            properties={
+                "query": {"type": "string"},
+            },
             required=(),
         ),
         _spec(

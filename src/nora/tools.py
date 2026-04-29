@@ -24,6 +24,7 @@ See also: `project_builder_mcp_surface.md` (user memory) for the full spec.
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 from typing import Any
 
@@ -820,6 +821,43 @@ async def submit_script(args: dict[str, Any]) -> dict[str, Any]:
 # Tool: expand_result
 # ---------------------------------------------------------------------------
 
+# Env-gated opt-in for cross-session result recall. Default OFF —
+# matches the historic per-session isolation that researcher mental
+# models depend on. Setting ``NORA_ALLOW_CROSS_SESSION_RECALL=1``
+# lets ``expand_result(result_id, session_path=...)`` and the
+# ``list_results_global`` tool reach into other sessions' stores.
+# Stored payloads are pre-sanitized so the privacy boundary is
+# preserved; the gate exists because researchers may want explicit
+# project separation regardless of payload safety.
+_CROSS_SESSION_ENV_VAR = "NORA_ALLOW_CROSS_SESSION_RECALL"
+
+
+def _cross_session_enabled() -> bool:
+    """Whether the env-gated cross-session lookup is on. Truthy
+    values: ``1`` / ``true`` / ``yes`` (case-insensitive)."""
+    val = os.environ.get(_CROSS_SESSION_ENV_VAR, "").strip().lower()
+    return val in ("1", "true", "yes")
+
+
+def _resolve_cross_session_cwd(session_path: str) -> Path | None:
+    """Validate a researcher-supplied session_path and return its
+    resolved Path, or None if it isn't a session under
+    ``~/.nora-sessions/``. Path-confined to that root so the model
+    can't direct the store-loader at arbitrary paths on the
+    machine."""
+    from nora.ui import SESSIONS_ROOT, _is_within
+
+    try:
+        target = Path(session_path).expanduser().resolve()
+    except OSError:
+        return None
+    if not _is_within(target, SESSIONS_ROOT.resolve()):
+        return None
+    if not target.is_dir():
+        return None
+    return target
+
+
 @tool(
     "expand_result",
     (
@@ -828,19 +866,51 @@ async def submit_script(args: dict[str, Any]) -> dict[str, Any]:
         "earlier result. E.g., coefficients from a prior regression; "
         "without carrying the whole payload in context.\n\n"
         "Arguments:\n"
-        "  result_id: the ID returned by a previous submit_script call."
+        "  result_id: the ID returned by a previous submit_script call.\n"
+        "  session_path: optional path to ANOTHER session under "
+        f"~/.nora-sessions/ to expand a result from. Requires the "
+        f"{_CROSS_SESSION_ENV_VAR}=1 env var to be set; otherwise "
+        f"returns 'cross-session disabled'."
     ),
-    {"result_id": str},
+    {"result_id": str, "session_path": str},
 )
 async def expand_result(args: dict[str, Any]) -> dict[str, Any]:
-    """Return the full stored sanitized payload for a given ID."""
+    """Return the full stored sanitized payload for a given ID.
+
+    Defaults to the current session's store. With ``session_path``
+    set and the cross-session env gate on, looks up in another
+    session's store under ``~/.nora-sessions/``.
+    """
     result_id = args.get("result_id", "")
     if not result_id:
         return _as_mcp_text({
             "status": "error",
             "reason": "result_id argument is required",
         })
-    store = get_store(get_cwd())
+    raw_session_path = (args.get("session_path") or "").strip()
+    if raw_session_path:
+        if not _cross_session_enabled():
+            return _as_mcp_text({
+                "status": "denied",
+                "reason": (
+                    f"cross-session expand is disabled in this "
+                    f"configuration. Set {_CROSS_SESSION_ENV_VAR}=1 "
+                    f"in the environment to enable, or omit "
+                    f"session_path to look up in the current session."
+                ),
+            })
+        target_cwd = _resolve_cross_session_cwd(raw_session_path)
+        if target_cwd is None:
+            return _as_mcp_text({
+                "status": "denied",
+                "reason": (
+                    "session_path must be a directory inside "
+                    "~/.nora-sessions/"
+                ),
+            })
+    else:
+        target_cwd = get_cwd()
+    store = get_store(target_cwd)
     row = store.get(result_id)
     if row is None:
         return _as_mcp_text({
@@ -857,6 +927,8 @@ async def expand_result(args: dict[str, Any]) -> dict[str, Any]:
         "transformations": row.transformations,
         "created_at": row.created_at,
     }
+    if raw_session_path:
+        response["session_path"] = str(target_cwd)
     # Surface the run_dir so the TUI can re-render the raw R/Stata
     # output alongside the (possibly dense) sanitized payload. Without
     # this, re-expanding a stored regression gives the researcher
@@ -899,6 +971,105 @@ async def list_results(args: dict[str, Any]) -> dict[str, Any]:
             }
             for r in rows
         ],
+    })
+
+
+# ---------------------------------------------------------------------------
+# Tool: list_results_global
+# ---------------------------------------------------------------------------
+
+@tool(
+    "list_results_global",
+    (
+        "List stored sanitized results from EVERY Nora session under "
+        "~/.nora-sessions/. Use when the researcher refers to an analysis "
+        "from a different project/session and you need to find it. "
+        "Returns rows tagged with their session_path; pair with "
+        f"expand_result(result_id, session_path=...) to fetch the full "
+        f"payload.\n\n"
+        f"Requires the {_CROSS_SESSION_ENV_VAR}=1 env var to be set "
+        f"(default OFF — researchers may want explicit project "
+        f"separation regardless of payload safety). When disabled, "
+        f"returns 'cross-session disabled' with no results.\n\n"
+        f"Arguments:\n"
+        f"  query: optional case-insensitive substring filter on "
+        f"label / analysis_type. Omit to list everything."
+    ),
+    {"query": str},
+)
+async def list_results_global(args: dict[str, Any]) -> dict[str, Any]:
+    """Walk ``~/.nora-sessions/*/.nora/results.db`` and return one
+    row per stored result across all sessions, optionally filtered
+    by ``query``.
+
+    Gated by ``NORA_ALLOW_CROSS_SESSION_RECALL``. The stored
+    payloads are pre-sanitized so the privacy boundary is preserved
+    regardless of which session they came from; the gate exists for
+    researcher-side project separation, not as a privacy property.
+    """
+    if not _cross_session_enabled():
+        return _as_mcp_text({
+            "status": "denied",
+            "reason": (
+                f"cross-session listing is disabled in this "
+                f"configuration. Set {_CROSS_SESSION_ENV_VAR}=1 in "
+                f"the environment to enable. Stored payloads are "
+                f"pre-sanitized — the gate exists for project "
+                f"separation, not privacy."
+            ),
+        })
+    query = (args.get("query") or "").strip().lower()
+
+    from nora.ui import SESSIONS_ROOT
+
+    if not SESSIONS_ROOT.exists():
+        return _as_mcp_text({
+            "status": "ok",
+            "count": 0,
+            "results": [],
+        })
+
+    rows_out: list[dict[str, Any]] = []
+    # Iterate every session dir under ~/.nora-sessions/. Skip the
+    # current session here because the model already has list_results
+    # for that — cross-session is the value-add. Including it would
+    # double-list and waste tokens.
+    current_cwd = get_cwd().resolve()
+    for child in sorted(SESSIONS_ROOT.iterdir()):
+        if not child.is_dir():
+            continue
+        if child.resolve() == current_cwd:
+            continue
+        db_path = child / ".nora" / "results.db"
+        if not db_path.is_file():
+            continue
+        try:
+            store = get_store(child)
+            rows = store.list_all()
+        except Exception:  # noqa: BLE001 — never let one bad db kill the listing
+            continue
+        for r in rows:
+            label = r.label or ""
+            atype = r.analysis_type or ""
+            if query and query not in label.lower() and query not in atype.lower():
+                continue
+            rows_out.append({
+                "session_path": str(child),
+                "session_name": child.name,
+                "id": r.id,
+                "label": label,
+                "analysis_type": atype,
+                "created_at": r.created_at,
+            })
+    # Newest-first so the model sees recent sessions before old ones.
+    rows_out.sort(
+        key=lambda r: r.get("created_at") or "", reverse=True,
+    )
+    return _as_mcp_text({
+        "status": "ok",
+        "count": len(rows_out),
+        "results": rows_out,
+        "query": query if query else None,
     })
 
 
@@ -1319,6 +1490,7 @@ REGISTERED_TOOLS: tuple[Any, ...] = (
     submit_script,
     expand_result,
     list_results,
+    list_results_global,
     recall_conversation,
     read_attached_file,
 )
@@ -1331,6 +1503,7 @@ ALLOWED_TOOL_NAMES: tuple[str, ...] = (
     f"mcp__{SERVER_NAME}__submit_script",
     f"mcp__{SERVER_NAME}__expand_result",
     f"mcp__{SERVER_NAME}__list_results",
+    f"mcp__{SERVER_NAME}__list_results_global",
     f"mcp__{SERVER_NAME}__recall_conversation",
     f"mcp__{SERVER_NAME}__read_attached_file",
 )
