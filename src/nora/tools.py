@@ -592,7 +592,14 @@ async def request_data(args: dict[str, Any]) -> dict[str, Any]:
         "list (one entry per helper call, in emission order, each with its "
         "own ``result_id``, ``label``, ``analysis_type``, and ``summary``) "
         "plus a shared ``script_run_id`` so the group can be retrieved "
-        "together for audit.\n\n"
+        "together for audit. For parameterized batches (the same model "
+        "across N specifications, subgroups, outcomes, or sensitivity "
+        "perturbations), use ONE looping script over N separate scripts "
+        "to avoid repeated data preparation and a fragmented audit. If "
+        "the script aborts mid-loop, status becomes "
+        "``execution_failed_partial`` and the helpers that emitted "
+        "before the abort are returned in ``results`` alongside a "
+        "``debug_excerpt`` of the abort cause.\n\n"
         "Arguments:\n"
         "  language: 'R', 'Stata', or 'Python'.\n"
         "  code: the full script source as a single string.\n"
@@ -671,78 +678,13 @@ async def submit_script(args: dict[str, Any]) -> dict[str, Any]:
                 pass
         raise
 
-    # Execution-level failures (interpreter missing, timeout, no structured
-    # output, bad JSON) come back to Claude as policy-shaped errors. The
-    # researcher still sees the raw log in the scratch dir.
-    if not exec_result.ok:
-        # Persist a diagnostic row anyway so the researcher can find the
-        # run dir from the store. Analysis type is "script_error" to keep
-        # it distinguishable from successful results.
-        store = get_store(cwd)
-        diag_row = store.insert(
-            label=f"[error] {label}",
-            analysis_type="script_error",
-            sanitized_payload={
-                "type": "script_error",
-                "reason": exec_result.error,
-                "exit_code": exec_result.exit_code,
-                "run_dir": str(exec_result.run_dir),
-            },
-            language=language,
-            script_code=code,
-            transformations=[],
-            raw_log_path=exec_result.run_dir,
-        )
-        # Build a short human-readable excerpt of the actual error so
-        # the model can debug something more specific than "exit code 1".
-        # ``debug_excerpt`` is the first channel that ever forwards
-        # stdout/stderr bytes to the model. The SDC boundary is
-        # preserved in error_summary.py via tightly-anchored patterns,
-        # length-aware redaction, credential scrub, and a 1 KB hard
-        # cap. See ``test_error_summary_no_leak.py`` for the
-        # regression coverage.
-        from nora.error_summary import extract_debug_excerpt
-        excerpt = extract_debug_excerpt(
-            exec_result.raw_stdout,
-            exec_result.raw_stderr,
-            exec_result.exit_code,
-            language,
-        )
-        if not excerpt:
-            excerpt = (
-                f"script failed (exit code {exec_result.exit_code}); "
-                f"inspect raw log in UI (result_id={diag_row.id})"
-            )
-        return _as_mcp_text({
-            "status": "execution_failed",
-            "reason": exec_result.error,
-            "exit_code": exec_result.exit_code,
-            "result_id": diag_row.id,
-            "duration_seconds": round(exec_result.duration_seconds, 3),
-            # Bounded excerpt of the language's own error output.
-            # Read it before re-trying. It usually points straight
-            # at the typo / missing column / wrong dtype.
-            "debug_excerpt": excerpt,
-            "hint": (
-                "The full raw stdout/stderr stays in the run directory "
-                "for the researcher (no model-side file-read tool). "
-                "The debug_excerpt above is a short slice of the "
-                "language's error output. Read it before resubmitting."
-            ),
-            "_run_dir": str(exec_result.run_dir),
-            # Language hint must travel on error paths too: the UI
-            # uses it to strip the Stata preamble from raw stdout
-            # and to pick the right "Open in Stata" / "Open in R"
-            # button. Without it, errored Stata runs leaked the
-            # preamble into the visible output.
-            "_language": language,
-        })
-
-    # --- Sanitizer ---------------------------------------------------------
-    # The executor returns one or more raw payloads (JSONL, one per
+    # The executor returns zero or more raw payloads (JSONL, one per
     # nora_result_* helper call inside the script). Sanitize each
     # independently and store one row per payload, all tagged with a
-    # shared script_run_id so the researcher can fetch them as a group.
+    # shared script_run_id so the researcher can fetch them as a
+    # group. The same loop runs on the success path AND on the
+    # partial-success path (script aborted mid-loop after emitting
+    # some helpers); the difference is the overall envelope status.
     #
     # SDC config depends only on source_dataset (a per-call argument),
     # so resolve it once outside the loop.
@@ -837,7 +779,30 @@ async def submit_script(args: dict[str, Any]) -> dict[str, Any]:
             "transformations": transformations,
         })
 
-    overall_status = "ok" if any_ok else "rejected_by_sanitizer"
+    # Decide the envelope status. Four distinct outcomes:
+    #
+    #   exec ok | payloads | sanitizer | envelope status
+    #   --------+----------+-----------+----------------------------
+    #     yes   |  any ok  |   any ok  | "ok"
+    #     yes   |  any ok  |  all bad  | "rejected_by_sanitizer"
+    #     no    |  any ok  |   any ok  | "execution_failed_partial"
+    #     no    |  none    |     -     | "execution_failed"
+    #
+    # The "execution_failed_partial" path is the load-bearing one for
+    # parameterized loops: a script doing 24 specs that hits a thin
+    # cell on iteration #5 still surfaces the four good payloads
+    # plus a debug_excerpt of what aborted iteration #5. Without it,
+    # the model would fall back to N separate scripts to defend
+    # against losing partial work, which negates the multi-result
+    # design.
+    if exec_result.ok:
+        overall_status = "ok" if any_ok else "rejected_by_sanitizer"
+    else:
+        overall_status = (
+            "execution_failed_partial" if exec_result.result_payloads
+            else "execution_failed"
+        )
+
     response: dict[str, Any] = {
         "status": overall_status,
         "script_run_id": script_run_id,
@@ -853,6 +818,7 @@ async def submit_script(args: dict[str, Any]) -> dict[str, Any]:
         # invocation when launching the native app.
         "_language": language,
     }
+
     if overall_status == "rejected_by_sanitizer":
         response["hint"] = (
             "Every payload this script emitted was rejected by the "
@@ -860,6 +826,66 @@ async def submit_script(args: dict[str, Any]) -> dict[str, Any]:
             "(e.g., n too small, forbidden field, type mismatch) and "
             "resubmit a corrected analysis."
         )
+
+    if overall_status in ("execution_failed", "execution_failed_partial"):
+        # Add the script-level error context: reason, exit code, and
+        # a bounded debug_excerpt of stdout/stderr so the model can
+        # diagnose the abort. The partial-success branch carries this
+        # ALONGSIDE the partial results — both are useful.
+        response["reason"] = exec_result.error
+        response["exit_code"] = exec_result.exit_code
+        from nora.error_summary import extract_debug_excerpt
+        excerpt = extract_debug_excerpt(
+            exec_result.raw_stdout,
+            exec_result.raw_stderr,
+            exec_result.exit_code,
+            language,
+        )
+        if not excerpt:
+            excerpt = (
+                f"script failed (exit code {exec_result.exit_code}); "
+                f"inspect raw log in UI"
+            )
+        response["debug_excerpt"] = excerpt
+
+        if overall_status == "execution_failed":
+            # No payloads survived. Persist a diagnostic row tagged
+            # with the same script_run_id so the researcher's audit
+            # path still finds the run dir from the store.
+            diag_row = store.insert(
+                label=f"[error] {label}",
+                analysis_type="script_error",
+                sanitized_payload={
+                    "type": "script_error",
+                    "reason": exec_result.error,
+                    "exit_code": exec_result.exit_code,
+                    "run_dir": str(exec_result.run_dir),
+                },
+                language=language,
+                script_code=code,
+                transformations=[],
+                raw_log_path=exec_result.run_dir,
+                script_run_id=script_run_id,
+            )
+            response["result_id"] = diag_row.id
+            response["hint"] = (
+                "The full raw stdout/stderr stays in the run directory "
+                "for the researcher (no model-side file-read tool). "
+                "The debug_excerpt above is a short slice of the "
+                "language's error output. Read it before resubmitting."
+            )
+        else:
+            # Partial success: tell the model both halves of the story.
+            response["hint"] = (
+                f"{len(results)} payload(s) reached you before the "
+                "script aborted. Read them as you would any other "
+                "result; the abort cause is in debug_excerpt. If the "
+                "abort was a known data condition (thin cell at one "
+                "spec, missing variable on one outcome), you can "
+                "skip / guard that case and re-emit only the missing "
+                "payloads in a follow-up."
+            )
+
     plot_summary = _summarize_plot_helpers(exec_result.run_dir)
     if plot_summary is not None:
         response["plots"] = plot_summary

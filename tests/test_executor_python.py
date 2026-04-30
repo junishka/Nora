@@ -190,6 +190,30 @@ def test_python_multiple_helpers_one_script(tmp_path: Path) -> None:
 
 
 @_skip_no_python
+def test_python_partial_payloads_preserved_on_mid_script_abort(
+    tmp_path: Path,
+) -> None:
+    """A script that emits two payloads then raises must surface those
+    two back to the caller — not collapse to a single execution_failed
+    with no payloads. This is the load-bearing property for the
+    partial-success branch in submit_script.
+    """
+    code = (
+        "import nora\n"
+        "nora.from_summarize('a', n=10, mean=1.0, sd=0.1, missing_count=0)\n"
+        "nora.from_summarize('b', n=20, mean=2.0, sd=0.2, missing_count=0)\n"
+        "raise RuntimeError('thin cell on iteration 3')\n"
+    )
+    res = executor.run_script("Python", code, tmp_path, timeout_seconds=30)
+    # Script aborted, so ok must be False...
+    assert res.ok is False
+    assert res.exit_code != 0
+    # ...but the two clean payloads must still be available to the caller.
+    assert len(res.result_payloads) == 2
+    assert [p["variable"] for p in res.result_payloads] == ["a", "b"]
+
+
+@_skip_no_python
 def test_python_handcrafted_payload_rejected(tmp_path: Path) -> None:
     """Authenticity guard: a script that writes JSON directly to
     NORA_RESULT_PATH (bypassing the runtime library) has no token

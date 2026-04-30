@@ -493,9 +493,15 @@ def run_script(
     # 6. Parse result file. The runtime libraries write JSONL (one
     # payload per line). A script that calls a single helper produces
     # one line; one that calls N helpers produces N lines, in
-    # emission order. Each line is independently token-validated;
-    # any line failure rejects the whole script (treat as runtime
-    # corruption rather than try to salvage partial payloads).
+    # emission order. Each line is independently token-validated.
+    #
+    # Partial-success surface: when a script aborts mid-loop after
+    # emitting some helpers, we KEEP the payloads that parsed and
+    # validated cleanly. The caller decides what to do with them
+    # (submit_script returns them under status="execution_failed_partial").
+    # Without this, a script doing 24 specs that hit a thin cell on
+    # iteration #5 would lose the four good results — the same loss
+    # mode multi-result was meant to fix.
     payloads: list[dict] = []
     error: str | None = None
     if not result_path.exists():
@@ -519,18 +525,23 @@ def run_script(
                 try:
                     raw_payload = json.loads(line)
                 except json.JSONDecodeError as je:
+                    # Stop parsing here, but keep what came before.
+                    # A trailing half-written line from a crashed helper
+                    # shouldn't discard the N-1 clean payloads.
                     error = (
-                        f"script emitted a result file with invalid JSON on "
-                        f"line {lineno}: {je.msg} at col {je.colno}"
+                        f"invalid JSON on result line {lineno}: "
+                        f"{je.msg} at col {je.colno} "
+                        f"({len(payloads)} prior payload(s) preserved)"
                     )
-                    payloads = []
                     break
                 cleaned, auth_err = _validate_and_strip_token(
                     raw_payload, run_token
                 )
                 if auth_err is not None:
-                    error = auth_err
-                    payloads = []
+                    error = (
+                        f"{auth_err} (on result line {lineno}; "
+                        f"{len(payloads)} prior payload(s) preserved)"
+                    )
                     break
                 payloads.append(cleaned)
             if error is None and not payloads:

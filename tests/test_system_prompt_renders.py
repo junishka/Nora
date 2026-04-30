@@ -141,6 +141,32 @@ def test_no_stale_stata_unimplemented_claims() -> None:
     assert "nora_plot_interaction" in rendered
 
 
+def test_loop_directive_for_parameterized_batches_present(
+    tmp_path: Path,
+) -> None:
+    """The model defaults to writing a loop in one script when running
+    N parameterized variants (specs, subgroups, sweeps). Without this
+    directive, prior single-result habits push toward N separate
+    scripts even though the architecture now supports multi-result
+    in one call. Pin the directive so a future prompt trim doesn't
+    silently drop it."""
+    rendered = build_system_prompt(tmp_path, "nora")
+    assert "For parameterized batches" in rendered
+    assert "write ONE script with a loop" in rendered
+    assert "Do NOT submit N separate scripts" in rendered
+
+
+def test_partial_failure_semantics_documented(tmp_path: Path) -> None:
+    """When a script aborts mid-loop, the model receives the helpers
+    that emitted before the abort plus the abort cause. The prompt
+    must document this so the model knows to read partials and not
+    assume "abort" means "no results"."""
+    rendered = build_system_prompt(tmp_path, "nora")
+    assert "execution_failed_partial" in rendered
+    assert "On partial failure" in rendered
+    assert "Do NOT re-run the helpers that already succeeded" in rendered
+
+
 def test_runtime_environment_block_renders(tmp_path: Path) -> None:
     """The system prompt includes a runtime-environment listing
     so the model can pick a language by what's actually installed

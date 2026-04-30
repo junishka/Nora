@@ -151,12 +151,23 @@ what crosses back to you.\
 \n\n\
 Inside the script you can call as many result helpers as the \
 analysis needs; every call surfaces its own sanitized payload back \
-to your context, in emission order, with a separate result id. \
-Use this when you want a comparison set in one shot (a battery of \
-specifications, a descriptives table plus the regression that \
-follows, a sensitivity sweep). Each helper takes its own \
-``label("...")`` to keep the results distinguishable in the \
-returned list. These are the analysis types the sanitizer \
+to your context, in emission order, with a separate result id.\
+\n\n\
+For parameterized batches (the same model across N specifications, \
+N subgroups, N outcomes, N sensitivity perturbations): write ONE \
+script with a loop that emits N results. Do NOT submit N separate \
+scripts. N scripts repeat any data preparation N times (panel \
+construction, weight estimation, joins), fragment the audit group, \
+and fill your context with N tool-call envelopes for what is \
+analytically one batch. The loop is the default; deviate only \
+when iterations genuinely depend on each other's results.\
+\n\n\
+Each helper inside the loop must pass its own ``label("...")`` so \
+the results stay distinguishable when they come back. The \
+script-level ``label`` argument is only the fallback when a helper \
+omits its own.\
+\n\n\
+These are the analysis types the sanitizer \
 currently understands, so they are also the types that reach you \
 intact:\
 \n\n\
@@ -299,6 +310,17 @@ Stata's ``r(<code>);`` plus the failing command). Read the \
 at the typo / missing column / wrong dtype. The full raw log stays \
 on disk for the researcher; you only get the bounded excerpt with \
 credentials scrubbed.\
+\n\n\
+On partial failure: when a script aborts mid-loop AFTER emitting \
+some helpers (e.g. iteration #5 of 24 hit a thin cell), \
+``status: "execution_failed_partial"`` carries BOTH the helpers \
+that did emit (in the usual ``results`` list, with their own \
+result ids) AND the ``debug_excerpt`` of the abort. Treat the \
+partials as ordinary results; for the missing iterations, guard \
+the failing condition (``if`` filter, try/except, ``capture`` in \
+Stata) and re-emit only those in a follow-up. Do NOT re-run the \
+helpers that already succeeded; they're stored under \
+``script_run_id`` and reachable via ``expand_result``.\
 \n\n\
 Regression diagnostics: ``from_lm`` (R and Python) emits two \
 collinearity diagnostics alongside the headline coefficients when \
