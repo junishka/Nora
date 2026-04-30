@@ -141,6 +141,46 @@ def test_no_stale_stata_unimplemented_claims() -> None:
     assert "nora_plot_interaction" in rendered
 
 
+def test_formatting_rules_sit_at_end_of_prompt(tmp_path: Path) -> None:
+    """Formatting rules drift after long contexts — by the time the
+    model is generating a multi-result analytical response, the
+    instructions need to be the LAST thing it read, not buried in
+    the middle. The "Think hard" closer references the formatting
+    block above it; if these get reordered with operational notes
+    after them, output regresses to bold sentence-leaders and
+    multi-paragraph prose blocks. Pin the structural ordering."""
+    rendered = build_system_prompt(tmp_path, "nora")
+    fmt_pos = rendered.find("DO NOT bold words inside prose")
+    think_pos = rendered.find("Think hard and thoroughly")
+    tool_use_pos = rendered.find("Tool use notes:")
+    assert fmt_pos > 0 and think_pos > 0 and tool_use_pos > 0
+    # Tool use notes come BEFORE formatting rules.
+    assert tool_use_pos < fmt_pos, (
+        "Tool use notes must precede formatting rules so formatting "
+        "is the last instruction block before the 'Think hard' anchor"
+    )
+    # Formatting rules come BEFORE the 'Think hard' closer.
+    assert fmt_pos < think_pos
+    # The 'Think hard' line is the last line before the prompt ends.
+    tail = rendered[think_pos:]
+    assert len(tail) < 400, (
+        f"'Think hard' should be near the very end; trailing "
+        f"content is {len(tail)} chars"
+    )
+
+
+def test_no_bold_in_prose_rule_is_imperative(tmp_path: Path) -> None:
+    """The previous "No bold in prose" wording was too gentle and the
+    model kept reverting to bold sentence-leaders ("**The big
+    picture.**", "**Pre-trends clean.**") on long analytical
+    responses. The rule needs imperative language and an explicit
+    anti-pattern name so it binds to the failure mode."""
+    rendered = build_system_prompt(tmp_path, "nora")
+    assert "DO NOT bold words inside prose" in rendered
+    assert "Bold sentence-leaders" in rendered
+    assert "Hard cap: four sentences" in rendered
+
+
 def test_inline_backtick_restraint_rule_present(tmp_path: Path) -> None:
     """Without explicit guidance the model wraps every Stata / R /
     Python command-name in backticks (``use``, ``save``, ``export``,
