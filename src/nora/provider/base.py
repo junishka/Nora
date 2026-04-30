@@ -76,9 +76,11 @@ class TurnDone:
     Anthropic subscription path doesn't carry ``cost_usd``; the OpenAI
     path doesn't populate the cache fields (no equivalent concept).
 
-    For Anthropic, the four token fields together describe the *full*
-    conversation context, which the UI sums for the "Context X / Y"
-    indicator:
+    Each field is a separate axis of the turn's token accounting; the
+    web "Context X / Y" chip sums all four to display "context
+    occupied after this turn." Consumers that care about the
+    pre-response prompt size only (cost estimation, billing-side
+    summaries) sum the three input-side fields and ignore output.
 
     - ``input_tokens``: new tokens in this turn's prompt (not cached).
     - ``cache_read_input_tokens``: prior context served from the
@@ -86,8 +88,11 @@ class TurnDone:
       occupies the model's context window.
     - ``cache_creation_input_tokens``: tokens written to the cache
       this turn (also in the window).
-    - ``output_tokens``: what the model just produced. Becomes part of
-      next turn's context, so we count it now.
+    - ``output_tokens``: what the model just produced. Folds back
+      into ``input_tokens`` / ``cache_read_input_tokens`` on the next
+      turn; the web chip adds it to the post-turn snapshot so a long
+      reply shows on the chip immediately rather than only after the
+      next turn.
     """
     input_tokens: int | None = None
     output_tokens: int | None = None

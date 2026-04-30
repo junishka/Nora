@@ -1712,20 +1712,23 @@ window.nora_event = function (evt) {
     case 'turn_done':
       // Terminal event: clear busy state for THIS session
       // (whether focused or background) and, if focused, refresh
-      // the composer + context chip. The chip tracks the *prompt*
-      // side only:
-      //   input_tokens + cache_read + cache_creation
-      // i.e. what the model actually loaded into its window this
-      // turn. ``output_tokens`` is deliberately excluded — Claude's
-      // fresh response is not in the window on THIS turn; it gets
-      // folded into input on the NEXT turn via cache_creation /
-      // input_tokens.
+      // the composer + context chip.
+      //
+      // The chip tracks "context occupied AFTER this turn" — i.e.,
+      // the prompt this turn loaded PLUS the response that just
+      // landed. Including ``output_tokens`` means a long reply
+      // shows up on the chip the instant it arrives, instead of
+      // only on the next turn (when the SDK folds it back into
+      // input/cache_read). The natural-language reading of "how
+      // full is my chat" wants the post-turn snapshot, not the
+      // pre-response one.
       if (isFocused) {
-        const prompt =
+        const occupied =
           (evt.input_tokens || 0) +
           (evt.cache_read_input_tokens || 0) +
-          (evt.cache_creation_input_tokens || 0);
-        updateContextChip(prompt);
+          (evt.cache_creation_input_tokens || 0) +
+          (evt.output_tokens || 0);
+        updateContextChip(occupied);
         if (activeLiveTurn && !activeLiveTurn.hasVisibleReply) {
           queueDisposableTurn(activeLiveTurn.nodes);
         }
@@ -2323,30 +2326,43 @@ const policyChipLabel = document.getElementById('policy-chip-label');
 const policyPopup = document.getElementById('policy-popup');
 let policyPopupBuiltFor = null;  // cached copy so we don't rebuild needlessly
 
-function updateContextChip(inputTokens) {
+function updateContextChip(occupiedTokens) {
   /* Updates the "Context X / Y (Z%)" chip below the composer.
-   * ``inputTokens`` is the conversation-context size reported in the
-   * latest ResultMessage.usage — already cumulative, since the whole
-   * conversation is re-sent each turn. Unhides the chip on first
-   * update and scales the ceiling up if the observed usage exceeds
-   * the default 200k window (Opus 4.7 1M variant, Sonnet 4.6, etc.)
-   * so the ratio stays meaningful. */
+   * ``occupiedTokens`` is "context occupied after this turn" —
+   * the prompt this turn loaded plus the response just produced
+   * (see the case 'turn_done' handler for the breakdown).
+   *
+   * Caveat by provider:
+   * - Anthropic: the SDK reports input_tokens + cache_read +
+   *   cache_creation that together span the whole prompt-side
+   *   window via the prompt cache. Adding output_tokens on top
+   *   gives the post-turn snapshot.
+   * - OpenAI: with previous_response_id, the SDK's input_tokens
+   *   reflects only the new content this turn — the cached
+   *   prefix isn't surfaced to us. The chip therefore undercounts
+   *   on OpenAI until that's plumbed through (see openai.py
+   *   usage handling).
+   *
+   * Unhides the chip on first update and scales the ceiling up
+   * if the observed usage exceeds the default 200k window
+   * (Opus 4.7 1M variant, Sonnet 4.6, etc.) so the ratio stays
+   * meaningful. */
   if (!contextChip) return;
-  if (typeof inputTokens !== 'number' || inputTokens < 0) return;
+  if (typeof occupiedTokens !== 'number' || occupiedTokens < 0) return;
 
-  if (inputTokens > contextWindow) {
+  if (occupiedTokens > contextWindow) {
     // Jumped beyond the assumed window — must be a larger-context
     // model. Round up to the next sensible tier so the ratio looks
     // stable across turns instead of creeping upward.
-    contextWindow = inputTokens <= 1_000_000 ? 1_000_000 : 2_000_000;
+    contextWindow = occupiedTokens <= 1_000_000 ? 1_000_000 : 2_000_000;
   }
 
   const fmt = (n) => (n >= 10_000 ? (n / 1000).toFixed(1) + 'k' : n.toString());
   const ceilingLabel = contextWindow >= 1_000_000
     ? (contextWindow / 1_000_000) + 'M'
     : (contextWindow / 1000) + 'k';
-  const pct = Math.min(100, Math.round((inputTokens / contextWindow) * 100));
-  contextChip.textContent = `Context ${fmt(inputTokens)} / ${ceilingLabel} (${pct}%)`;
+  const pct = Math.min(100, Math.round((occupiedTokens / contextWindow) * 100));
+  contextChip.textContent = `Context ${fmt(occupiedTokens)} / ${ceilingLabel} (${pct}%)`;
   contextChip.classList.remove('hidden');
 
   // Visual warning as context fills up — dim at low use, warm as it
