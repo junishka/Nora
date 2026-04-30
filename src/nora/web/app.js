@@ -960,7 +960,13 @@ if (form) {
     }
     for (const file of usable) {
       if (ALLOWED_IMAGE_MIMES.has(file.type)) {
+        // Stage for one-turn vision AND persist to the session cwd
+        // so the model can @-mention or read_attached_file the
+        // image on later turns. Earlier behavior was vision-only,
+        // which made dropped images one-shot while native "+ Add
+        // Files" persisted them — confusing inconsistency.
         await stageImageFile(file);
+        await stageDataFile(file);
       } else {
         await stageDataFile(file);
       }
@@ -986,7 +992,10 @@ if (input) {
     e.preventDefault();
     for (const f of usable) {
       if (ALLOWED_IMAGE_MIMES.has(f.type)) {
+        // Stage for vision AND persist — same dual-tracking as the
+        // drop handler so paste and drop produce identical state.
         await stageImageFile(f);
+        await stageDataFile(f);
       } else {
         await stageDataFile(f);
       }
@@ -1353,7 +1362,14 @@ form.addEventListener('submit', async (e) => {
   e.preventDefault();
   const text = input.value.trim();
   const images = stagedImages.slice();  // snapshot
-  if (!text && images.length === 0) return;
+  // Send is allowed when ANY of {text, image, attached data file} is
+  // present. The earlier guard ignored ``stagedDataNotices`` so a
+  // researcher who attached a .do file and pressed Send without
+  // typing got silent nothing — looked like file calling was
+  // broken. With a script chip in the composer the model gets the
+  // attachment as context and can proceed (the chip name itself is
+  // implicit "run / inspect this").
+  if (!text && images.length === 0 && stagedDataNotices.length === 0) return;
   if (!window.pywebview || !window.pywebview.api) {
     appendSystem('backend not ready yet; try again');
     return;

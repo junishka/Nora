@@ -1979,22 +1979,35 @@ async def read_attached_file(args: dict[str, Any]) -> dict[str, Any]:
         runs_root = cwd / ".nora" / "runs"
         if runs_root.is_dir():
             try:
-                for run_dir in runs_root.iterdir():
-                    plots_dir = run_dir / "_nora_plots"
-                    if not plots_dir.is_dir():
-                        continue
-                    candidate = plots_dir / safe_name
-                    if candidate.is_file():
+                cwd_resolved = cwd.resolve()
+            except OSError:
+                cwd_resolved = None
+            if cwd_resolved is not None:
+                try:
+                    for run_dir in runs_root.iterdir():
+                        plots_dir = run_dir / "_nora_plots"
+                        if not plots_dir.is_dir():
+                            continue
+                        candidate = plots_dir / safe_name
+                        if not candidate.is_file():
+                            continue
                         try:
                             resolved = candidate.resolve()
-                            cwd_resolved = cwd.resolve()
-                            if str(resolved).startswith(str(cwd_resolved)):
-                                target = candidate
-                                break
                         except OSError:
                             continue
-            except OSError:
-                pass
+                        # ``is_relative_to`` is the path-aware
+                        # containment check; ``str.startswith`` (the
+                        # earlier behavior) treats ``/sessions/foo``
+                        # as containing ``/sessions/foobar/...`` —
+                        # path-prefix collision opens an escape
+                        # vector for sibling sessions whose names
+                        # start with this session's name.
+                        if (resolved == cwd_resolved
+                                or resolved.is_relative_to(cwd_resolved)):
+                            target = candidate
+                            break
+                except OSError:
+                    pass
     if target is None or not target.is_file():
         return _as_mcp_text({
             "status": "not_found",

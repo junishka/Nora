@@ -558,6 +558,18 @@ class SessionRunner:
                     except Exception:  # noqa: BLE001
                         pass
                 except asyncio.CancelledError:
+                    # Carry the prefix and dataset-diff state back so
+                    # the next turn rebuilds context correctly. Plots
+                    # carry too because they're produced by tools and
+                    # the model hasn't yet reasoned about them.
+                    #
+                    # Mentioned files / images do NOT carry. The
+                    # composer chip already cleared on send, so the
+                    # researcher no longer sees those attachments.
+                    # Re-prepending them silently sneaks them into
+                    # the next message, which violates the
+                    # what-you-see-is-what-you-send contract. The
+                    # researcher can re-attach if they want.
                     if carried_prefix:
                         self.needs_context_prefix = True
                     if carried_dataset_diff:
@@ -567,16 +579,6 @@ class SessionRunner:
                     if attached_plots:
                         self.pending_plot_images = (
                             attached_plots + self.pending_plot_images
-                        )
-                    if carried_mentioned_files:
-                        self.pending_mentioned_files = (
-                            carried_mentioned_files
-                            + self.pending_mentioned_files
-                        )
-                    if attached_mentioned_images:
-                        self.pending_mentioned_images = (
-                            attached_mentioned_images
-                            + self.pending_mentioned_images
                         )
                     on_event(_stamp({
                         "type": "turn_error",
@@ -585,6 +587,11 @@ class SessionRunner:
                     self._current_turn_task = None
                     return
                 except Exception as e:  # noqa: BLE001
+                    # Same posture as the cancel branch above: prefix
+                    # and dataset-diff carry, plots carry, mentioned
+                    # files/images do not. The composer cleared the
+                    # chip on send; re-prepending the attachments
+                    # would smuggle them into the next message.
                     if carried_prefix:
                         self.needs_context_prefix = True
                     if carried_dataset_diff:
@@ -594,16 +601,6 @@ class SessionRunner:
                     if attached_plots:
                         self.pending_plot_images = (
                             attached_plots + self.pending_plot_images
-                        )
-                    if carried_mentioned_files:
-                        self.pending_mentioned_files = (
-                            carried_mentioned_files
-                            + self.pending_mentioned_files
-                        )
-                    if attached_mentioned_images:
-                        self.pending_mentioned_images = (
-                            attached_mentioned_images
-                            + self.pending_mentioned_images
                         )
                     on_event(_stamp({
                         "type": "turn_error",
