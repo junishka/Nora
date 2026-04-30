@@ -779,28 +779,34 @@ async def submit_script(args: dict[str, Any]) -> dict[str, Any]:
             "transformations": transformations,
         })
 
-    # Decide the envelope status. Four distinct outcomes:
+    # Decide the envelope status. The decision keys on whether ANY
+    # payload survived sanitization (``any_ok``), not just whether
+    # raw payloads were emitted, because a "partial" envelope that
+    # carries only sanitizer rejections would mislead the model into
+    # treating disclosure rejections as usable partial results.
     #
-    #   exec ok | payloads | sanitizer | envelope status
-    #   --------+----------+-----------+----------------------------
-    #     yes   |  any ok  |   any ok  | "ok"
-    #     yes   |  any ok  |  all bad  | "rejected_by_sanitizer"
-    #     no    |  any ok  |   any ok  | "execution_failed_partial"
-    #     no    |  none    |     -     | "execution_failed"
+    # Five outcomes; the "all-rejected then aborted" case is the one
+    # that's easy to get wrong:
     #
-    # The "execution_failed_partial" path is the load-bearing one for
-    # parameterized loops: a script doing 24 specs that hits a thin
-    # cell on iteration #5 still surfaces the four good payloads
-    # plus a debug_excerpt of what aborted iteration #5. Without it,
-    # the model would fall back to N separate scripts to defend
-    # against losing partial work, which negates the multi-result
-    # design.
+    #   exec ok | raw payloads | any_ok | envelope status
+    #   --------+--------------+--------+-----------------------------
+    #     yes   |    any       |  yes   | "ok"
+    #     yes   |    any       |  no    | "rejected_by_sanitizer"
+    #     no    |    any       |  yes   | "execution_failed_partial"
+    #     no    |    any       |  no    | "execution_failed"  (rejection rows visible in results)
+    #     no    |    none      |   -    | "execution_failed"  (no rows, diag row only)
+    #
+    # "execution_failed_partial" is reserved for partial SUCCESS:
+    # at least one payload made it through SDC despite the abort.
+    # When every emitted payload was rejected AND the script also
+    # aborted, status is "execution_failed" — but the rejection rows
+    # remain in ``results`` so the model still sees the per-payload
+    # reasons alongside the abort context.
     if exec_result.ok:
         overall_status = "ok" if any_ok else "rejected_by_sanitizer"
     else:
         overall_status = (
-            "execution_failed_partial" if exec_result.result_payloads
-            else "execution_failed"
+            "execution_failed_partial" if any_ok else "execution_failed"
         )
 
     response: dict[str, Any] = {
@@ -831,7 +837,8 @@ async def submit_script(args: dict[str, Any]) -> dict[str, Any]:
         # Add the script-level error context: reason, exit code, and
         # a bounded debug_excerpt of stdout/stderr so the model can
         # diagnose the abort. The partial-success branch carries this
-        # ALONGSIDE the partial results — both are useful.
+        # ALONGSIDE the partial results; the bare-failure branch
+        # carries it alone (or alongside rejection-only rows).
         response["reason"] = exec_result.error
         response["exit_code"] = exec_result.exit_code
         from nora.error_summary import extract_debug_excerpt
@@ -849,9 +856,10 @@ async def submit_script(args: dict[str, Any]) -> dict[str, Any]:
         response["debug_excerpt"] = excerpt
 
         if overall_status == "execution_failed":
-            # No payloads survived. Persist a diagnostic row tagged
-            # with the same script_run_id so the researcher's audit
-            # path still finds the run dir from the store.
+            # No payloads survived sanitization. Persist a diagnostic
+            # row tagged with the same script_run_id so the
+            # researcher's audit path always finds the run dir from
+            # the store, even when results carries only rejections.
             diag_row = store.insert(
                 label=f"[error] {label}",
                 analysis_type="script_error",
@@ -868,21 +876,39 @@ async def submit_script(args: dict[str, Any]) -> dict[str, Any]:
                 script_run_id=script_run_id,
             )
             response["result_id"] = diag_row.id
-            response["hint"] = (
-                "The full raw stdout/stderr stays in the run directory "
-                "for the researcher (no model-side file-read tool). "
-                "The debug_excerpt above is a short slice of the "
-                "language's error output. Read it before resubmitting."
-            )
+            # Hint depends on whether the script emitted anything at
+            # all. With rejection rows present, the model needs to
+            # read both the per-result rejection reasons AND the
+            # abort cause — these are independent failure modes.
+            if results:
+                response["hint"] = (
+                    f"{len(results)} payload(s) reached the sanitizer "
+                    f"but every one was rejected (see per-result "
+                    f"reasons). The script also aborted afterward "
+                    f"(see debug_excerpt). Both failures are "
+                    f"independent and both need addressing on "
+                    f"resubmit."
+                )
+            else:
+                response["hint"] = (
+                    "The full raw stdout/stderr stays in the run "
+                    "directory for the researcher (no model-side "
+                    "file-read tool). The debug_excerpt above is a "
+                    "short slice of the language's error output. "
+                    "Read it before resubmitting."
+                )
         else:
-            # Partial success: tell the model both halves of the story.
+            # Partial success: at least one payload reached the model.
+            # Rejection rows may also be present; the count below is
+            # ``any_ok`` payloads only, not the full results length.
+            ok_count = sum(1 for r in results if r.get("status") == "ok")
             response["hint"] = (
-                f"{len(results)} payload(s) reached you before the "
-                "script aborted. Read them as you would any other "
-                "result; the abort cause is in debug_excerpt. If the "
-                "abort was a known data condition (thin cell at one "
-                "spec, missing variable on one outcome), you can "
-                "skip / guard that case and re-emit only the missing "
+                f"{ok_count} payload(s) reached you cleanly before "
+                "the script aborted. Read them as you would any "
+                "other result; the abort cause is in debug_excerpt. "
+                "If the abort was a known data condition (thin cell "
+                "at one spec, missing variable on one outcome), "
+                "guard that case and re-emit only the missing "
                 "payloads in a follow-up."
             )
 

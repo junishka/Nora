@@ -92,3 +92,65 @@ def test_submit_script_returns_partial_results_when_script_aborts(
     grouped = store.list_by_script_run(body["script_run_id"])
     assert len(grouped) == 2
     assert {row.id for row in grouped} == {r["result_id"] for r in results}
+
+
+@_skip_no_python
+def test_status_is_failed_not_partial_when_emitted_payloads_all_rejected(
+    tmp_path: Path,
+) -> None:
+    """The "execution_failed_partial" envelope is reserved for partial
+    SUCCESS — at least one payload made it through SDC. When every
+    emitted payload was rejected by the sanitizer AND the script
+    also aborted, status is "execution_failed", because labelling
+    the response "partial" would push the model to treat rejections
+    as usable results.
+
+    Both failure modes still surface to the model: the rejection
+    rows stay in ``results`` (with their per-payload reasons) and
+    the abort cause is in ``debug_excerpt``. The hint distinguishes
+    the two so the model knows it's not just one problem.
+    """
+    set_cwd(tmp_path)
+    reset_store_for_tests()
+
+    # ``nora.result(type="totally_unknown_type")`` produces a payload
+    # the sanitizer rejects as an unknown analysis type. Emit two of
+    # those, then abort. No payload survives SDC.
+    code = (
+        "import nora\n"
+        "nora.result(type='totally_unknown_type', variable='a')\n"
+        "nora.result(type='totally_unknown_type', variable='b')\n"
+        "raise RuntimeError('aborted after rejected emits')\n"
+    )
+    response = asyncio.run(submit_script.handler({
+        "language": "Python",
+        "code": code,
+        "label": "all-rejected-then-aborted canary",
+        "source_dataset": "",
+    }))
+    body = _text_payload(response)
+
+    # NOT execution_failed_partial — the model would mistakenly read
+    # rejection rows as usable partials.
+    assert body["status"] == "execution_failed", body
+    assert "debug_excerpt" in body
+    assert "aborted after rejected emits" in body["debug_excerpt"]
+    assert body["exit_code"] != 0
+
+    # Rejection rows are still visible inline so the per-payload
+    # reasons reach the model.
+    results = body["results"]
+    assert len(results) == 2, results
+    assert all(r["status"] == "rejected_by_sanitizer" for r in results)
+
+    # Hint distinguishes the two failure modes — generic "read
+    # debug_excerpt before resubmit" alone would imply the
+    # rejections were just symptoms of the abort.
+    hint = body["hint"]
+    assert "rejected" in hint.lower()
+    assert "abort" in hint.lower()
+    assert "independent" in hint.lower()
+
+    # Diagnostic row is still persisted (the run dir must be
+    # recoverable from the store even when only rejections came back).
+    assert "result_id" in body, body
