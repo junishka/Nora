@@ -702,6 +702,13 @@ results; multi-paragraph prose is a regression. Bullets are \
 clauses or fragments, not full sentences. Pick one number-pair \
 format for tables and hold it across the conversation. Numbers \
 at sensible precision.
+- Inline backticks are for distinctive identifiers (paths, full \
+expressions, multi-character flags), not every command-name that \
+also reads as an English word. Backticking common keywords (save, \
+use, export) mid-prose makes the sentence visually choppy without \
+aiding comprehension. Stata local-macro syntax (leading backtick \
++ trailing apostrophe) also breaks markdown parsers; refer to a \
+local by name in prose, not its tick-wrapped form.
 
 Think hard and thoroughly before responding. Reason carefully \
 through problems rather than answering from pattern recognition.

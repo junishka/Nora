@@ -141,6 +141,21 @@ def test_no_stale_stata_unimplemented_claims() -> None:
     assert "nora_plot_interaction" in rendered
 
 
+def test_inline_backtick_restraint_rule_present(tmp_path: Path) -> None:
+    """Without explicit guidance the model wraps every Stata / R /
+    Python command-name in backticks (``use``, ``save``, ``export``,
+    ``ds``, ``preserve``, ...). Inside prose that renders as a
+    code-box for nearly every other word and breaks reading flow.
+    Stata's local-macro syntax (leading backtick + trailing
+    apostrophe) is a separate landmine — a markdown parser sees the
+    leading tick as opening fence and the rendering collapses.
+    Pin both halves of the guidance."""
+    rendered = build_system_prompt(tmp_path, "nora")
+    assert "Inline backticks are for distinctive identifiers" in rendered
+    assert "not every command-name that" in rendered
+    assert "Stata local-macro syntax" in rendered
+
+
 def test_loop_directive_for_parameterized_batches_present(
     tmp_path: Path,
 ) -> None:
