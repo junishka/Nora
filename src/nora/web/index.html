@@ -232,6 +232,18 @@
     </main>
 
     <footer class="composer">
+      <!-- Floating "scroll to latest" button. Anchored to the
+           composer's top edge so it sits just above the input area;
+           visibility is toggled by JS based on how far the
+           transcript is from the bottom. Clicking smooth-scrolls
+           the messages region to the bottom. -->
+      <button
+        type="button"
+        id="scroll-to-bottom"
+        class="scroll-to-bottom hidden"
+        aria-label="Scroll to latest"
+        title="Scroll to latest"
+      >↓</button>
       <!-- Staged image thumbnails. Populated when the researcher
            drops an image on the composer (or paste-pastes one).
            Each thumb carries a remove button. The list sends along

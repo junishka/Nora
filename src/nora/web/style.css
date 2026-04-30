@@ -1885,6 +1885,43 @@ kbd {
   padding: 2px 6px;
 }
 
+/* "Scroll to latest" floating button. Anchored to the top edge of
+ * the composer footer (.composer is the positioned ancestor) so it
+ * floats just above the input area regardless of attachments / chip
+ * row height. Hidden when the transcript is near the bottom; fades
+ * in when the researcher scrolls up. */
+.scroll-to-bottom {
+  position: absolute;
+  left: 50%;
+  bottom: calc(100% + 8px);
+  transform: translateX(-50%);
+  width: 32px;
+  height: 32px;
+  padding: 0;
+  border-radius: 50%;
+  border: 1px solid var(--border);
+  background: var(--bg-surface);
+  color: var(--text);
+  font-size: 16px;
+  line-height: 1;
+  cursor: pointer;
+  opacity: 0.85;
+  transition: opacity 0.18s ease-out, transform 0.12s ease-out;
+  z-index: 5;
+  box-shadow: 0 2px 6px rgba(0, 0, 0, 0.18);
+}
+
+.scroll-to-bottom:hover {
+  opacity: 1;
+  transform: translateX(-50%) translateY(-1px);
+}
+
+.scroll-to-bottom.hidden {
+  opacity: 0;
+  pointer-events: none;
+  transform: translateX(-50%) translateY(4px);
+}
+
 .compose-attachment {
   position: relative;
   width: 56px;

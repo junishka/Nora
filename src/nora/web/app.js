@@ -2330,6 +2330,47 @@ function scrollToBottom() {
   messagesEl.scrollTop = messagesEl.scrollHeight;
 }
 
+// "Scroll to latest" floating button. Anchored above the composer
+// in the markup; visibility tracks whether the transcript is near
+// its bottom. The threshold accommodates the natural overshoot of
+// in-flight typewriter renders without flashing the button.
+const scrollToBottomBtn = document.getElementById('scroll-to-bottom');
+const SCROLL_TO_BOTTOM_THRESHOLD = 100;
+
+function updateScrollToBottomVisibility() {
+  if (!scrollToBottomBtn || !messagesEl) return;
+  const distanceFromBottom = (
+    messagesEl.scrollHeight - messagesEl.scrollTop - messagesEl.clientHeight
+  );
+  const nearBottom = distanceFromBottom < SCROLL_TO_BOTTOM_THRESHOLD;
+  scrollToBottomBtn.classList.toggle('hidden', nearBottom);
+}
+
+if (messagesEl) {
+  messagesEl.addEventListener('scroll', updateScrollToBottomVisibility);
+  // Container resizes on sidebar drag, file panel toggle, etc. —
+  // the "near bottom" check depends on clientHeight, so we re-poll
+  // on resize too.
+  window.addEventListener('resize', updateScrollToBottomVisibility);
+}
+
+if (scrollToBottomBtn) {
+  scrollToBottomBtn.addEventListener('click', () => {
+    // Smooth scroll matches user expectation that this is a
+    // navigation gesture, not a snap. ``scrollToBottom()`` (the
+    // existing helper) is left as the immediate snap that other
+    // call sites use after appending content.
+    if (typeof messagesEl.scrollTo === 'function') {
+      messagesEl.scrollTo({
+        top: messagesEl.scrollHeight,
+        behavior: 'smooth',
+      });
+    } else {
+      scrollToBottom();
+    }
+  });
+}
+
 function setWelcomeOnlyMode(enabled) {
   if (!messagesEl) return;
   messagesEl.classList.toggle('welcome-only', !!enabled);
