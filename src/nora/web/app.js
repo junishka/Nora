@@ -2145,16 +2145,18 @@ function stripPreamble(stdout, _language) {
 
 function renderScriptResultInline(body, evt) {
   /* Appends to the submit_script tool-body:
-   *   1. Native script output (post-preamble) — inline, visible.
+   *   1. Nora-rendered canonical result tables, when the tool result
+   *      carries them. These are product output, not model prose.
+   *   2. Native script output (post-preamble) — inline, visible.
    *      This is the Stata regression table, the R summary, whatever
-   *      the script actually printed. The whole point of the card.
-   *   2. Action buttons row: [Open in R/Stata] [Show folder].
+   *      the script actually printed.
+   *   3. Action buttons row: [Open in R/Stata] [Show folder].
    *
-   * No sanitized-payload dropdown, no run_dir path, no stderr
-   * surfacing, no error banner. Errors are explained by Claude in
-   * the chat text that follows. Researchers who want the sanitized
-   * payload can ask Claude to show it.
+   * The model still interprets the result in chat, but table shape
+   * (including p-value columns) is enforced by Nora here.
    */
+  renderCanonicalResultTables(body, evt);
+
   const nativeStdout = stripPreamble(evt.raw_stdout || '', evt.language).trim();
   if (nativeStdout) {
     const pre = document.createElement('pre');
@@ -2270,6 +2272,50 @@ function renderScriptResultInline(body, evt) {
 
     body.appendChild(actions);
   }
+}
+
+function parseToolResultPayload(evt) {
+  if (!evt || !evt.text) return null;
+  try {
+    return JSON.parse(evt.text);
+  } catch (_) {
+    return null;
+  }
+}
+
+function renderCanonicalResultTables(body, evt) {
+  const payload = parseToolResultPayload(evt);
+  const results = payload && Array.isArray(payload.results)
+    ? payload.results
+    : [];
+  const rendered = results.filter((r) =>
+    r && r.status === 'ok' && typeof r.markdown === 'string' && r.markdown.trim()
+  );
+  if (rendered.length === 0) return;
+
+  const panel = document.createElement('div');
+  panel.className = 'result-panel';
+  rendered.forEach((r, idx) => {
+    const section = document.createElement('section');
+    section.className = 'result-markdown';
+
+    const header = document.createElement('div');
+    header.className = 'result-header';
+    const label = r.label || r.result_id || ('Result ' + (idx + 1));
+    header.textContent = label;
+    section.appendChild(header);
+
+    const tableWrap = document.createElement('div');
+    tableWrap.className = 'result-markdown-body';
+    if (window.NoraMarkdown) {
+      tableWrap.innerHTML = window.NoraMarkdown.render(r.markdown);
+    } else {
+      tableWrap.textContent = r.markdown;
+    }
+    section.appendChild(tableWrap);
+    panel.appendChild(section);
+  });
+  body.appendChild(panel);
 }
 
 async function openInNativeApp(path, btn, fallback, mode) {
