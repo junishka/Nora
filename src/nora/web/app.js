@@ -2332,16 +2332,16 @@ function updateContextChip(occupiedTokens) {
    * the prompt this turn loaded plus the response just produced
    * (see the case 'turn_done' handler for the breakdown).
    *
-   * Caveat by provider:
-   * - Anthropic: the SDK reports input_tokens + cache_read +
-   *   cache_creation that together span the whole prompt-side
-   *   window via the prompt cache. Adding output_tokens on top
-   *   gives the post-turn snapshot.
-   * - OpenAI: with previous_response_id, the SDK's input_tokens
-   *   reflects only the new content this turn — the cached
-   *   prefix isn't surfaced to us. The chip therefore undercounts
-   *   on OpenAI until that's plumbed through (see openai.py
-   *   usage handling).
+   * Provider semantics:
+   * - Anthropic: input_tokens + cache_read + cache_creation
+   *   together span the whole prompt-side window via the prompt
+   *   cache; output_tokens adds the just-produced reply.
+   * - OpenAI: with previous_response_id, the SDK reports
+   *   input_tokens for the FULL prompt at each round (cached
+   *   prefix included). The provider yields the LAST round's
+   *   value (= peak prompt size for the turn); cache fields stay
+   *   empty on this path because OpenAI's cached_tokens is a
+   *   subset of input_tokens, not additive.
    *
    * Unhides the chip on first update and scales the ceiling up
    * if the observed usage exceeds the default 200k window

@@ -305,8 +305,18 @@ class OpenAISession:
         # Bound the tool-loop iterations so a runaway model can't pin
         # the loop forever. 16 is generous — most analyses use 1–4.
         MAX_TOOL_ROUNDS = 16
-        total_input_tokens = 0
-        total_output_tokens = 0
+        # We capture the LAST round's prompt size (not a cross-round
+        # sum) because the Responses API reports ``input_tokens`` for
+        # the FULL prompt at each round — cached prefix from
+        # ``previous_response_id`` plus any new content this round.
+        # Within a tool-loop turn the prompt grows monotonically as
+        # tool outputs join the chain, so the last round naturally
+        # captures the peak prompt size for the turn. Accumulating
+        # with ``+=`` (the previous behavior) multi-counted the cached
+        # prefix once per round, inflating the chip into nonsense on
+        # tool-heavy turns.
+        last_input_tokens = 0
+        last_output_tokens = 0
 
         try:
             for _round in range(MAX_TOOL_ROUNDS):
@@ -347,17 +357,16 @@ class OpenAISession:
                 if isinstance(new_id, str) and new_id:
                     turn_response_id = new_id
 
-                # Track usage. Only the LAST round's output_tokens
-                # counts as the user-visible "this turn produced N
-                # output tokens", but input_tokens accumulates across
-                # rounds. With ``previous_response_id`` the per-round
-                # input shrinks to just the new content — the bulk of
-                # the token cost moves to the server-side cached
-                # prefix, which OpenAI bills at the cached-input rate.
+                # Track usage. ``=`` not ``+=`` (see the rationale
+                # above where last_input_tokens is initialized).
+                # ``input_tokens`` already includes the cached prefix
+                # for this round, so the last round's value is the
+                # full prompt size at end-of-turn — exactly what the
+                # "context occupied" chip wants.
                 usage = getattr(resp, "usage", None)
                 if usage is not None:
-                    total_input_tokens += getattr(usage, "input_tokens", 0) or 0
-                    total_output_tokens = getattr(usage, "output_tokens", 0) or 0
+                    last_input_tokens = getattr(usage, "input_tokens", 0) or 0
+                    last_output_tokens = getattr(usage, "output_tokens", 0) or 0
 
                 output = list(getattr(resp, "output", []) or [])
                 # Translate items + decide whether to keep looping.
@@ -446,9 +455,15 @@ class OpenAISession:
             self._last_response_id = turn_response_id
 
             yield TurnDone(
-                input_tokens=total_input_tokens,
-                output_tokens=total_output_tokens,
-                # Cache fields are Anthropic-specific; leave None.
+                input_tokens=last_input_tokens,
+                output_tokens=last_output_tokens,
+                # Cache fields stay None on this path. OpenAI's
+                # ``cached_tokens`` is a subset of ``input_tokens``
+                # (not additive), so emitting it through
+                # ``cache_read_input_tokens`` would double-count
+                # against any consumer that sums input + cache (the
+                # web context chip does). ``input_tokens`` already
+                # represents the full prompt size on the OpenAI path.
                 # ``cost_usd`` is also None — Nora doesn't compute
                 # OpenAI costs locally.
             )
