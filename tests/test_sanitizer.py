@@ -817,6 +817,55 @@ def test_correlation_matrix_clips_to_minus_one_to_one():
             assert -1.0 <= v <= 1.0
 
 
+def test_correlation_matrix_long_var_names_match_after_safe_key():
+    """``variables`` goes through ``safe_key`` (40-char cap) inside
+    ``_collect_allowed`` but the ``correlations`` keys came in raw.
+    Without applying ``safe_key`` to both sides of the comparison,
+    long-but-legitimate variable names get spuriously dropped as
+    "undeclared," collapsing the matrix to ``{}``. Pin that the
+    sanitizer applies the same transform to both sides so the
+    matrix survives."""
+    from nora.text_safety import safe_key
+    long_a = "a" * 50  # > 40-char safe_key cap
+    long_b = "b" * 50
+    p = _correlation_payload(
+        variables=[long_a, long_b],
+        correlations={
+            long_a: {long_a: 1.0, long_b: 0.4},
+            long_b: {long_a: 0.4, long_b: 1.0},
+        },
+    )
+    r = sanitize(p)
+    assert r.ok, r.rejection_reason
+    # Both sides come back as the safe_key-transformed form. Keys in
+    # the output dict match the entries in ``variables``.
+    safe_a = safe_key(long_a)
+    safe_b = safe_key(long_b)
+    assert sorted(r.sanitized["correlations"].keys()) == sorted([safe_a, safe_b])
+    assert sorted(r.sanitized["variables"]) == sorted([safe_a, safe_b])
+    assert r.sanitized["correlations"][safe_a][safe_b] == pytest.approx(0.4)
+
+
+def test_correlation_matrix_empty_after_sanitization_rejected():
+    """When every key in ``correlations`` fails the cross-field
+    declared-variable check (e.g., a payload-shape bug or hostile
+    smuggling attempt that filled the dict with names not present in
+    ``variables``), the sanitizer used to return ``ok=True`` with
+    ``correlations: {}`` — silent empty success that the model would
+    read as "the analysis ran but produced no numbers." Reject
+    instead so the model knows the payload is malformed."""
+    p = _correlation_payload(
+        variables=["age", "income"],
+        correlations={
+            "leak_row_a": {"leak_col_a": 0.5},
+            "leak_row_b": {"leak_col_b": 0.5},
+        },
+    )
+    r = sanitize(p)
+    assert not r.ok
+    assert "empty after sanitization" in (r.rejection_reason or "").lower()
+
+
 def test_correlation_matrix_too_many_variables_rejected():
     """Structural cap mirrors the OLS predictor cap — beyond ~30
     variables a correlation matrix isn't interpretable output, and

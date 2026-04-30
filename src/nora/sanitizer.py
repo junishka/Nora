@@ -1372,23 +1372,36 @@ def _sanitize_correlation_matrix(
         transformations=transformations,
     )
 
+    # ``out["variables"]`` is the safe_key-transformed list (each
+    # element passed through safe_key in _collect_allowed). The raw
+    # ``correlations`` dict keys are not yet transformed. Compare on
+    # safe_key both sides so a long or otherwise-transformed name
+    # doesn't get spuriously "dropped as undeclared" simply because
+    # the variables list shows the truncated form. Without this, a
+    # legitimate matrix with a 50-char variable name returned with
+    # ``correlations: {}`` and ``ok=True`` — silent empty success.
     declared = set(out.get("variables") or [])
 
-    # Walk the matrix, drop any keys not in the declared variable list.
-    # Symmetric layout means we'd see ``corr[a][b]`` and ``corr[b][a]``;
-    # if either reference an alien name, drop just that entry.
     sanitized_corr: dict[str, dict[str, float]] = {}
     dropped: list[str] = []
     n = out["n"]
-    for row_key, row_value in correlations.items():
+    for raw_row_key, row_value in correlations.items():
+        if not isinstance(raw_row_key, str):
+            dropped.append(f"row {raw_row_key!r} (non-string)")
+            continue
+        row_key = safe_key(raw_row_key)
         if row_key not in declared:
-            dropped.append(f"row {row_key!r}")
+            dropped.append(f"row {safe_key(raw_row_key)!r}")
             continue
         if not isinstance(row_value, dict):
             dropped.append(f"row {row_key!r} (non-dict)")
             continue
         kept_row: dict[str, float] = {}
-        for col_key, val in row_value.items():
+        for raw_col_key, val in row_value.items():
+            if not isinstance(raw_col_key, str):
+                dropped.append(f"{row_key}.{raw_col_key!r} (non-string)")
+                continue
+            col_key = safe_key(raw_col_key)
             if col_key not in declared:
                 dropped.append(f"{row_key}.{col_key}")
                 continue
@@ -1406,6 +1419,20 @@ def _sanitize_correlation_matrix(
             f"dropped {len(dropped)} undeclared key(s) from "
             f"correlations: {sorted(dropped)[:5]}"
             + (" …" if len(dropped) > 5 else "")
+        )
+    if not sanitized_corr:
+        # Every entry got dropped. Returning ok=True with an empty
+        # matrix is misleading — the model would think "the analysis
+        # ran but produced no correlations" when the truth is "the
+        # payload's keys didn't line up with the declared variables."
+        return SanitizerResult(
+            ok=False, analysis_type="correlation_matrix",
+            rejection_reason=(
+                "correlations dict is empty after sanitization — every "
+                "row/column key was either not in the declared "
+                "``variables`` list or had a non-finite value. The "
+                "payload likely has a variables/correlations mismatch."
+            ),
         )
     out["correlations"] = sanitized_corr
 

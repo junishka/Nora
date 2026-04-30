@@ -103,6 +103,43 @@ def test_list_all_orders_by_creation(store: ResultStore):
     assert [r.label for r in rows] == [f"label-{i}" for i in range(5)]
 
 
+def test_list_by_script_run_orders_by_insertion_not_lexical_id(
+    store: ResultStore,
+):
+    """Multiple helpers in one ``submit_script`` call insert N rows in
+    a tight loop where ``created_at`` can plausibly tie at sub-
+    microsecond resolution. The previous tiebreaker, ``ORDER BY id
+    ASC`` on a string id, sorted lexically (M1, M10, M11, ..., M2)
+    instead of in insertion order. Switch to ``rowid`` (always
+    monotone in insert order) and pin the property under a forced
+    same-timestamp scenario.
+    """
+    run_id = "R-deadbeef"
+    forced_ts = "2026-01-01T00:00:00.000000+00:00"
+    for i in range(12):
+        row = store.insert(
+            label=f"label-{i}",
+            analysis_type="descriptive",
+            sanitized_payload={"type": "descriptive", "variable": f"v{i}"},
+            language="R",
+            script_code="x",
+            transformations=[],
+            script_run_id=run_id,
+        )
+        # Force the timestamp tie that motivates this fix.
+        store._conn.execute(
+            "UPDATE results SET created_at = ? WHERE id = ?",
+            (forced_ts, row.id),
+        )
+
+    rows = store.list_by_script_run(run_id)
+    assert [r.label for r in rows] == [f"label-{i}" for i in range(12)]
+    # Cross-check: the previous lexical-id ordering would have put
+    # M10 before M2. Confirm we don't see that.
+    ids = [r.id for r in rows]
+    assert ids.index("M2") < ids.index("M10")
+
+
 def test_persistence_across_connections(tmp_path: Path):
     db = tmp_path / ".nora" / "results.db"
     s1 = ResultStore(db)

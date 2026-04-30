@@ -258,6 +258,24 @@ def test_correlation_pair_rejects_non_numeric_variable2(sample_csv: Path):
     assert "numeric" in r.reason.lower()
 
 
+def test_correlation_pair_denies_constant_column(tmp_path: Path) -> None:
+    """A constant column has zero variance, so Pearson is undefined
+    (pandas returns NaN). Don't ship NaN as a granted answer — the
+    token serializes to non-strict-JSON and forces every consumer
+    to special-case the value. Reject with a reason that names the
+    constant column so the model knows which one to drop."""
+    df = pd.DataFrame({
+        "x": np.arange(20, dtype=float),
+        "k": np.full(20, 7.0),  # constant
+    })
+    p = tmp_path / "const.csv"
+    df.to_csv(p, index=False)
+    r = handle(p, "correlation_pair", "x", variable2="k")
+    assert r.status == "denied"
+    assert "zero variance" in r.reason.lower()
+    assert "'k'" in r.reason or '"k"' in r.reason
+
+
 def test_correlation_pair_denies_few_complete_pairs(
     tmp_path: Path,
 ):

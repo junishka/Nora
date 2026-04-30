@@ -209,10 +209,17 @@ class ResultStore:
     def list_by_script_run(self, script_run_id: str) -> list[StoredResult]:
         """All rows produced by one ``submit_script`` invocation, in
         emission order. Returns ``[]`` for unknown ids or for legacy
-        rows where the field was never set."""
+        rows where the field was never set.
+
+        Orders by SQLite's implicit ``rowid``, which is monotone in
+        insertion order regardless of clock resolution. Ordering by
+        ``created_at`` alone risks ties on tight loops where multiple
+        helpers fire within the same microsecond; falling back to
+        ``id ASC`` lexically would then produce M1, M10, M11, ..., M2.
+        """
         cur = self._conn.execute(
             "SELECT * FROM results WHERE script_run_id = ? "
-            "ORDER BY created_at ASC, id ASC",
+            "ORDER BY rowid ASC",
             (script_run_id,),
         )
         return [self._hydrate(r) for r in cur.fetchall()]

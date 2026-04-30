@@ -458,6 +458,38 @@ def _correlation_pair(
         )
 
     r = float(pair[var1].corr(pair[var2]))
+    # Pearson is undefined when either column has zero variance
+    # (constant column, or a perfectly-imputed series). pandas returns
+    # NaN there. Don't ship NaN as a "granted" numeric answer — it
+    # serializes to a non-strict-JSON token and forces every consumer
+    # to special-case the value. Reject with a reason that names the
+    # constant column so the model knows what to fix.
+    import math
+    if not math.isfinite(r):
+        zero_var: list[str] = []
+        for name, series in ((var1, pair[var1]), (var2, pair[var2])):
+            try:
+                if float(series.std(ddof=0)) == 0.0:
+                    zero_var.append(safe_key(str(name)))
+            except (TypeError, ValueError):
+                continue
+        if zero_var:
+            culprits = " and ".join(repr(v) for v in zero_var)
+            reason = (
+                f"correlation_pair: undefined because {culprits} "
+                f"{'has' if len(zero_var) == 1 else 'have'} zero "
+                f"variance on the complete-case rows. A constant "
+                f"column has no correlation with anything."
+            )
+        else:
+            reason = (
+                "correlation_pair: result is not finite (NaN/Inf). "
+                "This usually means one of the two variables has zero "
+                "variance on the complete-case rows. Drop the constant "
+                "column or restrict the sample."
+            )
+        return RequestResult(status="denied", reason=reason)
+
     sigfigs = sigfigs_for_n(n_complete)
     return RequestResult(
         status="granted",
