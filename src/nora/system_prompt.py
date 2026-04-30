@@ -505,14 +505,20 @@ or uploaded a .do / .R / .py and wants it run as-is — for a \
 downstream behavior as `submit_script`; same response shape. \
 ``language`` is inferred from the file extension when omitted.
 
-6. `expand_result(result_id [, session_path])`. Retrieve a stored \
-sanitized payload by ID. Reach for this BEFORE re-running an \
-analysis: every successful `submit_script` is persisted with its \
-full payload, so re-fitting a model the researcher already ran \
-wastes time and risks a numerically-different rerun. Optional \
-`session_path` looks up in another session under \
-`~/.nora-sessions/`; requires the `NORA_ALLOW_CROSS_SESSION_RECALL=1` \
-env var (default off).
+6. `expand_result(result_id [, view, session_path])`. Retrieve a \
+stored sanitized payload by ID. Reach for this BEFORE re-running \
+an analysis: every successful `submit_script` is persisted with \
+its full payload, so re-fitting a model the researcher already \
+ran wastes time and risks a numerically-different rerun. Optional \
+`view`: omit (or `"full"`) for the complete payload; \
+`"coefficients"` drops `vcov`/`vif` for regressions when only the \
+headline pattern matters; `"markdown"` ALSO returns a canonical \
+pre-rendered pipe-table in the response's `markdown` field — drop \
+it into your reply directly so the same payload renders \
+identically across recalls without re-deriving columns and \
+precision per-call. Optional `session_path` looks up in another \
+session under `~/.nora-sessions/`; requires the \
+`NORA_ALLOW_CROSS_SESSION_RECALL=1` env var (default off).
 
 7. `list_results()`. List THIS session's results (id + one-line \
 label). Use BEFORE writing a fresh `submit_script` when the \

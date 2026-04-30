@@ -1414,13 +1414,17 @@ def _resolve_cross_session_cwd(session_path: str) -> Path | None:
         "context.\n\n"
         "Arguments:\n"
         "  result_id: the ID returned by a previous submit_script call.\n"
-        "  view: optional payload trim. ``\"\"`` (default) or "
-        "``\"full\"`` returns the complete stored payload. "
+        "  view: optional payload trim or render. ``\"\"`` (default) "
+        "or ``\"full\"`` returns the complete stored payload. "
         "``\"coefficients\"`` is a regression-specific shorthand that "
         "drops the variance-covariance matrix (``vcov``) and per-"
         "predictor VIF table — useful when you only need the headline "
         "coefficient pattern and not the collinearity diagnostics. "
-        "Other analysis types ignore the option.\n"
+        "``\"markdown\"`` ALSO returns a ``markdown`` field with a "
+        "canonical pipe-table rendered from the sanitized payload — "
+        "drop it into your reply directly so the same payload renders "
+        "identically across recalls without re-deriving columns and "
+        "precision per-call. Other analysis types ignore the trim.\n"
         "  session_path: optional path to ANOTHER session under "
         f"~/.nora-sessions/ to expand a result from. Requires the "
         f"{_CROSS_SESSION_ENV_VAR}=1 env var to be set; otherwise "
@@ -1444,11 +1448,12 @@ async def expand_result(args: dict[str, Any]) -> dict[str, Any]:
             "reason": "result_id argument is required",
         })
     view = (args.get("view") or "").strip().lower()
-    if view not in ("", "full", "coefficients"):
+    if view not in ("", "full", "coefficients", "markdown"):
         return _as_mcp_text({
             "status": "error",
             "reason": (
-                f"view must be '' / 'full' / 'coefficients', got {view!r}"
+                f"view must be '' / 'full' / 'coefficients' / "
+                f"'markdown', got {view!r}"
             ),
         })
     raw_session_path = (args.get("session_path") or "").strip()
@@ -1497,6 +1502,16 @@ async def expand_result(args: dict[str, Any]) -> dict[str, Any]:
                     payload.pop(key)
                     view_dropped.append(key)
 
+    # ``view="markdown"`` returns a canonical markdown pipe-table
+    # rendered from the sanitized payload. Same source as the JSON
+    # payload, but pre-formatted so the model can drop it into a
+    # response without re-deriving columns / precision per-call (the
+    # source of inconsistent renders across recalls).
+    markdown: str | None = None
+    if view == "markdown" and isinstance(payload, dict):
+        from nora.result_render import render_table
+        markdown = render_table(payload)
+
     response: dict[str, Any] = {
         "status": "ok",
         "result_id": row.id,
@@ -1511,6 +1526,8 @@ async def expand_result(args: dict[str, Any]) -> dict[str, Any]:
         response["view"] = view
     if view_dropped:
         response["view_dropped_fields"] = view_dropped
+    if markdown is not None:
+        response["markdown"] = markdown
     if raw_session_path:
         response["session_path"] = str(target_cwd)
     # Surface the run_dir so the TUI can re-render the raw R/Stata
