@@ -105,19 +105,28 @@ def write_session_state(
         return None
 
     # 1. Pull the last user / assistant exchange from the turn-grouped
-    #    chat log. We only need the last turn that has either side
-    #    populated — skipping the current in-flight turn until it's
-    #    been fully written would require listening to turn_done, so
-    #    we just reach into the current log as-is.
+    #    chat log. The pair must come from the SAME turn — earlier
+    #    versions walked reversed turns and grabbed the latest
+    #    user-side and the latest assistant-side independently. For
+    #    an in-flight turn (user typed, assistant hasn't replied yet)
+    #    that pulled the user from turn N and the assistant from
+    #    turn N-1, so the sidebar summary showed "user said X"
+    #    alongside "assistant said Y" where Y was actually a reply
+    #    to a different question.
+    #
+    #    Behavior: latest user-bearing turn wins. We pair its user
+    #    with its OWN assistant (or empty when in-flight). If the
+    #    assistant turns out to be empty, the sidebar shows
+    #    "what the researcher just asked, no answer yet" — accurate
+    #    to the current state, never a false pairing.
     turns = read_turns(cwd)
     last_user = ""
     last_assistant = ""
     for t in reversed(turns):
-        if t.user and not last_user:
+        if t.user:
             last_user = _truncate(t.user, _LAST_MESSAGE_CAP)
-        if t.assistant and not last_assistant:
-            last_assistant = _truncate(t.assistant, _LAST_MESSAGE_CAP)
-        if last_user and last_assistant:
+            if t.assistant:
+                last_assistant = _truncate(t.assistant, _LAST_MESSAGE_CAP)
             break
 
     # 2. Pull recent results. Either from the injected list (tests)

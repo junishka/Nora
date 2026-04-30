@@ -279,8 +279,17 @@ _LIST_RESULTS_GLOBAL_DESC = (
 
 _LIST_RESULTS_DESC = (
     "List stored sanitized results from this session as a table of "
-    "(id, label). Use to remind yourself what analyses you've run so "
-    "far without pulling full payloads into context."
+    "(id, label, analysis_type, created_at). Use to remind "
+    "yourself what analyses you've run without pulling full "
+    "payloads into context.\n\n"
+    "Newest-first ordering. Capped by ``limit`` (default 50, hard "
+    "max 500) so a long session doesn't ship hundreds of rows in "
+    "a single call. The response carries ``total`` (rows in the "
+    "store) and ``truncated`` (True iff total > rows shown) so "
+    "you know whether to refine.\n\n"
+    "Arguments:\n"
+    "  limit: optional cap on rows returned (default 50, max "
+    "500). 0 or unset uses the default."
 )
 
 _RECALL_CONVERSATION_DESC = (
@@ -505,7 +514,7 @@ def build_tool_specs() -> tuple[ToolSpec, ...]:
         _spec(
             "list_results",
             _LIST_RESULTS_DESC,
-            properties={},
+            properties={"limit": {"type": "integer"}},
             required=(),
         ),
         _spec(

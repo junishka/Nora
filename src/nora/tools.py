@@ -1530,22 +1530,54 @@ async def expand_result(args: dict[str, Any]) -> dict[str, Any]:
 # Tool: list_results
 # ---------------------------------------------------------------------------
 
+_LIST_RESULTS_DEFAULT_LIMIT = 50
+_LIST_RESULTS_HARD_CAP = 500
+
+
 @tool(
     "list_results",
     (
         "List stored sanitized results from this session as a table of "
-        "(id, label). Use to remind yourself what analyses you've run so "
-        "far without pulling full payloads into context."
+        "(id, label, analysis_type, created_at). Use to remind "
+        "yourself what analyses you've run without pulling full "
+        "payloads into context.\n\n"
+        "Newest-first ordering. Capped by ``limit`` (default 50, hard "
+        "max 500) so a long session doesn't ship hundreds of rows in "
+        "a single call. The response carries ``total`` (rows in the "
+        "store) and ``truncated`` (True iff total > rows shown) so "
+        "you know whether to refine.\n\n"
+        "Arguments:\n"
+        "  limit: optional cap on rows returned (default 50, max "
+        "500). 0 or unset uses the default."
     ),
-    {},  # no arguments
+    {"limit": int},
 )
 async def list_results(args: dict[str, Any]) -> dict[str, Any]:
-    """Return a table of (id, label, type, created_at) for this project's store."""
+    """Return the most recent stored results, capped at ``limit``.
+
+    Newest-first because the model's typical follow-up is "what did
+    we just run", not "what did we run six hours ago." The ``ASC``
+    chronological order from ``list_all()`` was the worst possible
+    layout for that.
+    """
+    requested_limit = args.get("limit", 0)
+    if not isinstance(requested_limit, int) or requested_limit <= 0:
+        limit = _LIST_RESULTS_DEFAULT_LIMIT
+    else:
+        limit = min(requested_limit, _LIST_RESULTS_HARD_CAP)
+
     store = get_store(get_cwd())
-    rows = store.list_all()
+    all_rows = store.list_all()
+    total = len(all_rows)
+    # Newest first: list_all returns chronological ASC, so reverse.
+    newest_first = list(reversed(all_rows))[:limit]
+    truncated = total > limit
     return _as_mcp_text({
         "status": "ok",
-        "count": len(rows),
+        "total": total,
+        "count": len(newest_first),
+        "limit": limit,
+        "truncated": truncated,
         "results": [
             {
                 "id": r.id,
@@ -1553,7 +1585,7 @@ async def list_results(args: dict[str, Any]) -> dict[str, Any]:
                 "analysis_type": r.analysis_type,
                 "created_at": r.created_at,
             }
-            for r in rows
+            for r in newest_first
         ],
     })
 
@@ -1660,6 +1692,30 @@ async def list_results_global(args: dict[str, Any]) -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 # Tool: recall_conversation
 # ---------------------------------------------------------------------------
+
+
+def _render_tool_use(use: Any) -> dict[str, Any]:
+    """Render a ``ToolUse`` into the recall response shape.
+
+    Carries the call's name, human label, and any ``result_id``s the
+    call produced. submit_script's multi-result wire format means one
+    tool call can yield N stored rows; for single-id tools (or pre-
+    multi-result rows) we emit a flat ``result_id`` field so casual
+    recalls stay compact. The older singular ``result_id`` attribute
+    on ``ToolUse`` was renamed to ``result_ids`` in commit f70a4e1;
+    this renderer used to read the stale name and AttributeError on
+    every recall path that included a tool call.
+    """
+    out: dict[str, Any] = {"name": use.name, "label": use.label}
+    rids = list(use.result_ids or [])
+    if len(rids) == 1:
+        out["result_id"] = rids[0]
+    elif rids:
+        out["result_ids"] = rids
+    if use.is_error:
+        out["is_error"] = True
+    return out
+
 
 @tool(
     "recall_conversation",
@@ -1800,19 +1856,21 @@ async def recall_conversation(args: dict[str, Any]) -> dict[str, Any]:
             entry["assistant"] = _cap(t.assistant)
         if t.tools:
             entry["tools"] = [
-                {
-                    "name": use.name,
-                    "label": use.label,
-                    **({"result_id": use.result_id} if use.result_id else {}),
-                    **({"is_error": True} if use.is_error else {}),
-                }
+                _render_tool_use(use)
                 for use in t.tools
             ]
         if t.result_ids:
             entry["result_ids"] = list(t.result_ids)
         if t.timestamp:
             entry["timestamp"] = t.timestamp
-        cost = FRAMING_PER_TURN + len(entry.get("user", "")) + len(entry.get("assistant", ""))
+        # Cost: framing overhead plus the JSON-rendered size of every
+        # field in the entry. Earlier versions counted only user +
+        # assistant text, which under-budgeted result-heavy turns
+        # (a 24-tool turn could add ~1.5 KB of `tools` and
+        # `result_ids` payload outside the cap). Using the actual
+        # serialized length keeps the soft limit honest regardless of
+        # how the turn skews between prose and structured fields.
+        cost = FRAMING_PER_TURN + len(json.dumps(entry, ensure_ascii=False))
         if running + cost > max_chars and rendered:
             break
         running += cost
