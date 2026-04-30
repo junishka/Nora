@@ -2860,30 +2860,27 @@ kbd {
 }
 
 .message.assistant .message-body table th {
-  /* Header row needs to read clearly as "labels" against the body
-   * data. The earlier 4% black overlay was nearly invisible in
-   * light mode (faint grey on cream-pink); pumped to ~12% so the
-   * column headers are obvious without going Excel-grey. Border
-   * underline gives a second visual cue independent of background
-   * darkness.   */
+  /* Use the same surface color as the session sidebar — cream-rose
+   * in light, warm charcoal in dark — so the header reads as page
+   * chrome distinct from the body data without inventing a new
+   * tint. Borders match the surrounding palette: mauve underline
+   * keeps the warm-pink tone in light mode; dark mode uses the
+   * subdued accent-soft. ``--bg-surface`` flips automatically with
+   * the theme toggle and ``prefers-color-scheme``, so this rule
+   * doesn't need its own dark-mode override. */
   font-weight: 600;
   color: var(--text);
-  background: rgba(0, 0, 0, 0.12);
+  background: var(--bg-surface);
   border-bottom: 1px solid var(--mauve);
 }
 
 @media (prefers-color-scheme: dark) {
   :root:not([data-theme="light"]) .message.assistant .message-body table th {
-    /* In dark mode the burgundy/pink palette flips; a light overlay
-     * at 8% gives the same "header is labels" cue against the dark
-     * neutral surface without going milky. */
-    background: rgba(255, 255, 255, 0.08);
     border-bottom-color: var(--accent-soft);
   }
 }
 
 :root[data-theme="dark"] .message.assistant .message-body table th {
-  background: rgba(255, 255, 255, 0.08);
   border-bottom-color: var(--accent-soft);
 }
 
