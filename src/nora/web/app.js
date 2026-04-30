@@ -1481,6 +1481,16 @@ const PLACEHOLDERS = [
   'A t-test? A table? Surprise me',
   'Pun buffer: loaded',
   'Ask away, researcher',
+  'Postcard from the ivory tower',
+  'Reviewer 2 is asleep, talk to me',
+  'Endogeneity hotline',
+  'Heteroskedasticity-robust greetings',
+  'I read code so you don\'t have to',
+  'Bring me your messy joins',
+  'Bring me your tired, your missing, your truncated',
+  'Surrender the .dta',
+  'Throw your reshapes at me',
+  'Panel data, biscuits, tea',
 ];
 
 function rotatePlaceholder() {
