@@ -201,7 +201,14 @@
         // Step back so the outer loop's `i++` doesn't skip the
         // line that ended the table.
         i--;
-        const parts = ['<table>', '<thead><tr>'];
+        // Wrap each table in a scroll container so CSS can put the
+        // horizontal scrollbar on the wrapper instead of leaking it
+        // up through the message body. Plain ``<table>`` outputs let
+        // the page itself decide where to put the scrollbar; on a
+        // wide regression matrix that produces an awkward double-
+        // scrollbar (top and bottom of the message-body's overflow
+        // area). The wrapper centralizes styling on ``.md-table``.
+        const parts = ['<div class="md-table"><table>', '<thead><tr>'];
         headerCells.forEach((c) =>
           parts.push('<th>' + renderInline(c) + '</th>')
         );
@@ -217,7 +224,7 @@
           });
           parts.push('</tbody>');
         }
-        parts.push('</table>');
+        parts.push('</table></div>');
         out.push(parts.join(''));
         continue;
       }
