@@ -271,6 +271,41 @@ def test_summarize_tool_call_get_schema():
     ) == "x.csv at names_types"
 
 
+def test_summarize_tool_call_submit_script_file():
+    assert summarize_tool_call(
+        "submit_script_file",
+        {"name": "reg_v10.do", "language": "Stata", "label": "main spec"},
+    ) == "reg_v10.do — main spec"
+
+
+def test_summarize_tool_call_search_schema():
+    assert summarize_tool_call(
+        "search_schema",
+        {"dataset": "panel.dta", "query": "salary"},
+    ) == "'salary' in panel.dta"
+
+
+def test_summarize_tool_call_list_results_global():
+    assert summarize_tool_call(
+        "list_results_global",
+        {"query": "FP arrival"},
+    ) == "query='FP arrival'"
+
+
+def test_summarize_tool_call_read_attached_file():
+    assert summarize_tool_call(
+        "read_attached_file",
+        {"name": "residuals.png"},
+    ) == "residuals.png"
+
+
+def test_summarize_tool_call_expand_result_with_view():
+    assert summarize_tool_call(
+        "expand_result",
+        {"result_id": "M5", "view": "markdown"},
+    ) == "M5 (view=markdown)"
+
+
 def test_summarize_tool_call_unknown_returns_empty():
     assert summarize_tool_call("unknown_tool", {"foo": "bar"}) == ""
 

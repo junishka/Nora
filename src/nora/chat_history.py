@@ -206,11 +206,19 @@ def summarize_tool_call(short_name: str, input_args: dict[str, Any]) -> str:
         lang = input_args.get("language") or ""
         label = input_args.get("label") or "(no label)"
         return f"{lang}: {label}" if lang else str(label)
+    if short_name == "submit_script_file":
+        name = input_args.get("name") or "(unnamed)"
+        label = input_args.get("label") or ""
+        return f"{name} — {label}" if label else str(name)
     if short_name == "get_schema":
         return (
             f"{input_args.get('dataset', '')} at "
             f"{input_args.get('depth', '')}"
         )
+    if short_name == "search_schema":
+        q = input_args.get("query") or ""
+        ds = input_args.get("dataset") or ""
+        return f"{q!r} in {ds}" if q else ds
     if short_name == "request_data":
         return (
             f"{input_args.get('request_type', '')} on "
@@ -218,7 +226,17 @@ def summarize_tool_call(short_name: str, input_args: dict[str, Any]) -> str:
             f"({input_args.get('dataset', '')})"
         )
     if short_name == "expand_result":
-        return str(input_args.get("result_id", ""))
+        rid = str(input_args.get("result_id", ""))
+        view = input_args.get("view") or ""
+        return f"{rid} (view={view})" if view else rid
+    if short_name == "list_results":
+        limit = input_args.get("limit")
+        return f"limit={limit}" if limit else ""
+    if short_name == "list_results_global":
+        q = input_args.get("query") or ""
+        return f"query={q!r}" if q else ""
+    if short_name == "read_attached_file":
+        return str(input_args.get("name", ""))
     if short_name == "recall_conversation":
         bits: list[str] = []
         q = input_args.get("query")

@@ -497,9 +497,24 @@ def _render_tool_use(block: ToolUseBlock) -> None:
         if code:
             lexer = "r" if lang.lower() == "r" else "stata"
             console.print(Syntax(code, lexer, theme="ansi_dark", line_numbers=False))
+    elif short == "submit_script_file":
+        lang = inp.get("language", "")
+        label = inp.get("label", "")
+        fname = inp.get("name", "?")
+        suffix = f"  [{lang}]" if lang else ""
+        header = f"⚙ submit_script_file  running {fname}{suffix}" + (
+            f"  {label}" if label else ""
+        )
+        console.print(Text(header, style="bold cyan"))
     elif short == "get_schema":
         summary = f"dataset={inp.get('dataset', '?')!r} depth={inp.get('depth', '?')!r}"
         console.print(Text(f"⚙ get_schema  {summary}", style="cyan"))
+    elif short == "search_schema":
+        summary = (
+            f"{inp.get('query', '?')!r} in "
+            f"dataset={inp.get('dataset', '?')!r}"
+        )
+        console.print(Text(f"⚙ search_schema  {summary}", style="cyan"))
     elif short == "request_data":
         summary = (
             f"{inp.get('request_type', '?')} on {inp.get('variable', '?')!r} "
@@ -507,9 +522,33 @@ def _render_tool_use(block: ToolUseBlock) -> None:
         )
         console.print(Text(f"⚙ request_data  {summary}", style="cyan"))
     elif short == "expand_result":
-        console.print(Text(f"⚙ expand_result  {inp.get('result_id', '?')!r}", style="cyan"))
+        view = inp.get("view", "")
+        view_part = f"  view={view!r}" if view else ""
+        console.print(Text(
+            f"⚙ expand_result  {inp.get('result_id', '?')!r}{view_part}",
+            style="cyan",
+        ))
     elif short == "list_results":
-        console.print(Text("⚙ list_results", style="cyan"))
+        limit = inp.get("limit")
+        suffix = f"  limit={limit}" if limit else ""
+        console.print(Text(f"⚙ list_results{suffix}", style="cyan"))
+    elif short == "list_results_global":
+        query = inp.get("query", "")
+        suffix = f"  query={query!r}" if query else ""
+        console.print(Text(f"⚙ list_results_global{suffix}", style="cyan"))
+    elif short == "recall_conversation":
+        bits = []
+        if inp.get("query"):
+            bits.append(f"query={inp.get('query')!r}")
+        if inp.get("tail"):
+            bits.append(f"tail={inp.get('tail')}")
+        suffix = "  " + ", ".join(bits) if bits else ""
+        console.print(Text(f"⚙ recall_conversation{suffix}", style="cyan"))
+    elif short == "read_attached_file":
+        console.print(Text(
+            f"⚙ read_attached_file  {inp.get('name', '?')!r}",
+            style="cyan",
+        ))
     else:
         # Should not happen given the allowlist — render loudly if it does.
         console.print(Text(f"⚙ {name}  {inp!r}  [UNEXPECTED]", style="red bold"))
@@ -711,11 +750,13 @@ async def _gate_tool_use(
         behavior="deny",
         message=(
             f"Tool '{tool_name}' is not available in Nora. Use one of the "
-            f"six custom tools described in the system prompt "
-            f"(mcp__{SERVER_NAME}__get_schema, request_data, submit_script, "
-            f"expand_result, list_results, recall_conversation). Nora "
-            f"does not expose Bash, Read, Write, Edit, Glob, Grep, or any "
-            f"other general tool."
+            f"ten custom tools described in the system prompt "
+            f"(mcp__{SERVER_NAME}__get_schema, search_schema, "
+            f"request_data, submit_script, submit_script_file, "
+            f"expand_result, list_results, list_results_global, "
+            f"recall_conversation, read_attached_file). Nora does not "
+            f"expose Bash, Read, Write, Edit, Glob, Grep, or any other "
+            f"general tool."
         ),
         interrupt=False,
     )
