@@ -1034,14 +1034,7 @@ async def submit_script(args: dict[str, Any]) -> dict[str, Any]:
         )
         store_seconds += _time.monotonic() - i0
         any_ok = True
-        markdown: str | None = None
-        try:
-            from nora.result_render import render_table
-            markdown = render_table(sanitized.sanitized or {})
-        except Exception:  # noqa: BLE001 — rendering must never block storage
-            markdown = None
-
-        result_entry: dict[str, Any] = {
+        results.append({
             "status": "ok",
             "result_id": row.id,
             "label": row.label,
@@ -1057,13 +1050,7 @@ async def submit_script(args: dict[str, Any]) -> dict[str, Any]:
             # ``expand_result(view="full")`` when collinearity
             # diagnostics matter.
             "payload": _compact_payload(sanitized.sanitized or {}),
-        }
-        if markdown is not None:
-            # Canonical table rendered by Nora, not improvised by the
-            # model. Fresh submit_script results now have the same hard
-            # table contract as expand_result(view="markdown").
-            result_entry["markdown"] = markdown
-        results.append(result_entry)
+        })
 
     # Decide the envelope status. The decision keys on whether ANY
     # payload survived sanitization (``any_ok``), not just whether

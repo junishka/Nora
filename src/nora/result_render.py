@@ -73,10 +73,10 @@ def render_table(payload: dict[str, Any]) -> str | None:
 def _render_linear_regression(p: dict[str, Any]) -> str | None:
     """One row per term. Columns: Term, Estimate, Std. Error, p-value.
 
-    The p-value column is part of Nora's public reporting contract, so
-    it stays present even when a malformed/custom payload omitted
-    ``p_values``. Missing cells render blank; the UI/model must not
-    silently change the table shape.
+    Optional p-values are omitted when the sanitizer didn't pass
+    ``p_values`` through (e.g., scripts that emitted coefficients +
+    SEs without t-stats). The intercept is rendered as ``(Intercept)``
+    if it appears in coefficients.
     """
     coefs = p.get("coefficients") or {}
     if not isinstance(coefs, dict) or not coefs:
@@ -84,11 +84,15 @@ def _render_linear_regression(p: dict[str, Any]) -> str | None:
     ses = p.get("standard_errors") or {}
     pvals = p.get("p_values") or {}
 
-    header = ["Term", "Estimate", "Std. Error", "p-value"]
+    has_p = bool(isinstance(pvals, dict) and pvals)
+    header = ["Term", "Estimate", "Std. Error"]
+    if has_p:
+        header.append("p-value")
     rows: list[list[str]] = []
     for term, est in coefs.items():
         row = [str(term), _fmt_num(est), _fmt_num(ses.get(term))]
-        row.append(_fmt_num(pvals.get(term) if isinstance(pvals, dict) else None))
+        if has_p:
+            row.append(_fmt_num(pvals.get(term)))
         rows.append(row)
     table = _markdown_table(header, rows)
 

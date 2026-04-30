@@ -37,7 +37,7 @@
   --border: #e8cdd4;        /* soft pink-mauve edge */
   --code-bg: var(--burgundy);
   --code-text: var(--pink-light);
-  --max-width: 960px;
+  --max-width: 1080px;
   --radius: 12px;
 
   --font-sans: 'Lexend', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
@@ -2832,43 +2832,6 @@ kbd {
   line-height: 1.5;
   white-space: pre;
   color: var(--text);
-}
-
-.result-markdown-body {
-  padding: 10px 14px 12px;
-  overflow-x: auto;
-}
-
-.result-markdown-body table,
-.message.assistant .message-body table {
-  border-collapse: collapse;
-  width: max-content;
-  max-width: 100%;
-  font-size: 13px;
-  line-height: 1.45;
-}
-
-.result-markdown-body th,
-.result-markdown-body td,
-.message.assistant .message-body th,
-.message.assistant .message-body td {
-  padding: 4px 8px;
-  border-bottom: 1px solid var(--border);
-  text-align: right;
-  white-space: nowrap;
-}
-
-.result-markdown-body th:first-child,
-.result-markdown-body td:first-child,
-.message.assistant .message-body th:first-child,
-.message.assistant .message-body td:first-child {
-  text-align: left;
-}
-
-.result-markdown-body th,
-.message.assistant .message-body th {
-  font-weight: 600;
-  color: var(--text-dim);
 }
 
 .result-note {

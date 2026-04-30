@@ -1,15 +1,23 @@
 # Nora — handoff
 
 Single-page entry point for picking this project up. Last
-substantive update **2026-04-29**, after the token-budget pass
-(OpenAI `previous_response_id`, 1h Anthropic cache TTL, minified
-tool JSON, leaner system prompt), per-provider system prompt +
-lean OpenAI tool descriptions, regression diagnostics (vif /
-condition_number / full vcov), self-contained Stata helpers
-(`nora_result_sum`, `nora_ttest`), correlation_matrix sanitizer
-type, two new `request_data` types (quartiles, correlation_pair),
-env-gated cross-session result recall, per-variable min/max opt-in
-via dataset policy, and the Stata residual-plot scaling fix. If
+substantive update **2026-04-30**, after the multi-result wire-
+format pass: `submit_script` now emits one structured payload per
+helper call instead of one per script (24-spec batches no longer
+lose 23 of 24 results), with a partial-success surface for mid-
+loop aborts; per-result inline `payload` + `markdown` fields so
+the model doesn't have to call `expand_result` once per result;
+new `submit_script_file` and `search_schema` tools (10 total
+now); canonical-table renderer (`result_render.render_table`)
+exposed via `expand_result(view="markdown")` and inline on every
+ok-status result; UI renders Nora's canonical tables on the
+submit_script tool-result card; row-count audit cached once per
+call (was re-reading a 3 GB .dta on every iteration); plus a
+batch of audit fixes: `recall_conversation` AttributeError on
+multi-result tool calls, `list_results` newest-first + bounded,
+`session_state` user/assistant pairing for in-flight turns,
+read_attached_file path-prefix containment, composer image
+durability, and the silent attachment carry-back on cancel. If
 something here disagrees with the code, trust the code and file a
 patch to this doc.
 
@@ -77,6 +85,20 @@ keep streaming.
 | **Stata residual-plot scaling fix** — `nora_plot_residuals` now samples to 5000 points before `rvfplot + graph export ... as(pdf)`. PDF embeds every point as a vector path, so unsampled rendering scaled linearly with N: 200k rows took ~8s, almost entirely PDF rendering. Sampled output reduces that to ~750ms with no loss of pattern visibility. `e()` is unaffected so the downstream `nora_result_regress` still sees the full-N regression | ✅ done |
 | **Allow deleting the active session** — sidebar × on the focused row now works; the bridge clears `self.cwd`, returns `was_active=True`, and the page navigates back to the landing screen. Confirm dialog adapts ("Delete the session you're currently in") | ✅ done |
 | **`debug_excerpt` on script failure** — system prompt now tells the model to read it; long-standing feature was effectively invisible because the prompt didn't acknowledge it | ✅ done |
+| **Multi-result `submit_script` wire format** — JSONL append-mode emit, executor parses N payloads per script with per-line token validation, response carries a `results` list with a shared `script_run_id`. Stata helpers, R `nora$.write_result`, Python `_write_result` all switched to append; sanitizer is stateless per payload so SDC stays exact across N. Solves the loss of 23-of-24 results on event-study batches | ✅ done |
+| **Partial-success on script abort** — when a script aborts mid-loop, payloads emitted before the abort still surface (`status: "execution_failed_partial"`) alongside `debug_excerpt`. All-rejected-then-aborted falls to `execution_failed` so the model doesn't read disclosure rejections as usable partials. Per-result `transformations_summary` dedupes shared SDC entries across results | ✅ done |
+| **`submit_script_file` tool** — read a `.do` / `.R` / `.Rmd` / `.py` from cwd by basename and forward to `submit_script`. Skips the round-trip cost of re-emitting attached scripts as inline tool input. Path-safety mirrors `read_attached_file`; language inferred from extension when omitted | ✅ done |
+| **`search_schema` tool** — case-insensitive substring filter against variable names, labels, and value-label content for wide datasets. `limit` default 50, hard max 200; response carries `total_matches` and `truncated` so the model knows whether to refine | ✅ done |
+| **Canonical table rendering** — `nora.result_render.render_table` produces a deterministic markdown pipe-table per analysis type (linear_regression, t_test, descriptive, frequency_table, crosstab, magnitude_table, correlation_matrix). Pure formatter; suppression markers preserved verbatim. Surfaced via `expand_result(view="markdown")` AND inline on every ok-status `submit_script` result, so the model can drop tables directly without re-deriving columns and precision per call. Web UI renders these inline on the tool-result card as a separate result panel above the native script stdout | ✅ done |
+| **Inline compact result payload** — every ok-status result entry now carries a `payload` field with full sanitized data minus `vcov`/`vif` for regressions (same trim as `expand_result(view="coefficients")`), full payload for other types. The model renders coefficient tables directly from the response without N `expand_result` round-trips on parameterized batches | ✅ done |
+| **Row-count audit perf fix** — `schema.row_count(path)` uses metadata-only paths where available (`.dta` via pyreadstat `metadataonly=True`, `.parquet` via pyarrow footer, `.csv` line-count). `submit_script` resolves the source row count ONCE per call and threads it through the per-payload loop, instead of re-reading the dataset on every result. ~390x faster on a 200k-row .dta benchmark; on a 3 GB file the absolute saving is on the order of a minute per call. Response also carries `_phase_timings` (executor / row_count_audit / sanitize / store seconds) so post-execution slowness can't hide behind `duration_seconds` again | ✅ done |
+| **Loop-default prompt directive** — for parameterized batches (N specs / subgroups / outcomes / sensitivity sweeps), prompt now directs ONE script with a loop emitting N results, not N separate scripts. Names the costs of N-scripts directly (repeated data prep, fragmented audit, context bloat). Pinned by render-test | ✅ done |
+| **Formatting rules at end of prompt** — moved formatting block past tool-use notes / honesty paragraph so it's the last thing the model reads before generating. Strengthened anti-bold rule with imperative phrasing and explicit anti-pattern call-out (`Bold sentence-leaders`); post-table interpretation is now 2 to 4 SHORT BULLETS, not prose paragraphs. Composite cell-format tables spell out the canonical shape `-0.013 (0.004) [0.002]` (significance stars forbidden as old convention) | ✅ done |
+| **OpenAI cumulative context fix** — `total_input_tokens += usage.input_tokens` was multi-counting the cached prefix once per tool-loop round. Switched to last-round value (peak prompt size), since each round's `input_tokens` already includes the cached chain. Context chip is honest on OpenAI now; chip docstring describes per-provider semantics | ✅ done |
+| **Context chip post-turn snapshot** — chip now sums `input + cache_read + cache_creation + output_tokens` so a long reply moves the chip immediately rather than only on the next turn. The chip's old "input only" framing made it look like context wasn't being used until the next turn folded the response back into input | ✅ done |
+| **read_attached_file head+tail truncation** — scripts > 96 KB come back as 48 KB head + elision marker + 48 KB tail instead of head-only. Save calls (`df.to_parquet`, `write_dta`, `saveRDS`) at the bottom of long pipelines now visible | ✅ done |
+| **scroll-to-latest button** — floating circular button above the composer fades in when the transcript is > 100 px from the bottom; click smooth-scrolls to the latest message | ✅ done |
+| **Audit fixes batch (Apr-30)** — `recall_conversation` AttributeError on multi-result tool calls (used the renamed `result_ids` list); `list_results` newest-first with `limit` (default 50, max 500) instead of unbounded ASC; recall budget includes serialized tool/result_ids size in the cap; `session_state` pairs latest user with its OWN assistant (or empty for in-flight) instead of cross-turn mismatch; `read_attached_file` plot fallback uses `is_relative_to` instead of `str.startswith` (fixes path-prefix collision); composer Send guard allows attachment-only sends; composer image drops persist to cwd via `add_files_from_blobs` AND stage for vision; cancel/error branches no longer re-prepend mentioned files (composer chip already cleared on send); per-script source row count cached once; NaN correlation on constant columns rejected with named culprit; correlation_matrix sanitizer applies `safe_key` to both sides of the cross-field check; store ordering uses `rowid` instead of lexical id sort | ✅ done |
 | **Real-researcher pilot** | ⏳ self-pilot in progress |
 | **Cross-query composition / release ledger** | ⏭ named, future-deployment scope |
 | **Apple Developer Program signing + notarization for distributable .dmg** | ⏭ blocked on $99/yr cert |
