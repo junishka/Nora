@@ -266,6 +266,31 @@ def _summarize(payload: dict[str, Any]) -> str:
         )
     return f"result of type {t!r}"
 
+def _compact_payload(sanitized: dict[str, Any]) -> dict[str, Any]:
+    """Inline-trimmed version of a sanitized payload for the per-result
+    response entry. Same shape as ``expand_result(view="coefficients")``
+    for regressions: full coefficient pattern, R^2, condition number,
+    n, df, etc., minus the variance-covariance matrix and per-
+    predictor VIF table. Other analysis types pass through unchanged
+    (their payloads are already small).
+
+    The motivation is the parameterized-batch case: a 24-spec script
+    used to force the model into 24 ``expand_result`` calls just to
+    render the headline coefficient tables, since the per-result
+    ``summary`` is a one-line ("OLS, n=…, R²=…, K predictor(s)")
+    that doesn't carry coefficients. Including the trimmed payload
+    inline turns those 24 round-trips into zero — the model has the
+    data it needs to render tables directly from the submit_script
+    response. ``expand_result`` is still there for the cases where
+    full ``vcov``/``vif`` matter (collinearity audits, joint tests).
+    """
+    if not isinstance(sanitized, dict):
+        return {}
+    if sanitized.get("type") == "linear_regression":
+        return {k: v for k, v in sanitized.items() if k not in ("vcov", "vif")}
+    return dict(sanitized)
+
+
 def _shared_transformations(results: list[dict[str, Any]]) -> list[str]:
     """Return transformation entries common to every status="ok" result,
     in first-seen order.
@@ -1016,6 +1041,15 @@ async def submit_script(args: dict[str, Any]) -> dict[str, Any]:
             "analysis_type": row.analysis_type,
             "summary": _summarize(sanitized.sanitized or {}),
             "transformations": transformations,
+            # Inline compact payload — same trim as
+            # ``expand_result(view="coefficients")``. Lets the model
+            # render coefficient tables from the submit_script
+            # response directly, instead of N separate
+            # ``expand_result`` round-trips on a parameterized
+            # batch. Full ``vcov`` / ``vif`` is still reachable via
+            # ``expand_result(view="full")`` when collinearity
+            # diagnostics matter.
+            "payload": _compact_payload(sanitized.sanitized or {}),
         })
 
     # Decide the envelope status. The decision keys on whether ANY
@@ -1193,6 +1227,141 @@ async def submit_script(args: dict[str, Any]) -> dict[str, Any]:
     if plot_summary is not None:
         response["plots"] = plot_summary
     return _as_mcp_text(response)
+
+
+# ---------------------------------------------------------------------------
+# Tool: submit_script_file
+# ---------------------------------------------------------------------------
+
+# Mapping from file suffix to ``submit_script``'s expected language
+# string. Kept narrow so a researcher who attaches an unrelated text
+# file (.txt, .md) gets a clear refusal instead of an ambiguous run
+# attempt.
+_SCRIPT_FILE_LANGUAGES: dict[str, str] = {
+    ".do": "Stata",
+    ".r": "R",
+    ".rmd": "R",
+    ".py": "Python",
+}
+
+
+@tool(
+    "submit_script_file",
+    (
+        "Run a script from a file the researcher attached, instead of "
+        "re-emitting the bytes through your tool input. Use this when "
+        "the researcher @-mentioned or uploaded a .do / .R / .py file "
+        "and wants it run as-is. For a 12 KB do-file, this skips a "
+        "12 KB tool-input round-trip and the latency that comes with "
+        "it.\n\n"
+        "Same downstream behavior as submit_script (sanitizer, "
+        "row-count audit, store, multi-result, partial-success). The "
+        "response shape is identical.\n\n"
+        "Arguments:\n"
+        "  name: basename of the attached file (e.g., 'reg_v10.do'). "
+        "Must exist in the session cwd. Path components are stripped "
+        "(same posture as read_attached_file).\n"
+        "  language: 'R', 'Stata', or 'Python'. Optional — when "
+        "omitted, inferred from the file extension (.do→Stata, .r/"
+        ".rmd→R, .py→Python).\n"
+        "  label: short description (used as the fallback row label "
+        "for any helper that didn't pass its own label).\n"
+        "  source_dataset: same as submit_script."
+    ),
+    {
+        "name": str,
+        "language": str,
+        "label": str,
+        "source_dataset": str,
+    },
+)
+async def submit_script_file(args: dict[str, Any]) -> dict[str, Any]:
+    """Read a script from cwd by basename and forward to submit_script.
+
+    Path safety mirrors ``read_attached_file``: the ``name`` argument
+    is treated as a basename (any directory component is stripped),
+    resolved against the session cwd, and refused if it escapes. The
+    extension allowlist (``_SCRIPT_FILE_LANGUAGES``) bounds what gets
+    treated as a runnable script.
+    """
+    raw_name = args.get("name", "")
+    if not raw_name or not isinstance(raw_name, str):
+        return _as_mcp_text({
+            "status": "error",
+            "reason": "name argument is required (basename of a script file)",
+        })
+    safe_name = Path(raw_name).name
+    if not safe_name:
+        return _as_mcp_text({
+            "status": "error",
+            "reason": f"could not parse a basename from {raw_name!r}",
+        })
+
+    try:
+        target = resolve_in_cwd(safe_name)
+    except (PathEscapeError, OSError):
+        return _as_mcp_text({
+            "status": "error",
+            "reason": f"path {raw_name!r} is outside the session cwd",
+        })
+    if not target.is_file():
+        return _as_mcp_text({
+            "status": "not_found",
+            "reason": f"no script named {safe_name!r} in this session",
+        })
+
+    ext = target.suffix.lower()
+    inferred_language = _SCRIPT_FILE_LANGUAGES.get(ext)
+    if inferred_language is None:
+        return _as_mcp_text({
+            "status": "error",
+            "reason": (
+                f"{safe_name!r} is not a recognised script file. "
+                f"Supported extensions: "
+                f"{sorted(_SCRIPT_FILE_LANGUAGES.keys())}"
+            ),
+        })
+
+    explicit_language = (args.get("language") or "").strip()
+    language = explicit_language or inferred_language
+    if explicit_language and explicit_language != inferred_language:
+        # The model overrode the extension-based inference. Honor it,
+        # but only if the override is one of the supported languages —
+        # otherwise the downstream submit_script would reject anyway.
+        if explicit_language not in {"R", "Stata", "Python"}:
+            return _as_mcp_text({
+                "status": "error",
+                "reason": (
+                    f"language must be one of R / Stata / Python; "
+                    f"got {explicit_language!r}"
+                ),
+            })
+
+    try:
+        code = target.read_text(encoding="utf-8")
+    except OSError as e:
+        return _as_mcp_text({
+            "status": "error",
+            "reason": f"could not read {safe_name}: {e}",
+        })
+    except UnicodeDecodeError:
+        # Fall back to replace-mode so a stray non-UTF-8 byte doesn't
+        # block the run; the script is the researcher's, they can fix
+        # it if encoding matters.
+        code = target.read_bytes().decode("utf-8", errors="replace")
+
+    if not code.strip():
+        return _as_mcp_text({
+            "status": "error",
+            "reason": f"{safe_name!r} is empty",
+        })
+
+    return await submit_script.handler({
+        "language": language,
+        "code": code,
+        "label": args.get("label") or safe_name,
+        "source_dataset": args.get("source_dataset") or "",
+    })
 
 
 # ---------------------------------------------------------------------------
@@ -1930,6 +2099,7 @@ REGISTERED_TOOLS: tuple[Any, ...] = (
     search_schema,
     request_data,
     submit_script,
+    submit_script_file,
     expand_result,
     list_results,
     list_results_global,
@@ -1944,6 +2114,7 @@ ALLOWED_TOOL_NAMES: tuple[str, ...] = (
     f"mcp__{SERVER_NAME}__search_schema",
     f"mcp__{SERVER_NAME}__request_data",
     f"mcp__{SERVER_NAME}__submit_script",
+    f"mcp__{SERVER_NAME}__submit_script_file",
     f"mcp__{SERVER_NAME}__expand_result",
     f"mcp__{SERVER_NAME}__list_results",
     f"mcp__{SERVER_NAME}__list_results_global",

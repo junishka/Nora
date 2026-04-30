@@ -139,6 +139,81 @@ def test_submit_script_returns_phase_timings(tmp_path: Path) -> None:
         assert pt[key] >= 0
 
 
+def test_compact_payload_drops_vcov_and_vif_for_regressions() -> None:
+    """The regression-specific trim drops the two largest collinearity-
+    diagnostic fields, keeps the headline pattern. Same shape as
+    ``expand_result(view="coefficients")``."""
+    from nora.tools import _compact_payload
+    full = {
+        "type": "linear_regression",
+        "n": 100,
+        "coefficients": {"x1": 0.4, "x2": -0.1},
+        "standard_errors": {"x1": 0.05, "x2": 0.04},
+        "p_values": {"x1": 0.001, "x2": 0.06},
+        "r_squared": 0.31,
+        "condition_number": 4.2,
+        "vif": {"x1": 1.05, "x2": 1.05},
+        "vcov": {"x1": {"x1": 0.0025}, "x2": {"x2": 0.0016}},
+    }
+    out = _compact_payload(full)
+    assert "vcov" not in out
+    assert "vif" not in out
+    assert out["coefficients"] == {"x1": 0.4, "x2": -0.1}
+    assert out["r_squared"] == 0.31
+    assert out["condition_number"] == 4.2
+
+
+def test_compact_payload_passes_through_non_regression_types() -> None:
+    """Non-regression payloads are already small; pass through unchanged."""
+    from nora.tools import _compact_payload
+    desc = {
+        "type": "descriptive", "variable": "x",
+        "n": 50, "mean": 1.0, "sd": 0.2, "missing_count": 0,
+    }
+    assert _compact_payload(desc) == desc
+
+
+@_skip_no_python
+def test_submit_script_inlines_compact_payload_per_result(
+    tmp_path: Path,
+) -> None:
+    """Each ok-status result entry carries its own ``payload`` field
+    so the model can render coefficient tables directly from the
+    submit_script response, instead of calling ``expand_result``
+    once per result on a multi-result script. Inline payload is
+    the same trim ``view="coefficients"`` applies — full sanitized
+    data minus ``vcov`` / ``vif`` for regressions, full payload for
+    other types."""
+    set_cwd(tmp_path)
+    reset_store_for_tests()
+
+    code = (
+        "import nora\n"
+        "for i in range(3):\n"
+        "    nora.from_summarize(f'v{i}', n=20+i, mean=float(i), "
+        "sd=0.5, missing_count=0)\n"
+    )
+    response = asyncio.run(submit_script.handler({
+        "language": "Python",
+        "code": code,
+        "label": "inline payload canary",
+        "source_dataset": "",
+    }))
+    body = _text_payload(response)
+    assert body["status"] == "ok"
+    assert len(body["results"]) == 3
+    for entry, expected_var, expected_n in zip(
+        body["results"], ["v0", "v1", "v2"], [20, 21, 22]
+    ):
+        assert entry["status"] == "ok"
+        payload = entry.get("payload")
+        assert isinstance(payload, dict), entry
+        # Descriptive type passes through full payload.
+        assert payload.get("type") == "descriptive"
+        assert payload.get("variable") == expected_var
+        assert payload.get("n") == expected_n
+
+
 @_skip_no_python
 def test_submit_script_dedupes_shared_transformations(tmp_path: Path) -> None:
     """A multi-result script that emits N payloads typically generates

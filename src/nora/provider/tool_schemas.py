@@ -219,6 +219,28 @@ _SUBMIT_SCRIPT_DESC = (
     "script generates its own data or touches multiple files."
 )
 
+_SUBMIT_SCRIPT_FILE_DESC = (
+    "Run a script from a file the researcher attached, instead of "
+    "re-emitting the bytes through your tool input. Use this when "
+    "the researcher @-mentioned or uploaded a .do / .R / .py file "
+    "and wants it run as-is. For a 12 KB do-file, this skips a "
+    "12 KB tool-input round-trip and the latency that comes with "
+    "it.\n\n"
+    "Same downstream behavior as submit_script (sanitizer, "
+    "row-count audit, store, multi-result, partial-success). The "
+    "response shape is identical.\n\n"
+    "Arguments:\n"
+    "  name: basename of the attached file (e.g., 'reg_v10.do'). "
+    "Must exist in the session cwd. Path components are stripped "
+    "(same posture as read_attached_file).\n"
+    "  language: 'R', 'Stata', or 'Python'. Optional — when "
+    "omitted, inferred from the file extension (.do→Stata, .r/"
+    ".rmd→R, .py→Python).\n"
+    "  label: short description (used as the fallback row label "
+    "for any helper that didn't pass its own label).\n"
+    "  source_dataset: same as submit_script."
+)
+
 _EXPAND_RESULT_DESC = (
     "Retrieve a stored sanitized payload by ID. Use this when you "
     "need details of an earlier result (e.g., coefficients from a "
@@ -458,6 +480,17 @@ def build_tool_specs() -> tuple[ToolSpec, ...]:
             },
             required=("language", "code", "label"),
             openai_description=_SUBMIT_SCRIPT_DESC_OAI,
+        ),
+        _spec(
+            "submit_script_file",
+            _SUBMIT_SCRIPT_FILE_DESC,
+            properties={
+                "name": {"type": "string"},
+                "language": {"type": "string"},
+                "label": {"type": "string"},
+                "source_dataset": {"type": "string"},
+            },
+            required=("name",),
         ),
         _spec(
             "expand_result",
