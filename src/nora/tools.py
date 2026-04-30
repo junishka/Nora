@@ -124,15 +124,16 @@ def _effective_n(payload: dict[str, Any]) -> int | None:
     return None
 
 
-def _check_row_count(
-    sanitized_payload: dict[str, Any], source_dataset: str | None
-) -> str | None:
-    """If ``source_dataset`` was given, compare analysis N to dataset N.
+def _resolve_source_row_count(source_dataset: str | None) -> int | None:
+    """Look up the row count of ``source_dataset`` for the row-count
+    audit. Returns ``None`` when the dataset can't be read, isn't
+    inside cwd, or the format has no fast row-count path.
 
-    Returns a transformation-log string describing the row-count change,
-    or ``None`` if no check could be made or no discrepancy exists.
-    All error paths are silent — this is a best-effort audit signal,
-    not a gate.
+    Used once per ``submit_script`` invocation, with the result threaded
+    into every per-payload ``_check_row_count`` call. Calling this once
+    per result instead — the previous behavior — re-read the entire
+    dataset on every iteration; on a 3 GB .dta with 24 emitted results
+    that meant a ~20 minute post-execution lag.
     """
     if not source_dataset:
         return None
@@ -142,13 +143,27 @@ def _check_row_count(
         return None
     if not path.is_file():
         return None
+    return schema.row_count(path)
 
-    try:
-        df = schema.load_data(path)
-        source_n = int(len(df))
-    except Exception:
-        # Any load problem → skip silently. The main submit_script
-        # result is unaffected.
+
+def _check_row_count(
+    sanitized_payload: dict[str, Any],
+    source_dataset: str | None,
+    source_n: int | None,
+) -> str | None:
+    """If ``source_dataset`` and ``source_n`` are given, compare
+    analysis N to dataset N.
+
+    Returns a transformation-log string describing the row-count change,
+    or ``None`` if no check could be made or no discrepancy exists.
+    All error paths are silent — this is a best-effort audit signal,
+    not a gate.
+
+    ``source_n`` is computed ONCE per submit_script call (in
+    ``_resolve_source_row_count``) and threaded in so the per-payload
+    loop doesn't re-read the dataset on every iteration.
+    """
+    if not source_dataset or source_n is None:
         return None
 
     analysis_n = _effective_n(sanitized_payload)
@@ -890,6 +905,7 @@ async def submit_script(args: dict[str, Any]) -> dict[str, Any]:
     #
     # SDC config depends only on source_dataset (a per-call argument),
     # so resolve it once outside the loop.
+    import time as _time
     sdc_cfg = sanitizer.DEFAULT_CONFIG
     if source_dataset:
         try:
@@ -906,6 +922,17 @@ async def submit_script(args: dict[str, Any]) -> dict[str, Any]:
                 non_disclosive_variables=non_disclosive,
             )
 
+    # Source-dataset row count for the per-payload audit. Compute ONCE
+    # per submit_script call — the file doesn't change between
+    # sanitize iterations. The previous behavior re-read the dataset
+    # on every iteration via _check_row_count, which on a multi-GB
+    # .dta with N emitted results meant N full pyreadstat loads (~60s
+    # each on a 3 GB file). schema.row_count() uses metadata-only
+    # paths where available (.dta / .parquet / line-counted .csv).
+    audit_t0 = _time.monotonic()
+    source_n = _resolve_source_row_count(source_dataset or None)
+    row_count_audit_seconds = _time.monotonic() - audit_t0
+
     # One id per submit_script call; every row produced by this call
     # is tagged with it so an audit can pull them together.
     script_run_id = "R-" + secrets.token_hex(4)
@@ -913,6 +940,9 @@ async def submit_script(args: dict[str, Any]) -> dict[str, Any]:
     store = get_store(cwd)
     results: list[dict[str, Any]] = []
     any_ok = False
+    sanitize_t0 = _time.monotonic()
+    sanitize_seconds = 0.0
+    store_seconds = 0.0
 
     for raw_payload in exec_result.result_payloads:
         # Prefer the per-helper label (each nora_result_* takes its own
@@ -923,11 +953,14 @@ async def submit_script(args: dict[str, Any]) -> dict[str, Any]:
             if isinstance(raw_payload, dict) else None
         ) or label
 
+        s0 = _time.monotonic()
         sanitized = sanitize(raw_payload, sdc_cfg)
+        sanitize_seconds += _time.monotonic() - s0
         if not sanitized.ok:
             # SDC bounced this payload. Still store it so the researcher
             # can audit, and surface the rejection inline so the model
             # sees which one failed without losing the others.
+            i0 = _time.monotonic()
             diag_row = store.insert(
                 label=f"[rejected] {helper_label}",
                 analysis_type=sanitized.analysis_type or "unknown",
@@ -942,6 +975,7 @@ async def submit_script(args: dict[str, Any]) -> dict[str, Any]:
                 raw_log_path=exec_result.run_dir,
                 script_run_id=script_run_id,
             )
+            store_seconds += _time.monotonic() - i0
             results.append({
                 "status": "rejected_by_sanitizer",
                 "result_id": diag_row.id,
@@ -952,15 +986,17 @@ async def submit_script(args: dict[str, Any]) -> dict[str, Any]:
             continue
 
         # Row-count check runs AFTER sanitize (operates on sanitized
-        # structure; row counts themselves aren't disclosive). Same
-        # source_dataset for every payload in this call.
+        # structure; row counts themselves aren't disclosive). Uses
+        # the ``source_n`` we resolved once above so the per-payload
+        # loop never re-reads the dataset.
         row_count_msg = _check_row_count(
-            sanitized.sanitized or {}, source_dataset or None
+            sanitized.sanitized or {}, source_dataset or None, source_n,
         )
         transformations = list(sanitized.transformations)
         if row_count_msg:
             transformations.append(row_count_msg)
 
+        i0 = _time.monotonic()
         row = store.insert(
             label=helper_label,
             analysis_type=sanitized.analysis_type or "unknown",
@@ -971,6 +1007,7 @@ async def submit_script(args: dict[str, Any]) -> dict[str, Any]:
             raw_log_path=exec_result.run_dir,
             script_run_id=script_run_id,
         )
+        store_seconds += _time.monotonic() - i0
         any_ok = True
         results.append({
             "status": "ok",
@@ -1031,11 +1068,27 @@ async def submit_script(args: dict[str, Any]) -> dict[str, Any]:
                 if t not in shared_set
             ]
 
+    # Phase timings: subprocess vs post-execution audit work. The
+    # default ``duration_seconds`` only reports the subprocess, which
+    # used to hide a real bug — the post-execution row-count audit
+    # was re-reading a 3 GB .dta on every iteration of the multi-
+    # result loop, costing 20+ minutes after Stata had already
+    # finished in seconds. ``_phase_timings`` makes that visible
+    # without bloating the default response (the model can read or
+    # ignore it).
+    phase_timings = {
+        "executor_seconds": round(exec_result.duration_seconds, 3),
+        "row_count_audit_seconds": round(row_count_audit_seconds, 3),
+        "sanitize_seconds": round(sanitize_seconds, 3),
+        "store_seconds": round(store_seconds, 3),
+    }
+
     response: dict[str, Any] = {
         "status": overall_status,
         "script_run_id": script_run_id,
         "results": results,
         "duration_seconds": round(exec_result.duration_seconds, 3),
+        "_phase_timings": phase_timings,
         # Path for the TUI to read raw R/Stata output from. Claude
         # seeing the path is not a leak (directory names are
         # structural, not data), but Claude should not try to read

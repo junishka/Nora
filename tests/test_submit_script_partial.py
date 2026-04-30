@@ -51,6 +51,95 @@ def _text_payload(response: dict) -> dict:
 
 
 @_skip_no_python
+def test_submit_script_resolves_source_row_count_once_per_call(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression test for the 20-minute lag observed on a 24-result
+    multi-result run against a 3 GB .dta. Before the fix, the post-
+    execution row-count audit re-loaded the source dataset on every
+    iteration of the per-payload loop. With N results that meant N
+    full pyreadstat reads of the same file. This test pins that the
+    dataset row-count resolver is called at most ONCE per
+    submit_script invocation regardless of how many payloads land.
+    """
+    set_cwd(tmp_path)
+    reset_store_for_tests()
+
+    # Build a tiny CSV the row-count audit can succeed against.
+    import pandas as pd
+    df = pd.DataFrame({"x": list(range(20))})
+    src = tmp_path / "tiny.csv"
+    df.to_csv(src, index=False)
+
+    # Spy on _resolve_source_row_count to count invocations.
+    calls = {"n": 0}
+    from nora import tools as tools_mod
+    real = tools_mod._resolve_source_row_count
+
+    def counting(source_dataset):
+        calls["n"] += 1
+        return real(source_dataset)
+
+    monkeypatch.setattr(tools_mod, "_resolve_source_row_count", counting)
+
+    code = (
+        "import nora\n"
+        "for i in range(5):\n"
+        "    nora.from_summarize(f'v{i}', n=10, mean=float(i), "
+        "sd=0.1, missing_count=0)\n"
+    )
+    response = asyncio.run(submit_script.handler({
+        "language": "Python",
+        "code": code,
+        "label": "row-count audit perf canary",
+        "source_dataset": "tiny.csv",
+    }))
+    body = _text_payload(response)
+    assert body["status"] == "ok"
+    assert len(body["results"]) == 5
+    # The whole point: ONE resolve, not five.
+    assert calls["n"] == 1, (
+        f"_resolve_source_row_count called {calls['n']} times for "
+        f"a 5-result script — the per-payload loop should NOT trigger "
+        f"a fresh row-count load on each iteration"
+    )
+
+
+@_skip_no_python
+def test_submit_script_returns_phase_timings(tmp_path: Path) -> None:
+    """The response carries a ``_phase_timings`` block so the model
+    (and humans reading the audit trail) can tell where the wall
+    clock went between the executor finishing and the tool returning.
+    Without this, the slow row-count-audit regression hid behind
+    ``duration_seconds`` which only reports the subprocess."""
+    set_cwd(tmp_path)
+    reset_store_for_tests()
+
+    code = (
+        "import nora\n"
+        "nora.from_summarize('a', n=10, mean=1.0, sd=0.1, missing_count=0)\n"
+    )
+    response = asyncio.run(submit_script.handler({
+        "language": "Python",
+        "code": code,
+        "label": "phase timings canary",
+        "source_dataset": "",
+    }))
+    body = _text_payload(response)
+    assert body["status"] == "ok"
+    pt = body["_phase_timings"]
+    for key in (
+        "executor_seconds",
+        "row_count_audit_seconds",
+        "sanitize_seconds",
+        "store_seconds",
+    ):
+        assert key in pt, f"missing phase timing: {key}"
+        assert isinstance(pt[key], (int, float))
+        assert pt[key] >= 0
+
+
+@_skip_no_python
 def test_submit_script_dedupes_shared_transformations(tmp_path: Path) -> None:
     """A multi-result script that emits N payloads typically generates
     the same SDC transformations (precision clamps, etc.) on each one.

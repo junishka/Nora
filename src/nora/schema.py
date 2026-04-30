@@ -134,6 +134,66 @@ def load_data(dataset_path: Path) -> Any:
     )
 
 
+def row_count(dataset_path: Path) -> int | None:
+    """Return the row count for the dataset at ``dataset_path`` without
+    materialising the values where the format allows it.
+
+    Used by ``submit_script``'s row-count audit (one comparison per
+    multi-result call against the source dataset's N). The audit doesn't
+    need any column data — just the row count — so we deliberately
+    avoid the full ``load_data`` path which can take 60+ seconds on a
+    multi-GB .dta.
+
+    Per format:
+    - ``.dta``: ``pyreadstat.read_dta(metadataonly=True).meta.number_rows``.
+      0.5s on a 3 GB file vs ~60s for a full load.
+    - ``.parquet``: ``pyarrow.parquet.ParquetFile(...).metadata.num_rows``.
+      Reads only the footer.
+    - ``.csv`` / ``.tsv``: byte-streamed line count minus 1 for the
+      header. Slower than metadata reads but still ~10x faster than a
+      full pandas parse on wide files.
+    - ``.jsonl`` / ``.ndjson``: byte-streamed line count.
+    - ``.rds``: no light path available without spinning up R; falls
+      back to ``load_data`` and counts.
+
+    Returns ``None`` on any failure — the audit is a best-effort signal,
+    not a gate, so callers should treat ``None`` as "skip the check"
+    rather than raise.
+    """
+    suffix = dataset_path.suffix.lower()
+    try:
+        if suffix == ".dta":
+            import pyreadstat
+            _df, meta = pyreadstat.read_dta(
+                str(dataset_path), metadataonly=True,
+            )
+            return int(meta.number_rows)
+        if suffix == ".parquet":
+            import pyarrow.parquet as pq
+            return int(pq.ParquetFile(str(dataset_path)).metadata.num_rows)
+        if suffix == ".csv" or suffix == ".tsv":
+            # Line count minus 1 for the header row. Streamed read so
+            # we don't materialise the file in memory.
+            n_lines = 0
+            with open(dataset_path, "rb") as f:
+                for _ in f:
+                    n_lines += 1
+            return max(0, n_lines - 1)
+        if suffix in (".jsonl", ".ndjson"):
+            n_lines = 0
+            with open(dataset_path, "rb") as f:
+                for line in f:
+                    if line.strip():
+                        n_lines += 1
+            return n_lines
+        if suffix == ".rds":
+            # No metadata-only path; fall back to full load.
+            return int(len(load_data(dataset_path)))
+    except Exception:  # noqa: BLE001 — audit is best-effort
+        return None
+    return None
+
+
 def extract(dataset_path: Path, depth: str) -> dict[str, Any]:
     """Return a structured schema summary for the file at `dataset_path`.
 
