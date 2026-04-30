@@ -1503,7 +1503,7 @@ const PLACEHOLDERS = [
   'Heteroskedasticity-robust greetings',
   'I read code so you don\'t have to',
   'Bring me your messy joins',
-  'Bring me your tired, your missing, your truncated',
+  'Give me your tired, your missing, your truncated',
   'Surrender the .dta',
   'Throw your reshapes at me',
   'Panel data, biscuits, tea',

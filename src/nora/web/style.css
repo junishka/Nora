@@ -1633,6 +1633,32 @@ kbd {
   margin: 6px 0;
   font-size: 12px;
   position: relative;
+  /* The pre's background is the dark code-bg even in light mode
+   * (burgundy on cream). Native scrollbars on that surface render
+   * as faint dark grooves against dark — easy to miss in light
+   * mode. Force a light-on-dark scrollbar so the affordance is
+   * visible regardless of OS theme. */
+  scrollbar-width: thin;
+  scrollbar-color: var(--pink-light) transparent;
+}
+
+.tool-card .tool-body pre::-webkit-scrollbar {
+  height: 8px;
+  width: 8px;
+}
+
+.tool-card .tool-body pre::-webkit-scrollbar-thumb {
+  background: var(--pink-light);
+  border-radius: 4px;
+  opacity: 0.6;
+}
+
+.tool-card .tool-body pre::-webkit-scrollbar-thumb:hover {
+  background: var(--pink);
+}
+
+.tool-card .tool-body pre::-webkit-scrollbar-track {
+  background: transparent;
 }
 
 .tool-card .tool-label {
@@ -2834,15 +2860,31 @@ kbd {
 }
 
 .message.assistant .message-body table th {
+  /* Header row needs to read clearly as "labels" against the body
+   * data. The earlier 4% black overlay was nearly invisible in
+   * light mode (faint grey on cream-pink); pumped to ~12% so the
+   * column headers are obvious without going Excel-grey. Border
+   * underline gives a second visual cue independent of background
+   * darkness.   */
   font-weight: 600;
   color: var(--text);
-  background: rgba(0, 0, 0, 0.04);
+  background: rgba(0, 0, 0, 0.12);
+  border-bottom: 1px solid var(--mauve);
 }
 
 @media (prefers-color-scheme: dark) {
-  .message.assistant .message-body table th {
-    background: rgba(255, 255, 255, 0.05);
+  :root:not([data-theme="light"]) .message.assistant .message-body table th {
+    /* In dark mode the burgundy/pink palette flips; a light overlay
+     * at 8% gives the same "header is labels" cue against the dark
+     * neutral surface without going milky. */
+    background: rgba(255, 255, 255, 0.08);
+    border-bottom-color: var(--accent-soft);
   }
+}
+
+:root[data-theme="dark"] .message.assistant .message-body table th {
+  background: rgba(255, 255, 255, 0.08);
+  border-bottom-color: var(--accent-soft);
 }
 
 .message.assistant .message-body table tr:last-child td {
