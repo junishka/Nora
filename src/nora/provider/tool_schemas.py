@@ -138,6 +138,29 @@ _GET_SCHEMA_DESC = (
     "named in the reason."
 )
 
+_SEARCH_SCHEMA_DESC = (
+    "Find variables in a dataset whose name or label matches a "
+    "case-insensitive substring. Designed for wide datasets where "
+    "``get_schema`` would return hundreds of variables; "
+    "search_schema lets you ask 'which columns are salary-related' "
+    "without pulling the full schema into context.\n\n"
+    "Matches against variable ``name`` and (when policy allows) "
+    "``label``. Results are capped at ``limit`` (default 50, hard "
+    "max 200); the response includes ``total_matches`` so you "
+    "know whether to refine the query.\n\n"
+    "The search depth is the lower of (a) the dataset's policy "
+    "ceiling and (b) names_types_labels (no need to load summary "
+    "stats just to filter names). Returned variables carry the "
+    "same fields ``get_schema`` would return at that depth.\n\n"
+    "Arguments:\n"
+    "  dataset: path to the dataset, relative to cwd.\n"
+    "  query: case-insensitive substring to match against names "
+    "and labels. Empty string is rejected — list-everything is "
+    "what get_schema is for.\n"
+    "  limit: optional cap on matches returned (default 50, max "
+    "200). 0 or unset uses the default."
+)
+
 # ``request_data``'s description is built from
 # ``data_request.SUPPORTED_REQUEST_TYPES`` so the tool's docstring
 # can never claim a request type the runtime doesn't support. Same
@@ -197,12 +220,19 @@ _SUBMIT_SCRIPT_DESC = (
 )
 
 _EXPAND_RESULT_DESC = (
-    "Retrieve the full sanitized payload for a previously stored result "
-    "by its ID. Use this when you need to reference details of an "
-    "earlier result. E.g., coefficients from a prior regression; "
-    "without carrying the whole payload in context.\n\n"
+    "Retrieve a stored sanitized payload by ID. Use this when you "
+    "need details of an earlier result (e.g., coefficients from a "
+    "prior regression) without carrying the whole payload in "
+    "context.\n\n"
     "Arguments:\n"
     "  result_id: the ID returned by a previous submit_script call.\n"
+    "  view: optional payload trim. ``\"\"`` (default) or "
+    "``\"full\"`` returns the complete stored payload. "
+    "``\"coefficients\"`` is a regression-specific shorthand that "
+    "drops the variance-covariance matrix (``vcov``) and per-"
+    "predictor VIF table — useful when you only need the headline "
+    "coefficient pattern and not the collinearity diagnostics. "
+    "Other analysis types ignore the option.\n"
     "  session_path: optional path to ANOTHER session under "
     "~/.nora-sessions/ to expand a result from. Requires the "
     "NORA_ALLOW_CROSS_SESSION_RECALL=1 env var to be set; otherwise "
@@ -397,6 +427,16 @@ def build_tool_specs() -> tuple[ToolSpec, ...]:
             openai_description=_GET_SCHEMA_DESC_OAI,
         ),
         _spec(
+            "search_schema",
+            _SEARCH_SCHEMA_DESC,
+            properties={
+                "dataset": {"type": "string"},
+                "query": {"type": "string"},
+                "limit": {"type": "integer"},
+            },
+            required=("dataset", "query"),
+        ),
+        _spec(
             "request_data",
             _request_data_desc(),
             properties={
@@ -424,6 +464,7 @@ def build_tool_specs() -> tuple[ToolSpec, ...]:
             _EXPAND_RESULT_DESC,
             properties={
                 "result_id": {"type": "string"},
+                "view": {"type": "string"},
                 "session_path": {"type": "string"},
             },
             required=("result_id",),

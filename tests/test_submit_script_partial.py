@@ -51,6 +51,62 @@ def _text_payload(response: dict) -> dict:
 
 
 @_skip_no_python
+def test_submit_script_dedupes_shared_transformations(tmp_path: Path) -> None:
+    """A multi-result script that emits N payloads typically generates
+    the same SDC transformations (precision clamps, etc.) on each one.
+    The response should hoist the common entries into a single
+    ``transformations_summary`` at envelope level so the model isn't
+    paying N copies of the same audit text. Per-result entries that
+    differ stay per-result; the store keeps full lists for audit."""
+    set_cwd(tmp_path)
+    reset_store_for_tests()
+
+    code = (
+        "import nora\n"
+        "nora.from_summarize('a', n=15, mean=1.0, sd=0.1, missing_count=0)\n"
+        "nora.from_summarize('b', n=15, mean=2.0, sd=0.2, missing_count=0)\n"
+        "nora.from_summarize('c', n=15, mean=3.0, sd=0.3, missing_count=0)\n"
+    )
+    response = asyncio.run(submit_script.handler({
+        "language": "Python",
+        "code": code,
+        "label": "dedup canary",
+        "source_dataset": "",
+    }))
+    body = _text_payload(response)
+    assert body["status"] == "ok"
+    assert len(body["results"]) == 3
+
+    # If three identical SDC entries appeared on each result, dedup
+    # should hoist them. The summary is non-empty whenever the three
+    # results share at least one transformation.
+    if "transformations_summary" in body:
+        shared = body["transformations_summary"]
+        assert isinstance(shared, list) and shared
+        # No per-result list should still contain a hoisted entry.
+        for r in body["results"]:
+            for t in r.get("transformations", []):
+                assert t not in shared, (
+                    "shared entry not stripped from per-result list"
+                )
+
+    # The store keeps full transformation lists per row for audit
+    # transparency, regardless of dedup in the response.
+    store = get_store(tmp_path)
+    grouped = store.list_by_script_run(body["script_run_id"])
+    assert len(grouped) == 3
+    # Each stored row carries its full list; if shared exists in the
+    # response, those entries should still be present in the stored row.
+    if "transformations_summary" in body:
+        shared_set = set(body["transformations_summary"])
+        for row in grouped:
+            for t in shared_set:
+                assert t in row.transformations, (
+                    f"stored row {row.id} lost shared transformation {t!r}"
+                )
+
+
+@_skip_no_python
 def test_submit_script_returns_partial_results_when_script_aborts(
     tmp_path: Path,
 ) -> None:

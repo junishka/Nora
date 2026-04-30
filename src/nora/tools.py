@@ -251,6 +251,46 @@ def _summarize(payload: dict[str, Any]) -> str:
         )
     return f"result of type {t!r}"
 
+def _shared_transformations(results: list[dict[str, Any]]) -> list[str]:
+    """Return transformation entries common to every status="ok" result,
+    in first-seen order.
+
+    Used by submit_script to hoist sanitizer transformations that
+    repeat across a multi-result response (e.g. "clamped coefficient
+    SEs to 3 sig figs at N=…" repeated 24 times in a 24-spec script).
+    Entries that don't appear on every ok result stay per-result.
+
+    Returns ``[]`` when there are fewer than 2 ok results (nothing
+    to dedupe), or when the intersection is empty.
+    """
+    ok_lists = [
+        entry.get("transformations", [])
+        for entry in results
+        if entry.get("status") == "ok"
+    ]
+    if len(ok_lists) < 2:
+        return []
+    ok_lists = [
+        list(lst) if isinstance(lst, list) else []
+        for lst in ok_lists
+    ]
+    if any(not lst for lst in ok_lists):
+        return []
+    intersection = set(ok_lists[0])
+    for lst in ok_lists[1:]:
+        intersection &= set(lst)
+    if not intersection:
+        return []
+    # Preserve first-seen order from the first list.
+    seen: set[str] = set()
+    ordered: list[str] = []
+    for t in ok_lists[0]:
+        if t in intersection and t not in seen:
+            seen.add(t)
+            ordered.append(t)
+    return ordered
+
+
 def _summarize_plot_helpers(run_dir: Any) -> dict[str, Any] | None:
     """Summarize what the script's plot helpers actually did.
 
@@ -480,6 +520,168 @@ async def get_schema(args: dict[str, Any]) -> dict[str, Any]:
     # needing to hit a denial to learn it.
     payload["policy_max_depth"] = ceiling
     return _as_mcp_text(payload)
+
+
+# ---------------------------------------------------------------------------
+# Tool: search_schema
+# ---------------------------------------------------------------------------
+
+# Cap on how many matches a single search_schema call returns. The model
+# can refine the query if the cap is hit. Higher caps trade context size
+# for fewer follow-ups; 50 is enough to surface every salary-related
+# column on a typical wide research dataset without burning context.
+_SEARCH_SCHEMA_DEFAULT_LIMIT = 50
+_SEARCH_SCHEMA_HARD_CAP = 200
+
+
+@tool(
+    "search_schema",
+    (
+        "Find variables in a dataset whose name or label matches a "
+        "case-insensitive substring. Designed for wide datasets where "
+        "``get_schema`` would return hundreds of variables; "
+        "search_schema lets you ask 'which columns are salary-related' "
+        "without pulling the full schema into context.\n\n"
+        "Matches against variable ``name`` and (when policy allows) "
+        "``label``. Results are capped at ``limit`` (default 50, hard "
+        "max 200); the response includes ``total_matches`` so you "
+        "know whether to refine the query.\n\n"
+        "The search depth is the lower of (a) the dataset's policy "
+        "ceiling and (b) names_types_labels (no need to load summary "
+        "stats just to filter names). Returned variables carry the "
+        "same fields ``get_schema`` would return at that depth.\n\n"
+        "Arguments:\n"
+        "  dataset: path to the dataset, relative to cwd.\n"
+        "  query: case-insensitive substring to match against names "
+        "and labels. Empty string is rejected — list-everything is "
+        "what get_schema is for.\n"
+        "  limit: optional cap on matches returned (default 50, max "
+        "200). 0 or unset uses the default."
+    ),
+    {"dataset": str, "query": str, "limit": int},
+)
+async def search_schema(args: dict[str, Any]) -> dict[str, Any]:
+    """Filter a dataset's schema by a case-insensitive name/label query.
+
+    Same path-sandbox and policy ceiling as ``get_schema``. Returns a
+    schema-shaped payload whose ``variables`` list is filtered to just
+    the matches, plus a ``total_matches`` count and the original
+    ``query`` so the response is self-describing.
+    """
+    dataset = args.get("dataset", "")
+    query = args.get("query", "")
+    requested_limit = args.get("limit", 0)
+
+    if not dataset:
+        return _as_mcp_text({
+            "status": "error",
+            "reason": "missing required argument: dataset",
+        })
+    if not isinstance(query, str) or not query.strip():
+        return _as_mcp_text({
+            "status": "error",
+            "reason": (
+                "missing required argument: query (case-insensitive "
+                "substring; use get_schema for the full variable list)"
+            ),
+        })
+
+    needle = query.strip().lower()
+
+    # Path sandbox: same logic as get_schema. A common branch would be
+    # nice to share but the divergence is small and inlining keeps
+    # each tool's error path self-contained.
+    try:
+        path = resolve_in_cwd(dataset)
+    except PathEscapeError as e:
+        return _as_mcp_text({
+            "status": "denied", "reason": str(e), "dataset": dataset,
+        })
+    if not path.exists():
+        return _as_mcp_text({
+            "status": "error",
+            "reason": f"file not found: {dataset!r}. Check the path is correct.",
+            "dataset": dataset,
+        })
+    if not path.is_file():
+        return _as_mcp_text({
+            "status": "error",
+            "reason": f"{dataset!r} is not a file.",
+            "dataset": dataset,
+        })
+
+    # Resolve the search depth: cap at names_types_labels (no point
+    # loading summary stats for a name/label search). Honor the
+    # researcher's policy ceiling — if they've restricted this
+    # dataset to names_only, the search runs at names_only and only
+    # name matches will land.
+    policy_doc = load_policy(get_cwd())
+    ceiling = get_max_depth(policy_doc, path.name)
+    search_target = "names_types_labels"
+    extract_depth = (
+        ceiling if not policy_module.depth_allowed(search_target, ceiling)
+        else search_target
+    )
+
+    try:
+        payload = schema.extract(path, extract_depth)
+    except ValueError as e:
+        return _as_mcp_text({
+            "status": "error",
+            "reason": str(e),
+            "dataset": dataset,
+            "depth": extract_depth,
+        })
+    except Exception as e:  # noqa: BLE001 — broad: lib-specific parse errors
+        return _as_mcp_text({
+            "status": "error",
+            "reason": f"failed to read {dataset!r}: {e.__class__.__name__}: {e}",
+            "dataset": dataset,
+        })
+
+    all_vars = payload.get("variables") or []
+    matches: list[dict[str, Any]] = []
+    for var in all_vars:
+        if not isinstance(var, dict):
+            continue
+        name = str(var.get("name", "")).lower()
+        label = str(var.get("label", "")).lower()
+        if needle in name or (label and needle in label):
+            matches.append(var)
+            continue
+        # Match against value_labels content too, when present —
+        # useful for "find columns whose levels include 'private'".
+        vls = var.get("value_labels")
+        if isinstance(vls, dict):
+            for k, v in vls.items():
+                if needle in str(k).lower() or needle in str(v).lower():
+                    matches.append(var)
+                    break
+
+    total_matches = len(matches)
+
+    # Resolve limit: 0 / negative / non-int → default. Above hard cap → cap.
+    if not isinstance(requested_limit, int) or requested_limit <= 0:
+        limit = _SEARCH_SCHEMA_DEFAULT_LIMIT
+    else:
+        limit = min(requested_limit, _SEARCH_SCHEMA_HARD_CAP)
+    truncated = total_matches > limit
+    matches = matches[:limit]
+
+    return _as_mcp_text({
+        "status": "ok",
+        "dataset": payload.get("dataset", dataset),
+        "file_type": payload.get("file_type"),
+        "depth": extract_depth,
+        "policy_max_depth": ceiling,
+        "observation_count": payload.get("observation_count"),
+        "variable_count": len(all_vars),
+        "query": query,
+        "total_matches": total_matches,
+        "limit": limit,
+        "truncated": truncated,
+        "variables": matches,
+    })
 
 
 # ---------------------------------------------------------------------------
@@ -809,6 +1011,26 @@ async def submit_script(args: dict[str, Any]) -> dict[str, Any]:
             "execution_failed_partial" if any_ok else "execution_failed"
         )
 
+    # Dedupe transformations that repeat across multi-result responses.
+    # A 24-spec script typically generates 24 identical SDC entries
+    # ("clamped coefficient SEs to 3 sig figs at N=…"); hoisting the
+    # shared set into one envelope-level field saves a lot of context
+    # while preserving audit transparency: per-result entries that
+    # actually differ (e.g. row-count messages with N specific to that
+    # spec) stay where they are. The store keeps the un-deduped lists
+    # per row regardless, so ``expand_result`` still surfaces every
+    # transformation a row received.
+    shared_transformations = _shared_transformations(results)
+    if shared_transformations:
+        shared_set = set(shared_transformations)
+        for entry in results:
+            if entry.get("status") != "ok":
+                continue
+            entry["transformations"] = [
+                t for t in entry.get("transformations", [])
+                if t not in shared_set
+            ]
+
     response: dict[str, Any] = {
         "status": overall_status,
         "script_run_id": script_run_id,
@@ -824,6 +1046,8 @@ async def submit_script(args: dict[str, Any]) -> dict[str, Any]:
         # invocation when launching the native app.
         "_language": language,
     }
+    if shared_transformations:
+        response["transformations_summary"] = shared_transformations
 
     if overall_status == "rejected_by_sanitizer":
         response["hint"] = (
@@ -962,31 +1186,48 @@ def _resolve_cross_session_cwd(session_path: str) -> Path | None:
 @tool(
     "expand_result",
     (
-        "Retrieve the full sanitized payload for a previously stored result "
-        "by its ID. Use this when you need to reference details of an "
-        "earlier result. E.g., coefficients from a prior regression; "
-        "without carrying the whole payload in context.\n\n"
+        "Retrieve a stored sanitized payload by ID. Use this when you "
+        "need details of an earlier result (e.g., coefficients from a "
+        "prior regression) without carrying the whole payload in "
+        "context.\n\n"
         "Arguments:\n"
         "  result_id: the ID returned by a previous submit_script call.\n"
+        "  view: optional payload trim. ``\"\"`` (default) or "
+        "``\"full\"`` returns the complete stored payload. "
+        "``\"coefficients\"`` is a regression-specific shorthand that "
+        "drops the variance-covariance matrix (``vcov``) and per-"
+        "predictor VIF table — useful when you only need the headline "
+        "coefficient pattern and not the collinearity diagnostics. "
+        "Other analysis types ignore the option.\n"
         "  session_path: optional path to ANOTHER session under "
         f"~/.nora-sessions/ to expand a result from. Requires the "
         f"{_CROSS_SESSION_ENV_VAR}=1 env var to be set; otherwise "
         f"returns 'cross-session disabled'."
     ),
-    {"result_id": str, "session_path": str},
+    {"result_id": str, "view": str, "session_path": str},
 )
 async def expand_result(args: dict[str, Any]) -> dict[str, Any]:
     """Return the full stored sanitized payload for a given ID.
 
     Defaults to the current session's store. With ``session_path``
     set and the cross-session env gate on, looks up in another
-    session's store under ``~/.nora-sessions/``.
+    session's store under ``~/.nora-sessions/``. The optional
+    ``view`` argument trims the payload to a regression-coefficient
+    slice when set to ``"coefficients"``.
     """
     result_id = args.get("result_id", "")
     if not result_id:
         return _as_mcp_text({
             "status": "error",
             "reason": "result_id argument is required",
+        })
+    view = (args.get("view") or "").strip().lower()
+    if view not in ("", "full", "coefficients"):
+        return _as_mcp_text({
+            "status": "error",
+            "reason": (
+                f"view must be '' / 'full' / 'coefficients', got {view!r}"
+            ),
         })
     raw_session_path = (args.get("session_path") or "").strip()
     if raw_session_path:
@@ -1018,16 +1259,36 @@ async def expand_result(args: dict[str, Any]) -> dict[str, Any]:
             "status": "not_found",
             "reason": f"no stored result with id {result_id!r}",
         })
+    payload = row.sanitized_payload
+    view_dropped: list[str] = []
+    if view == "coefficients" and isinstance(payload, dict):
+        # Trim the regression-collinearity diagnostics. ``vcov`` is the
+        # full variance-covariance matrix (NxN dict-of-dict, biggest
+        # field on a wide regression) and ``vif`` is the per-predictor
+        # VIF table. Coefficients, SEs, p-values, n, R², condition
+        # number, and degrees of freedom all stay; the model can
+        # re-fetch the trimmed fields with view="full" if needed.
+        if payload.get("type") == "linear_regression":
+            payload = dict(payload)
+            for key in ("vcov", "vif"):
+                if key in payload:
+                    payload.pop(key)
+                    view_dropped.append(key)
+
     response: dict[str, Any] = {
         "status": "ok",
         "result_id": row.id,
         "label": row.label,
         "analysis_type": row.analysis_type,
         "language": row.language,
-        "payload": row.sanitized_payload,
+        "payload": payload,
         "transformations": row.transformations,
         "created_at": row.created_at,
     }
+    if view:
+        response["view"] = view
+    if view_dropped:
+        response["view_dropped_fields"] = view_dropped
     if raw_session_path:
         response["session_path"] = str(target_cwd)
     # Surface the run_dir so the TUI can re-render the raw R/Stata
@@ -1613,6 +1874,7 @@ SERVER_NAME = "nora"
 
 REGISTERED_TOOLS: tuple[Any, ...] = (
     get_schema,
+    search_schema,
     request_data,
     submit_script,
     expand_result,
@@ -1626,6 +1888,7 @@ REGISTERED_TOOLS: tuple[Any, ...] = (
 # Keep this list in sync with the @tool-decorated functions above.
 ALLOWED_TOOL_NAMES: tuple[str, ...] = (
     f"mcp__{SERVER_NAME}__get_schema",
+    f"mcp__{SERVER_NAME}__search_schema",
     f"mcp__{SERVER_NAME}__request_data",
     f"mcp__{SERVER_NAME}__submit_script",
     f"mcp__{SERVER_NAME}__expand_result",
