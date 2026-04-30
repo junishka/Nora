@@ -64,7 +64,12 @@ def test_render_linear_regression_minimal() -> None:
     assert "R²" in md
 
 
-def test_render_linear_regression_without_p_values_drops_column() -> None:
+def test_render_linear_regression_keeps_p_value_column_when_missing() -> None:
+    """The p-value column is part of Nora's public reporting
+    contract; it stays present even when the payload didn't carry
+    ``p_values``. Missing cells render blank — the table SHAPE is
+    invariant so the model and UI don't have to special-case
+    column counts."""
     payload = {
         "type": "linear_regression",
         "n": 50,
@@ -75,7 +80,7 @@ def test_render_linear_regression_without_p_values_drops_column() -> None:
     }
     md = render_table(payload)
     assert md is not None
-    assert "p-value" not in md
+    assert "p-value" in md
     assert "Std. Error" in md
 
 

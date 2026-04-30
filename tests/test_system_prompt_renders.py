@@ -178,7 +178,24 @@ def test_no_bold_in_prose_rule_is_imperative(tmp_path: Path) -> None:
     rendered = build_system_prompt(tmp_path, "nora")
     assert "DO NOT bold words inside prose" in rendered
     assert "Bold sentence-leaders" in rendered
-    assert "Hard cap: four sentences" in rendered
+    # Post-table interpretation must be SHORT BULLETS, not a prose
+    # paragraph. The earlier "2-4 sentences of prose" wording made
+    # the model think paragraph flow was allowed; the bullets rule
+    # is the override.
+    assert "2 to 4 SHORT BULLETS" in rendered
+
+
+def test_composite_table_rule_pins_pvalue_in_brackets(tmp_path: Path) -> None:
+    """For wide composite spec × outcome matrices, cells must carry
+    the p-value in square brackets next to coefficient + SE.
+    Significance stars are the old convention and forbidden — explicit
+    p-values supersede them. Pin the format so the rule doesn't
+    silently revert."""
+    rendered = build_system_prompt(tmp_path, "nora")
+    assert "Composite cell-format table" in rendered
+    assert "[0.002]" in rendered  # the canonical example
+    assert "p-value in square brackets" in rendered
+    assert "Do NOT use significance stars" in rendered
 
 
 def test_inline_backtick_restraint_rule_present(tmp_path: Path) -> None:
