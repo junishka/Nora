@@ -85,19 +85,40 @@ def test_script_language_hint_per_extension(
     assert payload["ext"] == ext
 
 
-def test_script_oversize_is_truncated_with_marker(tmp_path: Path) -> None:
-    """Scripts larger than the 64 KB cap come back head-truncated.
-    The full ``size`` is reported so the model knows the file is
-    bigger than what it sees."""
+def test_script_oversize_is_head_and_tail_truncated_with_marker(
+    tmp_path: Path,
+) -> None:
+    """Scripts larger than the 96 KB cap come back head+tail-truncated:
+    the first half of the byte budget is the start of the file, the
+    second half is the end, and an elision marker names the gap.
+
+    The tail is the load-bearing property — it's where save calls
+    (``df.to_parquet``, ``write_dta``, ``saveRDS``) live, and the
+    answer to "did this script write the dataset out" is invisible
+    under head-only truncation.
+    """
     set_cwd(tmp_path)
-    big = "# header\n" + ("x = 1\n" * 20_000)  # ~120 KB
+    head_marker = "# HEAD_LINE_DO_NOT_DROP\n"
+    tail_marker = "df.to_parquet('out.parquet')\n# TAIL_LINE_DO_NOT_DROP\n"
+    middle = "x = 1\n" * 30_000  # ~180 KB
+    big = head_marker + middle + tail_marker
     (tmp_path / "big.py").write_text(big, encoding="utf-8")
+
     payload = _text_payload(_call("big.py"))
+
     assert payload["status"] == "ok"
     assert payload["truncated"] is True
     assert payload["size"] == len(big.encode("utf-8"))
-    # The returned content is at most 64 KB.
-    assert len(payload["content"].encode("utf-8")) <= 64 * 1024
+    content = payload["content"]
+    # Content is bounded by cap + the elision marker overhead.
+    assert len(content.encode("utf-8")) <= 96 * 1024 + 256
+    # Both ends survive — neither head-only nor tail-only truncation.
+    assert head_marker.strip() in content
+    assert "df.to_parquet" in content
+    assert tail_marker.strip().splitlines()[-1] in content
+    # The elision marker names the gap so the model knows truncation
+    # happened in the middle, not at the edges.
+    assert "elided" in content
 
 
 # ---------------------------------------------------------------------------

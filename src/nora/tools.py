@@ -1338,11 +1338,15 @@ _RECALL_IMAGE_MIMES: dict[str, str] = {
 # the existing sips-backed sidecar (same path the Files panel uses)
 # rather than shipping the original PDF — vision wants raster.
 _RECALL_RASTERIZE_EXTS: frozenset[str] = frozenset({".pdf", ".eps"})
-# Per-file caps. Scripts: same 64 KB cap the @-mention inline path
-# uses, so behavior is consistent regardless of how the model first
-# saw the file. Images: 5 MB matches the Anthropic vision ballpark
-# and the composer's drop limit.
-_RECALL_SCRIPT_MAX_BYTES = 64 * 1024
+# Per-file caps. Scripts: 96 KB. Most analysis scripts (Stata do-files,
+# Python pipelines, R scripts) fit whole. Over-cap files come back
+# head+tail-truncated (see below) so the imports up top AND the
+# save / write call at the bottom are both visible — the head-only
+# truncation we used to do hid the tail, which is exactly where the
+# question "did this script write the dataset out" gets answered.
+# Images: 5 MB matches the Anthropic vision ballpark and the
+# composer's drop limit.
+_RECALL_SCRIPT_MAX_BYTES = 96 * 1024
 _RECALL_IMAGE_MAX_BYTES = 5 * 1024 * 1024
 
 
@@ -1358,10 +1362,12 @@ _RECALL_IMAGE_MAX_BYTES = 5 * 1024 * 1024
         "tool fetches them again on demand so you don't have to ask "
         "the researcher to re-attach.\n\n"
         "Behaviour:\n"
-        "  - Scripts: full text returned inline (capped at 64 KB; "
-        "longer files are head-truncated with a marker). Use this to "
-        "recall a previously-attached do-file / .py before resubmitting "
-        "or proposing edits.\n"
+        "  - Scripts: full text returned inline (capped at 96 KB; "
+        "longer files come back head+tail-truncated with an explicit "
+        "elision marker, so imports up top AND save / write calls at "
+        "the bottom are both visible). Use this to recall a "
+        "previously-attached do-file / .py before resubmitting or "
+        "proposing edits.\n"
         "  - Images: returned as an MCP image content block so you can "
         "see the plot. PDF / EPS are rasterised first.\n\n"
         "Datasets (.csv / .dta / .parquet / .tsv / .jsonl / .ndjson / "
@@ -1442,7 +1448,27 @@ async def read_attached_file(args: dict[str, Any]) -> dict[str, Any]:
         original_size = len(blob)
         truncated = False
         if original_size > _RECALL_SCRIPT_MAX_BYTES:
-            blob = blob[:_RECALL_SCRIPT_MAX_BYTES]
+            # Head + tail truncation. Splits the byte budget evenly:
+            # the first half shows imports and setup; the second half
+            # shows the bottom of the script (save calls, main block).
+            # The middle is elided with a marker that names how many
+            # bytes were dropped, so the model knows the truncation
+            # exists and roughly how big the gap is.
+            #
+            # Why not head-only: scripts of interest almost always
+            # have load-bearing content at the END (df.to_parquet,
+            # save, write_dta, the main entry). Head-only truncation
+            # hides that and forces the model to either guess or ask
+            # the researcher.
+            half = _RECALL_SCRIPT_MAX_BYTES // 2
+            head = blob[:half]
+            tail = blob[-half:]
+            elided = original_size - len(head) - len(tail)
+            marker = (
+                f"\n\n# [... {elided} bytes elided by Nora's "
+                f"read_attached_file head+tail truncation ...]\n\n"
+            ).encode("utf-8")
+            blob = head + marker + tail
             truncated = True
         try:
             text = blob.decode("utf-8")
