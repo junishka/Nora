@@ -2167,16 +2167,20 @@ function stripPreamble(stdout, _language) {
 
 function renderScriptResultInline(body, evt) {
   /* Appends to the submit_script tool-body:
-   *   1. Native script output (post-preamble) — inline, visible.
-   *      This is the Stata regression table, the R summary, whatever
-   *      the script actually printed. The whole point of the card.
-   *   2. Action buttons row: [Open in R/Stata] [Show folder].
+   *   1. Nora-rendered canonical result tables, when the tool
+   *      result envelope carries them (one per ok-status entry's
+   *      ``markdown`` field). Product output, not model prose —
+   *      the same payload renders identically across recalls.
+   *   2. Native script output (post-preamble) — inline, visible.
+   *      The Stata regression table, the R summary, whatever the
+   *      script actually printed.
+   *   3. Action buttons row: [Open in R/Stata] [Show folder].
    *
-   * No sanitized-payload dropdown, no run_dir path, no stderr
-   * surfacing, no error banner. Errors are explained by Claude in
-   * the chat text that follows. Researchers who want the sanitized
-   * payload can ask Claude to show it.
+   * The model still interprets the result in chat; table SHAPE
+   * (column choice, p-value column, precision) is enforced here.
    */
+  renderCanonicalResultTables(body, evt);
+
   const nativeStdout = stripPreamble(evt.raw_stdout || '', evt.language).trim();
   if (nativeStdout) {
     const pre = document.createElement('pre');
@@ -2292,6 +2296,54 @@ function renderScriptResultInline(body, evt) {
 
     body.appendChild(actions);
   }
+}
+
+function _parseToolResultPayload(evt) {
+  if (!evt || !evt.text) return null;
+  try {
+    return JSON.parse(evt.text);
+  } catch (_) {
+    return null;
+  }
+}
+
+function renderCanonicalResultTables(body, evt) {
+  /* For every ok-status result entry whose ``markdown`` field is
+   * populated, append a ``.result-panel`` section to the tool-card
+   * body containing the rendered table. Same canonical source as
+   * ``expand_result(view="markdown")``; rendered in the UI here so
+   * the model doesn't have to decide whether to inline a table. */
+  const payload = _parseToolResultPayload(evt);
+  const results = payload && Array.isArray(payload.results)
+    ? payload.results
+    : [];
+  const rendered = results.filter((r) =>
+    r && r.status === 'ok' && typeof r.markdown === 'string' && r.markdown.trim()
+  );
+  if (rendered.length === 0) return;
+
+  const panel = document.createElement('div');
+  panel.className = 'result-panel';
+  rendered.forEach((r, idx) => {
+    const section = document.createElement('section');
+    section.className = 'result-markdown';
+
+    const header = document.createElement('div');
+    header.className = 'result-header';
+    header.textContent = r.label || r.result_id || ('Result ' + (idx + 1));
+    section.appendChild(header);
+
+    const tableWrap = document.createElement('div');
+    tableWrap.className = 'result-markdown-body';
+    if (window.NoraMarkdown) {
+      tableWrap.innerHTML = window.NoraMarkdown.render(r.markdown);
+    } else {
+      tableWrap.textContent = r.markdown;
+    }
+    section.appendChild(tableWrap);
+    panel.appendChild(section);
+  });
+  body.appendChild(panel);
 }
 
 async function openInNativeApp(path, btn, fallback, mode) {

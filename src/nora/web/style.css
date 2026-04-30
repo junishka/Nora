@@ -1793,6 +1793,78 @@ kbd {
   margin: 10px 0 4px;
 }
 
+/* Canonical Nora-rendered result tables, dropped into the tool-card
+ * body above the native script stdout. One ``.result-markdown``
+ * per ok-status result; the panel wraps them so a multi-result
+ * script reads as a vertical stack. Tables themselves are styled
+ * via the ``.message-body table`` rules so the look is consistent
+ * with markdown tables the model writes inline. */
+.tool-card .result-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  margin: 8px 0;
+}
+
+.tool-card .result-markdown {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--bg);
+  overflow: hidden;
+}
+
+.tool-card .result-header {
+  padding: 6px 14px;
+  font-size: 12px;
+  color: var(--text-dim);
+  font-weight: 500;
+  border-bottom: 1px solid var(--border);
+}
+
+.tool-card .result-markdown-body {
+  padding: 8px 14px 12px;
+  overflow-x: auto;
+  scrollbar-width: thin;
+  scrollbar-color: var(--border) transparent;
+}
+
+.tool-card .result-markdown-body::-webkit-scrollbar {
+  height: 6px;
+}
+
+.tool-card .result-markdown-body::-webkit-scrollbar-thumb {
+  background: var(--border);
+  border-radius: 3px;
+}
+
+.tool-card .result-markdown-body table {
+  border-collapse: collapse;
+  font-size: 13px;
+  font-variant-numeric: tabular-nums;
+}
+
+.tool-card .result-markdown-body th,
+.tool-card .result-markdown-body td {
+  padding: 4px 10px;
+  border-bottom: 1px solid var(--border);
+  text-align: right;
+  white-space: nowrap;
+}
+
+.tool-card .result-markdown-body th:first-child,
+.tool-card .result-markdown-body td:first-child {
+  text-align: left;
+}
+
+.tool-card .result-markdown-body th {
+  font-weight: 600;
+  color: var(--text-dim);
+}
+
+.tool-card .result-markdown-body tr:last-child td {
+  border-bottom: none;
+}
+
 .tool-card .tool-action {
   padding: 5px 12px;
   font-size: 12px;

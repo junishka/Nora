@@ -174,6 +174,43 @@ def test_compact_payload_passes_through_non_regression_types() -> None:
 
 
 @_skip_no_python
+def test_submit_script_inlines_canonical_markdown_per_result(
+    tmp_path: Path,
+) -> None:
+    """Every ok-status result entry carries a ``markdown`` field
+    rendered by ``nora.result_render.render_table``. The UI's
+    canonical-tables panel reads this same field. Regression pin
+    against the linter pass that twice removed this hookup
+    (handoff would claim the field exists, code wouldn't deliver)."""
+    set_cwd(tmp_path)
+    reset_store_for_tests()
+
+    code = (
+        "import nora\n"
+        "nora.from_summarize('a', n=20, mean=1.0, sd=0.1, missing_count=0)\n"
+        "nora.from_summarize('b', n=20, mean=2.0, sd=0.2, missing_count=0)\n"
+    )
+    response = asyncio.run(submit_script.handler({
+        "language": "Python",
+        "code": code,
+        "label": "markdown canary",
+        "source_dataset": "",
+    }))
+    body = _text_payload(response)
+    assert body["status"] == "ok"
+    assert len(body["results"]) == 2
+    for entry, var in zip(body["results"], ["a", "b"]):
+        assert entry["status"] == "ok"
+        md = entry.get("markdown")
+        assert isinstance(md, str) and md, (
+            f"expected canonical markdown for {var!r}, got {md!r}"
+        )
+        # Renderer's descriptive shape: Variable / n / Mean / SD / Missing.
+        assert "Variable" in md
+        assert var in md
+
+
+@_skip_no_python
 def test_submit_script_inlines_compact_payload_per_result(
     tmp_path: Path,
 ) -> None:

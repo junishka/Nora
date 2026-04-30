@@ -1034,7 +1034,20 @@ async def submit_script(args: dict[str, Any]) -> dict[str, Any]:
         )
         store_seconds += _time.monotonic() - i0
         any_ok = True
-        results.append({
+        # Render the canonical markdown table once per result and
+        # ship it inline. Same source as
+        # ``expand_result(view="markdown")``. The model can drop the
+        # table directly into a reply rather than re-deriving column
+        # choice and number precision per call; the UI can render it
+        # on the tool-result card without going through the model.
+        # Falls back to None when the renderer doesn't recognise the
+        # type — callers fall back to the JSON payload.
+        try:
+            from nora.result_render import render_table
+            md_table = render_table(sanitized.sanitized or {})
+        except Exception:  # noqa: BLE001 — formatting must never block storage
+            md_table = None
+        result_entry: dict[str, Any] = {
             "status": "ok",
             "result_id": row.id,
             "label": row.label,
@@ -1050,7 +1063,10 @@ async def submit_script(args: dict[str, Any]) -> dict[str, Any]:
             # ``expand_result(view="full")`` when collinearity
             # diagnostics matter.
             "payload": _compact_payload(sanitized.sanitized or {}),
-        })
+        }
+        if md_table is not None:
+            result_entry["markdown"] = md_table
+        results.append(result_entry)
 
     # Decide the envelope status. The decision keys on whether ANY
     # payload survived sanitization (``any_ok``), not just whether
@@ -1250,10 +1266,10 @@ _SCRIPT_FILE_LANGUAGES: dict[str, str] = {
     (
         "Run a script from a file the researcher attached, instead of "
         "re-emitting the bytes through your tool input. Use this when "
-        "the researcher @-mentioned or uploaded a .do / .R / .py file "
-        "and wants it run as-is. For a 12 KB do-file, this skips a "
-        "12 KB tool-input round-trip and the latency that comes with "
-        "it.\n\n"
+        "the researcher @-mentioned or uploaded a .do / .R / .Rmd / "
+        ".py file and wants it run as-is. For a 12 KB do-file, this "
+        "skips a 12 KB tool-input round-trip and the latency that "
+        "comes with it.\n\n"
         "Same downstream behavior as submit_script (sanitizer, "
         "row-count audit, store, multi-result, partial-success). The "
         "response shape is identical.\n\n"

@@ -495,7 +495,16 @@ def _render_tool_use(block: ToolUseBlock) -> None:
         header = f"⚙ submit_script  [{lang}]" + (f"  {label}" if label else "")
         console.print(Text(header, style="bold cyan"))
         if code:
-            lexer = "r" if lang.lower() == "r" else "stata"
+            # Three-way dispatch — earlier two-way "r else stata"
+            # rendered Python with the Stata lexer, mangling syntax
+            # highlighting on every Python script the model ran.
+            lang_lower = lang.lower()
+            if lang_lower == "r":
+                lexer = "r"
+            elif lang_lower == "python":
+                lexer = "python"
+            else:
+                lexer = "stata"
             console.print(Syntax(code, lexer, theme="ansi_dark", line_numbers=False))
     elif short == "submit_script_file":
         lang = inp.get("language", "")
