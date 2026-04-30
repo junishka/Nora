@@ -161,12 +161,19 @@ def test_python_script_without_runtime_call_is_rejected(
 ) -> None:
     """A script that runs cleanly but emits no result should be
     flagged so the model knows to add a nora.* call. The error
-    message should mention the runtime-library entry point so the
-    fix is obvious."""
+    message must mention the Python-specific entry point — earlier
+    versions had a binary R-vs-Stata branch that told a Python
+    script to call ``nora_result_regress in Stata``, which sent
+    the model down the wrong fix."""
     code = "x = 1 + 1\n"
     res = executor.run_script("Python", code, tmp_path, timeout_seconds=30)
     assert not res.ok
-    assert "result" in (res.error or "").lower()
+    err = (res.error or "").lower()
+    assert "result" in err
+    # Python guidance, not Stata or R guidance.
+    assert "python" in err
+    assert "stata" not in err
+    assert "in r" not in err  # would catch "in R" / " in r " stata fallback
 
 
 @_skip_no_python

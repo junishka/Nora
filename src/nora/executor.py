@@ -153,6 +153,19 @@ def _generate_run_token() -> str:
     return secrets.token_hex(32)
 
 
+def _runtime_call_hint(language: "Language") -> str:
+    """Per-language hint for "your script didn't emit a structured
+    result" errors. The fallback strings used to be a binary R-vs-
+    Stata branch from before Python was added; without this helper
+    a Python script that exits without a ``nora.*`` call gets told
+    to call ``nora_result_regress in Stata``, which is unhelpful."""
+    if language == "R":
+        return "nora$result(...) or nora$from_lm(...) in R"
+    if language == "Stata":
+        return "nora_result_regress in Stata"
+    return "nora.result(...) or nora.from_lm(...) in Python"
+
+
 def _validate_and_strip_token(
     payload: dict[str, Any], expected_token: str
 ) -> tuple[dict[str, Any] | None, str | None]:
@@ -508,8 +521,7 @@ def run_script(
         error = (
             "script finished but did not emit a structured result — no file "
             f"was written to {result_path.name}. Make sure your script "
-            f"calls the Nora runtime library "
-            f"({'nora$result(...) or nora$from_lm(...) in R' if language == 'R' else 'nora_result_regress in Stata'})."
+            f"calls the Nora runtime library ({_runtime_call_hint(language)})."
         )
     else:
         import json
@@ -547,8 +559,8 @@ def run_script(
             if error is None and not payloads:
                 error = (
                     "script finished but emitted an empty result file. "
-                    "Make sure your script calls the Nora runtime library "
-                    f"({'nora$result(...) or nora$from_lm(...) in R' if language == 'R' else 'nora_result_regress in Stata'})."
+                    "Make sure your script calls the Nora runtime "
+                    f"library ({_runtime_call_hint(language)})."
                 )
 
     ok = (exit_code == 0) and bool(payloads) and (error is None)

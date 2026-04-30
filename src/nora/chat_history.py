@@ -40,7 +40,11 @@ class ToolUse:
     label: str                      # one-line human summary
     call_id: str | None = None
     is_error: bool = False
-    result_id: str | None = None    # the sanitized-store id, if submit_script produced one
+    # All sanitized-store ids the call produced. submit_script under
+    # the multi-result wire format returns N ids per call (one per
+    # nora_result_* helper that emitted); expand_result and other
+    # single-result tools return one. Empty list when none.
+    result_ids: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -123,7 +127,11 @@ def read_turns(cwd: Path | None) -> list[Turn]:
     def _flush() -> None:
         if current_user is None:
             return
-        result_ids = [t.result_id for t in current_tools if t.result_id]
+        result_ids = [
+            rid
+            for t in current_tools
+            for rid in t.result_ids
+        ]
         turns.append(Turn(
             index=len(turns),
             user=current_user.get("text", "") or "",
@@ -178,7 +186,7 @@ def read_turns(cwd: Path | None) -> list[Turn]:
             use = tools_by_call_id.get(call_id) if call_id else None
             if use is not None:
                 use.is_error = bool(rec.get("is_error", False))
-                use.result_id = _extract_result_id(rec.get("text", ""))
+                use.result_ids = _extract_result_ids(rec.get("text", ""))
 
     _flush()
     return turns
@@ -296,8 +304,11 @@ def build_context_prefix(
             tag = f"tool: [{use.name}]"
             if use.label:
                 tag += f" {use.label}"
-            if use.result_id:
-                tag += f" → result_id={use.result_id}"
+            if use.result_ids:
+                if len(use.result_ids) == 1:
+                    tag += f" → result_id={use.result_ids[0]}"
+                else:
+                    tag += f" → result_ids={','.join(use.result_ids)}"
             if use.is_error:
                 tag += " (error)"
             parts.append(tag)
@@ -359,38 +370,47 @@ def build_context_prefix(
     return "\n\n".join(sections)
 
 
-def _extract_result_id(tool_result_text: str) -> str | None:
-    """Pull the first stored ``result_id`` from a tool_result payload.
+def _extract_result_ids(tool_result_text: str) -> list[str]:
+    """Pull every stored ``result_id`` from a tool_result payload.
 
     Two shapes occur in the wild:
     - ``expand_result`` and a few other tools carry ``result_id`` at
-      the top level.
-    - ``submit_script`` carries a ``results`` list, one entry per
-      helper call, each with its own ``result_id``. We return the
-      first as the canonical pointer for resume / recall summaries;
-      the full set is recoverable by re-reading the tool_result text.
+      the top level (single id).
+    - ``submit_script`` under the multi-result wire format carries a
+      ``results`` list, one entry per helper call, each with its own
+      ``result_id``. All are returned in emission order so resume /
+      recall context can point to every payload the call produced,
+      not just the first.
 
-    Returns None on shape mismatch. Best-effort, never raises.
+    Returns ``[]`` on shape mismatch. Best-effort, never raises.
     """
     if not tool_result_text or not isinstance(tool_result_text, str):
-        return None
+        return []
     s = tool_result_text.strip()
     if not s or s[0] != "{":
-        return None
+        return []
     try:
         payload = json.loads(s)
     except json.JSONDecodeError:
-        return None
+        return []
     if not isinstance(payload, dict):
-        return None
+        return []
+
+    out: list[str] = []
+    # Top-level id (expand_result, single-result tools, plus the
+    # error-diagnostic id submit_script attaches when status is
+    # "execution_failed"). Collected first so the diag id leads in
+    # bare-failure cases.
     rid = payload.get("result_id") or payload.get("id")
     if isinstance(rid, str) and rid:
-        return rid
+        out.append(rid)
+
     results = payload.get("results")
-    if isinstance(results, list) and results:
-        first = results[0]
-        if isinstance(first, dict):
-            rid = first.get("result_id")
-            if isinstance(rid, str) and rid:
-                return rid
-    return None
+    if isinstance(results, list):
+        for entry in results:
+            if not isinstance(entry, dict):
+                continue
+            rid = entry.get("result_id")
+            if isinstance(rid, str) and rid and rid not in out:
+                out.append(rid)
+    return out

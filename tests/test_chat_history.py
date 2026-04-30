@@ -133,9 +133,37 @@ def test_tool_call_and_result_paired_by_call_id(tmp_path: Path):
     assert len(t.tools) == 1
     assert t.tools[0].name == "submit_script"
     assert t.tools[0].label == "R: OLS fit"
-    assert t.tools[0].result_id == "r-42"
+    assert t.tools[0].result_ids == ["r-42"]
     assert t.tools[0].is_error is False
     assert t.result_ids == ["r-42"]
+
+
+def test_multi_result_submit_script_keeps_all_ids(tmp_path: Path):
+    """submit_script under the multi-result wire format returns N ids
+    in ``results`` per call. Resume / recall summaries must point to
+    every id, not just the first — losing N-1 ids per multi-helper
+    script breaks traceability for looped analyses."""
+    cwd = _write_jsonl(tmp_path, [
+        {"type": "user_message", "text": "run the spec sweep"},
+        {"type": "tool_call", "name": "mcp__nora__submit_script",
+         "call_id": "abc", "input": {"language": "R", "label": "spec sweep"}},
+        {"type": "tool_result", "call_id": "abc",
+         "text": (
+             '{"status": "ok", "script_run_id": "R-deadbeef", '
+             '"results": ['
+             '{"result_id": "M1", "status": "ok"}, '
+             '{"result_id": "M2", "status": "ok"}, '
+             '{"result_id": "M3", "status": "ok"}'
+             ']}'
+         ),
+         "is_error": False},
+        {"type": "assistant_text", "text": "Done."},
+    ])
+    turns = read_turns(cwd)
+    assert len(turns) == 1
+    t = turns[0]
+    assert t.tools[0].result_ids == ["M1", "M2", "M3"]
+    assert t.result_ids == ["M1", "M2", "M3"]
 
 
 def test_tool_call_error_result_flagged(tmp_path: Path):
@@ -148,7 +176,7 @@ def test_tool_call_error_result_flagged(tmp_path: Path):
     ])
     turns = read_turns(cwd)
     assert turns[0].tools[0].is_error is True
-    assert turns[0].tools[0].result_id is None  # no JSON → no id
+    assert turns[0].tools[0].result_ids == []  # no JSON → no ids
 
 
 def test_orphan_events_before_first_user_message_are_dropped(tmp_path: Path):
