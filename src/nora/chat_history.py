@@ -360,12 +360,17 @@ def build_context_prefix(
 
 
 def _extract_result_id(tool_result_text: str) -> str | None:
-    """Pull the stored ``result_id`` from a tool_result payload.
+    """Pull the first stored ``result_id`` from a tool_result payload.
 
-    submit_script and expand_result return JSON-encoded payloads whose
-    top level carries the id; other tools don't have one. We parse
-    best-effort and return None on any shape mismatch — the recall /
-    resume paths can live without result IDs, they're just a bonus.
+    Two shapes occur in the wild:
+    - ``expand_result`` and a few other tools carry ``result_id`` at
+      the top level.
+    - ``submit_script`` carries a ``results`` list, one entry per
+      helper call, each with its own ``result_id``. We return the
+      first as the canonical pointer for resume / recall summaries;
+      the full set is recoverable by re-reading the tool_result text.
+
+    Returns None on shape mismatch. Best-effort, never raises.
     """
     if not tool_result_text or not isinstance(tool_result_text, str):
         return None
@@ -381,4 +386,11 @@ def _extract_result_id(tool_result_text: str) -> str | None:
     rid = payload.get("result_id") or payload.get("id")
     if isinstance(rid, str) and rid:
         return rid
+    results = payload.get("results")
+    if isinstance(results, list) and results:
+        first = results[0]
+        if isinstance(first, dict):
+            rid = first.get("result_id")
+            if isinstance(rid, str) and rid:
+                return rid
     return None

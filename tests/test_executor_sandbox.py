@@ -99,9 +99,9 @@ nora$from_lm(lm(y ~ x, data = df), label = "ok")
 '''
     r = run_script("R", code, tmp_path)
     assert r.ok, f"script failed: error={r.error}\nstderr={r.raw_stderr}"
-    assert r.result_payload is not None
-    assert r.result_payload["type"] == "linear_regression"
-    assert r.result_payload["n"] == 12
+    assert r.result_payloads
+    assert r.result_payloads[0]["type"] == "linear_regression"
+    assert r.result_payloads[0]["n"] == 12
 
 
 # ---------------------------------------------------------------------------
@@ -145,7 +145,7 @@ def test_sandbox_blocks_read_outside_allowlist(tmp_path: Path, tiny_csv: Path):
     )
     r = run_script("R", code, tmp_path)
     assert r.ok, f"executor failure: {r.error}"
-    label = r.result_payload["label"]
+    label = r.result_payloads[0]["label"]
     assert "DENIED" in label, (
         f"sandbox failed — out-of-allowlist read was permitted: {label!r}"
     )
@@ -175,7 +175,7 @@ def test_sandbox_blocks_home_dotfile_reads(tmp_path: Path, tiny_csv: Path):
     )
     r = run_script("R", code, tmp_path)
     assert r.ok
-    label = r.result_payload["label"]
+    label = r.result_payloads[0]["label"]
     assert "DENIED" in label, f"home dotfile read was NOT denied: label={label!r}"
 
 

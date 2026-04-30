@@ -158,7 +158,7 @@ program define nora_ttest
     }
 
     tempname fh
-    file open `fh' using `"`path'"', write text replace
+    file open `fh' using `"`path'"', write text append
 
     file write `fh' `"{"type":"t_test""'
     file write `fh' `","_token":"`_nora_token'""'
@@ -201,7 +201,7 @@ program define nora_ttest
         file write `fh' `","p_value":`_x'"'
     }
 
-    file write `fh' "}"
+    file write `fh' "}" _newline
     file close `fh'
 
     display as text "nora_ttest: wrote result to " as result "`path'"

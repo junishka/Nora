@@ -182,7 +182,7 @@ def test_bypass_without_token_is_rejected(tmp_path: Path):
         or "authenticity" in err
         or "missing" in err
     ), f"expected token-related error, got: {r.error!r}"
-    assert r.result_payload is None, (
+    assert not r.result_payloads, (
         "unauthenticated payload must not be returned to the caller"
     )
 
@@ -199,7 +199,7 @@ def test_legitimate_script_with_token_succeeds(tmp_path: Path):
     )
     r = run_script("R", code, tmp_path)
     assert r.ok, f"legitimate script failed: {r.error}"
-    assert r.result_payload is not None
-    assert r.result_payload["type"] == "linear_regression"
+    assert r.result_payloads
+    assert r.result_payloads[0]["type"] == "linear_regression"
     # The token must be stripped from what the caller receives.
-    assert RESULT_TOKEN_FIELD not in r.result_payload
+    assert RESULT_TOKEN_FIELD not in r.result_payloads[0]

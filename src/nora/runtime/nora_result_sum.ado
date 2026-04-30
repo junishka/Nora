@@ -92,7 +92,7 @@ program define nora_result_sum
     }
 
     tempname fh
-    file open `fh' using `"`path'"', write text replace
+    file open `fh' using `"`path'"', write text append
 
     file write `fh' `"{"type":"descriptive""'
     file write `fh' `","_token":"`_nora_token'""'
@@ -113,7 +113,7 @@ program define nora_result_sum
 
     file write `fh' `","missing_count":`missing'"'
 
-    file write `fh' "}"
+    file write `fh' "}" _newline
     file close `fh'
 
     display as text "nora_result_sum: wrote result to " as result "`path'"

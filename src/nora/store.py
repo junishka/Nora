@@ -53,6 +53,11 @@ class StoredResult:
     transformations: list[str]           # what the sanitizer did
     raw_log_path: str | None             # filesystem pointer, not content
     created_at: str                      # ISO 8601 UTC
+    # Groups results that came from the same submit_script call. NULL on
+    # rows from before the multi-result wire format (one row per call).
+    # Today's submit_script generates one script_run_id per invocation
+    # and tags every row produced by that invocation with it.
+    script_run_id: str | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -77,7 +82,8 @@ class ResultStore:
         script_code       TEXT NOT NULL,
         transformations   TEXT NOT NULL,  -- JSON array
         raw_log_path      TEXT,
-        created_at        TEXT NOT NULL
+        created_at        TEXT NOT NULL,
+        script_run_id     TEXT             -- groups multi-result submit_script calls; NULL on legacy rows
     );
     CREATE INDEX IF NOT EXISTS idx_results_created_at ON results (created_at);
     """
@@ -103,6 +109,32 @@ class ResultStore:
         )
         self._conn.row_factory = sqlite3.Row
         self._conn.executescript(self.SCHEMA)
+        self._migrate()
+
+    def _migrate(self) -> None:
+        """Apply additive migrations to an existing DB.
+
+        SQLite's ``CREATE TABLE IF NOT EXISTS`` skips the body when the
+        table is already there, so a fresh column declared in SCHEMA
+        won't reach a pre-existing DB on its own. Each migration step
+        is idempotent: check ``PRAGMA table_info`` before issuing the
+        ``ALTER``, so re-running on an already-migrated DB is a no-op.
+        Indexes that depend on migrated columns are created here too,
+        not in SCHEMA: the SCHEMA's CREATE INDEX runs before _migrate
+        on legacy DBs and would fail referencing a column that doesn't
+        exist yet.
+        """
+        cols = {row["name"] for row in self._conn.execute(
+            "PRAGMA table_info(results)"
+        ).fetchall()}
+        if "script_run_id" not in cols:
+            self._conn.execute(
+                "ALTER TABLE results ADD COLUMN script_run_id TEXT"
+            )
+        self._conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_results_script_run_id "
+            "ON results (script_run_id)"
+        )
 
     def close(self) -> None:
         self._conn.close()
@@ -119,6 +151,7 @@ class ResultStore:
         script_code: str,
         transformations: list[str],
         raw_log_path: Path | None = None,
+        script_run_id: str | None = None,
     ) -> StoredResult:
         """Add a new result; return the hydrated row (including assigned ID)."""
         result_id = self._next_id()
@@ -133,13 +166,14 @@ class ResultStore:
             transformations=list(transformations),
             raw_log_path=str(raw_log_path) if raw_log_path else None,
             created_at=now,
+            script_run_id=script_run_id,
         )
         with self._txn():
             self._conn.execute(
                 "INSERT INTO results (id, label, analysis_type, "
                 "sanitized_payload, language, script_code, transformations, "
-                "raw_log_path, created_at) VALUES "
-                "(?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "raw_log_path, created_at, script_run_id) VALUES "
+                "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     row.id,
                     row.label,
@@ -150,6 +184,7 @@ class ResultStore:
                     json.dumps(row.transformations, ensure_ascii=False),
                     row.raw_log_path,
                     row.created_at,
+                    row.script_run_id,
                 ),
             )
         return row
@@ -171,6 +206,17 @@ class ResultStore:
         )
         return [self._hydrate(r) for r in cur.fetchall()]
 
+    def list_by_script_run(self, script_run_id: str) -> list[StoredResult]:
+        """All rows produced by one ``submit_script`` invocation, in
+        emission order. Returns ``[]`` for unknown ids or for legacy
+        rows where the field was never set."""
+        cur = self._conn.execute(
+            "SELECT * FROM results WHERE script_run_id = ? "
+            "ORDER BY created_at ASC, id ASC",
+            (script_run_id,),
+        )
+        return [self._hydrate(r) for r in cur.fetchall()]
+
     def count(self) -> int:
         cur = self._conn.execute("SELECT COUNT(*) AS c FROM results")
         return int(cur.fetchone()["c"])
@@ -188,6 +234,10 @@ class ResultStore:
         return f"M{self.count() + 1}"
 
     def _hydrate(self, row: sqlite3.Row) -> StoredResult:
+        keys = row.keys() if hasattr(row, "keys") else None
+        run_id = row["script_run_id"] if (
+            keys is None or "script_run_id" in keys
+        ) else None
         return StoredResult(
             id=row["id"],
             label=row["label"],
@@ -198,6 +248,7 @@ class ResultStore:
             transformations=json.loads(row["transformations"]),
             raw_log_path=row["raw_log_path"],
             created_at=row["created_at"],
+            script_run_id=run_id,
         )
 
     # Minimal transaction helper — we don't have complex write patterns yet.

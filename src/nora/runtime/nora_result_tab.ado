@@ -75,7 +75,7 @@ program define _nora_tab_1way
     * After contract: one row per distinct non-missing value, `_freq' the count.
 
     tempname fh
-    file open `fh' using `"`path'"', write text replace
+    file open `fh' using `"`path'"', write text append
 
     file write `fh' `"{"type":"frequency_table""'
     file write `fh' `","_token":"`_nora_token'""'
@@ -103,7 +103,7 @@ program define _nora_tab_1way
         file write `fh' `""`lvl'":`cnt'"'
         local first = 0
     }
-    file write `fh' "}}"
+    file write `fh' "}}" _newline
     file close `fh'
 
     restore
@@ -156,7 +156,7 @@ program define _nora_tab_2way
     sort `row_var' `col_var'
 
     tempname fh
-    file open `fh' using `"`path'"', write text replace
+    file open `fh' using `"`path'"', write text append
 
     file write `fh' `"{"type":"crosstab""'
     file write `fh' `","_token":"`_nora_token'""'
@@ -209,7 +209,7 @@ program define _nora_tab_2way
         file write `fh' "}"
     }
     * Close counts object and outer object.
-    file write `fh' "}}"
+    file write `fh' "}}" _newline
     file close `fh'
 
     restore

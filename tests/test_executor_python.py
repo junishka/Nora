@@ -129,15 +129,15 @@ def test_python_descriptive_round_trip(tmp_path: Path) -> None:
     res = executor.run_script("Python", code, tmp_path, timeout_seconds=30)
     assert res.ok, f"expected success, got error={res.error!r}"
     assert res.exit_code == 0
-    assert res.result_payload is not None
-    assert res.result_payload["type"] == "descriptive"
-    assert res.result_payload["variable"] == "outcome"
-    assert res.result_payload["n"] == 42
-    assert res.result_payload["mean"] == pytest.approx(3.14)
-    assert res.result_payload["sd"] == pytest.approx(0.5)
-    assert res.result_payload["missing_count"] == 2
+    assert res.result_payloads
+    assert res.result_payloads[0]["type"] == "descriptive"
+    assert res.result_payloads[0]["variable"] == "outcome"
+    assert res.result_payloads[0]["n"] == 42
+    assert res.result_payloads[0]["mean"] == pytest.approx(3.14)
+    assert res.result_payloads[0]["sd"] == pytest.approx(0.5)
+    assert res.result_payloads[0]["missing_count"] == 2
     # Token must be stripped before the payload reaches us.
-    assert "_token" not in res.result_payload
+    assert "_token" not in res.result_payloads[0]
 
 
 @_skip_no_python
@@ -152,7 +152,7 @@ def test_python_generic_result_round_trip(tmp_path: Path) -> None:
     )
     res = executor.run_script("Python", code, tmp_path, timeout_seconds=30)
     assert res.ok, res.error
-    assert res.result_payload["variable"] == "manual"
+    assert res.result_payloads[0]["variable"] == "manual"
 
 
 @_skip_no_python
@@ -167,6 +167,26 @@ def test_python_script_without_runtime_call_is_rejected(
     res = executor.run_script("Python", code, tmp_path, timeout_seconds=30)
     assert not res.ok
     assert "result" in (res.error or "").lower()
+
+
+@_skip_no_python
+def test_python_multiple_helpers_one_script(tmp_path: Path) -> None:
+    """A script can call nora.* helpers more than once. Each call
+    appends a JSONL line and the executor returns the full list in
+    emission order. Verifies the multi-result wire format end-to-end."""
+    code = (
+        "import nora\n"
+        "nora.from_summarize('a', n=10, mean=1.0, sd=0.1, missing_count=0)\n"
+        "nora.from_summarize('b', n=20, mean=2.0, sd=0.2, missing_count=0)\n"
+        "nora.from_summarize('c', n=30, mean=3.0, sd=0.3, missing_count=0)\n"
+    )
+    res = executor.run_script("Python", code, tmp_path, timeout_seconds=30)
+    assert res.ok, res.error
+    assert len(res.result_payloads) == 3
+    assert [p["variable"] for p in res.result_payloads] == ["a", "b", "c"]
+    assert [p["n"] for p in res.result_payloads] == [10, 20, 30]
+    # Tokens stripped from every line.
+    assert all("_token" not in p for p in res.result_payloads)
 
 
 @_skip_no_python
@@ -220,6 +240,6 @@ def test_python_subprocess_env_has_no_anthropic_key(tmp_path: Path) -> None:
     # The "transformations" field on the payload is where the script
     # tried to surface the leaked secret. Should be the missing-marker,
     # never the sentinel.
-    smuggled = res.result_payload.get("transformations") or []
+    smuggled = res.result_payloads[0].get("transformations") or []
     assert sentinel not in (smuggled[0] if smuggled else "")
     assert "__MISSING__" in (smuggled[0] if smuggled else "")

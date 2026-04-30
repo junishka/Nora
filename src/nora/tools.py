@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import json
 import os
+import secrets
 from pathlib import Path
 from typing import Any
 
@@ -582,18 +583,24 @@ async def request_data(args: dict[str, Any]) -> dict[str, Any]:
     (
         "Run an R, Stata, or Python analysis script against the researcher's "
         "data. The script must emit structured results via the nora runtime "
-        "library (nora$result(...) in R, nora_result_* in Stata, "
-        "nora.result(...) / nora.from_lm(...) in Python). Raw stdout/stderr "
+        "library (nora$result(...) / nora$from_* in R, nora_result_* in "
+        "Stata, nora.result(...) / nora.from_* in Python). Raw stdout/stderr "
         "is shown to the researcher in their TUI but is not returned to you "
-        ", you receive only the sanitized structured payload. Returns a "
-        "result ID and a one-line label.\n\n"
+        "; you receive only sanitized structured payloads.\n\n"
+        "A script can call helpers more than once; each call appends a "
+        "payload that comes back to you. The response carries a ``results`` "
+        "list (one entry per helper call, in emission order, each with its "
+        "own ``result_id``, ``label``, ``analysis_type``, and ``summary``) "
+        "plus a shared ``script_run_id`` so the group can be retrieved "
+        "together for audit.\n\n"
         "Arguments:\n"
         "  language: 'R', 'Stata', or 'Python'.\n"
         "  code: the full script source as a single string.\n"
         "  label: short description of what the script is doing (e.g., "
-        "'OLS of outcome on predictors').\n"
+        "'OLS of outcome on predictors'). Used as the fallback row label "
+        "for any helper call that didn't pass its own label(\"...\").\n"
         "  source_dataset: path (relative to cwd) of the dataset the "
-        "script reads. When set, Nora compares the analysis's "
+        "script reads. When set, Nora compares each analysis's "
         "effective N to the dataset's row count and flags silent "
         "filtering (NA-drops, subset conditions, listwise deletion) "
         "in the transformations log. PASS THIS whenever the script "
@@ -732,13 +739,13 @@ async def submit_script(args: dict[str, Any]) -> dict[str, Any]:
         })
 
     # --- Sanitizer ---------------------------------------------------------
-    raw_payload = exec_result.result_payload or {}
-    # Per-variable opt-in: when source_dataset names a real file in
-    # this session's policy, surface the dataset's
-    # ``non_disclosive_variables`` list to the descriptive sanitizer
-    # so min_value / max_value pass through for variables the
-    # researcher has explicitly judged safe to expose. Default empty
-    # ⇒ behaves exactly as before.
+    # The executor returns one or more raw payloads (JSONL, one per
+    # nora_result_* helper call inside the script). Sanitize each
+    # independently and store one row per payload, all tagged with a
+    # shared script_run_id so the researcher can fetch them as a group.
+    #
+    # SDC config depends only on source_dataset (a per-call argument),
+    # so resolve it once outside the loop.
     sdc_cfg = sanitizer.DEFAULT_CONFIG
     if source_dataset:
         try:
@@ -754,85 +761,105 @@ async def submit_script(args: dict[str, Any]) -> dict[str, Any]:
                 sanitizer.DEFAULT_CONFIG,
                 non_disclosive_variables=non_disclosive,
             )
-    sanitized = sanitize(raw_payload, sdc_cfg)
-    if not sanitized.ok:
-        # The script produced a result, but SDC rules / schema mismatch
-        # bounced it. Still store it so the researcher can audit.
-        store = get_store(cwd)
-        diag_row = store.insert(
-            label=f"[rejected] {label}",
-            analysis_type=sanitized.analysis_type or "unknown",
-            sanitized_payload={
-                "type": "sanitizer_rejection",
-                "reason": sanitized.rejection_reason,
+
+    # One id per submit_script call; every row produced by this call
+    # is tagged with it so an audit can pull them together.
+    script_run_id = "R-" + secrets.token_hex(4)
+
+    store = get_store(cwd)
+    results: list[dict[str, Any]] = []
+    any_ok = False
+
+    for raw_payload in exec_result.result_payloads:
+        # Prefer the per-helper label (each nora_result_* takes its own
+        # label("...") argument and embeds it in the payload). Fall
+        # back to the script-level label when a helper didn't pass one.
+        helper_label = (
+            raw_payload.get("label")
+            if isinstance(raw_payload, dict) else None
+        ) or label
+
+        sanitized = sanitize(raw_payload, sdc_cfg)
+        if not sanitized.ok:
+            # SDC bounced this payload. Still store it so the researcher
+            # can audit, and surface the rejection inline so the model
+            # sees which one failed without losing the others.
+            diag_row = store.insert(
+                label=f"[rejected] {helper_label}",
+                analysis_type=sanitized.analysis_type or "unknown",
+                sanitized_payload={
+                    "type": "sanitizer_rejection",
+                    "reason": sanitized.rejection_reason,
+                    "analysis_type": sanitized.analysis_type,
+                },
+                language=language,
+                script_code=code,
+                transformations=[],
+                raw_log_path=exec_result.run_dir,
+                script_run_id=script_run_id,
+            )
+            results.append({
+                "status": "rejected_by_sanitizer",
+                "result_id": diag_row.id,
+                "label": diag_row.label,
                 "analysis_type": sanitized.analysis_type,
-            },
+                "reason": sanitized.rejection_reason,
+            })
+            continue
+
+        # Row-count check runs AFTER sanitize (operates on sanitized
+        # structure; row counts themselves aren't disclosive). Same
+        # source_dataset for every payload in this call.
+        row_count_msg = _check_row_count(
+            sanitized.sanitized or {}, source_dataset or None
+        )
+        transformations = list(sanitized.transformations)
+        if row_count_msg:
+            transformations.append(row_count_msg)
+
+        row = store.insert(
+            label=helper_label,
+            analysis_type=sanitized.analysis_type or "unknown",
+            sanitized_payload=sanitized.sanitized or {},
             language=language,
             script_code=code,
-            transformations=[],
+            transformations=transformations,
             raw_log_path=exec_result.run_dir,
+            script_run_id=script_run_id,
         )
-        return _as_mcp_text({
-            "status": "rejected_by_sanitizer",
-            "reason": sanitized.rejection_reason,
-            "analysis_type": sanitized.analysis_type,
-            "result_id": diag_row.id,
-            "hint": (
-                "The script ran successfully but its output violates a "
-                "disclosure-control rule (e.g., n too small, forbidden "
-                "field, type mismatch). Adjust the analysis (e.g., "
-                "larger sample) and resubmit."
-            ),
-            "_run_dir": str(exec_result.run_dir),
-            "_language": language,
+        any_ok = True
+        results.append({
+            "status": "ok",
+            "result_id": row.id,
+            "label": row.label,
+            "analysis_type": row.analysis_type,
+            "summary": _summarize(sanitized.sanitized or {}),
+            "transformations": transformations,
         })
 
-    # --- Row-count change check --------------------------------------------
-    # Compare the analysis's effective N to the source dataset's N. A
-    # shortfall means rows were silently excluded — typically NA-drop
-    # from `lm()` / `ttest`, or a filter / subset / `if` in the script.
-    # Runs AFTER sanitization because the check operates on the
-    # sanitized payload structure; the row-counts themselves aren't
-    # disclosive.
-    row_count_msg = _check_row_count(
-        sanitized.sanitized or {}, source_dataset or None
-    )
-    transformations = list(sanitized.transformations)
-    if row_count_msg:
-        transformations.append(row_count_msg)
-
-    # --- Store -------------------------------------------------------------
-    store = get_store(cwd)
-    row = store.insert(
-        label=label,
-        analysis_type=sanitized.analysis_type or "unknown",
-        sanitized_payload=sanitized.sanitized or {},
-        language=language,
-        script_code=code,
-        transformations=transformations,
-        raw_log_path=exec_result.run_dir,
-    )
-
+    overall_status = "ok" if any_ok else "rejected_by_sanitizer"
     response: dict[str, Any] = {
-        "status": "ok",
-        "result_id": row.id,
-        "label": row.label,
-        "analysis_type": row.analysis_type,
-        "summary": _summarize(sanitized.sanitized or {}),
-        "transformations": transformations,
+        "status": overall_status,
+        "script_run_id": script_run_id,
+        "results": results,
         "duration_seconds": round(exec_result.duration_seconds, 3),
         # Path for the TUI to read raw R/Stata output from. Claude
         # seeing the path is not a leak (directory names are
         # structural, not data), but Claude should not try to read
-        # files from it — there are no tools for that. The researcher
-        # UI uses this to render the raw log alongside the sanitized
-        # result.
+        # files from it — there are no tools for that.
         "_run_dir": str(exec_result.run_dir),
         # Language the script was written in. The web UI uses this
         # to label the "Open in R / Stata" button and pick the right
         # invocation when launching the native app.
         "_language": language,
     }
+    if overall_status == "rejected_by_sanitizer":
+        response["hint"] = (
+            "Every payload this script emitted was rejected by the "
+            "disclosure-control layer. Inspect each result's reason "
+            "(e.g., n too small, forbidden field, type mismatch) and "
+            "resubmit a corrected analysis."
+        )
     plot_summary = _summarize_plot_helpers(exec_result.run_dir)
     if plot_summary is not None:
         response["plots"] = plot_summary

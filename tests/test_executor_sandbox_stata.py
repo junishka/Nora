@@ -77,9 +77,9 @@ nora_result_regress, label("stata-happy-path")
 '''
     r = run_script("Stata", code, tmp_path)
     assert r.ok, f"Stata script failed: error={r.error}\nstdout tail={r.raw_stdout[-500:]}"
-    assert r.result_payload is not None
-    assert r.result_payload["type"] == "linear_regression"
-    assert r.result_payload["n"] == 74
+    assert r.result_payloads
+    assert r.result_payloads[0]["type"] == "linear_regression"
+    assert r.result_payloads[0]["n"] == 74
 
 
 @requires_sandbox_apply
@@ -107,7 +107,7 @@ nora_result_regress, label("stata-cwd-read")
 '''
     r = run_script("Stata", code, tmp_path)
     assert r.ok, f"Stata script failed: error={r.error}\nstdout tail={r.raw_stdout[-500:]}"
-    assert r.result_payload["n"] == 12
+    assert r.result_payloads[0]["n"] == 12
 
 
 # ---------------------------------------------------------------------------
@@ -154,7 +154,7 @@ def test_stata_sandbox_blocks_read_outside_allowlist(tmp_path: Path):
 
     r = run_script("Stata", _probe_read_do(target), tmp_path)
     assert r.ok, f"executor failure: {r.error}"
-    label = r.result_payload["label"]
+    label = r.result_payloads[0]["label"]
     assert "DENIED" in label, (
         f"sandbox failed — Stata read out-of-allowlist path: {label!r}"
     )
@@ -172,7 +172,7 @@ def test_stata_sandbox_blocks_home_dotfile_reads(tmp_path: Path):
 
     r = run_script("Stata", _probe_read_do(str(target)), tmp_path)
     assert r.ok
-    label = r.result_payload["label"]
+    label = r.result_payloads[0]["label"]
     assert "DENIED" in label, (
         f"home dotfile read was NOT denied in Stata: {label!r}"
     )

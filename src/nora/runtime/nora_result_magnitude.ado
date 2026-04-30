@@ -90,7 +90,7 @@ program define nora_result_magnitude
     }
 
     tempname fh
-    file open `fh' using `"`path'"', write text replace
+    file open `fh' using `"`path'"', write text append
 
     file write `fh' `"{"type":"magnitude_table""'
     file write `fh' `","_token":"`_nora_token'""'
@@ -125,7 +125,7 @@ program define nora_result_magnitude
         file write `fh' `""`grp_esc'":{"value":`v_str',"n":`n_int',"max_share":`ms_str'}"'
         local first = 0
     }
-    file write `fh' "}}"
+    file write `fh' "}}" _newline
     file close `fh'
 
     restore

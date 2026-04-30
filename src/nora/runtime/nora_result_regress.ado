@@ -67,7 +67,7 @@ program define nora_result_regress
     local k = colsof(`bmat')
 
     tempname fh
-    file open `fh' using `"`path'"', write text replace
+    file open `fh' using `"`path'"', write text append
 
     file write `fh' `"{"type":"linear_regression""'
     file write `fh' `","_token":"`_nora_token'""'
@@ -142,7 +142,7 @@ program define nora_result_regress
         file write `fh' `","degrees_of_freedom":`=e(df_r)'"'
     }
 
-    file write `fh' "}"
+    file write `fh' "}" _newline
     file close `fh'
 
     display as text "nora_result_regress: wrote result to " as result "`path'"

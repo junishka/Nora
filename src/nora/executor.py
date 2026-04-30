@@ -221,14 +221,19 @@ def clear_environment_cache() -> None:
 class ExecutionResult:
     """Outcome of running one script.
 
-    - ``ok`` is ``True`` iff the subprocess exited 0 AND a valid JSON
-      payload was written to the result file. Any deviation (timeout,
-      non-zero exit, missing result, invalid JSON) flips ``ok=False``
-      and fills ``error``.
+    - ``ok`` is ``True`` iff the subprocess exited 0 AND at least one
+      valid JSON payload was written to the result file. Any deviation
+      (timeout, non-zero exit, missing result, invalid JSON, token
+      mismatch) flips ``ok=False`` and fills ``error``.
     - ``raw_stdout`` / ``raw_stderr`` are what the researcher sees in the
       TUI. Never routed to the sanitizer.
-    - ``result_payload`` is the parsed JSON from the result file, intended
-      for ``sanitize()``. Still raw — no SDC rules applied here.
+    - ``result_payloads`` is the list of parsed JSON payloads from the
+      result file, in emission order, intended for ``sanitize()``. Still
+      raw, no SDC rules applied here. The result file is JSONL: one
+      object per line. A single-helper script produces one entry; a
+      script that calls multiple ``nora_result_*`` helpers produces one
+      entry per call. Empty list means no payload was emitted, which
+      is treated as a script error in the success path.
     - ``run_dir`` and ``script_path`` are kept around for audit.
     - ``duration_seconds`` is wall-clock time inside the subprocess.
     """
@@ -237,7 +242,7 @@ class ExecutionResult:
     raw_stdout: str
     raw_stderr: str
     exit_code: int | None
-    result_payload: dict | None
+    result_payloads: list[dict]
     error: str | None
     run_dir: Path
     script_path: Path | None
@@ -282,7 +287,7 @@ def run_script(
     if env.sandbox_exec is None:
         return ExecutionResult(
             ok=False, language=language, raw_stdout="", raw_stderr="",
-            exit_code=None, result_payload=None,
+            exit_code=None, result_payloads=[],
             error=(
                 "sandbox-exec not available on this system — Nora "
                 "refuses to run scripts unsandboxed. On macOS this "
@@ -297,7 +302,7 @@ def run_script(
     if language == "R" and env.r is None:
         return ExecutionResult(
             ok=False, language=language, raw_stdout="", raw_stderr="",
-            exit_code=None, result_payload=None,
+            exit_code=None, result_payloads=[],
             error=(
                 "Rscript not found on this machine. Install R from "
                 "https://cran.r-project.org and re-launch Nora, or "
@@ -308,7 +313,7 @@ def run_script(
     if language == "Stata" and env.stata is None:
         return ExecutionResult(
             ok=False, language=language, raw_stdout="", raw_stderr="",
-            exit_code=None, result_payload=None,
+            exit_code=None, result_payloads=[],
             error=(
                 "Stata not found on this machine. Install Stata or submit "
                 "the script in R or Python instead."
@@ -319,7 +324,7 @@ def run_script(
         if env.python is None:
             return ExecutionResult(
                 ok=False, language=language, raw_stdout="", raw_stderr="",
-                exit_code=None, result_payload=None,
+                exit_code=None, result_payloads=[],
                 error=(
                     "python3 not found on PATH. Install Python 3 (the "
                     "official installer from python.org or via Homebrew, "
@@ -337,7 +342,7 @@ def run_script(
         if hard_missing:
             return ExecutionResult(
                 ok=False, language=language, raw_stdout="", raw_stderr="",
-                exit_code=None, result_payload=None,
+                exit_code=None, result_payloads=[],
                 error=(
                     "Python is installed at "
                     f"{env.python.binary} but the Nora runtime needs "
@@ -421,7 +426,7 @@ def run_script(
     except FileNotFoundError as e:
         return ExecutionResult(
             ok=False, language=language, raw_stdout="", raw_stderr="",
-            exit_code=None, result_payload=None,
+            exit_code=None, result_payloads=[],
             error=f"interpreter not found: {e}",
             run_dir=run_dir, script_path=script_path, duration_seconds=0.0,
         )
@@ -449,7 +454,7 @@ def run_script(
             ok=False, language=language,
             raw_stdout=stdout or "",
             raw_stderr=stderr or "",
-            exit_code=None, result_payload=None,
+            exit_code=None, result_payloads=[],
             error=f"script timed out after {timeout_seconds}s",
             run_dir=run_dir, script_path=script_path,
             duration_seconds=duration,
@@ -485,8 +490,13 @@ def run_script(
         # ExecutionResult fields for in-process rendering.
         pass
 
-    # 6. Parse result file.
-    payload: dict | None = None
+    # 6. Parse result file. The runtime libraries write JSONL (one
+    # payload per line). A script that calls a single helper produces
+    # one line; one that calls N helpers produces N lines, in
+    # emission order. Each line is independently token-validated;
+    # any line failure rejects the whole script (treat as runtime
+    # corruption rather than try to salvage partial payloads).
+    payloads: list[dict] = []
     error: str | None = None
     if not result_path.exists():
         error = (
@@ -498,37 +508,46 @@ def run_script(
     else:
         import json
         try:
-            raw_payload = json.loads(result_path.read_text(encoding="utf-8"))
-        except json.JSONDecodeError as je:
-            error = (
-                f"script emitted a result file that is not valid JSON: "
-                f"{je.msg} at line {je.lineno} col {je.colno}"
-            )
+            text = result_path.read_text(encoding="utf-8")
         except OSError as oe:
             error = f"could not read result file: {oe}"
         else:
-            # Authenticity check: payload must carry the per-run token
-            # the runtime library embeds. A script that wrote JSON
-            # directly to NORA_RESULT_PATH (bypassing the library)
-            # has no token and gets rejected here. The token is
-            # stripped from the payload before it flows on to the
-            # sanitizer, so downstream consumers don't see it.
-            cleaned, auth_err = _validate_and_strip_token(
-                raw_payload, run_token
-            )
-            if auth_err is not None:
-                error = auth_err
-            else:
-                payload = cleaned
+            for lineno, raw_line in enumerate(text.splitlines(), start=1):
+                line = raw_line.strip()
+                if not line:
+                    continue
+                try:
+                    raw_payload = json.loads(line)
+                except json.JSONDecodeError as je:
+                    error = (
+                        f"script emitted a result file with invalid JSON on "
+                        f"line {lineno}: {je.msg} at col {je.colno}"
+                    )
+                    payloads = []
+                    break
+                cleaned, auth_err = _validate_and_strip_token(
+                    raw_payload, run_token
+                )
+                if auth_err is not None:
+                    error = auth_err
+                    payloads = []
+                    break
+                payloads.append(cleaned)
+            if error is None and not payloads:
+                error = (
+                    "script finished but emitted an empty result file. "
+                    "Make sure your script calls the Nora runtime library "
+                    f"({'nora$result(...) or nora$from_lm(...) in R' if language == 'R' else 'nora_result_regress in Stata'})."
+                )
 
-    ok = (exit_code == 0) and (payload is not None) and (error is None)
+    ok = (exit_code == 0) and bool(payloads) and (error is None)
     if not ok and error is None:
         error = f"interpreter exited with non-zero code {exit_code}"
 
     return ExecutionResult(
         ok=ok, language=language,
         raw_stdout=raw_stdout, raw_stderr=raw_stderr,
-        exit_code=exit_code, result_payload=payload,
+        exit_code=exit_code, result_payloads=payloads,
         error=error,
         run_dir=run_dir, script_path=script_path,
         duration_seconds=duration,

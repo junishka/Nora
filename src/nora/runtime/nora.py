@@ -138,12 +138,14 @@ def _to_json(payload: dict[str, Any]) -> str:
 
 
 def _write_result(payload: dict[str, Any]) -> None:
-    """Embed the per-run token and write the JSON payload to disk.
+    """Embed the per-run token and append the JSON payload to disk.
 
-    The executor validates the token and strips it before the
-    payload reaches the sanitizer. A hand-crafted payload that
-    bypasses this function and writes JSON directly to
-    ``NORA_RESULT_PATH`` will be rejected (no token).
+    The result file is JSONL: one object per line. Each helper call
+    appends its own line, so a script that calls multiple helpers
+    surfaces every payload back to the executor. The executor
+    validates the token on each line and strips it before the
+    payload reaches the sanitizer. A hand-crafted line that
+    bypasses this function will be rejected (no token).
     """
     if not isinstance(payload, dict):
         raise TypeError(
@@ -151,8 +153,9 @@ def _write_result(payload: dict[str, Any]) -> None:
         )
     payload = dict(payload)  # don't mutate caller's dict
     payload["_token"] = _RUN_TOKEN
-    with open(_RESULT_PATH, "w", encoding="utf-8") as f:
+    with open(_RESULT_PATH, "a", encoding="utf-8") as f:
         f.write(_to_json(payload))
+        f.write("\n")
 
 
 def result(*, type: str, **fields: Any) -> None:  # noqa: A002 — match R API

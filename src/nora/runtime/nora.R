@@ -122,10 +122,12 @@ nora$.write_result <- function(payload) {
       "Nora — direct `Rscript` invocation isn't supported."
     )
   }
-  # Embed the per-run authenticity token. The executor validates this
-  # and strips it before the payload reaches the sanitizer.
+  # Embed the per-run authenticity token, then APPEND a single JSONL
+  # line so multiple emit calls in one script all reach the executor.
+  # Single-helper scripts produce one line; multi-helper scripts
+  # produce N lines in emission order.
   payload[["_token"]] <- nora$.run_token
-  con <- file(result_path, open = "w", encoding = "UTF-8")
+  con <- file(result_path, open = "a", encoding = "UTF-8")
   on.exit(close(con), add = TRUE)
   writeLines(nora$.to_json(payload), con)
   invisible(NULL)
