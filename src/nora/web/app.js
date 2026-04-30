@@ -2017,20 +2017,21 @@ function append(kind, text, markdown, attachments, images) {
 }
 
 function appendToolCall(evt) {
-  // Only ``submit_script`` renders a card. ``get_schema``,
-  // ``request_data``, ``expand_result``, ``list_results`` all happen
-  // silently — they're plumbing, not results the researcher reads.
-  // Claude summarizes whatever matters from them in the chat text
-  // that follows.
+  // Only ``submit_script`` and ``submit_script_file`` render cards.
+  // ``get_schema``, ``request_data``, ``expand_result``,
+  // ``list_results`` etc. happen silently — they're plumbing, not
+  // results the researcher reads. Claude summarizes whatever
+  // matters from them in the chat text that follows.
   finalizeActiveTypewriter();
   setWelcomeOnlyMode(false);
   const shortName = shortenToolName(evt.name);
-  if (shortName !== 'submit_script') return;
+  const isSubmitScript = shortName === 'submit_script';
+  const isSubmitScriptFile = shortName === 'submit_script_file';
+  if (!isSubmitScript && !isSubmitScriptFile) return;
 
   const card = document.createElement('div');
   card.dataset.callId = evt.call_id;
   card.className = 'tool-card';
-  const isSubmitScript = true;
 
   const header = document.createElement('div');
   header.className = 'tool-header';
@@ -2047,10 +2048,10 @@ function appendToolCall(evt) {
   const body = document.createElement('div');
   body.className = 'tool-body';
 
+  const input = evt.input || {};
   if (isSubmitScript) {
     // Render the language + code + label prominently, not as JSON
     // stringification. Researcher sees the actual script.
-    const input = evt.input || {};
     const langText = (input.language || '').toString().toUpperCase();
     if (input.label) {
       const label = document.createElement('div');
@@ -2076,12 +2077,33 @@ function appendToolCall(evt) {
       src.textContent = 'source: ' + input.source_dataset;
       body.appendChild(src);
     }
-  } else {
-    // Other tools — show the input as JSON (it's short and
-    // structural, so stringification is fine).
+  } else if (isSubmitScriptFile) {
+    // The script bytes don't ride in the tool input — the file is
+    // already on disk in cwd. Render filename + label + language so
+    // the researcher recognises which attachment is being run.
+    const langText = (input.language || '').toString().toUpperCase();
+    if (input.label) {
+      const label = document.createElement('div');
+      label.className = 'tool-label';
+      label.textContent = input.label;
+      body.appendChild(label);
+    }
     const pre = document.createElement('pre');
-    pre.textContent = JSON.stringify(evt.input, null, 2);
+    pre.className = 'tool-code lang-' + (input.language || 'text').toLowerCase();
+    const badge = document.createElement('span');
+    badge.className = 'tool-lang-badge';
+    badge.textContent = langText || 'script';
+    pre.appendChild(badge);
+    const fileEl = document.createElement('code');
+    fileEl.textContent = 'running ' + (input.name || '(unnamed file)');
+    pre.appendChild(fileEl);
     body.appendChild(pre);
+    if (input.source_dataset) {
+      const src = document.createElement('div');
+      src.className = 'tool-source';
+      src.textContent = 'source: ' + input.source_dataset;
+      body.appendChild(src);
+    }
   }
 
   header.addEventListener('click', () => card.classList.toggle('collapsed'));

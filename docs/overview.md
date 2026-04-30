@@ -26,20 +26,31 @@ UI: `nora`). Supported formats are `.csv`, `.dta` (Stata), and
 `.rds` (R). A chat starts with Claude through Nora; Claude is
 then restricted — no filesystem access, no shell, no network tools.
 
-Instead, Claude has exactly six operations, through a narrow tool
-interface:
+Instead, Claude reaches the researcher's machine through ten
+narrow operations:
 
 1. **Ask for the schema** of a dataset — variable names, types,
    and (optionally) labels.
-2. **Ask bounded questions** about a variable — how many
+2. **Search the schema** by name or label substring on wide
+   datasets, instead of pulling the full schema.
+3. **Ask bounded questions** about a variable — how many
    categories does this have? What's the rough 5th-to-95th
-   percentile range?
-3. **Submit an R or Stata script** to analyze the data.
-4. **See previous results.**
-5. **Expand a specific result** for more detail.
-6. **Recall earlier turns** of the conversation — Nora persists
+   percentile range? What's the correlation with this other
+   variable?
+4. **Submit an R, Stata, or Python script** to analyze the data.
+5. **Submit a script from a file** the researcher attached, so
+   the script bytes don't have to round-trip through the model.
+6. **Expand a stored result** for more detail (full payload,
+   trimmed to coefficients, or rendered as a canonical markdown
+   table).
+7. **List results** in this session.
+8. **List results across all sessions** (env-gated).
+9. **Recall earlier turns** of the conversation — Nora persists
    the chat log to disk and Claude can search older turns when
    the auto-loaded recent window isn't enough.
+10. **Re-fetch an attached file** the researcher mentioned
+    earlier (script text or image), so the model can act on it
+    without asking the researcher to re-attach.
 
 When Claude submits a script, Nora runs it locally in a
 **sandbox** that blocks network access and restricts which files

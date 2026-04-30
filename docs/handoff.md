@@ -29,7 +29,7 @@ the scenes, without that data leaving the machine. From the
 researcher's point of view, Nora is one product they talk to — the
 underlying model (Claude or GPT-5.5) is the engine, not exposed in
 the UI. The model reaches the researcher's files through a narrow
-six-tool MCP interface — no Bash, no filesystem, no network. Scripts
+ten-tool MCP interface — no Bash, no filesystem, no network. Scripts
 run under `sandbox-exec` with network denied and a tight
 subpath-allowlist for reads; every output passes through a
 disclosure-control sanitizer (SDC rules from Eurostat / UK ONS
@@ -93,18 +93,25 @@ keep streaming.
 | **Inline compact result payload** — every ok-status result entry now carries a `payload` field with full sanitized data minus `vcov`/`vif` for regressions (same trim as `expand_result(view="coefficients")`), full payload for other types. The model renders coefficient tables directly from the response without N `expand_result` round-trips on parameterized batches | ✅ done |
 | **Row-count audit perf fix** — `schema.row_count(path)` uses metadata-only paths where available (`.dta` via pyreadstat `metadataonly=True`, `.parquet` via pyarrow footer, `.csv` line-count). `submit_script` resolves the source row count ONCE per call and threads it through the per-payload loop, instead of re-reading the dataset on every result. ~390x faster on a 200k-row .dta benchmark; on a 3 GB file the absolute saving is on the order of a minute per call. Response also carries `_phase_timings` (executor / row_count_audit / sanitize / store seconds) so post-execution slowness can't hide behind `duration_seconds` again | ✅ done |
 | **Loop-default prompt directive** — for parameterized batches (N specs / subgroups / outcomes / sensitivity sweeps), prompt now directs ONE script with a loop emitting N results, not N separate scripts. Names the costs of N-scripts directly (repeated data prep, fragmented audit, context bloat). Pinned by render-test | ✅ done |
-| **Formatting rules at end of prompt** — moved formatting block past tool-use notes / honesty paragraph so it's the last thing the model reads before generating. Strengthened anti-bold rule with imperative phrasing and explicit anti-pattern call-out (`Bold sentence-leaders`); post-table interpretation is now 2 to 4 SHORT BULLETS, not prose paragraphs. Composite cell-format tables spell out the canonical shape `-0.013 (0.004) [0.002]` (significance stars forbidden as old convention) | ✅ done |
+| **Formatting rules at end of prompt** — moved formatting block past tool-use notes / honesty paragraph so it's the last thing the model reads before generating. Strengthened anti-bold rule with imperative phrasing and explicit anti-pattern call-out (`Bold sentence-leaders`); post-table interpretation is bullets, not prose paragraphs. Composite cell-format tables spell out the canonical shape `-0.013 (0.004) [0.002]` (significance stars forbidden as old convention) | ✅ done |
+| **Flexible bullet count + 160-char cap** — dropped the rigid "2 to 4 bullets" rule; the model picks bullet count from what the result actually shows (one tight bullet beats four padded ones). Hard cap of 160 characters per bullet (tweet length); thoughts that genuinely need more space write a SHORT prose paragraph (3-5 sentences), not a "long bullet" that reads as prose with a dot on the front | ✅ done |
 | **OpenAI cumulative context fix** — `total_input_tokens += usage.input_tokens` was multi-counting the cached prefix once per tool-loop round. Switched to last-round value (peak prompt size), since each round's `input_tokens` already includes the cached chain. Context chip is honest on OpenAI now; chip docstring describes per-provider semantics | ✅ done |
 | **Context chip post-turn snapshot** — chip now sums `input + cache_read + cache_creation + output_tokens` so a long reply moves the chip immediately rather than only on the next turn. The chip's old "input only" framing made it look like context wasn't being used until the next turn folded the response back into input | ✅ done |
 | **read_attached_file head+tail truncation** — scripts > 96 KB come back as 48 KB head + elision marker + 48 KB tail instead of head-only. Save calls (`df.to_parquet`, `write_dta`, `saveRDS`) at the bottom of long pipelines now visible | ✅ done |
 | **scroll-to-latest button** — floating circular button above the composer fades in when the transcript is > 100 px from the bottom; click smooth-scrolls to the latest message | ✅ done |
+| **Wider chat column + scroll-wrapped tables** — `--max-width` 960 → 1080 px so wide composite tables (H1a/H1b cell-format matrices) breathe. Markdown tables now render inside `<div class="md-table">` with thin custom scrollbars (Firefox `scrollbar-width: thin`, WebKit 6 px); the previous `display: block; overflow-x: auto` directly on `<table>` produced an awkward double-scrollbar above and below wide tables. Tables that fit show no scrollbar at all | ✅ done |
 | **Audit fixes batch (Apr-30)** — `recall_conversation` AttributeError on multi-result tool calls (used the renamed `result_ids` list); `list_results` newest-first with `limit` (default 50, max 500) instead of unbounded ASC; recall budget includes serialized tool/result_ids size in the cap; `session_state` pairs latest user with its OWN assistant (or empty for in-flight) instead of cross-turn mismatch; `read_attached_file` plot fallback uses `is_relative_to` instead of `str.startswith` (fixes path-prefix collision); composer Send guard allows attachment-only sends; composer image drops persist to cwd via `add_files_from_blobs` AND stage for vision; cancel/error branches no longer re-prepend mentioned files (composer chip already cleared on send); per-script source row count cached once; NaN correlation on constant columns rejected with named culprit; correlation_matrix sanitizer applies `safe_key` to both sides of the cross-field check; store ordering uses `rowid` instead of lexical id sort | ✅ done |
 | **Real-researcher pilot** | ⏳ self-pilot in progress |
 | **Cross-query composition / release ledger** | ⏭ named, future-deployment scope |
 | **Apple Developer Program signing + notarization for distributable .dmg** | ⏭ blocked on $99/yr cert |
 | **Stata batch wrapper around `_cons` "omitted" edge case** | ⏭ named, low-priority |
 
-**610 tests passing.** Coverage spans SDK lockdown (Anthropic) +
+**679 tests passing** (one pre-existing failure unrelated to
+this branch: `test_python_helper_writes_helper_errors_jsonl_on_import_failure`
+in `test_run_dir_plots.py`; the `plot_coefficients` helper's
+no-`.params` branch returns without invoking
+`_append_plot_helper_error`. Confirmed pre-branch on `main`).
+Coverage spans SDK lockdown (Anthropic) +
 OpenAI lockdown, schema for all six file formats, executor SBPL
 profile, Python executor end-to-end, helper-through-sanitizer
 round-trips for every `from_*` emitter, sanitizer property tests,
@@ -122,13 +129,32 @@ routes by event `session_cwd`, Stop only cancels the active
 runner), **plot vision** (`test_plot_vision.py`: manifest-only
 allowlist, kind allowlist, path-traversal refusal, byte cap,
 end-to-end capture → next-turn attachment, cancel restores
-pending plots), and **plot rendering / Stata export reliability**
+pending plots), **plot rendering / Stata export reliability**
 (`test_run_dir_plots.py`: thumbnail collector, helper diagnostic,
 `png_for` PDF→PNG conversion via `sips`, helper-error
 surfacing in the model-visible tool result, `_nora_export_plot`
 PDF→PNG→EPS→.gph fallback order, `nora_safe_export` doesn't write
 a manifest entry, runtime environment block renders in the prompt
-with `✓`/`✗` package status).
+with `✓`/`✗` package status), **multi-result wire format**
+(`test_submit_script_partial.py`: dedup of shared transformations,
+partial-success on mid-loop abort, all-rejected-then-aborted
+falls to `execution_failed`, source row count resolved exactly
+once per call, `_phase_timings` populated, inline compact
+payload per result), **canonical-table rendering**
+(`test_result_render.py`: per-type renderers, the `markdown`
+view on `expand_result`, unknown-type passthrough),
+**search_schema** (`test_search_schema.py`: name/label match,
+case-insensitive, limit clamping, path safety),
+**submit_script_file** (`test_submit_script_file.py`:
+extension allowlist, language inference, empty-file refusal,
+basename-only path safety),
+**recall + listing fixes** (`test_recall_and_listing_fixes.py`:
+recall renders multi-result tool calls, list_results bounded
+newest-first, recall budget counts the tools array,
+session_state pairs same-turn user/assistant), and the **edge-
+case audit batch** (`test_audit_fixes_2.py`: plot-fallback
+path-prefix containment via `is_relative_to`, runner does
+not re-prepend mentioned files on cancel/error).
 
 ## Running it
 
@@ -142,7 +168,7 @@ uv run nora                              # opens landing prompt
 uv run nora /path/to/data                # opens straight into chat
 
 # Tests
-uv run pytest -q                         # expect 477 passing
+uv run pytest -q                         # expect 679 passing (1 pre-existing skip)
 
 # Build the .app + .dmg locally. Bundles the web UI.
 # Distribution to other people is blocked on Apple Developer Program
@@ -195,15 +221,17 @@ Three independent privacy layers. A break in any one is a bug; a
 break in two at the same time is a privacy incident.
 
 1. **Tool interface** (`src/nora/tools.py` + `provider/tool_schemas.py`)
-   — the model has exactly six tools: `get_schema`, `request_data`,
-   `submit_script`, `expand_result`, `list_results`,
-   `recall_conversation`. Anthropic SDK built-ins (Bash, Read,
+   — the model has exactly ten tools: `get_schema`,
+   `search_schema`, `request_data`, `submit_script`,
+   `submit_script_file`, `expand_result`, `list_results`,
+   `list_results_global`, `recall_conversation`,
+   `read_attached_file`. Anthropic SDK built-ins (Bash, Read,
    Write, …) are disabled via `disallowed_tools` + `can_use_tool`
-   catch-all + `setting_sources=[]`. OpenAI: only the six function
-   tools are passed; built-ins (`web_search`, `code_interpreter`,
-   `file_search`, `image_generation`, `mcp`) are explicitly
-   forbidden — verified on every request by `_verify_lockdown` and
-   pinned by `test_openai_lockdown.py`.
+   catch-all + `setting_sources=[]`. OpenAI: only the ten
+   function tools are passed; built-ins (`web_search`,
+   `code_interpreter`, `file_search`, `image_generation`, `mcp`)
+   are explicitly forbidden — verified on every request by
+   `_verify_lockdown` and pinned by `test_openai_lockdown.py`.
 2. **Sandbox** (`src/nora/executor.py`) — `sandbox-exec` with
    `(deny default)` base, explicit subpath-allowlist for reads
    (cwd + runtime dirs + a minimal set of system paths + the
