@@ -42,13 +42,15 @@ PROVIDER_PRICING_URLS: dict[str, str] = {
 # ---------------------------------------------------------------------------
 
 # Anthropic. The ``[1m]`` suffix on Sonnet/Opus requests the 1M-context
-# beta via the Claude CLI / Agent SDK. Within the first 200k tokens,
-# 1M costs the same as the standard tier; above 200k, the 1M tier is
-# ~2x input and ~1.5x output. Labels are clean — context-window
-# numbers live in the picker's right-side column, no need to repeat
-# them in the name. Haiku is intentionally excluded for now: the
-# Nora workload (multi-turn analysis with tool use) calls for the
-# heavier models.
+# beta via the Claude CLI / Agent SDK. As of March 2026 there's no
+# pricing tier on context length — Opus 4.7 / Opus 4.6 / Sonnet 4.6
+# bill the full 1M window at standard rates (a 900k-token request
+# costs the same per-token as a 9k-token request, per Anthropic's
+# pricing doc). The suffix is a beta-header opt-in, not a paid
+# tier. Labels are clean — context-window numbers live in the
+# picker's right-side column, no need to repeat them in the name.
+# Haiku is intentionally excluded for now: the Nora workload
+# (multi-turn analysis with tool use) calls for the heavier models.
 ANTHROPIC_MODELS: tuple[ModelInfo, ...] = (
     ModelInfo(
         id="claude-sonnet-4-6[1m]",
