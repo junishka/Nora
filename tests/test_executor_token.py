@@ -38,6 +38,7 @@ from nora.env_detect import find_sandbox_exec
 from nora.executor import (
     RESULT_TOKEN_FIELD,
     _generate_run_token,
+    _parse_result_jsonl,
     _validate_and_strip_token,
     run_script,
 )
@@ -112,6 +113,78 @@ def test_validate_rejects_non_dict_payload():
     cleaned, err = _validate_and_strip_token(["not", "a", "dict"], "a" * 64)  # type: ignore[arg-type]
     assert cleaned is None
     assert err is not None
+
+
+# ---------------------------------------------------------------------------
+# Unit tests — JSONL parser preserves valid lines past a corrupt one
+# ---------------------------------------------------------------------------
+
+def test_parse_jsonl_preserves_valid_lines_past_a_bad_one():
+    """A degenerate Stata fit can emit a missing-value marker (``.``) in
+    the middle of an otherwise valid JSON line — the line is unparseable
+    and the parser used to ``break``, silently losing every later valid
+    line in the same multi-result batch. Pin: bad lines are skipped and
+    the rest land in ``payloads``, with a per-line error message in the
+    ``bad_lines`` return."""
+    token = "a" * 64
+    good = (
+        '{"type":"linear_regression","n":100,"r_squared":0.5,'
+        f'"_token":"{token}"' + '}'
+    )
+    bad_json = '{"type":"linear_regression","n":100,"f_statistic":.,'\
+        f'"_token":"{token}"' + '}'
+    text = "\n".join([good, bad_json, good, "", good])
+
+    payloads, bad_lines = _parse_result_jsonl(text, token)
+    assert len(payloads) == 3, (
+        f"expected 3 valid payloads past the corrupt line, got "
+        f"{len(payloads)}"
+    )
+    assert len(bad_lines) == 1
+    assert "line 2" in bad_lines[0]
+    # Bad line message names the JSON failure, not just "skipped".
+    assert "Expecting" in bad_lines[0] or "valid" in bad_lines[0].lower()
+    # Tokens stripped from the surviving payloads.
+    for p in payloads:
+        assert RESULT_TOKEN_FIELD not in p
+
+
+def test_parse_jsonl_preserves_valid_lines_past_a_token_failure():
+    """The same skip-and-keep-going contract applies when a line parses
+    as JSON but fails token validation (e.g., a hand-crafted bypass
+    payload from a malicious script). Earlier valid payloads survive,
+    later valid payloads survive, the bad payload is dropped with an
+    explanatory message."""
+    token = "a" * 64
+    wrong = "b" * 64
+    valid_line = (
+        '{"type":"linear_regression","n":100,'
+        f'"_token":"{token}"' + '}'
+    )
+    forged_line = (
+        '{"type":"linear_regression","n":100,'
+        f'"_token":"{wrong}"' + '}'
+    )
+    text = "\n".join([valid_line, forged_line, valid_line])
+
+    payloads, bad_lines = _parse_result_jsonl(text, token)
+    assert len(payloads) == 2
+    assert len(bad_lines) == 1
+    assert "line 2" in bad_lines[0]
+
+
+def test_parse_jsonl_returns_no_bad_lines_for_clean_input():
+    """The happy path: a multi-result file with three clean payloads
+    parses to three results and zero bad lines."""
+    token = "a" * 64
+    line = (
+        '{"type":"linear_regression","n":50,'
+        f'"_token":"{token}"' + '}'
+    )
+    text = "\n".join([line, line, line])
+    payloads, bad_lines = _parse_result_jsonl(text, token)
+    assert len(payloads) == 3
+    assert bad_lines == []
 
 
 # ---------------------------------------------------------------------------

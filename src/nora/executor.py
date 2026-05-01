@@ -201,6 +201,45 @@ def _validate_and_strip_token(
     return cleaned, None
 
 
+def _parse_result_jsonl(
+    text: str, run_token: str
+) -> tuple[list[dict[str, Any]], list[str]]:
+    """Parse a JSONL result file line by line, skipping bad lines.
+
+    A single corrupt line (e.g. a degenerate Stata fit that emitted a
+    missing-value marker in ``f_statistic``, or a payload that fails
+    authenticity-token validation) used to shadow every later valid
+    line in the same batch — the parser would ``break`` and lose the
+    rest. The current contract is "skip the bad line, keep going", so
+    1 of 8 corrupt lines becomes "7 results + 1 documented error", not
+    "0 results + 1 documented error".
+
+    Returns ``(payloads, bad_line_messages)``. ``payloads`` carries
+    every line that parsed AND token-validated, in emission order;
+    ``bad_line_messages`` carries one short string per failed line for
+    the caller to surface back to the model.
+    """
+    import json
+
+    payloads: list[dict[str, Any]] = []
+    bad_lines: list[str] = []
+    for lineno, raw_line in enumerate(text.splitlines(), start=1):
+        line = raw_line.strip()
+        if not line:
+            continue
+        try:
+            raw_payload = json.loads(line)
+        except json.JSONDecodeError as je:
+            bad_lines.append(f"line {lineno}: {je.msg} at col {je.colno}")
+            continue
+        cleaned, auth_err = _validate_and_strip_token(raw_payload, run_token)
+        if auth_err is not None:
+            bad_lines.append(f"line {lineno}: {auth_err}")
+            continue
+        payloads.append(cleaned)
+    return payloads, bad_lines
+
+
 @lru_cache(maxsize=1)
 def _cached_environment() -> Environment:
     """Return a process-local cached runtime probe.
@@ -524,38 +563,19 @@ def run_script(
             f"calls the Nora runtime library ({_runtime_call_hint(language)})."
         )
     else:
-        import json
         try:
             text = result_path.read_text(encoding="utf-8")
         except OSError as oe:
             error = f"could not read result file: {oe}"
         else:
-            for lineno, raw_line in enumerate(text.splitlines(), start=1):
-                line = raw_line.strip()
-                if not line:
-                    continue
-                try:
-                    raw_payload = json.loads(line)
-                except json.JSONDecodeError as je:
-                    # Stop parsing here, but keep what came before.
-                    # A trailing half-written line from a crashed helper
-                    # shouldn't discard the N-1 clean payloads.
-                    error = (
-                        f"invalid JSON on result line {lineno}: "
-                        f"{je.msg} at col {je.colno} "
-                        f"({len(payloads)} prior payload(s) preserved)"
-                    )
-                    break
-                cleaned, auth_err = _validate_and_strip_token(
-                    raw_payload, run_token
+            payloads, bad_lines = _parse_result_jsonl(text, run_token)
+            if bad_lines:
+                error = (
+                    f"{len(bad_lines)} malformed result line(s) "
+                    f"skipped ({len(payloads)} valid preserved): "
+                    + "; ".join(bad_lines[:5])
+                    + (" …" if len(bad_lines) > 5 else "")
                 )
-                if auth_err is not None:
-                    error = (
-                        f"{auth_err} (on result line {lineno}; "
-                        f"{len(payloads)} prior payload(s) preserved)"
-                    )
-                    break
-                payloads.append(cleaned)
             if error is None and not payloads:
                 error = (
                     "script finished but emitted an empty result file. "

@@ -329,16 +329,23 @@ at the typo / missing column / wrong dtype. The full raw log stays \
 on disk for the researcher; you only get the bounded excerpt with \
 credentials scrubbed.\
 \n\n\
-On partial failure: when a script aborts mid-loop AFTER emitting \
-some helpers (e.g. iteration #5 of 24 hit a thin cell), \
-``status: "execution_failed_partial"`` carries BOTH the helpers \
-that did emit (in the usual ``results`` list, with their own \
-result ids) AND the ``debug_excerpt`` of the abort. Treat the \
-partials as ordinary results; for the missing iterations, guard \
-the failing condition (``if`` filter, try/except, ``capture`` in \
-Stata) and re-emit only those in a follow-up. Do NOT re-run the \
-helpers that already succeeded; they're stored under \
-``script_run_id`` and reachable via ``expand_result``.\
+On partial failure: when a script aborts mid-loop or emits a \
+malformed line AFTER some helpers succeeded, \
+``status: "execution_failed_partial"`` carries BOTH the partials \
+(in ``results``, each with its own result id) AND the failure \
+context (``reason``, ``debug_excerpt``). Treat the partials as \
+ordinary results. Do NOT re-run the helpers that already \
+succeeded; they're stored under ``script_run_id`` and reachable \
+via ``expand_result``. Read the actual reason before re-emitting \
+the missing ones: if the cause is deterministic (perfect fit, \
+FE absorption, df_r = 0, missing variable, collinearity-induced \
+omission), re-running the same spec hits the same wall. State \
+that plainly to the researcher — "<spec> isn't estimable here \
+because <reason>" — and propose the spec change, not a retry. \
+Only re-emit when the cause is genuinely transient (a thin cell \
+at one subgroup, a one-off data condition); guard the failing \
+case (``if`` filter, try/except, Stata ``capture``) before \
+re-running.\
 \n\n\
 Regression diagnostics: ``from_lm`` (R and Python) emits two \
 collinearity diagnostics alongside the headline coefficients when \

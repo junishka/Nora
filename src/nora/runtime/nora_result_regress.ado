@@ -1,4 +1,4 @@
-*! version 0.0.3  Nora runtime: emit a linear_regression payload from e().
+*! version 0.0.4  Nora runtime: emit a linear_regression payload from e().
 *!
 *! Call after a regression command (regress, logit, etc. — anything that
 *! populates e(b), e(V), e(N), e(depvar)). Writes the structured payload
@@ -94,26 +94,41 @@ program define nora_result_regress
     }
     file write `fh' "]"
 
-    * coefficients (named dict, integer-indexed into e(b)).
+    * coefficients (named dict, integer-indexed into e(b)). Missing
+    * values (degenerate fits, perfect collinearity in some
+    * estimators) are written as JSON null — strofreal(., ...)
+    * returns "." which would corrupt the entire JSON line and
+    * break the executor's line-by-line parser.
     file write `fh' `","coefficients":{"'
     local first = 1
     forvalues i = 1/`k' {
         local v : word `i' of `vnames'
         if !`first' file write `fh' ","
-        local coef_str = strofreal(`bmat'[1, `i'], "%21.17e")
-        file write `fh' `""`v'":`coef_str'"'
+        if missing(`bmat'[1, `i']) {
+            file write `fh' `""`v'":null"'
+        }
+        else {
+            local coef_str = strofreal(`bmat'[1, `i'], "%21.17e")
+            file write `fh' `""`v'":`coef_str'"'
+        }
         local first = 0
     }
     file write `fh' "}"
 
-    * standard_errors (named dict, from sqrt(diag(V))).
+    * standard_errors (named dict, from sqrt(diag(V))). Same
+    * missing → null treatment as coefficients above.
     file write `fh' `","standard_errors":{"'
     local first = 1
     forvalues i = 1/`k' {
         local v : word `i' of `vnames'
         if !`first' file write `fh' ","
-        local se_str = strofreal(sqrt(`Vmat'[`i', `i']), "%21.17e")
-        file write `fh' `""`v'":`se_str'"'
+        if missing(`Vmat'[`i', `i']) {
+            file write `fh' `""`v'":null"'
+        }
+        else {
+            local se_str = strofreal(sqrt(`Vmat'[`i', `i']), "%21.17e")
+            file write `fh' `""`v'":`se_str'"'
+        }
         local first = 0
     }
     file write `fh' "}"
@@ -151,26 +166,30 @@ program define nora_result_regress
     }
 
     * Optional fit statistics. Missing e() macros mean the command didn't
-    * populate them (e.g. robust SE paths change what's in e()), so we
-    * only emit fields we actually have. All floats go through the
-    * same scientific-notation formatter for JSON-safety.
-    if "`e(r2)'" != "" {
+    * populate them (e.g. robust SE paths change what's in e()) — omit
+    * the field. ``e(F)`` and ``e(r2_a)`` can also be SET to missing
+    * under degenerate fits (perfect fit, df_r = 0, FE absorption);
+    * the ``& !missing(...)`` guard catches that case too. Without it
+    * ``strofreal(., "%21.17e")`` returns "." and the JSON line is
+    * malformed — the executor's parser breaks at that line and
+    * silently loses every later result in the same script.
+    if "`e(r2)'" != "" & !missing(`=e(r2)') {
         local _x = strofreal(`=e(r2)', "%21.17e")
         file write `fh' `","r_squared":`_x'"'
     }
-    if "`e(r2_a)'" != "" {
+    if "`e(r2_a)'" != "" & !missing(`=e(r2_a)') {
         local _x = strofreal(`=e(r2_a)', "%21.17e")
         file write `fh' `","adj_r_squared":`_x'"'
     }
-    if "`e(F)'" != "" {
+    if "`e(F)'" != "" & !missing(`=e(F)') {
         local _x = strofreal(`=e(F)', "%21.17e")
         file write `fh' `","f_statistic":`_x'"'
     }
-    if "`e(rmse)'" != "" {
+    if "`e(rmse)'" != "" & !missing(`=e(rmse)') {
         local _x = strofreal(`=e(rmse)', "%21.17e")
         file write `fh' `","residual_std_error":`_x'"'
     }
-    if "`e(df_r)'" != "" {
+    if "`e(df_r)'" != "" & !missing(`=e(df_r)') {
         file write `fh' `","degrees_of_freedom":`=e(df_r)'"'
     }
 
