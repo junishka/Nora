@@ -1621,6 +1621,130 @@ async def expand_result(args: dict[str, Any]) -> dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
+# Tool: compose_results
+# ---------------------------------------------------------------------------
+
+
+@tool(
+    "compose_results",
+    (
+        "Compose a multi-result comparison table from a layout spec. "
+        "Use this AFTER ``submit_script`` returns N>=2 stored "
+        "regressions when the researcher would benefit from a "
+        "side-by-side comparison instead of N separate cards.\n\n"
+        "You emit the layout (which results to surface together, how "
+        "to label groups, which terms go in columns); the renderer "
+        "looks up cell values in the sanitized store by result_id. "
+        "You never type a coefficient. A result_id you got wrong, or "
+        "a term_id not in a payload's coefficients, renders as ``—`` "
+        "— grouping is fallible (you can re-emit a corrected spec) "
+        "but the numbers are infallible (they come from the store, "
+        "not your typing).\n\n"
+        "Spec shape (single ``spec`` argument, JSON object):\n"
+        "  {\n"
+        "    \"title\": \"Mechanism A: revenue effects\",   // optional\n"
+        "    \"columns\": [\n"
+        "      {\"id\": \"fp_y0\",  \"label\": \"year 0\"},\n"
+        "      {\"id\": \"fp_yp1\", \"label\": \"year +1\"}\n"
+        "    ],\n"
+        "    \"groups\": [\n"
+        "      {\n"
+        "        \"label\": \"H1: direct effect\",          // optional row header\n"
+        "        \"rows\": [\n"
+        "          {\"result_id\": \"M1\", \"label\": \"ln_rev_total\"},\n"
+        "          {\"result_id\": \"M2\", \"label\": \"ln_exp_total\"}\n"
+        "        ]\n"
+        "      }\n"
+        "    ]\n"
+        "  }\n\n"
+        "Cells render as ``estimate (SE) [p-value]``. Columns are "
+        "shared across all groups in one spec. If different groups "
+        "use different treatment terms (e.g., one panel uses "
+        "``fp_*``, another uses ``np_*``), call this tool once per "
+        "group rather than smashing them into one columns list — "
+        "non-matching cells will render as ``—``, which is honest "
+        "but not useful.\n\n"
+        "Returns ``markdown`` (the rendered table) and a "
+        "``missing_result_ids`` list flagging IDs you referenced "
+        "that aren't in the current session's store. Drop the "
+        "``markdown`` directly into your reply."
+    ),
+    {"spec": dict},
+)
+async def compose_results(args: dict[str, Any]) -> dict[str, Any]:
+    """Render a layout spec into a composite comparison table."""
+    spec = args.get("spec")
+    if not isinstance(spec, dict):
+        return _as_mcp_text({
+            "status": "error",
+            "reason": "spec argument is required and must be a JSON object",
+        })
+
+    cwd = get_cwd()
+    store = get_store(cwd)
+
+    # Walk the spec and collect referenced result_ids; fetch each from
+    # the store. Missing IDs are flagged separately so the model can
+    # see exactly which references it got wrong.
+    referenced_ids: list[str] = []
+    groups = spec.get("groups")
+    if isinstance(groups, list):
+        for group in groups:
+            if not isinstance(group, dict):
+                continue
+            rows = group.get("rows")
+            if not isinstance(rows, list):
+                continue
+            for row in rows:
+                if isinstance(row, dict):
+                    rid = row.get("result_id")
+                    if isinstance(rid, str) and rid:
+                        referenced_ids.append(rid)
+
+    payloads_by_id: dict[str, dict[str, Any]] = {}
+    missing: list[str] = []
+    seen: set[str] = set()
+    for rid in referenced_ids:
+        if rid in seen:
+            continue
+        seen.add(rid)
+        row_obj = store.get(rid)
+        if row_obj is None:
+            missing.append(rid)
+            continue
+        if isinstance(row_obj.sanitized_payload, dict):
+            payloads_by_id[rid] = row_obj.sanitized_payload
+
+    from nora.result_render import compose_layout
+    markdown = compose_layout(spec, payloads_by_id)
+    if markdown is None:
+        return _as_mcp_text({
+            "status": "error",
+            "reason": (
+                "spec is malformed. Required shape: an object with "
+                "non-empty ``columns`` (list of {id, label}) and "
+                "non-empty ``groups`` (list of {rows: [...]}). Each "
+                "row must carry a string ``result_id``."
+            ),
+        })
+
+    response: dict[str, Any] = {
+        "status": "ok",
+        "markdown": markdown,
+        "rows_rendered": len(payloads_by_id),
+        "result_ids_referenced": sorted(seen),
+    }
+    if missing:
+        response["missing_result_ids"] = sorted(missing)
+        response["hint"] = (
+            f"{len(missing)} referenced result_id(s) not in this "
+            f"session's store; cells for those rows rendered as '—'. "
+            f"Use list_results to get the canonical IDs and re-emit."
+        )
+    return _as_mcp_text(response)
+
+
+# ---------------------------------------------------------------------------
 # Tool: list_results
 # ---------------------------------------------------------------------------
 
@@ -2266,6 +2390,7 @@ REGISTERED_TOOLS: tuple[Any, ...] = (
     submit_script,
     submit_script_file,
     expand_result,
+    compose_results,
     list_results,
     list_results_global,
     recall_conversation,
@@ -2281,6 +2406,7 @@ ALLOWED_TOOL_NAMES: tuple[str, ...] = (
     f"mcp__{SERVER_NAME}__submit_script",
     f"mcp__{SERVER_NAME}__submit_script_file",
     f"mcp__{SERVER_NAME}__expand_result",
+    f"mcp__{SERVER_NAME}__compose_results",
     f"mcp__{SERVER_NAME}__list_results",
     f"mcp__{SERVER_NAME}__list_results_global",
     f"mcp__{SERVER_NAME}__recall_conversation",

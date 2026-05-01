@@ -241,6 +241,50 @@ _SUBMIT_SCRIPT_FILE_DESC = (
     "  source_dataset: same as submit_script."
 )
 
+_COMPOSE_RESULTS_DESC = (
+    "Compose a multi-result comparison table from a layout spec. "
+    "Use this AFTER ``submit_script`` returns N>=2 stored "
+    "regressions when the researcher would benefit from a "
+    "side-by-side comparison instead of N separate cards.\n\n"
+    "You emit the layout (which results to surface together, how "
+    "to label groups, which terms go in columns); the renderer "
+    "looks up cell values in the sanitized store by result_id. "
+    "You never type a coefficient. A result_id you got wrong, or "
+    "a term_id not in a payload's coefficients, renders as ``—`` "
+    "— grouping is fallible (you can re-emit a corrected spec) "
+    "but the numbers are infallible (they come from the store, "
+    "not your typing).\n\n"
+    "Spec shape (single ``spec`` argument, JSON object):\n"
+    "  {\n"
+    "    \"title\": \"Mechanism A: revenue effects\",   // optional\n"
+    "    \"columns\": [\n"
+    "      {\"id\": \"fp_y0\",  \"label\": \"year 0\"},\n"
+    "      {\"id\": \"fp_yp1\", \"label\": \"year +1\"}\n"
+    "    ],\n"
+    "    \"groups\": [\n"
+    "      {\n"
+    "        \"label\": \"H1: direct effect\",          // optional row header\n"
+    "        \"rows\": [\n"
+    "          {\"result_id\": \"M1\", \"label\": \"ln_rev_total\"},\n"
+    "          {\"result_id\": \"M2\", \"label\": \"ln_exp_total\"}\n"
+    "        ]\n"
+    "      }\n"
+    "    ]\n"
+    "  }\n\n"
+    "Cells render as ``estimate (SE) [p-value]``. Columns are "
+    "shared across all groups in one spec. If different groups "
+    "use different treatment terms (e.g., one panel uses "
+    "``fp_*``, another uses ``np_*``), call this tool once per "
+    "group rather than smashing them into one columns list — "
+    "non-matching cells will render as ``—``, which is honest "
+    "but not useful.\n\n"
+    "Returns ``markdown`` (the rendered table) and a "
+    "``missing_result_ids`` list flagging IDs you referenced "
+    "that aren't in the current session's store. Drop the "
+    "``markdown`` directly into your reply."
+)
+
+
 _EXPAND_RESULT_DESC = (
     "Retrieve a stored sanitized payload by ID. Use this when you "
     "need details of an earlier result (e.g., coefficients from a "
@@ -514,6 +558,14 @@ def build_tool_specs() -> tuple[ToolSpec, ...]:
                 "session_path": {"type": "string"},
             },
             required=("result_id",),
+        ),
+        _spec(
+            "compose_results",
+            _COMPOSE_RESULTS_DESC,
+            properties={
+                "spec": {"type": "object"},
+            },
+            required=("spec",),
         ),
         _spec(
             "list_results",

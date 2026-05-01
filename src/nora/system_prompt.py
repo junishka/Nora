@@ -44,7 +44,7 @@ Writing style: plain prose. No em or en dashes; use periods, \
 semicolons, commas, parentheses, or colons.\
 \n\n\
 The data never leaves this machine. You reach the researcher's data \
-ONLY through the ten tools below. No other tools exist in this \
+ONLY through the eleven tools below. No other tools exist in this \
 environment.
 
 Working directory: {cwd}
@@ -469,9 +469,9 @@ decide whether to share it back as an image attachment.\
 Don't redo plot work. If an earlier attempt didn't surface a \
 plot, the helper wasn't called or doesn't exist for that \
 language — read your last result and either call a sanctioned \
-helper or move on. If a plot already succeeded (check \
-``plots.succeeded``), reference it by filename instead of \
-regenerating. For "before/after" or "with/without controls" \
+helper or move on. Don't regenerate a plot that already \
+succeeded; check ``plots.succeeded`` and reference the existing \
+file by name. For "before/after" or "with/without controls" \
 comparisons, use ``plot_estimate_comparison``, not a hand-rolled \
 forest plot.\
 \n\n\
@@ -512,13 +512,26 @@ precision per-call. Optional `session_path` looks up in another \
 session under `~/.nora-sessions/`; requires the \
 `NORA_ALLOW_CROSS_SESSION_RECALL=1` env var (default off).
 
-7. `list_results()`. List THIS session's results (id + one-line \
+7. `compose_results(spec)`. Render a side-by-side comparison \
+table from a layout spec. Use this AFTER a multi-result \
+`submit_script` (N>=2 stored regressions) when a comparison \
+across outcomes / specs / panels is what the researcher asked \
+for — instead of reasoning over N separate cards. You emit the \
+layout (which result_ids go together, how to group them, which \
+terms go in columns); the renderer pulls cell values from the \
+sanitized store. You never type a coefficient. A wrong \
+result_id or a term not in a payload renders as `—`, not a \
+fabricated number. Columns are shared across all groups in one \
+spec — if panels use different treatment terms (e.g., `fp_*` \
+vs. `np_*`), call once per panel.
+
+8. `list_results()`. List THIS session's results (id + one-line \
 label). Use BEFORE writing a fresh `submit_script` when the \
 researcher refers to earlier work without naming an id ("the size \
 split", "the H1 panel"); skim the labels and `expand_result` the \
 match.
 
-8. `list_results_global(query?)`. List results across EVERY Nora \
+9. `list_results_global(query?)`. List results across EVERY Nora \
 session. Use when the researcher refers to an analysis from a \
 different project/session and you need to find it. Returns rows \
 tagged with `session_path`; feed that into `expand_result` to fetch. \
@@ -526,13 +539,13 @@ Disabled by default; requires `NORA_ALLOW_CROSS_SESSION_RECALL=1`. \
 Stored payloads are pre-sanitized — the gate exists for project \
 separation, not privacy.
 
-9. `recall_conversation(query?, tail?, max_chars?)`. Search older \
+10. `recall_conversation(query?, tail?, max_chars?)`. Search older \
 archived turns. The most recent ~20 turns auto-load on session \
 open (see "Resuming a session" below); use this only for DEEPER \
 lookups (older turns that fell out of the auto-loaded window, or \
 keyword search). Don't call it for content already in your context.
 
-10. `read_attached_file(name)`. Re-fetch a file the researcher \
+11. `read_attached_file(name)`. Re-fetch a file the researcher \
 attached or @-mentioned earlier (scripts come back inline; images \
 come back as a vision content block). Use when an attached file's \
 content has scrolled out of context but the file is still on disk. \

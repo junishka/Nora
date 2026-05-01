@@ -578,6 +578,145 @@ def test_compose_layout_returns_none_for_malformed_specs() -> None:
     ) is None
 
 
+def test_compose_results_tool_renders_from_store(tmp_path: Path) -> None:
+    """End-to-end: insert two regressions in the session store, call
+    the ``compose_results`` tool with a spec referencing them, assert
+    the response carries a markdown table whose cells came out of
+    the store. Pin the wire shape (``status``, ``markdown``,
+    ``rows_rendered``, ``result_ids_referenced``)."""
+    cwd = tmp_path / "session"
+    cwd.mkdir()
+    reset_store_for_tests()
+    try:
+        store = get_store(cwd)
+        m1 = store.insert(
+            label="H1 ln_rev",
+            analysis_type="linear_regression",
+            sanitized_payload={
+                "type": "linear_regression",
+                "n": 1000,
+                "coefficients": {"fp_y0": 0.020, "fp_yp1": 0.015},
+                "standard_errors": {"fp_y0": 0.005, "fp_yp1": 0.004},
+                "p_values": {"fp_y0": 0.001, "fp_yp1": 0.002},
+                "response_variable": "ln_rev",
+                "predictor_variables": ["fp_y0", "fp_yp1"],
+            },
+            language="Stata", script_code="", transformations=[],
+        )
+        m2 = store.insert(
+            label="H1 ln_exp",
+            analysis_type="linear_regression",
+            sanitized_payload={
+                "type": "linear_regression",
+                "n": 1000,
+                "coefficients": {"fp_y0": 0.010, "fp_yp1": 0.005},
+                "standard_errors": {"fp_y0": 0.003, "fp_yp1": 0.002},
+                "p_values": {"fp_y0": 0.0001, "fp_yp1": 0.05},
+                "response_variable": "ln_exp",
+                "predictor_variables": ["fp_y0", "fp_yp1"],
+            },
+            language="Stata", script_code="", transformations=[],
+        )
+        with use_cwd(cwd):
+            res = asyncio.run(HANDLERS["compose_results"]({
+                "spec": {
+                    "title": "H1 mechanism",
+                    "columns": [
+                        {"id": "fp_y0",  "label": "year 0"},
+                        {"id": "fp_yp1", "label": "year +1"},
+                    ],
+                    "groups": [
+                        {"label": "Direct effect", "rows": [
+                            {"result_id": m1.id, "label": "ln_rev"},
+                            {"result_id": m2.id, "label": "ln_exp"},
+                        ]},
+                    ],
+                },
+            }))
+        body = _mcp_text(res)
+        assert body["status"] == "ok"
+        md = body["markdown"]
+        assert "**H1 mechanism**" in md
+        assert "**Direct effect**" in md
+        assert "ln_rev" in md and "ln_exp" in md
+        assert "0.02 (0.005) [0.001]" in md  # m1 fp_y0 cell
+        assert "[<0.001]" in md              # m2 fp_y0 cell
+        assert body["rows_rendered"] == 2
+        assert sorted(body["result_ids_referenced"]) == sorted([m1.id, m2.id])
+        assert "missing_result_ids" not in body
+    finally:
+        reset_store_for_tests()
+
+
+def test_compose_results_tool_flags_missing_ids(tmp_path: Path) -> None:
+    """A spec that references a result_id not in the store gets a
+    ``missing_result_ids`` array back so the model can correct
+    without inventing a coefficient. The rendered markdown still
+    comes back, with ``—`` cells in the missing rows."""
+    cwd = tmp_path / "session"
+    cwd.mkdir()
+    reset_store_for_tests()
+    try:
+        store = get_store(cwd)
+        real = store.insert(
+            label="real",
+            analysis_type="linear_regression",
+            sanitized_payload={
+                "type": "linear_regression",
+                "n": 100,
+                "coefficients": {"x": 0.5},
+                "standard_errors": {"x": 0.05},
+                "response_variable": "y",
+                "predictor_variables": ["x"],
+            },
+            language="Python", script_code="", transformations=[],
+        )
+        with use_cwd(cwd):
+            res = asyncio.run(HANDLERS["compose_results"]({
+                "spec": {
+                    "columns": [{"id": "x", "label": "x"}],
+                    "groups": [{"rows": [
+                        {"result_id": real.id, "label": "real"},
+                        {"result_id": "M_BOGUS", "label": "made up"},
+                    ]}],
+                },
+            }))
+        body = _mcp_text(res)
+        assert body["status"] == "ok"
+        assert body["missing_result_ids"] == ["M_BOGUS"]
+        assert "hint" in body and "list_results" in body["hint"]
+        # Bogus row renders with em-dash, real row has the real value.
+        md = body["markdown"]
+        assert "made up" in md and "—" in md
+        assert "0.5" in md
+    finally:
+        reset_store_for_tests()
+
+
+def test_compose_results_tool_rejects_malformed_spec(tmp_path: Path) -> None:
+    """The tool returns a structured error (not a crash) on a
+    malformed spec, with a hint pointing at the required shape."""
+    cwd = tmp_path / "session"
+    cwd.mkdir()
+    reset_store_for_tests()
+    try:
+        with use_cwd(cwd):
+            # Missing ``spec`` argument.
+            res = asyncio.run(HANDLERS["compose_results"]({}))
+            assert _mcp_text(res)["status"] == "error"
+            # spec not a dict.
+            res = asyncio.run(HANDLERS["compose_results"]({"spec": "no"}))
+            assert _mcp_text(res)["status"] == "error"
+            # spec missing required keys.
+            res = asyncio.run(HANDLERS["compose_results"]({"spec": {}}))
+            body = _mcp_text(res)
+            assert body["status"] == "error"
+            assert "columns" in body["reason"]
+            assert "groups" in body["reason"]
+    finally:
+        reset_store_for_tests()
+
+
 def test_compose_layout_against_real_24_result_run() -> None:
     """Smoke test against the user's actual reg_v11.do output: 24
     valid sanitized linear_regression payloads. Compose a layout
