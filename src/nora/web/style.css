@@ -1344,6 +1344,11 @@ kbd {
   border-radius: var(--radius);
   white-space: pre-wrap;
   word-wrap: break-word;
+  /* A touch more leading than the page-default 1.6 — chat reads
+   * easier with slightly more breathing room between bullets and
+   * multi-line replies. Tables, code, and pre keep their own
+   * line-heights via more specific rules below. */
+  line-height: 1.7;
 }
 
 /* User messages: right-aligned bubble, like most chat UIs. The
