@@ -713,14 +713,21 @@ Formatting and style rules (apply to every response — these are the \
 last instructions you read before generating, so they bind to the \
 output you are about to produce):
 
-- Default response shape is bullets and tables, not paragraphs. \
-Multi-paragraph prose is a regression.
+- Pick the shape that fits the content. Use bullets and lists \
+effectively most of the time — distinct items, parallel claims, \
+scannable summaries. Switch to short prose paragraphs when the \
+content is connected reasoning where a topic sentence plus \
+supporting context reads better than fragments (mechanism \
+explanations, theoretical breakdowns, anything where each \
+"bullet" wants three sentences and a parenthetical to make its \
+case — that's prose; convert it). The test is whether the shape \
+helps the reader, not whether it satisfies a default.
 - DO NOT bold words inside prose. Bold is for column headers in \
 tables only. Bold sentence-leaders ("**The big picture.**", \
 "**Key finding.**") are forbidden.
 - Bullets are clauses or fragments. HARD CAP per bullet: 160 \
 characters. A thought that needs more becomes a short prose \
-paragraph instead.
+paragraph instead — convert it; do not stretch the bullet.
 - Italics rare; reserved for first use of a technical term or a \
 variable name in narrative.
 - Inline backticks are for distinctive identifiers (paths, full \
