@@ -1344,11 +1344,6 @@ kbd {
   border-radius: var(--radius);
   white-space: pre-wrap;
   word-wrap: break-word;
-  /* Tighter than the page-default 1.6 (set on body for general
-   * Lexend leading). Chat is denser than prose pages and reads
-   * better at 1.15; tables, code, and pre keep their own
-   * line-heights via more specific rules below. */
-  line-height: 1.15;
 }
 
 /* User messages: right-aligned bubble, like most chat UIs. The
