@@ -1348,7 +1348,7 @@ kbd {
    * easier with slightly more breathing room between bullets and
    * multi-line replies. Tables, code, and pre keep their own
    * line-heights via more specific rules below. */
-  line-height: 1.7;
+  line-height: 1.8;
 }
 
 /* User messages: right-aligned bubble, like most chat UIs. The
@@ -1744,8 +1744,17 @@ kbd {
 .tool-card .tool-code {
   /* Keep the code block distinctive — monospace, preserve
    * whitespace, scrollable. The language badge in the corner tells
-   * the researcher what runtime this will hit. */
+   * the researcher what runtime this will hit.
+   *
+   * Long scripts (50+ lines) used to dominate the transcript with
+   * a wall of code that the researcher rarely needs to re-read in
+   * full. Cap height so the script-input card sits at roughly the
+   * same visual weight as the result card that follows; vertical
+   * scroll keeps the whole script accessible without taking over
+   * the chat. */
   white-space: pre;
+  max-height: 380px;
+  overflow-y: auto;
 }
 
 .tool-card .tool-lang-badge {
