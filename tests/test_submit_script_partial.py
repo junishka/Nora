@@ -251,6 +251,71 @@ def test_submit_script_inlines_compact_payload_per_result(
         assert payload.get("n") == expected_n
 
 
+def test_trim_oversize_inline_payloads_drops_payload_keeps_markdown() -> None:
+    """When the per-result ``payload`` + ``markdown`` cost would push
+    the assembled envelope past the budget, the helper drops only
+    ``payload`` from each ok-status entry and reports the trim. The
+    UI's per-result panels read ``markdown`` directly, so leaving it
+    intact keeps the inline cards rendering — and the model can still
+    quote tables off ``markdown`` without an ``expand_result`` round-
+    trip. Pin against accidentally also dropping ``markdown``, which
+    is what re-broke the user's 24-regression session."""
+    from nora.tools import _INLINE_PAYLOAD_BUDGET, _trim_oversize_inline_payloads
+
+    bulky_payload = {"type": "linear_regression", "n": 1000, "blob": "x" * 800}
+    bulky_markdown = "| col | val |\n| --- | --- |\n" + ("| a | b |\n" * 30)
+    results = [
+        {
+            "status": "ok",
+            "result_id": f"M{i}",
+            "label": f"spec {i}",
+            "payload": dict(bulky_payload),
+            "markdown": bulky_markdown,
+        }
+        for i in range(30)
+    ]
+    cost = (
+        sum(len(json.dumps(r["payload"])) for r in results)
+        + sum(len(r["markdown"]) for r in results)
+    )
+    assert cost > _INLINE_PAYLOAD_BUDGET, (
+        f"sanity: synthesized {cost} chars must exceed budget "
+        f"{_INLINE_PAYLOAD_BUDGET} for the trim to fire"
+    )
+
+    trimmed = _trim_oversize_inline_payloads(results)
+    assert trimmed is True
+    for entry in results:
+        assert "payload" not in entry, f"payload should be dropped: {entry!r}"
+        assert entry.get("markdown") == bulky_markdown, "markdown must stay"
+        assert entry["status"] == "ok"
+        assert entry["result_id"].startswith("M")
+
+
+def test_trim_oversize_inline_payloads_no_trim_below_budget() -> None:
+    """A handful of small results stays under the budget — the trim
+    must NOT fire and ``payload`` must survive intact. Pin against
+    accidentally trimming the small-N happy path (single regression,
+    a few descriptives) where the model relies on inline payload to
+    render the headline numbers without an extra round-trip."""
+    from nora.tools import _trim_oversize_inline_payloads
+
+    results = [
+        {
+            "status": "ok",
+            "result_id": f"M{i}",
+            "payload": {"type": "descriptive", "variable": f"v{i}", "n": 100},
+            "markdown": "| Variable | n |\n| --- | --- |\n| v | 100 |",
+        }
+        for i in range(3)
+    ]
+    trimmed = _trim_oversize_inline_payloads(results)
+    assert trimmed is False
+    for entry in results:
+        assert "payload" in entry
+        assert isinstance(entry["payload"], dict)
+
+
 @_skip_no_python
 def test_submit_script_dedupes_shared_transformations(tmp_path: Path) -> None:
     """A multi-result script that emits N payloads typically generates

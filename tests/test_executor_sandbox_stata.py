@@ -78,8 +78,13 @@ nora_result_regress, label("stata-happy-path")
     r = run_script("Stata", code, tmp_path)
     assert r.ok, f"Stata script failed: error={r.error}\nstdout tail={r.raw_stdout[-500:]}"
     assert r.result_payloads
-    assert r.result_payloads[0]["type"] == "linear_regression"
-    assert r.result_payloads[0]["n"] == 74
+    payload = r.result_payloads[0]
+    assert payload["type"] == "linear_regression"
+    assert payload["n"] == 74
+    pvals = payload.get("p_values")
+    assert isinstance(pvals, dict) and set(pvals) == {"mpg", "_cons"}
+    for term, p in pvals.items():
+        assert isinstance(p, float) and 0.0 <= p <= 1.0, f"{term}={p!r}"
 
 
 @requires_sandbox_apply

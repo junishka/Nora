@@ -283,12 +283,68 @@ def _compact_payload(sanitized: dict[str, Any]) -> dict[str, Any]:
     data it needs to render tables directly from the submit_script
     response. ``expand_result`` is still there for the cases where
     full ``vcov``/``vif`` matter (collinearity audits, joint tests).
+
+    Note: a second-stage trim in ``submit_script`` may strip this
+    field entirely from each entry when the assembled envelope would
+    exceed ``_INLINE_PAYLOAD_BUDGET`` (the SDK persists oversize tool
+    results to a file the model can't read). When that fires, the
+    inline ``markdown`` table remains and the model can call
+    ``expand_result(view="full")`` on specific result_ids for raw
+    numbers.
     """
     if not isinstance(sanitized, dict):
         return {}
     if sanitized.get("type") == "linear_regression":
         return {k: v for k, v in sanitized.items() if k not in ("vcov", "vif")}
     return dict(sanitized)
+
+
+# Per-call inline budget for the assembled ``submit_script`` envelope.
+# The Claude Agent SDK enforces a tool-result size cap (~56k chars in
+# practice) — over the cap, the inline body is replaced with an
+# "output saved to <path>" message and the JSON is persisted to
+# ``~/.claude/projects/<...>/tool-results/<id>``. Nora exposes no
+# Read/Bash, so the model can't fetch the persisted file and falls
+# back to ``list_results`` + N × ``expand_result``, defeating the
+# inline-payload optimization the model just lost. Budget is set
+# below the cap with margin for the wrapper (status, timings,
+# transformations_summary, plot summary, _run_dir).
+_INLINE_PAYLOAD_BUDGET = 35_000
+
+
+def _trim_oversize_inline_payloads(results: list[dict[str, Any]]) -> bool:
+    """Drop ``payload`` from ok-status entries when the inline body
+    (sum of per-entry ``payload`` JSON + ``markdown``) would cross
+    ``_INLINE_PAYLOAD_BUDGET``. Returns True iff a trim happened.
+
+    ``markdown`` stays on every entry — it's what the UI's per-
+    result panels render from and the canonical table the model
+    reads from. For raw numbers the model still has
+    ``expand_result(view="full")`` per result_id; trimming converts
+    forced N × round-trips on big batches into a few targeted ones.
+
+    Mutates ``results`` in place. The caller (``submit_script``) is
+    expected to surface the boolean return value as
+    ``response["_inline_payload_omitted"] = True`` so the model
+    knows the inline shape changed for this turn.
+    """
+    payload_cost = sum(
+        len(json.dumps(r.get("payload"), ensure_ascii=False))
+        for r in results
+        if r.get("status") == "ok" and "payload" in r
+    )
+    markdown_cost = sum(
+        len(r.get("markdown", "")) for r in results
+        if r.get("status") == "ok"
+    )
+    if payload_cost + markdown_cost <= _INLINE_PAYLOAD_BUDGET:
+        return False
+    trimmed = False
+    for entry in results:
+        if entry.get("status") == "ok" and "payload" in entry:
+            del entry["payload"]
+            trimmed = True
+    return trimmed
 
 
 def _shared_transformations(results: list[dict[str, Any]]) -> list[str]:
@@ -1118,6 +1174,9 @@ async def submit_script(args: dict[str, Any]) -> dict[str, Any]:
                 if t not in shared_set
             ]
 
+    # Envelope-size guard — see ``_trim_oversize_inline_payloads``.
+    inline_payload_omitted = _trim_oversize_inline_payloads(results)
+
     # Phase timings: subprocess vs post-execution audit work. The
     # default ``duration_seconds`` only reports the subprocess, which
     # used to hide a real bug — the post-execution row-count audit
@@ -1151,6 +1210,8 @@ async def submit_script(args: dict[str, Any]) -> dict[str, Any]:
     }
     if shared_transformations:
         response["transformations_summary"] = shared_transformations
+    if inline_payload_omitted:
+        response["_inline_payload_omitted"] = True
 
     if overall_status == "rejected_by_sanitizer":
         response["hint"] = (

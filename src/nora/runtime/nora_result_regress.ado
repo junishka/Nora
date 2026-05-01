@@ -1,4 +1,4 @@
-*! version 0.0.2  Nora runtime: emit a linear_regression payload from e().
+*! version 0.0.3  Nora runtime: emit a linear_regression payload from e().
 *!
 *! Call after a regression command (regress, logit, etc. — anything that
 *! populates e(b), e(V), e(N), e(depvar)). Writes the structured payload
@@ -117,6 +117,38 @@ program define nora_result_regress
         local first = 0
     }
     file write `fh' "}"
+
+    * p_values (named dict, two-sided t-test against e(df_r)). Skipped
+    * when the estimator didn't populate e(df_r) — the renderer drops
+    * the p-value column when the dict is absent. Dropped/collinear
+    * terms have SE=0, which makes b/se missing; emit JSON `null` for
+    * those rather than Stata's "." (not valid JSON).
+    if "`e(df_r)'" != "" {
+        tempname _se _b _t _p
+        scalar `_se' = .
+        scalar `_b' = .
+        scalar `_t' = .
+        scalar `_p' = .
+        file write `fh' `","p_values":{"'
+        local first = 1
+        forvalues i = 1/`k' {
+            local v : word `i' of `vnames'
+            if !`first' file write `fh' ","
+            scalar `_se' = sqrt(`Vmat'[`i', `i'])
+            scalar `_b' = `bmat'[1, `i']
+            if `_se' == 0 | missing(`_se') | missing(`_b') {
+                file write `fh' `""`v'":null"'
+            }
+            else {
+                scalar `_t' = abs(`_b' / `_se')
+                scalar `_p' = 2 * ttail(`=e(df_r)', `_t')
+                local _pstr = strofreal(`_p', "%21.17e")
+                file write `fh' `""`v'":`_pstr'"'
+            }
+            local first = 0
+        }
+        file write `fh' "}"
+    }
 
     * Optional fit statistics. Missing e() macros mean the command didn't
     * populate them (e.g. robust SE paths change what's in e()), so we

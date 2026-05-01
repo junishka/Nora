@@ -92,7 +92,7 @@ def _render_linear_regression(p: dict[str, Any]) -> str | None:
     for term, est in coefs.items():
         row = [str(term), _fmt_num(est), _fmt_num(ses.get(term))]
         if has_p:
-            row.append(_fmt_num(pvals.get(term)))
+            row.append(_fmt_pvalue(pvals.get(term)))
         rows.append(row)
     table = _markdown_table(header, rows)
 
@@ -148,7 +148,7 @@ def _render_t_test(p: dict[str, Any]) -> str | None:
     if tstat is not None:
         diff_lines.append(f"t = {_fmt_num(tstat)}")
     if pval is not None:
-        diff_lines.append(f"p = {_fmt_num(pval)}")
+        diff_lines.append(f"p = {_fmt_pvalue(pval)}")
     diff = " · ".join(diff_lines)
     label = test_type.replace("_", "-") or "t-test"
     return f"{table}\n\n{label}: {diff}" if diff else f"{table}\n\n{label}"
@@ -366,11 +366,18 @@ def _markdown_table(header: list[str], rows: list[list[str]]) -> str:
 def _fmt_num(x: Any) -> str:
     """Render a number for table display.
 
-    Suppression markers (string values like ``"<10"``) pass through.
-    Non-finite values render empty so a NaN doesn't read as a
-    suspicious zero. Otherwise: 4 sig figs at the magnitude boundary,
-    scientific notation only for very small / very large absolute
-    values.
+    4 significant figures, fixed-point notation only — never
+    scientific. Coefficients in a regression often span many
+    magnitudes within one table (continuous slope ≈ 0.0004,
+    dummy ≈ 0.5, intercept / year FE ≈ 13.6); a mid-row hop into
+    ``e-04`` reads worse than a slightly wider column. Trailing
+    zeros after the decimal are trimmed so columns stay tight,
+    but precision is preserved (``0.0021`` keeps two sig figs;
+    ``0.002100`` would falsely advertise four).
+
+    Suppression markers (string values like ``"<10"``) pass
+    through. Non-finite or missing values render empty so a NaN
+    doesn't read as a suspicious zero.
     """
     if isinstance(x, str):
         return x  # suppression marker or pre-formatted
@@ -385,11 +392,50 @@ def _fmt_num(x: Any) -> str:
     abs_v = abs(v)
     if abs_v == 0:
         return "0"
-    if abs_v >= 1e6 or abs_v < 1e-3:
-        return f"{v:.3e}"
-    # 4 sig figs, trimmed of trailing zeros where natural.
-    s = f"{v:.4g}"
+    # Decimal places needed to show 4 sig figs in fixed notation.
+    # ``place`` is the index of the leading sig fig (e.g. 0.0021
+    # has ``place = -3``; 13.58 has ``place = 1``). ``decimals``
+    # can go negative for very large magnitudes — Python's
+    # ``round(v, ndigits)`` accepts negative ndigits to round
+    # left of the decimal point, which is exactly what we want
+    # for e.g. 1234567 → 1235000.
+    place = math.floor(math.log10(abs_v))
+    decimals = 4 - 1 - place
+    if decimals >= 0:
+        s = f"{v:.{decimals}f}"
+    else:
+        s = f"{round(v, decimals):.0f}"
+    if "." in s:
+        s = s.rstrip("0").rstrip(".")
+        if s in ("", "-"):
+            s = "0"
     return s
+
+
+def _fmt_pvalue(x: Any) -> str:
+    """Render a p-value for table display in publication style.
+
+    Three decimals; ``<0.001`` floor (the standard convention — a
+    bare ``0.000`` reads as exactly zero, which it isn't); ``>0.999``
+    ceiling for symmetric honesty on near-1 values. Suppression
+    markers and non-finite/missing values follow ``_fmt_num``'s
+    conventions: pass through / render empty.
+    """
+    if isinstance(x, str):
+        return x
+    if x is None:
+        return ""
+    try:
+        v = float(x)
+    except (TypeError, ValueError):
+        return ""
+    if not math.isfinite(v) or v < 0 or v > 1:
+        return ""
+    if v < 0.001:
+        return "<0.001"
+    if v > 0.999:
+        return ">0.999"
+    return f"{v:.3f}"
 
 
 def _fmt_int(x: Any) -> str:

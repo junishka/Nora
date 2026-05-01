@@ -39,6 +39,97 @@ def test_render_unknown_type_returns_none() -> None:
     assert render_table({"type": None}) is None
 
 
+def test_fmt_num_never_uses_scientific_notation() -> None:
+    """Estimate / Std. Error formatting stays fixed-point even for
+    very small or very large magnitudes — 4 sig figs. Pin against
+    the previous ``e-04`` / ``e+06`` hop the user explicitly asked
+    to remove from the regression card."""
+    from nora.result_render import _fmt_num
+
+    # Very small: 4 sig figs in fixed notation, no e-notation.
+    # Trailing zeros trimmed (the input ``0.000383`` carries 3 sig
+    # figs, so showing ``0.0003830`` would falsely advertise 4).
+    assert _fmt_num(0.000383) == "0.000383"
+    assert _fmt_num(1.8e-06) == "0.0000018"
+    assert _fmt_num(-0.000383) == "-0.000383"
+    # Common regression-coefficient range.
+    assert _fmt_num(0.02158) == "0.02158"
+    assert _fmt_num(0.004531) == "0.004531"
+    assert _fmt_num(-0.009297) == "-0.009297"
+    assert _fmt_num(13.58) == "13.58"
+    # Trailing zeros trimmed.
+    assert _fmt_num(0.5) == "0.5"
+    assert _fmt_num(10.0) == "10"
+    # Large magnitudes round to 4 sig figs but stay fixed-point.
+    assert _fmt_num(1234567) == "1235000"
+    assert _fmt_num(-1234567) == "-1235000"
+    # Edge cases.
+    assert _fmt_num(0) == "0"
+    assert _fmt_num(None) == ""
+    assert _fmt_num(float("nan")) == ""
+    assert _fmt_num("<10") == "<10"
+    # No string from this formatter contains an exponent marker.
+    for v in (1.8e-06, 0.000383, 0.02158, 13.58, 1234567, -1234567, 1e-15):
+        assert "e" not in _fmt_num(v).lower(), f"scientific leaked for {v}"
+
+
+def test_fmt_pvalue_publication_style() -> None:
+    """P-values render in publication style: 3 decimals, ``<0.001``
+    floor for very small values (a bare ``0.000`` reads as exactly
+    zero, which it isn't), ``>0.999`` ceiling on the high end. Pin
+    against the previous use of ``_fmt_num`` which switched to
+    scientific notation below 1e-3 (``1.800e-06``) — too noisy for a
+    card the researcher reads."""
+    from nora.result_render import _fmt_pvalue
+
+    # Floor: anything < 0.001 collapses to "<0.001".
+    assert _fmt_pvalue(1.8e-06) == "<0.001"
+    assert _fmt_pvalue(0.0009) == "<0.001"
+    assert _fmt_pvalue(0.0) == "<0.001"
+    # Three-decimal band.
+    assert _fmt_pvalue(0.001) == "0.001"
+    assert _fmt_pvalue(0.0023) == "0.002"
+    assert _fmt_pvalue(0.05) == "0.050"
+    assert _fmt_pvalue(0.222) == "0.222"
+    assert _fmt_pvalue(0.999) == "0.999"
+    # Ceiling: anything > 0.999 collapses to ">0.999".
+    assert _fmt_pvalue(0.9995) == ">0.999"
+    assert _fmt_pvalue(1.0) == ">0.999"
+    # Missing / None / non-finite / out-of-range render empty (matches
+    # the rest of the renderer's "blank cell, not a fake zero" rule).
+    assert _fmt_pvalue(None) == ""
+    assert _fmt_pvalue(float("nan")) == ""
+    assert _fmt_pvalue(-0.1) == ""  # invalid range
+    assert _fmt_pvalue(1.5) == ""
+    # Suppression markers pass through unchanged.
+    assert _fmt_pvalue("<10") == "<10"
+
+
+def test_render_linear_regression_pvalues_use_publication_format() -> None:
+    """The regression card's p-value column uses the 3-decimal /
+    ``<0.001`` formatter, NOT scientific notation. Pin against the
+    user-visible formatting the researcher reads off the card."""
+    payload = {
+        "type": "linear_regression",
+        "n": 561758,
+        "coefficients": {"a_ym2": 0.02158, "a_yp1": 0.01348, "fp_yp3": -0.009297},
+        "standard_errors": {"a_ym2": 0.004531, "a_yp1": 0.003795, "fp_yp3": 0.007613},
+        # First two were the noisy-scientific cases under _fmt_num
+        # (1.8e-06, 3.83e-04); the third is a plain mid-range value.
+        "p_values": {"a_ym2": 1.8e-06, "a_yp1": 0.000383, "fp_yp3": 0.222},
+        "response_variable": "y",
+        "predictor_variables": ["a_ym2", "a_yp1", "fp_yp3"],
+    }
+    md = render_table(payload)
+    assert md is not None
+    assert "<0.001" in md, f"expected <0.001 floor, got:\n{md}"
+    assert "0.222" in md
+    # Scientific notation must not leak into the p-value column.
+    assert "e-06" not in md and "e-04" not in md, (
+        f"scientific notation leaked into p-value column:\n{md}"
+    )
+
+
 def test_render_linear_regression_minimal() -> None:
     payload = {
         "type": "linear_regression",
