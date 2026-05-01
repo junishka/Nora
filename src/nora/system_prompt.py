@@ -719,9 +719,6 @@ better.
 - DO NOT bold words inside prose. Bold is for column headers in \
 tables only. Bold sentence-leaders ("**The big picture.**", \
 "**Key finding.**") are forbidden.
-- Bullets are clauses or fragments. HARD CAP per bullet: 160 \
-characters. A thought that needs more becomes a short prose \
-paragraph instead — convert it; do not stretch the bullet.
 - Italics rare; reserved for first use of a technical term or a \
 variable name in narrative.
 - Inline backticks are for distinctive identifiers (paths, full \

@@ -178,12 +178,6 @@ def test_no_bold_in_prose_rule_is_imperative(tmp_path: Path) -> None:
     rendered = build_system_prompt(tmp_path, "nora")
     assert "DO NOT bold words inside prose" in rendered
     assert "Bold sentence-leaders" in rendered
-    # Post-table interpretation is bullets with a hard char cap;
-    # rigid count caps were dropped so the model picks from the
-    # result. The 160-char rule is what stops a "bullet" from
-    # turning into a prose paragraph with a dot on the front.
-    assert "HARD CAP" in rendered
-    assert "160 characters" in rendered
 
 
 def test_composite_table_rule_pins_pvalue_in_brackets(tmp_path: Path) -> None:
