@@ -16,7 +16,7 @@ import json
 from pathlib import Path
 
 from nora.config import use_cwd
-from nora.result_render import render_table
+from nora.result_render import compose_layout, render_table
 from nora.store import StoredResult, get_store, reset_store_for_tests
 from nora.tools import HANDLERS
 
@@ -408,3 +408,247 @@ def test_expand_result_unknown_view_rejected(tmp_path: Path) -> None:
         assert "markdown" in body["reason"]
     finally:
         reset_store_for_tests()
+
+
+# ---------------------------------------------------------------------------
+# compose_layout — multi-result composite tables
+# ---------------------------------------------------------------------------
+
+
+def _payload(coefs, ses, pvals=None):
+    """Compact constructor for a fake regression payload."""
+    out = {
+        "type": "linear_regression",
+        "coefficients": dict(coefs),
+        "standard_errors": dict(ses),
+    }
+    if pvals is not None:
+        out["p_values"] = dict(pvals)
+    return out
+
+
+def test_compose_layout_happy_path() -> None:
+    """A single-group spec with two rows and two columns produces a
+    table whose cells are looked up from the payload store. Pin the
+    cell shape (``estimate (SE) [p-value]``) and the column-label /
+    row-label rendering."""
+    payloads = {
+        "M1": _payload(
+            {"x": 0.020, "y": -0.010},
+            {"x": 0.005, "y": 0.004},
+            {"x": 0.001, "y": 0.022},
+        ),
+        "M2": _payload(
+            {"x": 0.015, "y": 0.005},
+            {"x": 0.003, "y": 0.006},
+            {"x": 0.0001, "y": 0.4},
+        ),
+    }
+    spec = {
+        "title": "Mechanism A",
+        "columns": [{"id": "x", "label": "treat × t0"},
+                    {"id": "y", "label": "treat × t+1"}],
+        "groups": [
+            {"label": None, "rows": [
+                {"result_id": "M1", "label": "ln_rev"},
+                {"result_id": "M2", "label": "ln_exp"},
+            ]},
+        ],
+    }
+    md = compose_layout(spec, payloads)
+    assert md is not None
+    assert "**Mechanism A**" in md
+    assert "treat × t0" in md and "treat × t+1" in md
+    assert "ln_rev" in md and "ln_exp" in md
+    # Cell shape: estimate (SE) [p-value], no scientific notation,
+    # publication-style p-value formatting (3 decimals or <0.001).
+    assert "0.02 (0.005) [0.001]" in md or "0.02 (0.005) [<0.001]" in md
+    assert "[<0.001]" in md  # M2 row x has p=0.0001
+
+
+def test_compose_layout_hallucinated_result_id_renders_em_dash() -> None:
+    """The structural guarantee: a result_id the model invented (or
+    typed wrong) renders as a row of ``—`` cells, NOT a hallucinated
+    coefficient. Grouping is fallible; the numbers aren't. Pin this
+    against any future "fall back to a guess" change."""
+    payloads = {
+        "M1": _payload({"x": 0.5}, {"x": 0.05}, {"x": 0.001}),
+    }
+    spec = {
+        "columns": [{"id": "x", "label": "x"}],
+        "groups": [{"label": None, "rows": [
+            {"result_id": "M1", "label": "real"},
+            {"result_id": "M_BOGUS", "label": "made up"},
+        ]}],
+    }
+    md = compose_layout(spec, payloads)
+    assert md is not None
+    lines = md.splitlines()
+    bogus_line = next(ln for ln in lines if "made up" in ln)
+    # Every cell on the bogus row should be the dash, not a number.
+    cells = [c.strip() for c in bogus_line.split("|") if c.strip()]
+    assert cells[0] == "made up"
+    for c in cells[1:]:
+        assert c == "—", f"hallucinated row leaked a non-dash cell: {c!r}"
+
+
+def test_compose_layout_missing_term_id_renders_em_dash() -> None:
+    """Term IDs not in the payload's coefficients dict render as
+    ``—`` for that cell (the result existed, but didn't carry the
+    requested coefficient — e.g., a robust-SE estimator that didn't
+    populate p_values, or a column the spec asked for that wasn't
+    in the regression)."""
+    payloads = {
+        "M1": _payload({"x": 0.5}, {"x": 0.05}, {"x": 0.001}),
+    }
+    spec = {
+        "columns": [
+            {"id": "x", "label": "x"},
+            {"id": "z_not_in_model", "label": "z"},
+        ],
+        "groups": [{"label": None, "rows": [
+            {"result_id": "M1", "label": "row1"},
+        ]}],
+    }
+    md = compose_layout(spec, payloads)
+    assert md is not None
+    line = next(ln for ln in md.splitlines() if "row1" in ln)
+    cells = [c.strip() for c in line.split("|") if c.strip()]
+    assert cells[0] == "row1"
+    assert cells[1].startswith("0.5")  # x cell has values
+    assert cells[2] == "—", f"missing-term cell should be '—', got {cells[2]!r}"
+
+
+def test_compose_layout_multi_group_has_bold_header_rows() -> None:
+    """Group labels render as bold first-cell header rows above their
+    member rows. Markdown pipe tables don't support row spans, so the
+    blank-cells convention is what we pin."""
+    payloads = {
+        "M1": _payload({"x": 0.1}, {"x": 0.01}),
+        "M2": _payload({"x": 0.2}, {"x": 0.02}),
+    }
+    spec = {
+        "columns": [{"id": "x", "label": "x"}],
+        "groups": [
+            {"label": "H1: direct", "rows": [
+                {"result_id": "M1", "label": "outcome A"}]},
+            {"label": "H2: indirect", "rows": [
+                {"result_id": "M2", "label": "outcome B"}]},
+        ],
+    }
+    md = compose_layout(spec, payloads)
+    assert md is not None
+    assert "**H1: direct**" in md
+    assert "**H2: indirect**" in md
+    # Headers come BEFORE their member rows.
+    pos_h1 = md.find("**H1: direct**")
+    pos_a = md.find("outcome A")
+    pos_h2 = md.find("**H2: indirect**")
+    pos_b = md.find("outcome B")
+    assert 0 < pos_h1 < pos_a < pos_h2 < pos_b
+
+
+def test_compose_layout_returns_none_for_malformed_specs() -> None:
+    """Malformed specs return None instead of raising or rendering
+    garbage. Caller falls back to its default error handling."""
+    payloads = {"M1": _payload({"x": 0.5}, {"x": 0.05})}
+    # Not a dict.
+    assert compose_layout("not a spec", payloads) is None  # type: ignore[arg-type]
+    # Missing columns.
+    assert compose_layout({"groups": [{"rows": [{"result_id": "M1"}]}]}, payloads) is None
+    # Empty columns.
+    assert compose_layout(
+        {"columns": [], "groups": [{"rows": [{"result_id": "M1"}]}]},
+        payloads,
+    ) is None
+    # Missing groups.
+    assert compose_layout({"columns": [{"id": "x", "label": "x"}]}, payloads) is None
+    # Group missing rows.
+    assert compose_layout(
+        {"columns": [{"id": "x", "label": "x"}], "groups": [{}]},
+        payloads,
+    ) is None
+    # Row missing result_id.
+    assert compose_layout(
+        {
+            "columns": [{"id": "x", "label": "x"}],
+            "groups": [{"rows": [{"label": "no id"}]}],
+        },
+        payloads,
+    ) is None
+
+
+def test_compose_layout_against_real_24_result_run() -> None:
+    """Smoke test against the user's actual reg_v11.do output: 24
+    valid sanitized linear_regression payloads. Compose a layout
+    grouped by hypothesis panel (H1a / H1b / H2a / H2b), verify the
+    markdown comes back with one header row per group, one row per
+    outcome, and no scientific-notation leakage in cells. This is
+    the regression pin for the design proposal that motivated the
+    feature."""
+    fixture = Path(
+        "/Users/bb/.nora-sessions/20260501T032851Z_be5f2a77/.nora/runs/"
+        "20260501T032915Z_69914fb1/result.json"
+    )
+    if not fixture.exists():
+        # Fixture not present in CI; skip silently.
+        import pytest
+        pytest.skip("real-data fixture not available on this machine")
+
+    from nora.sanitizer import DEFAULT_CONFIG, sanitize
+
+    payloads_by_id: dict[str, dict] = {}
+    labels: list[tuple[str, str]] = []
+    with fixture.open() as f:
+        for i, line in enumerate(f, start=1):
+            raw = json.loads(line)
+            result = sanitize(raw, DEFAULT_CONFIG)
+            assert result.ok, f"line {i}: {result.rejection_reason}"
+            rid = f"M{i}"
+            payloads_by_id[rid] = result.sanitized or {}
+            labels.append((rid, raw.get("label", rid)))
+    assert len(payloads_by_id) == 24
+
+    # Group by hypothesis prefix (H1a / H1b / H2a / H2b → 6 outcomes each).
+    def _group_for(label: str) -> str:
+        for tag in ("H1a", "H1b", "H2a", "H2b"):
+            if label.startswith(tag):
+                return tag
+        return "other"
+
+    groups: dict[str, list] = {"H1a": [], "H1b": [], "H2a": [], "H2b": []}
+    for rid, label in labels:
+        outcome = label.split(" ", 1)[1] if " " in label else label
+        groups[_group_for(label)].append({"result_id": rid, "label": outcome})
+
+    spec = {
+        "title": "reg_v11: event-study coefficients across panels",
+        "columns": [
+            {"id": "fp_ym2", "label": "year -2"},
+            {"id": "fp_y0",  "label": "year 0"},
+            {"id": "fp_yp1", "label": "year +1"},
+            {"id": "fp_yp2", "label": "year +2"},
+            {"id": "fp_yp3", "label": "year +3"},
+        ],
+        "groups": [
+            {"label": tag, "rows": rows}
+            for tag, rows in groups.items() if rows
+        ],
+    }
+    md = compose_layout(spec, payloads_by_id)
+    assert md is not None
+    # Title + four group headers + 24 outcome rows + table header line.
+    assert "**reg_v11" in md
+    for tag in ("**H1a**", "**H1b**", "**H2a**", "**H2b**"):
+        assert tag in md, f"missing group header {tag} in:\n{md}"
+    # 24 outcome rows: each label appears once.
+    for _, label in labels:
+        outcome = label.split(" ", 1)[1] if " " in label else label
+        assert outcome in md
+    # No scientific notation leak in cells.
+    assert "e-0" not in md and "e+0" not in md
+    # Cell format ``est (SE) [p-value]`` present somewhere.
+    import re
+    assert re.search(r"-?\d+\.\d+ \(\d+\.\d+\) \[", md), (
+        f"cell shape ``est (SE) [p]`` not found in:\n{md[:1500]}"
+    )

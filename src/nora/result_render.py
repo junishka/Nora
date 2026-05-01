@@ -18,10 +18,6 @@ Scope notes:
 - This module formats. It does NOT validate, sanitize, or interpret.
   Inputs are already-sanitized payloads from the disclosure-control
   layer; outputs are markdown bytes. No SDC decisions live here.
-- Single-payload only. Composite tables (24 specs in one matrix,
-  before/after-controls forest plots) require choices about row
-  order, column emphasis, and which results to highlight — those
-  are model judgment, not deterministic formatting.
 - Suppressed cells (the ``"<10"`` / similar markers the sanitizer
   inserts) pass through verbatim. Never silently drop them.
 - Fields the sanitizer has dropped (e.g., ``vif`` not present)
@@ -30,10 +26,17 @@ Scope notes:
 
 Public surface:
 
-- ``render_table(payload)`` — top-level dispatch by ``payload["type"]``.
-  Returns ``None`` if the type is unknown or the payload is malformed
-  beyond what we can render. Callers fall back to whatever they were
-  doing before.
+- ``render_table(payload)`` — single-payload dispatch by
+  ``payload["type"]``. One result per call.
+- ``compose_layout(spec, payloads_by_id)`` — multi-result composite
+  table from a model-emitted layout spec. Cell values are looked up
+  from the payload store by the spec's result IDs; the model never
+  types a coefficient. Hallucinated IDs render as ``—`` so grouping
+  errors are recoverable but number errors are structurally
+  impossible.
+
+Both return ``None`` if the input is malformed beyond what we can
+render; callers fall back to whatever they had.
 """
 
 from __future__ import annotations
@@ -63,6 +66,149 @@ def render_table(payload: dict[str, Any]) -> str | None:
         return handler(payload)
     except Exception:  # noqa: BLE001 — formatting must never crash callers
         return None
+
+
+# ---------------------------------------------------------------------------
+# Layout-driven composite table
+# ---------------------------------------------------------------------------
+
+
+def compose_layout(
+    spec: dict[str, Any],
+    payloads_by_id: dict[str, dict[str, Any]],
+) -> str | None:
+    """Compose a multi-result comparison table from a model-emitted
+    layout spec.
+
+    The spec carries the model's judgment about which results to
+    surface together, how to group them, and which terms to put in
+    columns. Cell values are looked up in ``payloads_by_id`` — the
+    model never types a coefficient. A ``result_id`` not in the
+    store, or a ``term_id`` not in a payload's coefficients, renders
+    as ``—``. This separation matches where each kind of error is
+    recoverable: grouping is fallible (the user can re-prompt or
+    edit), the numbers aren't (they come from the sanitized store).
+
+    Spec shape::
+
+        {
+            "title": "Mechanism A: revenue effects",   # optional
+            "columns": [
+                {"id": "fp_y0",  "label": "year 0"},
+                {"id": "fp_yp1", "label": "year +1"},
+                ...
+            ],
+            "groups": [
+                {
+                    "label": "H1: direct effect",      # optional row header
+                    "rows": [
+                        {"result_id": "M1", "label": "ln_rev_total"},
+                        ...
+                    ]
+                },
+                ...
+            ]
+        }
+
+    Cells render as ``estimate (SE) [p-value]``. Each piece falls
+    back to ``—`` independently when the underlying payload doesn't
+    carry it (a Stata robust-SE path with no t-stats produces
+    ``coef (SE) [—]``; a fully-omitted collinear term produces
+    ``—``). Group labels render as bold header rows above their
+    members; missing labels just skip the header row.
+
+    Returns ``None`` when the spec is malformed (not a dict, missing
+    or empty ``columns`` / ``groups``, wrong inner shapes); callers
+    fall back to their default error handling. Never raises.
+    """
+    try:
+        return _compose_layout_inner(spec, payloads_by_id)
+    except Exception:  # noqa: BLE001 — formatting must never crash callers
+        return None
+
+
+def _compose_layout_inner(
+    spec: dict[str, Any],
+    payloads_by_id: dict[str, dict[str, Any]],
+) -> str | None:
+    if not isinstance(spec, dict):
+        return None
+    columns = spec.get("columns")
+    groups = spec.get("groups")
+    if not isinstance(columns, list) or not columns:
+        return None
+    if not isinstance(groups, list) or not groups:
+        return None
+
+    col_ids: list[str] = []
+    col_labels: list[str] = []
+    for c in columns:
+        if not isinstance(c, dict):
+            return None
+        cid = c.get("id")
+        if not isinstance(cid, str) or not cid:
+            return None
+        col_ids.append(cid)
+        clabel = c.get("label", cid)
+        col_labels.append(str(clabel) if clabel is not None else cid)
+
+    header = ["Outcome", *col_labels]
+    rows: list[list[str]] = []
+
+    for group in groups:
+        if not isinstance(group, dict):
+            return None
+        group_rows = group.get("rows")
+        if not isinstance(group_rows, list) or not group_rows:
+            return None
+        group_label = group.get("label")
+        if isinstance(group_label, str) and group_label.strip():
+            # Header row: bold label in first cell, blanks elsewhere.
+            # Markdown pipe tables don't support row spans, so a
+            # blank-cells header row is the conventional shape.
+            rows.append([f"**{group_label.strip()}**", *([""] * len(col_ids))])
+        for row in group_rows:
+            if not isinstance(row, dict):
+                return None
+            rid = row.get("result_id")
+            if not isinstance(rid, str) or not rid:
+                return None
+            rlabel = row.get("label", rid)
+            payload = payloads_by_id.get(rid) or {}
+            coefs = payload.get("coefficients") if isinstance(payload, dict) else None
+            ses = payload.get("standard_errors") if isinstance(payload, dict) else None
+            pvals = payload.get("p_values") if isinstance(payload, dict) else None
+            cells = [
+                _compose_cell(coefs, ses, pvals, col_id) for col_id in col_ids
+            ]
+            rows.append([str(rlabel) if rlabel is not None else rid, *cells])
+
+    table = _markdown_table(header, rows)
+    title = spec.get("title")
+    if isinstance(title, str) and title.strip():
+        return f"**{title.strip()}**\n\n{table}"
+    return table
+
+
+def _compose_cell(
+    coefs: Any, ses: Any, pvals: Any, term_id: str,
+) -> str:
+    """Render one ``estimate (SE) [p-value]`` cell.
+
+    Each component falls back to ``—`` independently. If all three
+    are absent (the result_id missed entirely, or the term isn't in
+    any of coefficients / SEs / p_values), collapse to a single
+    ``—`` rather than ``— (—) [—]`` which is just noise.
+    """
+    e = coefs.get(term_id) if isinstance(coefs, dict) else None
+    s = ses.get(term_id) if isinstance(ses, dict) else None
+    p = pvals.get(term_id) if isinstance(pvals, dict) else None
+    if e is None and s is None and p is None:
+        return "—"
+    e_str = (_fmt_num(e) if e is not None else "") or "—"
+    s_str = (_fmt_num(s) if s is not None else "") or "—"
+    p_str = (_fmt_pvalue(p) if p is not None else "") or "—"
+    return f"{e_str} ({s_str}) [{p_str}]"
 
 
 # ---------------------------------------------------------------------------
