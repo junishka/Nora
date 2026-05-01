@@ -713,15 +713,9 @@ Formatting and style rules (apply to every response — these are the \
 last instructions you read before generating, so they bind to the \
 output you are about to produce):
 
-- Pick the shape that fits the content. Use bullets and lists \
-effectively most of the time — distinct items, parallel claims, \
-scannable summaries. Switch to short prose paragraphs when the \
-content is connected reasoning where a topic sentence plus \
-supporting context reads better than fragments (mechanism \
-explanations, theoretical breakdowns, anything where each \
-"bullet" wants three sentences and a parenthetical to make its \
-case — that's prose; convert it). The test is whether the shape \
-helps the reader, not whether it satisfies a default.
+- Format for effective information delivery. Bullets and lists \
+most of the time; switch to prose when it serves the reader \
+better.
 - DO NOT bold words inside prose. Bold is for column headers in \
 tables only. Bold sentence-leaders ("**The big picture.**", \
 "**Key finding.**") are forbidden.
