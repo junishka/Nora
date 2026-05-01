@@ -1832,6 +1832,58 @@ kbd {
   margin: 8px 0;
 }
 
+/* Multi-result audit panel: collapsed by default. Summary line is
+ * the audit affordance — researcher sees the count and id range,
+ * clicks to expand the per-result tables when they actually want
+ * the detail. The composite table from ``compose_results`` is the
+ * primary reading surface; the inner panels back it up. */
+.tool-card .result-panel-collapsed {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--bg);
+  padding: 0;
+}
+
+.tool-card .result-panel-summary {
+  padding: 8px 14px;
+  font-size: 12px;
+  color: var(--text-dim);
+  cursor: pointer;
+  user-select: none;
+  list-style: none;
+}
+
+.tool-card .result-panel-summary::-webkit-details-marker {
+  display: none;
+}
+
+.tool-card .result-panel-summary::before {
+  content: "▶";
+  display: inline-block;
+  margin-right: 8px;
+  font-size: 10px;
+  transition: transform 0.15s ease;
+  color: var(--text-dim);
+}
+
+.tool-card .result-panel-collapsed[open] .result-panel-summary::before {
+  transform: rotate(90deg);
+}
+
+.tool-card .result-panel-collapsed[open] .result-panel-summary {
+  border-bottom: 1px solid var(--border);
+}
+
+.tool-card .result-panel-collapsed > .result-markdown {
+  border: 0;
+  border-radius: 0;
+  border-bottom: 1px solid var(--border);
+}
+
+.tool-card .result-panel-collapsed > .result-markdown:last-child {
+  border-bottom: 0;
+}
+
 .tool-card .result-markdown {
   border: 1px solid var(--border);
   border-radius: 8px;

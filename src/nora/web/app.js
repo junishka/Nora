@@ -2308,11 +2308,21 @@ function _parseToolResultPayload(evt) {
 }
 
 function renderCanonicalResultTables(body, evt) {
-  /* For every ok-status result entry whose ``markdown`` field is
-   * populated, append a ``.result-panel`` section to the tool-card
-   * body containing the rendered table. Same canonical source as
-   * ``expand_result(view="markdown")``; rendered in the UI here so
-   * the model doesn't have to decide whether to inline a table. */
+  /* Append the per-result canonical tables to the tool-card body.
+   *
+   * Single-result run: render the one panel inline (it IS the
+   * reading surface; nothing to compare against). Multi-result
+   * run (N >= 2): collapse the panels into a ``<details>``
+   * element closed by default, with a summary line naming the
+   * count and id range. The model is now expected to call
+   * ``compose_results`` and drop the comparison table into its
+   * reply — that becomes the primary reading surface. The
+   * collapsed panels stay accessible for audit (one click to
+   * expand) without dominating the transcript with N stacked
+   * tables.
+   *
+   * Same data source for both: each entry's ``markdown`` field,
+   * canonical render from the sanitized payload. */
   const payload = _parseToolResultPayload(evt);
   const results = payload && Array.isArray(payload.results)
     ? payload.results
@@ -2324,15 +2334,14 @@ function renderCanonicalResultTables(body, evt) {
 
   const panel = document.createElement('div');
   panel.className = 'result-panel';
-  rendered.forEach((r, idx) => {
+
+  function renderOneSection(r, idx) {
     const section = document.createElement('section');
     section.className = 'result-markdown';
-
     const header = document.createElement('div');
     header.className = 'result-header';
     header.textContent = r.label || r.result_id || ('Result ' + (idx + 1));
     section.appendChild(header);
-
     const tableWrap = document.createElement('div');
     tableWrap.className = 'result-markdown-body';
     if (window.NoraMarkdown) {
@@ -2341,8 +2350,36 @@ function renderCanonicalResultTables(body, evt) {
       tableWrap.textContent = r.markdown;
     }
     section.appendChild(tableWrap);
-    panel.appendChild(section);
+    return section;
+  }
+
+  if (rendered.length === 1) {
+    panel.appendChild(renderOneSection(rendered[0], 0));
+    body.appendChild(panel);
+    return;
+  }
+
+  // Multi-result: collapsed by default. Summary line names what's
+  // inside (count + id range) so the audit affordance is visible
+  // even when collapsed; one click to expand for the per-result
+  // detail. The composite table from ``compose_results`` lives in
+  // the model's reply, not here.
+  const details = document.createElement('details');
+  details.className = 'result-panel-collapsed';
+  const summary = document.createElement('summary');
+  summary.className = 'result-panel-summary';
+  const firstId = rendered[0].result_id || '?';
+  const lastId = rendered[rendered.length - 1].result_id || '?';
+  const idRange = firstId === lastId
+    ? firstId
+    : `${firstId}–${lastId}`;
+  summary.textContent =
+    `${rendered.length} regressions stored: ${idRange} (click to expand)`;
+  details.appendChild(summary);
+  rendered.forEach((r, idx) => {
+    details.appendChild(renderOneSection(r, idx));
   });
+  panel.appendChild(details);
   body.appendChild(panel);
 }
 
