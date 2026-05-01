@@ -716,16 +716,17 @@ output you are about to produce):
 - Format for effective information delivery. Bullets and lists \
 most of the time; switch to prose when it serves the reader \
 better.
-- DO NOT bold words inside prose. Bold is for column headers in \
-tables only. Bold sentence-leaders ("**The big picture.**", \
+- Bold for column headers in tables and genuine inline emphasis. \
+Bold sentence-leaders ("**The big picture.**", \
 "**Key finding.**") are forbidden.
 - Italics rare; reserved for first use of a technical term or a \
 variable name in narrative.
-- Inline backticks are for distinctive identifiers (paths, full \
-expressions, multi-character flags), not every command-name that \
-also reads as an English word. Stata local-macro syntax (leading \
-backtick + trailing apostrophe) breaks markdown parsers; refer \
-to a local by name in prose.
+- Inline backticks for variable names, column identifiers, paths, \
+and full expressions — anything from the data or the code. Use \
+them consistently so the researcher can scan code/data tokens \
+apart from prose. Stata local-macro syntax (leading backtick + \
+trailing apostrophe) breaks markdown parsers; refer to a local \
+by name in prose.
 - Reader is intelligent and impatient. No hedging, no meta \
 commentary, no restating their point.
 - Composite cell-format table (one cell per regression in a \

@@ -150,7 +150,7 @@ def test_formatting_rules_sit_at_end_of_prompt(tmp_path: Path) -> None:
     after them, output regresses to bold sentence-leaders and
     multi-paragraph prose blocks. Pin the structural ordering."""
     rendered = build_system_prompt(tmp_path, "nora")
-    fmt_pos = rendered.find("DO NOT bold words inside prose")
+    fmt_pos = rendered.find("Bold sentence-leaders")
     think_pos = rendered.find("Think hard and thoroughly")
     tool_use_pos = rendered.find("Tool use notes:")
     assert fmt_pos > 0 and think_pos > 0 and tool_use_pos > 0
@@ -169,15 +169,17 @@ def test_formatting_rules_sit_at_end_of_prompt(tmp_path: Path) -> None:
     )
 
 
-def test_no_bold_in_prose_rule_is_imperative(tmp_path: Path) -> None:
-    """The previous "No bold in prose" wording was too gentle and the
-    model kept reverting to bold sentence-leaders ("**The big
+def test_no_bold_sentence_leaders_rule_is_imperative(tmp_path: Path) -> None:
+    """The model kept reverting to bold sentence-leaders ("**The big
     picture.**", "**Pre-trends clean.**") on long analytical
-    responses. The rule needs imperative language and an explicit
-    anti-pattern name so it binds to the failure mode."""
+    responses. The rule needs an explicit anti-pattern name so it
+    binds to the failure mode. Inline emphasis bold is allowed —
+    the earlier blanket "DO NOT bold words inside prose" overshot
+    the failure mode and made the model also drop legitimate
+    emphasis."""
     rendered = build_system_prompt(tmp_path, "nora")
-    assert "DO NOT bold words inside prose" in rendered
     assert "Bold sentence-leaders" in rendered
+    assert "are forbidden" in rendered
 
 
 def test_composite_table_rule_pins_pvalue_in_brackets(tmp_path: Path) -> None:
@@ -193,18 +195,20 @@ def test_composite_table_rule_pins_pvalue_in_brackets(tmp_path: Path) -> None:
     assert "Do NOT use significance stars" in rendered
 
 
-def test_inline_backtick_restraint_rule_present(tmp_path: Path) -> None:
-    """Without explicit guidance the model wraps every Stata / R /
-    Python command-name in backticks (``use``, ``save``, ``export``,
-    ``ds``, ``preserve``, ...). Inside prose that renders as a
-    code-box for nearly every other word and breaks reading flow.
-    Stata's local-macro syntax (leading backtick + trailing
-    apostrophe) is a separate landmine — a markdown parser sees the
-    leading tick as opening fence and the rendering collapses.
-    Pin both halves of the guidance."""
+def test_inline_backtick_rule_present(tmp_path: Path) -> None:
+    """Two independent failure modes the prompt must guard:
+    (1) the model dropping backticks on data-identifier tokens
+    (variable names, column refs) so ``ln_govt_grants`` and
+    ``has_np`` render as plain prose — the rule must explicitly
+    name variable names / column identifiers so the model uses
+    backticks consistently;
+    (2) the Stata local-macro syntax landmine (leading backtick +
+    trailing apostrophe) which a markdown parser sees as an opening
+    code fence and renders broken.
+    Pin both halves."""
     rendered = build_system_prompt(tmp_path, "nora")
-    assert "Inline backticks are for distinctive identifiers" in rendered
-    assert "not every command-name that" in rendered
+    assert "Inline backticks for variable names" in rendered
+    assert "column identifiers" in rendered
     assert "Stata local-macro syntax" in rendered
 
 
