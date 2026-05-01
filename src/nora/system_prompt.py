@@ -716,7 +716,7 @@ output you are about to produce):
 - Format for effective information delivery. Bullets and lists \
 most of the time; switch to prose when it serves the reader \
 better.
-- Bold for column headers in tables and genuine inline emphasis. \
+- Bold judiciously — column headers in tables; otherwise scant. \
 Bold sentence-leaders ("**The big picture.**", \
 "**Key finding.**") are forbidden.
 - Italics rare; reserved for first use of a technical term or a \
