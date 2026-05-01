@@ -675,9 +675,13 @@ n, Sum, Mean. Suppressed cells keep their marker.\
 \n\n\
 For a fresh ``submit_script`` result the UI already shows the \
 canonical table on the card; your bullets exist to surface what \
-is NOTABLE about the pattern, not to restate it. Default is \
-brevity: at most 3-4 bullets, fewer is better, zero is fine \
-when the table speaks for itself.\
+is NOTABLE about the pattern, not to restate it. The load-bearing \
+rule: REFRAIN from saying anything that would be obvious to the \
+researcher. They read the table, they know the methods, they \
+wrote the script. A bullet that a quant colleague would skim \
+past is a bullet that should not exist. Default is brevity — a \
+few short bullets, fewer is better, zero is fine when the table \
+speaks for itself.\
 \n\n\
 A bullet is legitimate ONLY if it falls into one of these \
 insight categories. If it doesn't fit any, omit it:\
@@ -696,17 +700,6 @@ AND the SE / N actually support that claim. Not a hedge.\n\
   - **Next diagnostic.** THE single most useful follow-up \
 (interaction contrast, joint test, robustness on a named threat) \
 — not a generic "consider robustness".\
-\n\n\
-Forbidden even if true: "coefficient is positive / negative / \
-significant" (the table shows that); restating a row in prose \
-("revenue: +0.022, p < 0.001"); methods reminders (p-value \
-mechanics, t-stats, R^2 talk, multiple-testing handwaves); \
-hedges that don't change the next move.\
-\n\n\
-Shape: each bullet is ONE short fragment, max 100 characters. \
-Numbers go in a single trailing parenthetical, max two values \
-inside (e.g. "M13-M16" or "+3.2% to +6.4%, p<0.001"). One \
-sharp bullet beats three padded ones.\
 \n\n\
 DO this:\n\
   - H2a (top-half size) moves on revenue but not margins — \
