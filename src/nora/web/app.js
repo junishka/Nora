@@ -2568,27 +2568,34 @@ function updateContextChip(occupiedTokens) {
   // dropping to zero.
   if (currentCwd) sessionHighWaters.set(currentCwd, occupiedTokens);
 
-  if (occupiedTokens > contextWindow) {
-    // Jumped beyond the assumed window — must be a larger-context
-    // model. Round up to the next sensible tier so the ratio looks
-    // stable across turns instead of creeping upward.
-    contextWindow = occupiedTokens <= 1_000_000 ? 1_000_000 : 2_000_000;
-  }
+  // Trust the authoritative ceiling set in updateModelChip (line ~3085)
+  // from the model-info payload. The previous code auto-scaled the
+  // ceiling to 2M whenever usage exceeded 1M, which silently
+  // misreported overruns: an Opus 4.7 1M turn at 1426k chars showed
+  // "71%" of 2M instead of the truthful "143% of 1M, you've blown
+  // past the window". Anthropic has no 2M model today, so the
+  // heuristic never matched reality. If the chip looks pinned at
+  // 100% on a different model in the future, fix the model registry
+  // (catalog.py / updateModelChip), not the chip.
 
   const fmt = (n) => (n >= 10_000 ? (n / 1000).toFixed(1) + 'k' : n.toString());
   const ceilingLabel = contextWindow >= 1_000_000
     ? (contextWindow / 1_000_000) + 'M'
     : (contextWindow / 1000) + 'k';
-  const pct = Math.min(100, Math.round((occupiedTokens / contextWindow) * 100));
-  contextChip.textContent = `Context ${fmt(occupiedTokens)} / ${ceilingLabel} (${pct}%)`;
+  const rawPct = Math.round((occupiedTokens / contextWindow) * 100);
+  // Show the real ratio uncapped so an over-window state is visible
+  // ("143%") instead of clamped to "100%" and blending into a normal
+  // full-but-fine state.
+  contextChip.textContent = `Context ${fmt(occupiedTokens)} / ${ceilingLabel} (${rawPct}%)`;
   contextChip.classList.remove('hidden');
 
   // Visual warning as context fills up — dim at low use, warm as it
-  // climbs, red near the ceiling. Gives the researcher a chance to
-  // wrap up a thread before the turn that exceeds the window fails.
-  contextChip.classList.remove('warn', 'danger');
-  if (pct >= 90) contextChip.classList.add('danger');
-  else if (pct >= 70) contextChip.classList.add('warn');
+  // climbs, red near the ceiling, the strongest tone past 100% so a
+  // window overrun is visually unmistakable.
+  contextChip.classList.remove('warn', 'danger', 'over');
+  if (rawPct >= 100) contextChip.classList.add('over');
+  else if (rawPct >= 90) contextChip.classList.add('danger');
+  else if (rawPct >= 70) contextChip.classList.add('warn');
 }
 
 function updatePolicyChip(policy) {

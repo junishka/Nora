@@ -2605,6 +2605,18 @@ kbd {
   font-weight: 600;
 }
 
+.context-chip.over {
+  /* Past 100% of the model's context window. ``danger`` warns about
+   * approach; ``over`` says the next turn is going to fail or get
+   * silently truncated. Same hot-pink, but bold + a faint background
+   * pulse so it stops blending with a normal "full but fine" state. */
+  color: var(--hot-pink);
+  font-weight: 700;
+  background: rgba(224, 90, 139, 0.10);
+  border-radius: 6px;
+  padding: 2px 6px;
+}
+
 .permission-wrap {
   /* Anchor for the popup — position: absolute popup resolves
    * against this wrapper, so the popup always appears just above

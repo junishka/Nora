@@ -443,6 +443,19 @@ class AnthropicSession:
                 cr = _maybe_int(usage.get("cache_read_input_tokens")) or 0
                 cc = _maybe_int(usage.get("cache_creation_input_tokens")) or 0
                 prompt_total = inp + cr + cc
+                # Diagnostic: gated by NORA_DEBUG_USAGE so a researcher
+                # who notices the chip showing >100% of a known model
+                # window can dump the raw usage dict and we can see
+                # which fields are double-counting (or which new
+                # ephemeral-cache field we're missing).
+                if os.environ.get("NORA_DEBUG_USAGE") == "1":
+                    import sys as _sys
+                    print(
+                        f"[nora.usage] round usage={dict(usage)} "
+                        f"computed prompt_total={prompt_total} "
+                        f"(inp={inp}, cr={cr}, cc={cc}, out={outp})",
+                        file=_sys.stderr, flush=True,
+                    )
                 if prompt_total >= max_prompt_total:
                     max_prompt_total = prompt_total
                     max_input = inp
