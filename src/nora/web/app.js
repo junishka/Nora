@@ -2218,10 +2218,22 @@ function renderScriptResultInline(body, evt) {
 
   const nativeStdout = stripPreamble(evt.raw_stdout || '', evt.language).trim();
   if (nativeStdout) {
+    // Collapsed by default. The script + the canonical regression
+    // tables above already tell the researcher what they need; the
+    // raw R/Stata/Python log is for "let me audit" moments. Same
+    // disclosure pattern as the multi-result panel.
+    const details = document.createElement('details');
+    details.className = 'tool-output-collapsed';
+    const summary = document.createElement('summary');
+    summary.className = 'tool-output-summary';
+    const lang = evt.language || 'script';
+    summary.textContent = `${lang} output (click to expand)`;
+    details.appendChild(summary);
     const pre = document.createElement('pre');
     pre.className = 'tool-output';
     pre.textContent = nativeStdout;
-    body.appendChild(pre);
+    details.appendChild(pre);
+    body.appendChild(details);
   }
 
   // Plot-helper diagnostic — surfaced when a helper was clearly

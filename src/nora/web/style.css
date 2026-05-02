@@ -1826,6 +1826,58 @@ kbd {
   white-space: pre;
 }
 
+/* Collapsed wrapper around the native output. Same disclosure
+ * pattern as ``.result-panel-collapsed`` — small dim summary line,
+ * click to expand the actual log. Default-collapsed: the canonical
+ * tables and the chat reply already tell the story; the raw log is
+ * for audit. */
+.tool-card .tool-output-collapsed {
+  margin: 4px 0;
+}
+
+.tool-card .tool-output-summary {
+  padding: 8px 14px;
+  font-size: 12px;
+  color: var(--text-dim);
+  cursor: pointer;
+  user-select: none;
+  list-style: none;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--bg);
+}
+
+.tool-card .tool-output-summary::-webkit-details-marker {
+  display: none;
+}
+
+.tool-card .tool-output-summary::before {
+  content: "▶";
+  display: inline-block;
+  margin-right: 8px;
+  font-size: 10px;
+  transition: transform 0.15s ease;
+  color: var(--text-dim);
+}
+
+.tool-card .tool-output-collapsed[open] .tool-output-summary::before {
+  transform: rotate(90deg);
+}
+
+.tool-card .tool-output-collapsed[open] .tool-output-summary {
+  /* Visually join the summary to the pre below when open. */
+  border-bottom-left-radius: 0;
+  border-bottom-right-radius: 0;
+  border-bottom: 0;
+  margin-bottom: 0;
+}
+
+.tool-card .tool-output-collapsed[open] .tool-output {
+  border-top-left-radius: 0;
+  border-top-right-radius: 0;
+  margin-top: 0;
+}
+
 .tool-card .tool-output-stderr {
   border-color: rgba(183, 121, 31, 0.3);
 }
@@ -1867,7 +1919,15 @@ kbd {
    * artifact (these are the canonical regression rows the model can
    * re-cite, not chrome). Text and chevron stay neutral — highlight
    * is on the box, not the letters. The accent tracks the palette:
-   * pink in dark mode, teal in light. */
+   * pink in dark mode, teal in light.
+   *
+   * ``overflow: hidden`` clips the inner summary's bottom border to
+   * the rounded-corner radius. Without it, when the panel is open
+   * the summary's border-bottom paints over the parent's rounded
+   * corner pixels and looks like the highlight has gaps at the
+   * top corners. */
+  display: block;
+  overflow: hidden;
   border: 1px solid var(--accent);
   border-radius: 8px;
   background: var(--bg);
