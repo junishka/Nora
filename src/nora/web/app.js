@@ -505,28 +505,17 @@ async function replayHistory() {
       replayTailTurn = null;
     }
     scrollToBottom();
-    // Seed the context chip with a rough token estimate of what the
-    // bridge replayed back to the model on warm-start. Without this
-    // the chip stays hidden until the next turn_done — making a
-    // restarted session visually look empty even though the model
-    // already has the warm-start prefix loaded. ~4 chars per English
-    // token is a coarse approximation that under-counts code and
-    // over-counts whitespace, but it's good enough for the chip's
-    // "roughly how full is the window" purpose. The next turn_done
-    // overwrites this with the provider's authoritative number.
-    const seed = estimateReplayTokens(events);
-    if (seed > 0) updateContextChip(seed);
+    // Don't seed the chip from the replayed history. A chars/4
+    // estimate undercounts the real prompt by a wide margin (it
+    // misses the system prompt, tool schemas, tool result envelopes,
+    // and reasoning traces), so the chip would show one number on
+    // load and a much larger one the moment the first turn_done
+    // arrived — exactly the "two largely different numbers" the
+    // researcher noticed. Better to stay hidden until the provider
+    // gives us the authoritative count on the next turn.
   } catch (err) {
     console.warn('get_chat_history failed', err);
   }
-}
-
-function estimateReplayTokens(events) {
-  let chars = 0;
-  for (const evt of events) {
-    if (typeof evt.text === 'string') chars += evt.text.length;
-  }
-  return Math.ceil(chars / 4);
 }
 
 function replayEvent(evt) {
