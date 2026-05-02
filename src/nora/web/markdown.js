@@ -87,8 +87,14 @@
     let inCodeBlock = false;
     let codeLines = [];
     let codeLang = '';
-    let listType = null;     // 'ul' | 'ol' | null
-    let listItems = [];      // pending <li> content
+    // Stack of open lists, root → deepest. Each entry is
+    //   { type: 'ul'|'ol', indent: number, items: [...] }
+    // and each item is
+    //   { content: string, children: [list, ...] }
+    // Only the top of the stack is "live" for receiving new items;
+    // entries below it are kept open so a later sibling at a shallower
+    // indent can append to its parent list.
+    let listStack = [];
     let pendingBlankInList = false;  // see "Blank line" handling below
     let paraLines = [];
 
@@ -122,17 +128,75 @@
       paraLines = [];
     }
 
+    function renderList(list) {
+      const parts = ['<' + list.type + '>'];
+      for (let k = 0; k < list.items.length; k++) {
+        const item = list.items[k];
+        parts.push('<li>');
+        parts.push(renderInline(item.content));
+        for (let j = 0; j < item.children.length; j++) {
+          parts.push(renderList(item.children[j]));
+        }
+        parts.push('</li>');
+      }
+      parts.push('</' + list.type + '>');
+      return parts.join('');
+    }
+
     function flushList() {
-      if (listType === null) return;
-      const tag = listType;
-      out.push('<' + tag + '>');
-      listItems.forEach((item) => {
-        out.push('<li>' + renderInline(item) + '</li>');
-      });
-      out.push('</' + tag + '>');
-      listType = null;
-      listItems = [];
+      if (listStack.length === 0) return;
+      // Always render from the root — nested lists are already attached
+      // to their parent items as `children`, so the root walk emits
+      // everything.
+      out.push(renderList(listStack[0]));
+      listStack.length = 0;
       pendingBlankInList = false;
+    }
+
+    // Add a new list item at `indent` columns, of `type` ('ul'|'ol'),
+    // with `content` as its inline text. Maintains `listStack` so that
+    // shallower indents continue parent lists rather than starting new
+    // ones (which would make every interrupted ordered list restart at
+    // 1 — the original bug).
+    function addListItem(type, indent, content) {
+      // Close any lists deeper than the new item.
+      while (listStack.length > 0 &&
+             listStack[listStack.length - 1].indent > indent) {
+        listStack.pop();
+      }
+      const top = listStack.length > 0
+        ? listStack[listStack.length - 1] : null;
+      const newItem = { content: content, children: [] };
+      if (top && top.indent === indent) {
+        if (top.type === type) {
+          // Same level, same type — append to the open list.
+          top.items.push(newItem);
+          return;
+        }
+        // Same level, different type — start a sibling list. If we're
+        // at the root, flush the old list to output and begin a new
+        // root; otherwise hang the sibling off the parent's last item.
+        listStack.pop();
+        const newList = { type: type, indent: indent, items: [newItem] };
+        if (listStack.length === 0) {
+          out.push(renderList(top));
+          listStack.push(newList);
+          return;
+        }
+        const parent = listStack[listStack.length - 1];
+        parent.items[parent.items.length - 1].children.push(newList);
+        listStack.push(newList);
+        return;
+      }
+      const newList = { type: type, indent: indent, items: [newItem] };
+      if (!top) {
+        // Empty stack — new root list.
+        listStack.push(newList);
+        return;
+      }
+      // top.indent < indent — nest deeper inside the previous item.
+      top.items[top.items.length - 1].children.push(newList);
+      listStack.push(newList);
     }
 
     function flushCode() {
@@ -178,7 +242,7 @@
       // we flush.
       if (!raw.trim()) {
         flushPara();
-        if (listType !== null) {
+        if (listStack.length > 0) {
           pendingBlankInList = true;
         }
         continue;
@@ -249,23 +313,19 @@
       }
 
       // Unordered list item.
-      const ul = raw.match(/^\s*[-*]\s+(.*)$/);
+      const ul = raw.match(/^(\s*)[-*]\s+(.*)$/);
       if (ul) {
         flushPara();
-        if (listType !== 'ul') flushList();
-        listType = 'ul';
-        listItems.push(ul[1]);
+        addListItem('ul', ul[1].length, ul[2]);
         pendingBlankInList = false;
         continue;
       }
 
       // Ordered list item.
-      const ol = raw.match(/^\s*\d+\.\s+(.*)$/);
+      const ol = raw.match(/^(\s*)\d+\.\s+(.*)$/);
       if (ol) {
         flushPara();
-        if (listType !== 'ol') flushList();
-        listType = 'ol';
-        listItems.push(ol[1]);
+        addListItem('ol', ol[1].length, ol[2]);
         pendingBlankInList = false;
         continue;
       }
