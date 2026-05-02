@@ -40,9 +40,15 @@ let contextWindow = DEFAULT_CONTEXT_WINDOW;
 // conversation chain only grows. Taking ``max(prev, latest)`` keeps
 // the chip stable and informative — it tracks "biggest prompt this
 // session has ever needed" instead of "whatever the last event said."
-// Reset to 0 on session switch in showChat(); seeded from replayed
-// chat history so the chip reflects warm-start size after restart
-// instead of looking like context dropped to zero.
+//
+// Stored per-cwd (not as a single scalar) because ``showChat()`` runs
+// on every ``ready`` event — including model swaps and reconnects on
+// the SAME session, not just session switches. A scalar would get
+// wiped to zero on those re-readies and the chip would visibly drop
+// inside one conversation. Keying by cwd lets a re-ready restore the
+// session's actual watermark, and a real switch start the new
+// session at zero (or its own remembered value if revisited).
+const sessionHighWaters = new Map();
 let sessionContextHighWater = 0;
 
 // ---- multi-session focus state -------------------------------------------
@@ -434,11 +440,13 @@ function showChat(payload) {
   updatePolicyChip(payload.policy);
   loadSessions();
   loadModels();
-  // New conversation: reset the high-water mark to 0 so the chip
-  // reflects THIS session, not the one we just left. Hide it until
-  // either replayHistory() seeds a warm-start estimate or the next
-  // turn_done lands real numbers.
-  sessionContextHighWater = 0;
+  // Restore the high-water mark for THIS session. ``ready`` fires on
+  // initial open, on every session switch, and ALSO on intra-session
+  // events like model swap or provider reconnect — so we cannot
+  // simply reset to zero here without wiping a chip that was already
+  // tracking 500k+ within an active conversation. The map is keyed by
+  // cwd; a fresh session with no prior high-water lands at zero.
+  sessionContextHighWater = sessionHighWaters.get(currentCwd) || 0;
   if (contextChip) contextChip.classList.add('hidden');
 
   replayHistory();
@@ -2555,6 +2563,10 @@ function updateContextChip(occupiedTokens) {
   // not the last measurement.
   occupiedTokens = Math.max(occupiedTokens, sessionContextHighWater);
   sessionContextHighWater = occupiedTokens;
+  // Persist per-cwd so a re-ready (model swap, reconnect) or a
+  // session-switch round-trip restores the watermark instead of
+  // dropping to zero.
+  if (currentCwd) sessionHighWaters.set(currentCwd, occupiedTokens);
 
   if (occupiedTokens > contextWindow) {
     // Jumped beyond the assumed window — must be a larger-context
