@@ -1848,50 +1848,20 @@ function appendUser(text, attachments, images) {
 }
 
 function appendAssistant(text) {
-  // Replay path: skip the animation entirely. Past messages should
-  // land instantly so loading a session doesn't take N seconds per
-  // assistant bubble.
-  if (replayMode) {
-    return append('assistant', text || '', /*markdown=*/ true);
-  }
-  const textSafe = text || '';
-  // The SDK hands us complete text blocks per turn, not token-by-token
-  // deltas, so real streaming isn't available at this layer. To give
-  // the conversation a "typing" feel anyway, we drop in the bubble
-  // immediately and animate the text into it at a visible-but-snappy
-  // rate, then swap to rendered markdown once the animation finishes.
-  // Errors / tool calls arriving mid-animation force an instant
-  // finish so the transcript order stays honest.
+  // Render markdown immediately for both replay and live paths. The
+  // earlier typewriter animation cushioned wall-of-text shock but
+  // showed RAW markdown during typing — tables as ``|---|---|``,
+  // code blocks as escaped text, bold as literal asterisks — and
+  // delayed the rendered version by up to ~37 s on long replies.
+  // For Nora's audience (dense regression tables, stata/python
+  // code, multi-section answers) the cost compounded: the researcher
+  // couldn't read the structure that mattered most until the swap.
+  // Going without typing animation; revisit if it turns out the
+  // chat metaphor needed it.
   //
-  // Long messages were previously dumped instantly via a length
-  // threshold; that stripped the typing rhythm from anything past
-  // a paragraph. We removed the threshold and now type at a constant
-  // pace regardless of length (see ``runTypewriter``). Any follow-up
-  // UI event (next block, tool call, turn done) calls
-  // ``finalizeActiveTypewriter`` so a long animation never blocks the
-  // next thing the researcher needs to see.
-  finalizeActiveTypewriter();
-  setWelcomeOnlyMode(false);
-  const wrapper = document.createElement('div');
-  wrapper.className = 'message assistant';
-  const body = document.createElement('div');
-  body.className = 'message-body typing';
-  wrapper.appendChild(body);
-  messagesEl.appendChild(wrapper);
-  scrollToBottom();
-  runTypewriter(body, textSafe, () => {
-    // Swap from plain-text animation to rendered markdown. Clearing
-    // the `typing` class drops the caret and flips white-space back
-    // to normal so paragraphs/lists/tables lay out correctly.
-    body.classList.remove('typing');
-    if (textSafe && window.NoraMarkdown) {
-      body.innerHTML = window.NoraMarkdown.render(textSafe);
-    } else {
-      body.textContent = textSafe;
-    }
-    scrollToBottom();
-  });
-  return wrapper;
+  // The runTypewriter / finalizeActiveTypewriter scaffolding still
+  // lives below in case we re-enable a (skippable) version of this.
+  return append('assistant', text || '', /*markdown=*/ true);
 }
 
 // The typewriter currently animating, if any. Tracked globally so
