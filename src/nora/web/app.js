@@ -34,6 +34,17 @@ const contextChip = document.getElementById('context-chip');
 const DEFAULT_CONTEXT_WINDOW = 1_000_000;
 let contextWindow = DEFAULT_CONTEXT_WINDOW;
 
+// Session-level high-water mark for the context chip. Per-turn usage
+// events can fluctuate (a tool-heavy turn reports a peak prompt; a
+// follow-up plain turn reports a smaller one) but the underlying
+// conversation chain only grows. Taking ``max(prev, latest)`` keeps
+// the chip stable and informative — it tracks "biggest prompt this
+// session has ever needed" instead of "whatever the last event said."
+// Reset to 0 on session switch in showChat(); seeded from replayed
+// chat history so the chip reflects warm-start size after restart
+// instead of looking like context dropped to zero.
+let sessionContextHighWater = 0;
+
 // ---- multi-session focus state -------------------------------------------
 // The bridge runs every session as its own SessionRunner: turns in
 // session A keep streaming after the researcher clicks B in the
@@ -423,8 +434,11 @@ function showChat(payload) {
   updatePolicyChip(payload.policy);
   loadSessions();
   loadModels();
-  // New conversation (or resumed one) so the context-usage chip
-  // stays hidden until the next turn_done provides real numbers.
+  // New conversation: reset the high-water mark to 0 so the chip
+  // reflects THIS session, not the one we just left. Hide it until
+  // either replayHistory() seeds a warm-start estimate or the next
+  // turn_done lands real numbers.
+  sessionContextHighWater = 0;
   if (contextChip) contextChip.classList.add('hidden');
 
   replayHistory();
@@ -483,9 +497,28 @@ async function replayHistory() {
       replayTailTurn = null;
     }
     scrollToBottom();
+    // Seed the context chip with a rough token estimate of what the
+    // bridge replayed back to the model on warm-start. Without this
+    // the chip stays hidden until the next turn_done — making a
+    // restarted session visually look empty even though the model
+    // already has the warm-start prefix loaded. ~4 chars per English
+    // token is a coarse approximation that under-counts code and
+    // over-counts whitespace, but it's good enough for the chip's
+    // "roughly how full is the window" purpose. The next turn_done
+    // overwrites this with the provider's authoritative number.
+    const seed = estimateReplayTokens(events);
+    if (seed > 0) updateContextChip(seed);
   } catch (err) {
     console.warn('get_chat_history failed', err);
   }
+}
+
+function estimateReplayTokens(events) {
+  let chars = 0;
+  for (const evt of events) {
+    if (typeof evt.text === 'string') chars += evt.text.length;
+  }
+  return Math.ceil(chars / 4);
 }
 
 function replayEvent(evt) {
@@ -2541,6 +2574,17 @@ function updateContextChip(occupiedTokens) {
    * meaningful. */
   if (!contextChip) return;
   if (typeof occupiedTokens !== 'number' || occupiedTokens < 0) return;
+
+  // Session-monotonic clamp. Per-turn usage events report whatever
+  // the most recent request measured — for OpenAI that's the last
+  // Responses round's input_tokens (+ output); for Anthropic it's
+  // the prompt-cache snapshot for that turn. Both can DECREASE
+  // turn-to-turn (a tool-heavy turn reports a peak prompt; a plain
+  // follow-up reports a smaller one) even though the underlying
+  // chain only grows. Take the max so the chip tracks the chain,
+  // not the last measurement.
+  occupiedTokens = Math.max(occupiedTokens, sessionContextHighWater);
+  sessionContextHighWater = occupiedTokens;
 
   if (occupiedTokens > contextWindow) {
     // Jumped beyond the assumed window — must be a larger-context
