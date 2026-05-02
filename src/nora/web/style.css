@@ -1915,20 +1915,13 @@ kbd {
  * the detail. The composite table from ``compose_results`` is the
  * primary reading surface; the inner panels back it up. */
 .tool-card .result-panel-collapsed {
-  /* Accent border so the audit affordance reads as a meaningful
-   * artifact (these are the canonical regression rows the model can
-   * re-cite, not chrome). Text and chevron stay neutral — highlight
-   * is on the box, not the letters. The accent tracks the palette:
-   * pink in dark mode, teal in light.
-   *
-   * ``overflow: hidden`` clips the inner summary's bottom border to
-   * the rounded-corner radius. Without it, when the panel is open
-   * the summary's border-bottom paints over the parent's rounded
-   * corner pixels and looks like the highlight has gaps at the
-   * top corners. */
+  /* Neutral chrome — the panel is an audit affordance, not a
+   * highlighted artifact. ``overflow: hidden`` clips the inner
+   * summary's bottom border to the rounded-corner radius so the
+   * border reads as one continuous outline when expanded. */
   display: block;
   overflow: hidden;
-  border: 1px solid var(--accent);
+  border: 1px solid var(--border);
   border-radius: 8px;
   background: var(--bg);
   padding: 0;
