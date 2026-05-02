@@ -443,19 +443,28 @@ class AnthropicSession:
                 cr = _maybe_int(usage.get("cache_read_input_tokens")) or 0
                 cc = _maybe_int(usage.get("cache_creation_input_tokens")) or 0
                 prompt_total = inp + cr + cc
-                # Diagnostic: gated by NORA_DEBUG_USAGE so a researcher
-                # who notices the chip showing >100% of a known model
-                # window can dump the raw usage dict and we can see
-                # which fields are double-counting (or which new
-                # ephemeral-cache field we're missing).
+                # Diagnostic: gated by NORA_DEBUG_USAGE. Writes to
+                # stderr (visible if launched from a terminal) AND
+                # appends to ``<cwd>/.nora-usage.log`` (always reachable
+                # by the researcher regardless of launch method —
+                # pywebview swallows stderr on a double-clicked app).
+                # We dump the raw usage dict so we can see whether
+                # input_tokens already includes cached portions, whether
+                # there are new ephemeral-cache fields we're missing,
+                # and which interpretation the 1M model uses.
                 if os.environ.get("NORA_DEBUG_USAGE") == "1":
                     import sys as _sys
-                    print(
+                    line = (
                         f"[nora.usage] round usage={dict(usage)} "
                         f"computed prompt_total={prompt_total} "
-                        f"(inp={inp}, cr={cr}, cc={cc}, out={outp})",
-                        file=_sys.stderr, flush=True,
+                        f"(inp={inp}, cr={cr}, cc={cc}, out={outp})"
                     )
+                    print(line, file=_sys.stderr, flush=True)
+                    try:
+                        with (self.cwd / ".nora-usage.log").open("a") as _f:
+                            _f.write(line + "\n")
+                    except Exception:  # noqa: BLE001 — diagnostic must never crash a turn
+                        pass
                 if prompt_total >= max_prompt_total:
                     max_prompt_total = prompt_total
                     max_input = inp
