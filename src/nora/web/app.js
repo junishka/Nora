@@ -1831,11 +1831,12 @@ function appendAssistant(text) {
   // finish so the transcript order stays honest.
   //
   // Long messages were previously dumped instantly via a length
-  // threshold; the time cap inside ``runTypewriter`` (max 2.5 s
-  // regardless of length) already handles "don't make me wait", so
-  // the threshold just stripped the typing rhythm from any
-  // paragraph the model wrote — researchers noticed and wanted it
-  // back.
+  // threshold; that stripped the typing rhythm from anything past
+  // a paragraph. We removed the threshold and now type at a constant
+  // pace regardless of length (see ``runTypewriter``). Any follow-up
+  // UI event (next block, tool call, turn done) calls
+  // ``finalizeActiveTypewriter`` so a long animation never blocks the
+  // next thing the researcher needs to see.
   finalizeActiveTypewriter();
   setWelcomeOnlyMode(false);
   const wrapper = document.createElement('div');
@@ -1876,14 +1877,23 @@ function runTypewriter(bodyEl, fullText, onComplete) {
     onComplete();
     return;
   }
-  // Adaptive speed: short messages land in ~700 ms; longer ones
-  // cap at ~4 s so the "typing" cue reads clearly without making
-  // the researcher wait through a crawl. Per-char pacing is ~22 ms
-  // (~45 chars/sec), closer to a thoughtful typing rhythm than the
-  // earlier ~80 cps which read more like a stream than typing.
-  const targetMs = Math.min(4000, Math.max(700, len * 22));
-  const charsPerMs = len / targetMs;
+  // Constant pace: ~22 ms per char (~45 chars/sec), a thoughtful
+  // typing rhythm rather than a stream. We deliberately do NOT cap
+  // total animation time — earlier code clamped to ~4 s and the rate
+  // ballooned on long messages (a 5000-char turn typed at ~1250 cps,
+  // visibly indistinguishable from an instant dump). A long turn now
+  // takes proportionally longer, but any subsequent UI event
+  // (next assistant block, tool call, turn done) calls
+  // ``finalizeActiveTypewriter()`` and the animation collapses
+  // immediately — see the call sites of ``finalizeActiveTypewriter``.
+  const MS_PER_CHAR = 22;
   let typed = 0;
+  // Fractional accumulator. Per-frame ``Math.ceil`` (the earlier
+  // approach) forced at least 1 char every animation frame, which at
+  // 60 fps clamps the floor to ~60 cps — the documented 45 cps target
+  // was unreachable. Accumulating fractional progress lets us advance
+  // 0 chars on some frames so the visible rate matches MS_PER_CHAR.
+  let accumulator = 0;
   let lastTime = performance.now();
   let rafId = 0;
   let finalized = false;
@@ -1903,9 +1913,14 @@ function runTypewriter(bodyEl, fullText, onComplete) {
     if (finalized) return;
     const dt = now - lastTime;
     lastTime = now;
-    typed = Math.min(len, typed + Math.max(1, Math.ceil(charsPerMs * dt)));
-    bodyEl.textContent = fullText.slice(0, typed);
-    scrollToBottom();
+    accumulator += dt / MS_PER_CHAR;
+    const advance = Math.floor(accumulator);
+    if (advance > 0) {
+      typed = Math.min(len, typed + advance);
+      accumulator -= advance;
+      bodyEl.textContent = fullText.slice(0, typed);
+      scrollToBottom();
+    }
     if (typed < len) {
       rafId = requestAnimationFrame(frame);
     } else {
