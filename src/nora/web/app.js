@@ -1877,16 +1877,25 @@ function runTypewriter(bodyEl, fullText, onComplete) {
     onComplete();
     return;
   }
-  // Constant pace: ~22 ms per char (~45 chars/sec), a thoughtful
-  // typing rhythm rather than a stream. We deliberately do NOT cap
-  // total animation time — earlier code clamped to ~4 s and the rate
-  // ballooned on long messages (a 5000-char turn typed at ~1250 cps,
-  // visibly indistinguishable from an instant dump). A long turn now
-  // takes proportionally longer, but any subsequent UI event
-  // (next assistant block, tool call, turn done) calls
-  // ``finalizeActiveTypewriter()`` and the animation collapses
-  // immediately — see the call sites of ``finalizeActiveTypewriter``.
-  const MS_PER_CHAR = 22;
+  // Tiered constant pace. Base rate is ~22 ms per char (~45 chars/sec),
+  // a thoughtful typing rhythm rather than a stream. To keep long
+  // messages from trapping the reader, the rate steps up at two length
+  // thresholds: 2× past 500 chars, 3× past 2000. It never goes faster
+  // than 3× — past 2000 chars the animation just takes longer, the way
+  // a constant-pace typewriter naturally would.
+  //
+  // Earlier code clamped total animation time to ~4 s, which made
+  // ``charsPerMs = len/4000`` grow linearly with length (a 5000-char
+  // turn typed at ~1250 cps, indistinguishable from an instant dump).
+  // The tiered approach gives the same "doesn't make me wait forever"
+  // behavior on truly long turns without erasing the typing rhythm
+  // entirely the moment a message crosses some arbitrary length.
+  //
+  // Any follow-up UI event (next assistant block, tool call, thinking,
+  // user input) calls ``finalizeActiveTypewriter()`` and collapses the
+  // animation immediately — see its call sites.
+  const speedFactor = len < 500 ? 1 : len < 2000 ? 2 : 3;
+  const MS_PER_CHAR = 22 / speedFactor;
   let typed = 0;
   // Fractional accumulator. Per-frame ``Math.ceil`` (the earlier
   // approach) forced at least 1 char every animation frame, which at
