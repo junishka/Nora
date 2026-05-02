@@ -418,3 +418,66 @@ def test_request_failure_does_not_advance_committed_response_id(
     assert sess._last_response_id == "resp_good", (
         "a failed turn must not overwrite the committed response id"
     )
+
+
+def test_send_yields_turnerror_when_tool_loop_does_not_converge(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """A model that emits a function_call on every one of
+    MAX_TOOL_ROUNDS rounds must produce a TurnError, not TurnDone.
+
+    Before the fix, the for-loop's natural exhaustion fell through to
+    the same TurnDone branch as a clean exit, so a runaway tool-using
+    model looked indistinguishable from a normal completion to the UI.
+    """
+    import asyncio
+
+    from nora.provider import openai as openai_provider
+    from nora.provider.base import TurnDone, TurnError
+    monkeypatch.setattr(openai_provider, "_resolve_api_key", lambda: "sk-test")
+
+    # Sixteen scripted responses, each requesting a function_call. This
+    # is exactly the number range(MAX_TOOL_ROUNDS) gives us, so the
+    # loop exhausts on iteration 16 without ever seeing a plain message
+    # — the path the old code mishandled.
+    scripted = [
+        _ScriptedResponse(f"resp_{i}", with_tool_call=True)
+        for i in range(16)
+    ]
+
+    import openai as openai_pkg
+    monkeypatch.setattr(
+        openai_pkg, "AsyncOpenAI",
+        lambda api_key=None: _ScriptedAsyncOpenAI(api_key, responses=scripted),
+        raising=True,
+    )
+
+    sess = OpenAISession(
+        cwd=tmp_path,
+        model="gpt-5.5",
+        system_prompt="you are nora",
+    )
+
+    events: list[Any] = []
+
+    async def _drive() -> None:
+        async for ev in sess.send("loop forever"):
+            events.append(ev)
+
+    asyncio.run(_drive())
+
+    assert events, "send() yielded no events"
+    assert not any(isinstance(e, TurnDone) for e in events), (
+        "exhausted tool loop must NOT emit TurnDone; that's the silent "
+        "truncation the fix prevents"
+    )
+    assert isinstance(events[-1], TurnError), (
+        f"last event must be TurnError; got {type(events[-1]).__name__}"
+    )
+    # Loop ran exactly MAX_TOOL_ROUNDS times before giving up — no
+    # short-circuit, no overrun.
+    api = sess._client.responses  # type: ignore[union-attr]
+    assert len(api.calls) == 16
+    # The chain head still advances through every successful round-trip
+    # so a follow-up user message threads onto the last response we got.
+    assert sess._last_response_id == "resp_15"

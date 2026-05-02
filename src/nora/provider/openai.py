@@ -395,7 +395,27 @@ class OpenAISession:
                     # local tracking needed.
 
                 if not pending_calls:
-                    break  # no more tool calls; turn is done
+                    # Clean turn end. Promote the in-turn pointer to the
+                    # durable session field and emit TurnDone here —
+                    # falling through to the post-loop branch would also
+                    # emit TurnDone on the exhausted-rounds path, which
+                    # silently truncates a model that's still requesting
+                    # tools. That path is now treated as TurnError below.
+                    self._last_response_id = turn_response_id
+                    yield TurnDone(
+                        input_tokens=last_input_tokens,
+                        output_tokens=last_output_tokens,
+                        # Cache fields stay None on this path. OpenAI's
+                        # ``cached_tokens`` is a subset of ``input_tokens``
+                        # (not additive), so emitting it through
+                        # ``cache_read_input_tokens`` would double-count
+                        # against any consumer that sums input + cache (the
+                        # web context chip does). ``input_tokens`` already
+                        # represents the full prompt size on the OpenAI
+                        # path. ``cost_usd`` is also None — Nora doesn't
+                        # compute OpenAI costs locally.
+                    )
+                    return
 
                 # Dispatch every function_call in this round (parallel-
                 # friendly but executed serially here; the underlying
@@ -446,26 +466,21 @@ class OpenAISession:
                     })
                 pending_input = next_input
 
-            # Promote the in-turn pointer to the durable session
-            # field only after the whole turn settled. A turn that
-            # fell through MAX_TOOL_ROUNDS without exiting via the
-            # ``break`` above still committed something coherent on
-            # the server side; preserve it so the next user message
-            # threads on cleanly.
+            # Loop exhausted — the model kept requesting tools through
+            # MAX_TOOL_ROUNDS without producing a final non-tool
+            # response. Surface as TurnError so the caller sees the
+            # truncation rather than a misleading "clean done". Still
+            # promote the in-turn pointer: every round-trip we made
+            # committed something coherent on the server side, and
+            # leaving the chain head where it is lets a follow-up user
+            # message thread on without replaying the whole transcript.
             self._last_response_id = turn_response_id
-
-            yield TurnDone(
-                input_tokens=last_input_tokens,
-                output_tokens=last_output_tokens,
-                # Cache fields stay None on this path. OpenAI's
-                # ``cached_tokens`` is a subset of ``input_tokens``
-                # (not additive), so emitting it through
-                # ``cache_read_input_tokens`` would double-count
-                # against any consumer that sums input + cache (the
-                # web context chip does). ``input_tokens`` already
-                # represents the full prompt size on the OpenAI path.
-                # ``cost_usd`` is also None — Nora doesn't compute
-                # OpenAI costs locally.
+            yield TurnError(
+                message=(
+                    f"OpenAI tool loop did not converge within "
+                    f"{MAX_TOOL_ROUNDS} rounds; last response still had "
+                    f"pending function calls."
+                ),
             )
         except Exception as e:  # noqa: BLE001 — last-line catch
             yield TurnError(message=f"OpenAI session error: {e}")
