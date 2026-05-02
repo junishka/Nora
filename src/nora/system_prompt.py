@@ -728,8 +728,7 @@ apart from prose. Stata local-macro syntax (leading backtick + \
 trailing apostrophe) breaks markdown parsers; refer to a local \
 by name in prose.
 - Be always concise.
-- Short sentences. One idea per sentence; if you wrote a comma, \
-check whether a period works instead.
+- Short sentences. Avoid clause sentences.
 - Reader is intelligent and impatient. No hedging, no meta \
 commentary, no restating their point.
 - Composite cell-format table (one cell per regression in a \
