@@ -469,12 +469,17 @@ class OpenAISession:
             # Loop exhausted — the model kept requesting tools through
             # MAX_TOOL_ROUNDS without producing a final non-tool
             # response. Surface as TurnError so the caller sees the
-            # truncation rather than a misleading "clean done". Still
-            # promote the in-turn pointer: every round-trip we made
-            # committed something coherent on the server side, and
-            # leaving the chain head where it is lets a follow-up user
-            # message thread on without replaying the whole transcript.
-            self._last_response_id = turn_response_id
+            # truncation rather than a misleading "clean done".
+            #
+            # Do NOT promote ``turn_response_id`` here. The last response
+            # in this turn carries an unsatisfied ``function_call`` and
+            # we built ``function_call_output`` items in ``pending_input``
+            # that we never sent back. Chaining the next user message
+            # onto that response would either 400 server-side (open tool
+            # call) or silently continue with inconsistent context. Roll
+            # back to the prior committed turn instead — the next user
+            # message threads onto the last clean state, and the
+            # orphaned round-trips on the server are simply abandoned.
             yield TurnError(
                 message=(
                     f"OpenAI tool loop did not converge within "

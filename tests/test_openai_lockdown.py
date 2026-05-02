@@ -457,6 +457,10 @@ def test_send_yields_turnerror_when_tool_loop_does_not_converge(
         model="gpt-5.5",
         system_prompt="you are nora",
     )
+    # Pre-set the committed pointer so we can verify it is NOT
+    # overwritten by the exhausted turn — chaining onto the last
+    # in-turn response would point at an unsatisfied function_call.
+    sess._last_response_id = "prior_clean_turn"
 
     events: list[Any] = []
 
@@ -478,6 +482,13 @@ def test_send_yields_turnerror_when_tool_loop_does_not_converge(
     # short-circuit, no overrun.
     api = sess._client.responses  # type: ignore[union-attr]
     assert len(api.calls) == 16
-    # The chain head still advances through every successful round-trip
-    # so a follow-up user message threads onto the last response we got.
-    assert sess._last_response_id == "resp_15"
+    # _last_response_id stays at the prior clean turn. Promoting to
+    # ``resp_15`` would chain the NEXT user message onto a response
+    # that still has an unsatisfied function_call (its
+    # function_call_output items lived in our local pending_input,
+    # never sent), so the server would either reject the chain or
+    # continue with inconsistent context.
+    assert sess._last_response_id == "prior_clean_turn", (
+        "exhausted tool loop must NOT advance the committed response id "
+        "onto a turn whose last response has a pending function_call"
+    )
