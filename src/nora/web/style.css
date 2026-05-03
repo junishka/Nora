@@ -1743,43 +1743,37 @@ kbd {
   margin: 6px 0;
   font-size: 12px;
   position: relative;
-  /* The pre's background is the dark code-bg even in light mode
-   * (burgundy on cream). Native scrollbars on that surface render
-   * as faint dark grooves against dark — easy to miss in light
-   * mode. Force a saturated-pink scrollbar so the affordance is
-   * visibly pink (not the near-white ``--pink-light`` it used to
-   * be, which on burgundy reads as white especially when BOTH
-   * horizontal + vertical scrollbars show at once with a corner
-   * between them). ``--pink`` (#ee8ba9) at 70% sits visibly on the
-   * burgundy without shouting. */
-  scrollbar-width: thin;
-  scrollbar-color: rgba(238, 139, 169, 0.7) transparent;
+  /* DIAGNOSTIC PASS — see commit message. Setting the scrollbar
+   * to RED with !important to confirm CSS is being applied at
+   * all. After the next HARD restart of the .app the scrollbar
+   * should be visibly red. If it still renders white, the CSS
+   * isn't loading (cache / build issue) and the next move is
+   * forcing a fresh CSS fetch. If it renders red, the cascade
+   * works and we just need to pick a better non-white color. */
+  scrollbar-width: thin !important;
+  scrollbar-color: red transparent !important;
 }
 
 .tool-card .tool-body pre::-webkit-scrollbar {
-  height: 8px;
-  width: 8px;
+  height: 12px !important;
+  width: 12px !important;
 }
 
 .tool-card .tool-body pre::-webkit-scrollbar-thumb {
-  background: rgba(238, 139, 169, 0.7);
+  background: red !important;
   border-radius: 4px;
 }
 
 .tool-card .tool-body pre::-webkit-scrollbar-thumb:hover {
-  background: var(--pink);
+  background: red !important;
 }
 
 .tool-card .tool-body pre::-webkit-scrollbar-track {
-  background: transparent;
+  background: red !important;
 }
 
-/* Without this, the corner where horizontal + vertical scrollbars
- * meet defaults to the user-agent fill (a bright white square in
- * WKWebView) — visible as a small white block in the bottom-right
- * of every script card whose code is both wide and tall. */
 .tool-card .tool-body pre::-webkit-scrollbar-corner {
-  background: transparent;
+  background: red !important;
 }
 
 .tool-card .tool-label {
