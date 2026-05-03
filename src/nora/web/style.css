@@ -2995,15 +2995,22 @@ kbd {
 .message.assistant .message-body h2 { font-size: 1.15em; }
 .message.assistant .message-body h3 { font-size: 1.05em; }
 
+.message.assistant .message-body {
+  /* Reset the ordered-list counter once per assistant reply, not
+   * per <ol>. The markdown renderer closes and reopens an <ol>
+   * every time prose interrupts the list (Claude's common
+   * `1. **Heading.**` + body-paragraph idiom), which would
+   * otherwise restart numbering at 1 on every item. Scoping the
+   * counter to the message-body keeps numbering monotonic across
+   * those paragraph-separated blocks. */
+  counter-reset: chat-ol;
+}
+
 .message.assistant .message-body ul,
 .message.assistant .message-body ol {
   margin: 0 0 10px 0;
   padding-left: 0;
   list-style: none;
-}
-
-.message.assistant .message-body ol {
-  counter-reset: chat-ol;
 }
 
 .message.assistant .message-body li {
