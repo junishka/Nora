@@ -1,7 +1,22 @@
 # Nora — handoff
 
 Single-page entry point for picking this project up. Last
-substantive update **2026-04-30**, after the multi-result wire-
+substantive update **2026-05-03**, after a chat-UX polish batch:
+sessions are now researcher-renameable (click the topbar pill or
+the sidebar `✎` to type a custom name; persists in
+`session_state.json`, falls back to the auto-derived
+dataset/timestamp label when cleared); a long assistant reply now
+top-anchors so it's read from its first sentence rather than
+landing the researcher at the bottom (`scrollMessageToTop`,
+re-applied on `turn_done` after the cat removal shifts layout);
+list bullets in chat output replace the native `::marker` with a
+`::before` rendered inside the `<li>` content box (fixes a WebKit
+selection-paint leak that left thin colored bars in the marker
+gutter after a multi-bullet drag-select); the loading-indicator
+label rotation expanded with data-themed gerunds (`crunching`,
+`wrangling`, `reticulating splines`, …); sidebar arrow-nav no
+longer hijacks `Backspace` while the user is typing in the rename
+input. Previous batch (2026-04-30) was the multi-result wire-
 format pass: `submit_script` now emits one structured payload per
 helper call instead of one per script (24-spec batches no longer
 lose 23 of 24 results), with a partial-success surface for mid-
@@ -101,16 +116,21 @@ keep streaming.
 | **scroll-to-latest button** — floating circular button above the composer fades in when the transcript is > 100 px from the bottom; click smooth-scrolls to the latest message | ✅ done |
 | **Wider chat column + scroll-wrapped tables** — `--max-width` 960 → 1080 px so wide composite tables (H1a/H1b cell-format matrices) breathe. Markdown tables now render inside `<div class="md-table">` with thin custom scrollbars (Firefox `scrollbar-width: thin`, WebKit 6 px); the previous `display: block; overflow-x: auto` directly on `<table>` produced an awkward double-scrollbar above and below wide tables. Tables that fit show no scrollbar at all | ✅ done |
 | **Audit fixes batch (Apr-30)** — `recall_conversation` AttributeError on multi-result tool calls (used the renamed `result_ids` list); `list_results` newest-first with `limit` (default 50, max 500) instead of unbounded ASC; recall budget includes serialized tool/result_ids size in the cap; `session_state` pairs latest user with its OWN assistant (or empty for in-flight) instead of cross-turn mismatch; `read_attached_file` plot fallback uses `is_relative_to` instead of `str.startswith` (fixes path-prefix collision); composer Send guard allows attachment-only sends; composer image drops persist to cwd via `add_files_from_blobs` AND stage for vision; cancel/error branches no longer re-prepend mentioned files (composer chip already cleared on send); per-script source row count cached once; NaN correlation on constant columns rejected with named culprit; correlation_matrix sanitizer applies `safe_key` to both sides of the cross-field check; store ordering uses `rowid` instead of lexical id sort | ✅ done |
+| **Editable session names** — `SessionState.custom_name` (≤120 chars, trimmed; empty clears back to auto). `set_session_name` bridge (sandboxed to `~/.nora-sessions/`); preserved across the per-turn `write_session_state` rewrite by reading the prior file first. Topbar pill is click-to-edit (Enter/Space keyboard-accessible); each sidebar row gets a `✎` button that swaps the row's button for an edit container (avoids the invalid `<input>`-inside-`<button>` nesting); `loadSessions()` re-renders on commit/cancel so both surfaces stay in sync. Renamed sessions show the custom name as the primary line with `date · datasets · size` demoted to the meta row | ✅ done |
+| **Top-anchor scroll on assistant replies** — long answers used to land the researcher at the LAST line via `scrollToBottom()`, forcing a manual scroll back to the first sentence; `append()` now top-aligns assistant wrappers via `scrollMessageToTop` (sets `messagesEl.scrollTop = wrapper.offsetTop - 16`, clamped to scroll max). Re-applied on `turn_done` after the loading-indicator removal shifts layout by ~80 px. User / system / error messages still pin to the bottom (composer / status visibility) | ✅ done |
+| **List-marker selection-leak fix** — chat-output `<ul>` / `<ol>` drop the native `::marker` (which lives in the parent's padding gutter where WebKit paints text-selection background but does NOT repaint it on selection clear, leaving thin colored bars on every li after a multi-bullet drag-select). Bullets / numbers now render via `::before` inside the `<li>` content box, with a CSS counter (`chat-ol`) for ordered lists. Visual indent unchanged; selection paints/clears uniformly | ✅ done |
+| **Loading-label rotation expansion + sidebar shortcut guard** — added 18 data-themed gerunds (`crunching`, `wrangling`, `polishing`, …) and 3 noun-phrase jokes (`herding outliers`, `minding the gaps`, `reticulating splines`). Sidebar arrow/Backspace shortcut handler now bails out when focus is inside an `<input>` / `<textarea>` / `[contenteditable]` so typing in the rename input doesn't fire the row's delete confirm | ✅ done |
 | **Real-researcher pilot** | ⏳ self-pilot in progress |
 | **Cross-query composition / release ledger** | ⏭ named, future-deployment scope |
 | **Apple Developer Program signing + notarization for distributable .dmg** | ⏭ blocked on $99/yr cert |
 | **Stata batch wrapper around `_cons` "omitted" edge case** | ⏭ named, low-priority |
 
-**679 tests passing** (one pre-existing failure unrelated to
-this branch: `test_python_helper_writes_helper_errors_jsonl_on_import_failure`
-in `test_run_dir_plots.py`; the `plot_coefficients` helper's
-no-`.params` branch returns without invoking
-`_append_plot_helper_error`. Confirmed pre-branch on `main`).
+**696 tests passing** (two pre-existing failures unrelated to
+this branch in `test_system_prompt_renders.py`:
+`test_language_choice_guidance_pins_dta_to_stata` and
+`test_partial_failure_semantics_documented` — both expect string
+fragments that earlier prompt-tightening passes removed; confirmed
+pre-branch by stashing the working tree).
 Coverage spans SDK lockdown (Anthropic) +
 OpenAI lockdown, schema for all six file formats, executor SBPL
 profile, Python executor end-to-end, helper-through-sanitizer
@@ -151,10 +171,15 @@ basename-only path safety),
 **recall + listing fixes** (`test_recall_and_listing_fixes.py`:
 recall renders multi-result tool calls, list_results bounded
 newest-first, recall budget counts the tools array,
-session_state pairs same-turn user/assistant), and the **edge-
+session_state pairs same-turn user/assistant), the **edge-
 case audit batch** (`test_audit_fixes_2.py`: plot-fallback
 path-prefix containment via `is_relative_to`, runner does
-not re-prepend mentioned files on cancel/error).
+not re-prepend mentioned files on cancel/error), and the **editable
+session names** suite (`test_session_state.py` additions:
+`set_custom_name` round-trip, trim + 120-char cap, empty/whitespace
+clears back to `None`, the critical preservation guarantee that
+`custom_name` survives the per-turn `write_session_state`
+rewrite, refusal on a non-existent cwd).
 
 ## Running it
 
@@ -168,7 +193,7 @@ uv run nora                              # opens landing prompt
 uv run nora /path/to/data                # opens straight into chat
 
 # Tests
-uv run pytest -q                         # expect 679 passing (1 pre-existing skip)
+uv run pytest -q                         # expect 696 passing (2 pre-existing failures unrelated to this branch)
 
 # Build the .app + .dmg locally. Bundles the web UI.
 # Distribution to other people is blocked on Apple Developer Program

@@ -1,134 +1,169 @@
 # Nora
 
-Local research assistant that helps analyze sensitive data without
-that data leaving the researcher's machine. Claude is the model
-behind Nora — wired in via the Claude Agent SDK — but the product
-the researcher talks to is Nora.
+Local research assistant for sensitive data. The data stays on the
+researcher's machine. The model behind Nora is Claude (Anthropic) or
+GPT-5.5 (OpenAI). The product the researcher talks to is Nora.
 
-Nora exposes the model to the researcher's data through a narrow
-MCP tool interface — six operations (`get_schema`, `request_data`,
-`submit_script`, `expand_result`, `list_results`,
-`recall_conversation`); scripts run locally under macOS
-`sandbox-exec` with network denied and a narrow subpath-allowlist
-for file reads; every output passes through a disclosure-control
-sanitizer before the model sees it. The researcher sees raw logs.
-The model only ever sees sanitized, SDC-filtered results.
+The model reaches the researcher's files through an eleven-tool MCP
+interface. No Bash. No filesystem. No network. Scripts run under
+macOS `sandbox-exec` with network denied and a tight subpath
+allowlist for reads. Every result passes through a disclosure-control
+sanitizer before the model sees it. The researcher sees raw R,
+Stata, or Python output. The model only ever sees sanitized
+summaries.
 
-See [`docs/handoff.md`](docs/handoff.md) for the single-page
-summary if you're picking the project up. [`docs/overview.md`](docs/overview.md)
-has a plain-language description; [`docs/direction.md`](docs/direction.md)
-has the long-form architectural direction and open-question log.
+For a one-page pickup, see [`docs/handoff.md`](docs/handoff.md). For
+plain-language framing, [`docs/overview.md`](docs/overview.md). For
+the long-form direction and open-question log,
+[`docs/direction.md`](docs/direction.md).
 
 ## Status
 
-Alpha. Privacy invariants are implemented and tested (194 tests).
-Two frontends ship: a terminal UI (`nora`) and a pywebview-based
-web UI (`nora-ui`). The `.dmg` currently distributes the terminal
-entry point only; `nora-ui` runs from source. See
-[the handoff doc's status table](docs/handoff.md#where-it-stands).
+Alpha. Privacy invariants are implemented and tested (696 tests).
+Two frontends ship. The terminal UI is `nora`. The pywebview web UI
+is `nora-ui` and is also what the `.app` launches. Bundled `.dmg`
+distribution to other people is blocked on Apple Developer Program
+signing. See [the handoff status table](docs/handoff.md#where-it-stands)
+for the layer-by-layer view.
 
-## Platform requirements
+## Platform
 
-**macOS-only at this stage.** The `submit_script` tool relies on
-macOS `sandbox-exec` for its privacy boundary — the deny-default
-subpath-allowlist profile is what enforces "Claude's scripts can
-only read the researcher's cwd and a narrow set of system paths."
-On other platforms `get_schema` and `request_data` still work
-(schema inspection and bounded-fact queries), but scripts refuse to
-execute. A Linux port using `bubblewrap` or an equivalent would be
-possible but is not on the near-term roadmap.
+macOS only at this stage. The `submit_script` tool relies on
+`sandbox-exec` for its privacy boundary. On other platforms,
+schema inspection and bounded-fact queries still work, but
+scripts refuse to execute. A Linux port via `bubblewrap` is
+possible but not on the near-term roadmap.
 
 Also needs:
 
-- Python 3.10+.
-- R (`Rscript` on PATH) to run R-language analyses, OR Stata
-  (`stata-mp` / `stata-se` / `stata` on PATH, or installed at
-  `/Applications/Stata`) to run Stata-language analyses. At least
-  one is required for `submit_script`.
-- A Claude subscription or `ANTHROPIC_API_KEY` — auth is inherited
-  from the `claude` CLI or environment.
+- Python 3.10+
+- At least one of: R (`Rscript` on PATH), Stata (`stata-mp` /
+  `stata-se` / `stata` on PATH, or installed at `/Applications/Stata`),
+  or Python with `pandas` + `statsmodels`.
+- Anthropic credentials (Claude subscription or `ANTHROPIC_API_KEY`)
+  or an OpenAI API key. The first launch shows an auth screen and
+  stores the credential in the system keyring.
 
-## Installing
+## Install
 
-If you have a `Nora.dmg` handed to you, see
-[`docs/install.md`](docs/install.md) for double-click install
-instructions and first-run Gatekeeper workaround.
+If you have a `Nora.dmg`, see [`docs/install.md`](docs/install.md)
+for the double-click flow and the first-run Gatekeeper workaround.
 
-If you want to build the `.dmg` yourself from the repo, or just run
-from the development checkout, see "Running from source" below.
+To build the `.dmg` yourself or run from source, see below.
 
-## Running from source (developer workflow)
+## Run from source
 
 ```bash
 git clone https://github.com/junishka/builder.git nora
 cd nora
 uv sync --group dev
-uv run pytest                       # expect: 194 passed
+uv run pytest                       # expect 696 passed
 
-# Terminal frontend
-uv run nora                      # landing prompt for the data dir
-uv run nora /path/to/your/data   # straight into chat
+# Web UI (the recommended frontend; native WKWebView window)
+uv run nora-ui                      # landing: drop files or pick folder
+uv run nora-ui /path/to/data        # straight into chat
 
-# Web-UI frontend (native WKWebView window via pywebview)
-uv run nora-ui                   # landing screen: drop files or pick folder
-uv run nora-ui /path/to/data     # straight into chat
+# Terminal UI (power-user, shell-only)
+uv run nora                         # landing prompt
+uv run nora /path/to/data           # straight into chat
 ```
 
-With no path argument, `nora-ui` opens a landing screen where you
-can drag `.csv` / `.dta` / `.rds` files onto a drop zone, click
-**Choose files…** (native multi-select), or **Choose folder…**.
-Dropped files land in `~/.nora-sessions/<timestamp>_<id>/`
-which becomes the sandbox root for that session.
+With no path, `nora-ui` opens a landing screen. Drop `.csv`, `.tsv`,
+`.dta`, `.rds`, `.parquet`, `.jsonl`, or `.ndjson` files onto the
+drop zone. Or click **Choose files…** or **Choose folder…**. Dropped
+files land in `~/.nora-sessions/<timestamp>_<id>/`. That directory
+becomes the sandbox root for the session.
 
-To rebuild the distributable `.app` and `.dmg`:
+To rebuild the bundle:
 
 ```bash
-bash packaging/build_app.sh   # → dist/Nora.app  (unsigned)
-bash packaging/build_dmg.sh   # → dist/Nora.dmg  (~34 MB)
+bash packaging/build_app.sh         # → dist/Nora.app   (~70 MB, unsigned)
+bash packaging/build_dmg.sh         # → dist/Nora.dmg   (~35 MB)
+open dist/Nora.app                  # smoke test
 ```
 
-The resulting `.app` bundles Python, all dependencies, and the
-runtime libraries — researchers running it don't need Python,
-`uv`, or any build tooling installed. R and (optionally) Stata are
-still required separately since Nora invokes them as
-subprocesses.
+The `.app` bundles Python, the dependencies, and the runtime
+libraries. Researchers running it do not need Python, `uv`, or any
+build tooling. R, Stata, and Python are still required separately
+because Nora invokes them as subprocesses.
 
-## Project layout
+## What it can do
 
-- `src/nora/` — Python source.
-  - `app.py` — terminal entry point, system prompt, chat loop.
-  - `ui.py` + `web/` — pywebview shell + HTML/CSS/JS frontend.
-  - `tools.py` — the six MCP tools Claude sees.
-  - `executor.py` — sandbox profile, R/Stata subprocess, per-run token.
-  - `sanitizer.py` + `sdc.py` + `text_safety.py` — disclosure control.
-  - `schema.py` — dataset metadata extraction (`.csv`/`.dta`/`.rds`).
-  - `policy.py` — per-dataset schema-depth ceilings + persistence.
-  - `store.py` — SQLite result store, audit log.
-  - `runtime/` — R library + five Stata `.ado` files scripts call.
-  - `chat_service.py` — typed event stream both frontends consume.
-- `tests/` — 194 tests. `test_sanitizer.py` is the property-test
-  backbone; `test_executor_*` cover the sandbox SBPL profile.
-- `docs/` — handoff, overview, direction, install, verification.
-- `packaging/` — PyInstaller spec + `.app`/`.dmg` build scripts.
+- **Multi-provider.** Anthropic (subscription or API key) and
+  OpenAI (API key). One auth screen. Per-provider session memory.
+- **Multi-session.** Each session has its own runner. Switching
+  the visible chat is a pure focus change. Long jobs in unfocused
+  sessions keep streaming. The sidebar shows a busy dot per
+  active runner.
+- **Editable session names.** Click the topbar pill or the
+  per-row `✎` to set a custom label. Persists in
+  `session_state.json`. Empty save reverts to the auto-derived
+  dataset or timestamp label.
+- **Concurrent execution with cwd isolation.** Tool execution
+  picks up the focused session's cwd via a `ContextVar`, so two
+  runners cannot read each other's files.
+- **Plot vision (model-output only).** Helper-produced figures
+  cross to the model on the next turn. Raw-data plots stay
+  researcher-only by construction.
+- **Memory stack.** Chat history persists per session. A warm-
+  start prefix injects the recent turns and recent results when
+  the conversation reopens. The `recall_conversation` tool covers
+  older lookups.
+
+## Layout
+
+- `src/nora/`
+  - `app.py` and `__main__.py` for the terminal entry point.
+  - `ui.py` and `web/` for the pywebview shell and the HTML, CSS,
+    JS frontend.
+  - `tools.py` for the eleven MCP tools the model sees.
+  - `executor.py` for the sandbox profile and the R, Stata,
+    Python subprocess runners.
+  - `sanitizer.py`, `sdc.py`, `text_safety.py` for disclosure
+    control.
+  - `schema.py` for dataset metadata extraction across the seven
+    supported formats.
+  - `policy.py` for per-dataset schema-depth ceilings.
+  - `store.py` for the SQLite result store and audit log.
+  - `session_state.py` for the per-session "at a glance" snapshot.
+  - `runtime/` for the R library, the Python library, and the ten
+    Stata `.ado` helpers scripts call.
+  - `provider/` for the Anthropic and OpenAI session adapters.
+  - `chat_service.py` for the typed event stream both frontends
+    consume.
+- `tests/` for 696 tests. `test_sanitizer.py` is the property-test
+  backbone. `test_executor_*` cover the sandbox profile.
+  `test_concurrent_sessions.py` covers multi-runner isolation.
+- `docs/` for handoff, overview, direction, install, verification.
+- `packaging/` for the PyInstaller spec and the `.app` / `.dmg`
+  build scripts.
+
+## The eleven tools
+
+`get_schema`, `search_schema`, `request_data`, `submit_script`,
+`submit_script_file`, `expand_result`, `compose_results`,
+`list_results`, `list_results_global` (env-gated cross-session
+recall), `recall_conversation`, `read_attached_file`. The full
+descriptions live in `src/nora/tools.py`.
 
 ## Security model
 
-Three independent layers provide the privacy guarantee:
+Three independent layers carry the privacy guarantee:
 
-1. **Tool interface** — Claude has no general-purpose tools (no
-   filesystem, no shell, no network). Only the six MCP tools, and
-   they're enumerated exhaustively.
-2. **Sandbox** — `(deny default)` `sandbox-exec` profile; narrow
-   subpath-allowlist for reads and writes; network denied entirely.
-3. **Sanitizer** — every execution result passes through
-   statistical-disclosure-control rules (precision clamping,
-   cell-size suppression, dominance checks) and text-safety
-   sanitation before it reaches Claude.
+1. **Tool interface.** No general-purpose tools. No filesystem,
+   no shell, no network. Eleven tools, enumerated exhaustively.
+2. **Sandbox.** A `(deny default)` `sandbox-exec` profile.
+   Narrow subpath allowlist for reads and writes. Network
+   denied entirely.
+3. **Sanitizer.** Every result passes through statistical-
+   disclosure-control rules (precision clamping, cell-size
+   suppression, dominance checks) and text-safety sanitation
+   before it reaches the model.
 
-None of these three layers depends on which of the allowed tools
-Claude invokes. See [`docs/direction.md`](docs/direction.md) for
-the full analysis, including what a local LLM would and would not
-add on top of these layers.
+None of these layers depends on which allowed tool the model
+invokes. The full analysis, including what a local model would and
+would not add on top of these layers, lives in
+[`docs/direction.md`](docs/direction.md).
 
 ## License
 

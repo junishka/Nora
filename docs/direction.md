@@ -293,7 +293,11 @@ current friction bites:
   the session, the chat replays from `chat_history.jsonl`, and the
   warm-start prefix injects the recent turns + recent results so
   the model picks up where the conversation left off. Sidebar is
-  collapsible and drag-to-resize.
+  collapsible and drag-to-resize. Sessions are renameable: click
+  the topbar pill or the per-row `✎` button to set a custom name
+  (persisted in `session_state.json` as `custom_name`, preserved
+  across the per-turn snapshot rewrite); empty save reverts to the
+  auto-derived dataset/timestamp label.
 - **Bundling web assets into the PyInstaller `.app`.** *Done.*
   The spec lists `src/nora/web/` (HTML / JS / CSS / Lottie / vendored
   player) as data files; the .app's bundle entry is
