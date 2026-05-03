@@ -55,22 +55,18 @@ if (cwdEl) {
 const DEFAULT_CONTEXT_WINDOW = 1_000_000;
 let contextWindow = DEFAULT_CONTEXT_WINDOW;
 
-// Session-level high-water mark for the context chip. Per-turn usage
-// events can fluctuate (a tool-heavy turn reports a peak prompt; a
-// follow-up plain turn reports a smaller one) but the underlying
-// conversation chain only grows. Taking ``max(prev, latest)`` keeps
-// the chip stable and informative — it tracks "biggest prompt this
-// session has ever needed" instead of "whatever the last event said."
-//
-// Stored per-cwd (not as a single scalar) because ``showChat()`` runs
-// on every ``ready`` event — including model swaps and reconnects on
-// the SAME session, not just session switches. A scalar would get
-// wiped to zero on those re-readies and the chip would visibly drop
-// inside one conversation. Keying by cwd lets a re-ready restore the
-// session's actual watermark, and a real switch start the new
-// session at zero (or its own remembered value if revisited).
-const sessionHighWaters = new Map();
-let sessionContextHighWater = 0;
+// (No high-water clamp on the context chip. Earlier we Math.max'd
+// each turn_done's reported usage against a per-cwd watermark so the
+// chip "only grew." That hid measurement asymmetries between
+// providers — Anthropic's MAX-across-rounds inflation got pinned in
+// place forever, and OpenAI's silent truncation never visibly shrank
+// the chip even though it was happening. The chip now reflects
+// exactly what the last completed turn reported. The conversation
+// chain grows monotonically on its own, so under normal use the
+// chip will only rise. If it drops, that's a real signal — a
+// reconnect that lost in-context state, a model swap that opened a
+// fresh session, a truncation event — and surfacing it is the
+// point.)
 
 // ---- multi-session focus state -------------------------------------------
 // The bridge runs every session as its own SessionRunner: turns in
@@ -461,13 +457,8 @@ function showChat(payload) {
   updatePolicyChip(payload.policy);
   loadSessions();
   loadModels();
-  // Restore the high-water mark for THIS session. ``ready`` fires on
-  // initial open, on every session switch, and ALSO on intra-session
-  // events like model swap or provider reconnect — so we cannot
-  // simply reset to zero here without wiping a chip that was already
-  // tracking 500k+ within an active conversation. The map is keyed by
-  // cwd; a fresh session with no prior high-water lands at zero.
-  sessionContextHighWater = sessionHighWaters.get(currentCwd) || 0;
+  // Hide the chip until the first turn_done arrives — without a
+  // measurement we have nothing honest to display.
   if (contextChip) contextChip.classList.add('hidden');
 
   replayHistory();
@@ -2654,20 +2645,12 @@ function updateContextChip(occupiedTokens) {
   if (!contextChip) return;
   if (typeof occupiedTokens !== 'number' || occupiedTokens < 0) return;
 
-  // Session-monotonic clamp. Per-turn usage events report whatever
-  // the most recent request measured — for OpenAI that's the last
-  // Responses round's input_tokens (+ output); for Anthropic it's
-  // the prompt-cache snapshot for that turn. Both can DECREASE
-  // turn-to-turn (a tool-heavy turn reports a peak prompt; a plain
-  // follow-up reports a smaller one) even though the underlying
-  // chain only grows. Take the max so the chip tracks the chain,
-  // not the last measurement.
-  occupiedTokens = Math.max(occupiedTokens, sessionContextHighWater);
-  sessionContextHighWater = occupiedTokens;
-  // Persist per-cwd so a re-ready (model swap, reconnect) or a
-  // session-switch round-trip restores the watermark instead of
-  // dropping to zero.
-  if (currentCwd) sessionHighWaters.set(currentCwd, occupiedTokens);
+  // No clamp. The chip displays exactly what the last completed
+  // turn reported. Under normal use the conversation chain grows
+  // monotonically, so the chip will only rise; if it drops, that's
+  // an honest signal (reconnect that lost in-context state, model
+  // swap that opened a fresh session, truncation event) worth
+  // showing rather than hiding.
 
   // Trust the authoritative ceiling set in updateModelChip (line ~3085)
   // from the model-info payload. The previous code auto-scaled the
