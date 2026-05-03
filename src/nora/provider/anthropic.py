@@ -394,15 +394,25 @@ class AnthropicSession:
             yield TurnError(message=f"failed to send prompt: {e}")
             return
 
-        # See chat_service.run_turn for the rationale behind tracking
-        # the *peak* prompt-side usage across multiple ResultMessages
-        # in a single turn (tool-use turns produce multiple internal
-        # round-trips).
-        max_input = 0
-        max_output = 0
-        max_cache_read = 0
-        max_cache_creation = 0
-        max_prompt_total = -1
+        # Track the LAST observed ResultMessage usage, not the peak
+        # across rounds. The conversation chain grows monotonically as
+        # tool outputs join it, so the LAST round's prompt_total is
+        # the actual context size at the end of this turn — exactly
+        # what the "context occupied" chip wants to display.
+        #
+        # Picking MAX (the previous behavior) inflated the chip when
+        # an intermediate round happened to report an unusually high
+        # prompt_total — e.g., a transient retry or an SDK accounting
+        # quirk where a tool result is double-counted before being
+        # folded into the cache. The peak then stuck around forever
+        # via the chip's high-water clamp, leaving the chip well above
+        # the actual chain size. Trusting the LAST measurement matches
+        # OpenAI's accounting (which uses the last round's
+        # input_tokens) and gives a directly comparable number.
+        last_input = 0
+        last_output = 0
+        last_cache_read = 0
+        last_cache_creation = 0
         last_cost: float | None = None
         saw_result = False
 
@@ -465,21 +475,19 @@ class AnthropicSession:
                             _f.write(line + "\n")
                     except Exception:  # noqa: BLE001 — diagnostic must never crash a turn
                         pass
-                if prompt_total >= max_prompt_total:
-                    max_prompt_total = prompt_total
-                    max_input = inp
-                    max_output = outp
-                    max_cache_read = cr
-                    max_cache_creation = cc
+                last_input = inp
+                last_output = outp
+                last_cache_read = cr
+                last_cache_creation = cc
                 if msg.total_cost_usd is not None:
                     last_cost = msg.total_cost_usd
 
         if saw_result:
             yield TurnDone(
-                input_tokens=max_input,
-                output_tokens=max_output,
-                cache_read_input_tokens=max_cache_read,
-                cache_creation_input_tokens=max_cache_creation,
+                input_tokens=last_input,
+                output_tokens=last_output,
+                cache_read_input_tokens=last_cache_read,
+                cache_creation_input_tokens=last_cache_creation,
                 cost_usd=last_cost,
             )
 
