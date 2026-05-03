@@ -1743,32 +1743,50 @@ kbd {
   margin: 6px 0;
   font-size: 12px;
   position: relative;
-  /* The pre's background is the dark code-bg even in light mode
-   * (burgundy on cream). Native scrollbars on that surface render
-   * as faint dark grooves against dark — easy to miss in light
-   * mode. Force a light-on-dark scrollbar so the affordance is
-   * visible regardless of OS theme. */
+  /* Scrollbar styling, exposed by 79f01256 (which added a vertical
+   * scrollbar to .tool-code via max-height + overflow-y) and broken
+   * by af10ab6 (which set the thumb to ``--pink-light`` and left
+   * track / corner unspecified).
+   *
+   * Two things matter, both relearned the hard way:
+   *
+   * 1. ``background: transparent`` on ``::-webkit-scrollbar-track``
+   *    and ``::-webkit-scrollbar-corner`` does NOT suppress the
+   *    track in WKWebView when macOS is set to "Always show
+   *    scrollbars" (conventional, gutter-taking scrollbars). WebKit
+   *    paints a default WHITE under the transparent fill — exactly
+   *    the wide white bar in the screenshots. Set the track and
+   *    corner to an EXPLICIT color matching ``--code-bg`` so the
+   *    gutter blends into the dark code surface.
+   *
+   * 2. ``--pink-light`` (#f5c6d3) is light enough that on the dark
+   *    code-bg it reads as near-white. Use ``--pink`` (#ee8ba9)
+   *    instead — distinctly pink, doesn't disappear in light mode. */
   scrollbar-width: thin;
-  scrollbar-color: var(--pink-light) transparent;
+  scrollbar-color: var(--pink) var(--code-bg);
 }
 
 .tool-card .tool-body pre::-webkit-scrollbar {
   height: 8px;
   width: 8px;
+  background: var(--code-bg);
 }
 
 .tool-card .tool-body pre::-webkit-scrollbar-thumb {
-  background: var(--pink-light);
+  background: var(--pink);
   border-radius: 4px;
-  opacity: 0.6;
 }
 
 .tool-card .tool-body pre::-webkit-scrollbar-thumb:hover {
-  background: var(--pink);
+  background: var(--accent);
 }
 
 .tool-card .tool-body pre::-webkit-scrollbar-track {
-  background: transparent;
+  background: var(--code-bg);
+}
+
+.tool-card .tool-body pre::-webkit-scrollbar-corner {
+  background: var(--code-bg);
 }
 
 .tool-card .tool-label {
