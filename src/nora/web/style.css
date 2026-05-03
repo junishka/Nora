@@ -3006,6 +3006,17 @@ kbd {
   counter-reset: chat-ol;
 }
 
+.message.assistant .message-body li ol {
+  /* Nested ordered lists need their OWN counter scope. Without
+   * this reset they inherit the message-body counter and continue
+   * the parent numbering — a structured "1. parent / 1.1 child"
+   * answer would render as a single flat sequence. The reset
+   * creates a fresh ``chat-ol`` counter inside the nested list so
+   * its items count 1, 2, 3 independently; the outer list resumes
+   * from where it left off after the nested subtree ends. */
+  counter-reset: chat-ol;
+}
+
 .message.assistant .message-body ul,
 .message.assistant .message-body ol {
   margin: 0 0 10px 0;
