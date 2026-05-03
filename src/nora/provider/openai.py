@@ -44,6 +44,7 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 from pathlib import Path
 from typing import Any, AsyncIterator
 
@@ -381,6 +382,32 @@ class OpenAISession:
                 if usage is not None:
                     last_input_tokens = getattr(usage, "input_tokens", 0) or 0
                     last_output_tokens = getattr(usage, "output_tokens", 0) or 0
+                # Diagnostic: gated by NORA_DEBUG_USAGE. Mirrors the
+                # Anthropic provider's logging so a head-to-head
+                # comparison of the two providers' token accounting is
+                # possible from the same on-disk file. Writes to
+                # stderr (visible if launched from a terminal) AND
+                # appends to ``<cwd>/.nora-usage.log`` (always reachable
+                # by the researcher regardless of launch method —
+                # pywebview swallows stderr on a double-clicked app).
+                if os.environ.get("NORA_DEBUG_USAGE") == "1" and usage is not None:
+                    cached = (
+                        getattr(getattr(usage, "input_tokens_details", None),
+                                "cached_tokens", 0) or 0
+                    )
+                    line = (
+                        f"[nora.usage.openai] round model={self.model} "
+                        f"input_tokens={last_input_tokens} "
+                        f"output_tokens={last_output_tokens} "
+                        f"cached_tokens={cached} "
+                        f"(cached is a SUBSET of input_tokens, not additive)"
+                    )
+                    print(line, file=sys.stderr, flush=True)
+                    try:
+                        with (self.cwd / ".nora-usage.log").open("a") as _f:
+                            _f.write(line + "\n")
+                    except Exception:  # noqa: BLE001 — diagnostic must never crash a turn
+                        pass
 
                 output = list(getattr(resp, "output", []) or [])
                 # Translate items + decide whether to keep looping.
