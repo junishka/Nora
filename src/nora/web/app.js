@@ -1808,6 +1808,11 @@ window.nora_event = function (evt) {
       if (!flushPendingFor(evtCwd)) {
         setSending(false, evtCwd);
       }
+      // hideLoadingIndicator() (inside setSending(false)) removed
+      // the cat above the new assistant reply, so the reply just
+      // shifted up by ~80 px. Re-apply the top-anchor so the
+      // researcher still lands on the answer's first line.
+      reapplyAssistantTopAnchor();
       break;
     case 'auth_failure':
       // Auth failures matter cross-session: even a background
@@ -2057,8 +2062,59 @@ function append(kind, text, markdown, attachments, images) {
     wrapper.appendChild(row);
   }
   messagesEl.appendChild(wrapper);
-  scrollToBottom();
+  if (kind === 'assistant') {
+    // Top-align the new reply so a long answer is read from its
+    // beginning, not from its bottom. scrollToBottom() would land
+    // the researcher at the LAST line of the answer and force them
+    // to scroll back up to the first sentence — exactly the wrong
+    // direction for prose. Other message kinds (user, system,
+    // error) still pin to the bottom: a user message pairs with
+    // the empty composer below it, and system / error notices are
+    // usually short status lines.
+    //
+    // Remember this wrapper so the turn_done handler can re-anchor
+    // to it AFTER the loading indicator is removed. Without that
+    // re-anchor, hiding the cat shifts everything up by ~80px and
+    // the answer's first line scrolls off the top of the viewport.
+    pendingAssistantTopAnchor = wrapper;
+    scrollMessageToTop(wrapper);
+  } else {
+    if (kind === 'user') pendingAssistantTopAnchor = null;
+    scrollToBottom();
+  }
   return wrapper;
+}
+
+// Set when we top-align a new assistant reply; the turn_done handler
+// re-applies the same top-align after hideLoadingIndicator() removes
+// the cat (which would otherwise shift the reply up off the viewport).
+let pendingAssistantTopAnchor = null;
+
+function reapplyAssistantTopAnchor() {
+  if (!pendingAssistantTopAnchor) return;
+  const wrapper = pendingAssistantTopAnchor;
+  pendingAssistantTopAnchor = null;
+  // Defer one frame so layout has settled after the indicator removal.
+  requestAnimationFrame(() => scrollMessageToTop(wrapper));
+}
+
+function scrollMessageToTop(wrapper) {
+  /* Scroll ``messagesEl`` so ``wrapper``'s top edge sits near the
+   * top of the visible chat region. Uses offset arithmetic instead
+   * of ``scrollIntoView`` because the messages container is the
+   * scroll parent (not the document) and ``scrollIntoView`` on a
+   * descendant can scroll the WHOLE page in some WebKit builds.
+   *
+   * A small breathing-room offset (16 px) keeps the message from
+   * kissing the topbar; if the wrapper sits very close to the
+   * bottom (short tail) the clamp prevents an over-scroll that
+   * would leave the wrapper not actually at the top.
+   */
+  if (!messagesEl || !wrapper) return;
+  const breathingRoom = 16;
+  const target = Math.max(0, wrapper.offsetTop - breathingRoom);
+  const max = Math.max(0, messagesEl.scrollHeight - messagesEl.clientHeight);
+  messagesEl.scrollTop = Math.min(target, max);
 }
 
 function appendToolCall(evt) {
