@@ -299,10 +299,10 @@ def test_cold_start_prefix_contains_prior_exchange(tmp_path: Path):
     )
 
     prefix = build_context_prefix(tmp_path, results=[])
-    assert "Prior conversation context" in prefix
+    assert "Session state at resume" in prefix
     assert "what does the gate do?" in prefix
     assert "revolving-door" in prefix
-    assert "End of prior context" in prefix
+    assert "End of session state" in prefix
 
 
 def test_cold_start_brand_new_session_has_no_prefix(tmp_path: Path):

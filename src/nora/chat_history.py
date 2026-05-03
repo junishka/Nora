@@ -367,17 +367,33 @@ def build_context_prefix(
     results_block = ""
     if results_lines:
         header_r = (
-            f"[Recent analytical results in this session "
+            f"[Analyses already produced in this session "
             f"({len(rows_with_ts)} stored, newest first; "
-            f"call expand_result(id) to see any payload):]"
+            f"call expand_result(id) for any payload):]"
         )
         results_block = header_r + "\n" + "\n".join(results_lines)
 
-    header = "[Prior conversation context — resuming this session:"
+    # Reframed from "Prior conversation context" to "Session state".
+    # The previous wording read as background chatter that PRECEDED
+    # the current task; the model parsed it as history and would
+    # silently re-derive or replace listed work on a fresh request
+    # after reload (the "drift on resume" failure mode). The new
+    # wording tells the model this is the current state of analytical
+    # work, plus an explicit directive to build on it rather than
+    # around it. The system prompt has a paired rule for the same
+    # thing — both surfaces matter because the prefix sits with the
+    # data and the system prompt sits with the instructions.
+    header = (
+        "[Session state at resume — analyses and turns already "
+        "completed in this session. Treat this as the current state "
+        "of the analytical work, not background. Build on what is "
+        "here; use list_results / expand_result for any id you need "
+        "to inspect."
+    )
     if omitted > 0:
         header += f" {omitted} earlier turns omitted,"
-    header += f" showing last {len(blocks)} of {total_turns} turns]"
-    footer = "[End of prior context. Current message follows.]"
+    header += f" showing last {len(blocks)} of {total_turns} turns.]"
+    footer = "[End of session state. Current message follows.]"
 
     sections = [header]
     if results_block:

@@ -657,6 +657,12 @@ missingness), `request_data` is faster and pre-approved. Prefer it over \
 writing a probe script.
 - Don't suggest uploading data, using cloud services, or anything that \
 moves data off the machine.
+- Treat the session-state block (the warm-start prefix that opens a \
+resumed session) as the current state of analytical work, not as \
+background. Analyses listed there are the basis for this session; \
+build on them by default, do not silently re-derive or replace \
+them. When a request would conflict with or duplicate listed work, \
+surface that and ask before proceeding.
 - When the researcher refers to prior work without naming it \
 explicitly, look it up before acting. Use `list_results` or \
 `recall_conversation` to identify the source. If the lookup is \

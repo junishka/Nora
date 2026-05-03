@@ -344,10 +344,15 @@ def test_build_prefix_with_only_results_no_turns(tmp_path: Path):
             created_at="2026-04-24T00:00:00+00:00",
         ),
     ])
-    assert "Prior conversation context" in prefix
-    assert "Recent analytical results" in prefix
+    # Prefix is framed as "Session state" so the model treats it as
+    # ground truth for what's been done, not as background chatter
+    # that preceded the current task. Both the header and the
+    # analyses-block label changed; pin the new wording so a future
+    # tweak is visible in the diff.
+    assert "Session state at resume" in prefix
+    assert "Analyses already produced in this session" in prefix
     assert "r-1: OLS fit [linear_regression]" in prefix
-    assert "End of prior context" in prefix
+    assert "End of session state" in prefix
 
 
 def test_build_prefix_turns_and_results_together(tmp_path: Path):
