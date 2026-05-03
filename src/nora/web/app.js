@@ -1651,6 +1651,29 @@ const LOADING_LABELS = [
   'consulting the oracle',
   'squinting at it',
   'untangling',
+  // Data-massage flavor — same gerund shape, vaguely statistical
+  // verbs that sound like they describe what's happening to the
+  // numbers without committing to any specific tool call. Bare
+  // verb when the verb stands alone; object retained only where
+  // the noun IS the joke (e.g. "reticulating splines").
+  'massaging',
+  'crunching',
+  'wrangling',
+  'kneading',
+  'sifting',
+  'whisking',
+  'polishing',
+  'coaxing',
+  'shuffling',
+  'tightening',
+  'auditing',
+  'interrogating',
+  'sweeping',
+  'tuning',
+  'weighing',
+  'herding outliers',
+  'minding the gaps',
+  'reticulating splines',
 ];
 
 function showLoadingIndicator() {
