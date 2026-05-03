@@ -2,7 +2,7 @@
 
 Local research assistant for sensitive data. The data stays on the
 researcher's machine. The model behind Nora is Claude (Anthropic) or
-GPT-5.5 (OpenAI). The product the researcher talks to is Nora.
+ChatGPT (OpenAI). The product the researcher talks to is Nora.
 
 The model reaches the researcher's files through an eleven-tool MCP
 interface. No Bash. No filesystem. No network. Scripts run under

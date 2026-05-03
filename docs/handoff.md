@@ -42,7 +42,7 @@ A local macOS app that lets a researcher drive statistical analysis
 (R, Stata, or Python) on their own data with a frontier model behind
 the scenes, without that data leaving the machine. From the
 researcher's point of view, Nora is one product they talk to — the
-underlying model (Claude or GPT-5.5) is the engine, not exposed in
+underlying model (Claude or ChatGPT) is the engine, not exposed in
 the UI. The model reaches the researcher's files through a narrow
 ten-tool MCP interface — no Bash, no filesystem, no network. Scripts
 run under `sandbox-exec` with network denied and a tight
@@ -517,7 +517,7 @@ them by surprise.
   with a `pip install` hint otherwise); `statsmodels` and
   `scipy` are needed only by `from_lm` / `from_t_test`
   respectively, so descriptive scripts work without them.
-- **The product is Nora; the model is Claude or GPT-5.5.** Don't
+- **The product is Nora; the model is Claude or ChatGPT.** Don't
   expose model names in user-facing copy. The system prompt has
   an explicit identity rule telling the model to introduce
   itself as Nora and to use first person ("I noticed…" not
