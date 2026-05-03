@@ -517,14 +517,30 @@ async function replayHistory() {
       replayTailTurn = null;
     }
     scrollToBottom();
-    // Don't seed the chip from the replayed history. A chars/4
-    // estimate undercounts the real prompt by a wide margin (it
-    // misses the system prompt, tool schemas, tool result envelopes,
-    // and reasoning traces), so the chip would show one number on
-    // load and a much larger one the moment the first turn_done
-    // arrived — exactly the "two largely different numbers" the
-    // researcher noticed. Better to stay hidden until the provider
-    // gives us the authoritative count on the next turn.
+    // Restore the context chip from the LAST persisted ``turn_done``,
+    // if there is one. Each ``turn_done`` carries the provider's
+    // authoritative token counts (input + cache_read + cache_creation
+    // + output), so this is honest data, not a chars/4 estimate. The
+    // earlier behavior of staying hidden until the next live turn
+    // meant a session with valid prior measurements showed no context
+    // pressure across reload / session-switch / model-swap until
+    // another turn completed — which can be a long wait on idle
+    // resumes.
+    let lastTurnDone = null;
+    for (let i = events.length - 1; i >= 0; i--) {
+      if (events[i].type === 'turn_done') {
+        lastTurnDone = events[i];
+        break;
+      }
+    }
+    if (lastTurnDone) {
+      const occupied =
+        (lastTurnDone.input_tokens || 0) +
+        (lastTurnDone.cache_read_input_tokens || 0) +
+        (lastTurnDone.cache_creation_input_tokens || 0) +
+        (lastTurnDone.output_tokens || 0);
+      if (occupied > 0) updateContextChip(occupied);
+    }
   } catch (err) {
     console.warn('get_chat_history failed', err);
   }
