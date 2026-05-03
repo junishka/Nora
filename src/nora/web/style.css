@@ -1746,19 +1746,10 @@ kbd {
   /* The pre's background is the dark code-bg even in light mode
    * (burgundy on cream). Native scrollbars on that surface render
    * as faint dark grooves against dark — easy to miss in light
-   * mode. Force a slim, dim scrollbar so the affordance is visible
-   * but doesn't dominate the card.
-   *
-   * The previous rules used --pink-light (#f5c6d3) for the thumb,
-   * which on dark backgrounds (burgundy in light mode, charcoal in
-   * dark mode) renders as bright white — a wide bright bar that
-   * stole attention from the code. Switching to a 30%-opacity
-   * white for thumb + transparent track + transparent corner gives
-   * a subtle pill-shaped indicator that fades into the card edge
-   * regardless of theme. The hover state warms slightly so the
-   * researcher can tell where the thumb is without it shouting. */
+   * mode. Force a light-on-dark scrollbar so the affordance is
+   * visible regardless of OS theme. */
   scrollbar-width: thin;
-  scrollbar-color: rgba(255, 255, 255, 0.3) transparent;
+  scrollbar-color: var(--pink-light) transparent;
 }
 
 .tool-card .tool-body pre::-webkit-scrollbar {
@@ -1767,23 +1758,16 @@ kbd {
 }
 
 .tool-card .tool-body pre::-webkit-scrollbar-thumb {
-  background: rgba(255, 255, 255, 0.3);
+  background: var(--pink-light);
   border-radius: 4px;
+  opacity: 0.6;
 }
 
 .tool-card .tool-body pre::-webkit-scrollbar-thumb:hover {
-  background: rgba(255, 255, 255, 0.5);
+  background: var(--pink);
 }
 
 .tool-card .tool-body pre::-webkit-scrollbar-track {
-  background: transparent;
-}
-
-/* Without this, the corner where horizontal + vertical scrollbars
- * meet defaults to the user-agent fill (a bright white square in
- * WKWebView) — visible as a small white block in the bottom-right
- * of every script card whose code is both wide and tall. */
-.tool-card .tool-body pre::-webkit-scrollbar-corner {
   background: transparent;
 }
 
