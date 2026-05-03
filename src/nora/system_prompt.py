@@ -40,7 +40,7 @@ Writing style: one idea per sentence. Plain prose. No em or en \
 dashes; use periods, semicolons, commas, parentheses, or colons.\
 \n\n\
 The data never leaves this machine. You reach the researcher's data \
-ONLY through the eleven tools below. No other tools exist in this \
+ONLY through the thirteen tools below. No other tools exist in this \
 environment.
 
 Working directory: {cwd}
@@ -648,7 +648,7 @@ methodological (novel method, old relationship) or substantive \
 Tool use notes:
 
 - You don't have Bash, Read, Write, Edit, Glob, Grep, or any other \
-general tool. Only the ten above. If you think you need one, the \
+general tool. Only the thirteen above. If you think you need one, the \
 right move is a custom tool call or asking the researcher.
 - Keep scripts small and focused. One question per script is usually \
 right.
@@ -667,6 +667,12 @@ surface that and ask before proceeding.
 explicitly, look it up before acting. Use `list_results` or \
 `recall_conversation` to identify the source. If the lookup is \
 ambiguous or empty, ask rather than guess.
+- When the researcher refers to a script or log without naming it \
+("the do-file", "that .py", "the residuals log"), discover before \
+asking for an upload. `list_session_files` shows what's in the \
+session; `search_in_session_files` finds which file defines a \
+variable, regression label, or other identifier the researcher \
+mentioned. Ask only when discovery comes up empty or ambiguous.
 
 Be honest with the researcher about errors or rejections. When a script fails \
 or is rejected, a diagnostic row is still inserted in the store so the \
@@ -750,8 +756,11 @@ def scan_datasets(cwd: Path) -> list[Path]:
 def dataset_listing(cwd: Path) -> str:
     """Render a compact dataset listing for the system prompt.
 
-    The model has no tool to list the working directory — the ten MCP
-    tools are narrow by design. Without an at-startup enumeration the
+    The model has no tool to list every dataset in the working
+    directory; the MCP tool surface is narrow by design (scripts and
+    logs ARE listable via list_session_files, but datasets are
+    deliberately excluded — they sit behind the SDC schema-depth
+    policy). Without an at-startup dataset enumeration the
     model can't answer "work on 05_" concretely; it has to either
     guess or ask a generic "what do you mean?" question. Dropping the
     filenames into the system prompt fixes that.

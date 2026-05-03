@@ -4,7 +4,7 @@ Local research assistant for sensitive data. The data stays on the
 researcher's machine. The model behind Nora is Claude (Anthropic) or
 ChatGPT (OpenAI). The product the researcher talks to is Nora.
 
-The model reaches the researcher's files through an eleven-tool MCP
+The model reaches the researcher's files through an thirteen-tool MCP
 interface. No Bash. No filesystem. No network. Scripts run under
 macOS `sandbox-exec` with network denied and a tight subpath
 allowlist for reads. Every result passes through a disclosure-control
@@ -116,7 +116,7 @@ because Nora invokes them as subprocesses.
   - `app.py` and `__main__.py` for the terminal entry point.
   - `ui.py` and `web/` for the pywebview shell and the HTML, CSS,
     JS frontend.
-  - `tools.py` for the eleven MCP tools the model sees.
+  - `tools.py` for the thirteen MCP tools the model sees.
   - `executor.py` for the sandbox profile and the R, Stata,
     Python subprocess runners.
   - `sanitizer.py`, `sdc.py`, `text_safety.py` for disclosure
@@ -138,12 +138,13 @@ because Nora invokes them as subprocesses.
 - `packaging/` for the PyInstaller spec and the `.app` / `.dmg`
   build scripts.
 
-## The eleven tools
+## The thirteen tools
 
 `get_schema`, `search_schema`, `request_data`, `submit_script`,
 `submit_script_file`, `expand_result`, `compose_results`,
 `list_results`, `list_results_global` (env-gated cross-session
-recall), `recall_conversation`, `read_attached_file`. The full
+recall), `recall_conversation`, `read_attached_file`,
+`list_session_files`, `search_in_session_files`. The full
 descriptions live in `src/nora/tools.py`.
 
 ## Security model
@@ -151,7 +152,7 @@ descriptions live in `src/nora/tools.py`.
 Three independent layers carry the privacy guarantee:
 
 1. **Tool interface.** No general-purpose tools. No filesystem,
-   no shell, no network. Eleven tools, enumerated exhaustively.
+   no shell, no network. Thirteen tools, enumerated exhaustively.
 2. **Sandbox.** A `(deny default)` `sandbox-exec` profile.
    Narrow subpath allowlist for reads and writes. Network
    denied entirely.

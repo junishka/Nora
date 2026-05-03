@@ -407,6 +407,50 @@ _READ_ATTACHED_FILE_DESC = (
 )
 
 
+_LIST_SESSION_FILES_DESC = (
+    "List script, log, and graph files the researcher has uploaded "
+    "or generated in the current session directory. Datasets are NOT "
+    "included — those are already in your system-prompt context "
+    "listing and gated by the SDC schema-depth policy.\n\n"
+    "Use this when the researcher refers to a script or log without "
+    "naming it explicitly ('the do-file', 'that .py', 'the residuals "
+    "log'), when you need to discover what's been uploaded before "
+    "asking for an upload, or to confirm a referenced filename "
+    "actually exists in the session.\n\n"
+    "Each entry carries name, kind (script / log / graph), size in "
+    "bytes, and last-modified mtime (ISO 8601 UTC). Newest first "
+    "within each kind.\n\n"
+    "Path safety: scan is non-recursive against cwd. Names are "
+    "basenames only.\n\n"
+    "Arguments:\n"
+    "  kinds: optional list of kinds to include — any subset of "
+    "['script', 'log', 'graph']. Empty / unset returns all three."
+)
+
+
+_SEARCH_IN_SESSION_FILES_DESC = (
+    "Search the contents of script and log files in the session for "
+    "a case-insensitive substring. Returns matching lines with file "
+    "+ line-number context.\n\n"
+    "Use this when the researcher mentions a variable name, "
+    "regression label, or other identifier you don't recognize from "
+    "the conversation — find which script defined it before asking "
+    "for an upload. Pairs naturally with list_session_files: list to "
+    "see what's there, search to find which file contains the term "
+    "you care about.\n\n"
+    "Searches scripts and logs only by default; never searches "
+    "datasets (the SDC layer owns dataset content). Files larger "
+    "than 256 KB are skipped with a 'too large' marker — read those "
+    "via read_attached_file directly.\n\n"
+    "Arguments:\n"
+    "  query: case-insensitive substring. Empty string is rejected.\n"
+    "  kinds: optional list — any subset of ['script', 'log']. "
+    "Default ['script', 'log']. 'graph' is never searchable.\n"
+    "  max_matches_per_file: optional cap on matches returned per "
+    "file (default 10, hard max 50)."
+)
+
+
 # ---------------------------------------------------------------------------
 # The seven tools.
 # ---------------------------------------------------------------------------
@@ -601,6 +645,30 @@ def build_tool_specs() -> tuple[ToolSpec, ...]:
             },
             required=("name",),
             openai_description=_READ_ATTACHED_FILE_DESC_OAI,
+        ),
+        _spec(
+            "list_session_files",
+            _LIST_SESSION_FILES_DESC,
+            properties={
+                "kinds": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                },
+            },
+            required=(),
+        ),
+        _spec(
+            "search_in_session_files",
+            _SEARCH_IN_SESSION_FILES_DESC,
+            properties={
+                "query": {"type": "string"},
+                "kinds": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                },
+                "max_matches_per_file": {"type": "integer"},
+            },
+            required=("query",),
         ),
     )
 

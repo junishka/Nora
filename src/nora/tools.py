@@ -2378,6 +2378,307 @@ def _ext_to_language(ext: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Tool: list_session_files
+# ---------------------------------------------------------------------------
+
+# Extension → kind map. Datasets are intentionally NOT included: they're
+# already enumerated in the system prompt's cwd listing AND gated by the
+# SDC schema-depth policy. Listing them through this tool would create
+# a second discovery path that bypasses the policy story.
+_SESSION_FILE_KINDS: dict[str, str] = {
+    ".py": "script",
+    ".do": "script",
+    ".r": "script",
+    ".rmd": "script",
+    ".ipynb": "script",
+    ".log": "log",
+    ".smcl": "log",
+    ".png": "graph",
+    ".jpg": "graph",
+    ".jpeg": "graph",
+    ".pdf": "graph",
+    ".eps": "graph",
+    ".gph": "graph",
+}
+_SESSION_FILE_KIND_VALUES: frozenset[str] = frozenset({"script", "log", "graph"})
+
+
+@tool(
+    "list_session_files",
+    (
+        "List script, log, and graph files the researcher has uploaded "
+        "or generated in the current session directory. Datasets are "
+        "NOT included — those are already in your system-prompt context "
+        "listing and gated by the SDC schema-depth policy.\n\n"
+        "Use this when the researcher refers to a script or log without "
+        "naming it explicitly ('the do-file', 'that .py', 'the residuals "
+        "log'), when you need to discover what's been uploaded before "
+        "asking for an upload, or to confirm a referenced filename "
+        "actually exists in the session.\n\n"
+        "Each entry carries name, kind (script / log / graph), size in "
+        "bytes, and last-modified mtime (ISO 8601 UTC). Newest first "
+        "within each kind.\n\n"
+        "Path safety: scan is non-recursive against cwd. Names are "
+        "basenames only.\n\n"
+        "Arguments:\n"
+        "  kinds: optional list of kinds to include — any subset of "
+        "['script', 'log', 'graph']. Empty / unset returns all three."
+    ),
+    {"kinds": list},
+)
+async def list_session_files(args: dict[str, Any]) -> dict[str, Any]:
+    """Enumerate non-data files in the session cwd, grouped by kind."""
+    from datetime import datetime, timezone
+    from nora.text_safety import safe_text
+
+    raw_kinds = args.get("kinds") or []
+    if not isinstance(raw_kinds, list):
+        return _as_mcp_text({
+            "status": "error",
+            "reason": "kinds must be a list of strings",
+        })
+    requested = {str(k).lower() for k in raw_kinds if isinstance(k, (str, int))}
+    if requested and not requested.issubset(_SESSION_FILE_KIND_VALUES):
+        bad = requested - _SESSION_FILE_KIND_VALUES
+        return _as_mcp_text({
+            "status": "error",
+            "reason": (
+                f"unknown kinds: {sorted(bad)!r}; "
+                f"valid: {sorted(_SESSION_FILE_KIND_VALUES)!r}"
+            ),
+        })
+    keep_kinds = requested or _SESSION_FILE_KIND_VALUES
+
+    cwd = get_cwd()
+    if cwd is None or not cwd.is_dir():
+        return _as_mcp_text({
+            "status": "error",
+            "reason": "no active session cwd",
+        })
+
+    rows: list[dict[str, Any]] = []
+    try:
+        children = list(cwd.iterdir())
+    except OSError as e:
+        return _as_mcp_text({
+            "status": "error",
+            "reason": f"could not list session cwd: {e}",
+        })
+    for child in children:
+        try:
+            if not child.is_file():
+                continue
+        except OSError:
+            continue
+        ext = child.suffix.lower()
+        kind = _SESSION_FILE_KINDS.get(ext)
+        if kind is None or kind not in keep_kinds:
+            continue
+        try:
+            st = child.stat()
+        except OSError:
+            continue
+        # Sanitize filenames before they land in the model's context —
+        # a dropped file with embedded "System:" markers / bidi
+        # overrides / newlines is exactly the prompt-injection vector
+        # the system prompt's dataset listing already guards against.
+        name = safe_text(child.name)
+        if not name:
+            continue
+        rows.append({
+            "name": name,
+            "kind": kind,
+            "size_bytes": st.st_size,
+            "mtime": datetime.fromtimestamp(
+                st.st_mtime, tz=timezone.utc,
+            ).isoformat(timespec="seconds"),
+        })
+    rows.sort(key=lambda r: (r["kind"], -r["size_bytes"]))
+    rows.sort(key=lambda r: r["mtime"], reverse=True)
+    counts = {k: 0 for k in _SESSION_FILE_KIND_VALUES}
+    for r in rows:
+        counts[r["kind"]] += 1
+    return _as_mcp_text({
+        "status": "ok",
+        "files": rows,
+        "counts": counts,
+        "total": len(rows),
+    })
+
+
+# ---------------------------------------------------------------------------
+# Tool: search_in_session_files
+# ---------------------------------------------------------------------------
+
+# Bound the per-file work so a giant log can't dominate the response.
+_SEARCH_FILES_MATCH_DEFAULT = 10
+_SEARCH_FILES_MATCH_HARD_CAP = 50
+# Don't ingest huge files into memory just to grep — anything past the
+# cap returns a "skipped: too large" entry so the model knows to read
+# it directly via read_attached_file if it really needs to.
+_SEARCH_FILES_FILE_BYTE_CAP = 256 * 1024
+# Per-line excerpt cap so a 5000-char line in a generated log doesn't
+# blow up the response payload.
+_SEARCH_FILES_LINE_EXCERPT_CAP = 240
+
+
+@tool(
+    "search_in_session_files",
+    (
+        "Search the contents of script and log files in the session "
+        "for a case-insensitive substring. Returns matching lines with "
+        "file + line-number context.\n\n"
+        "Use this when the researcher mentions a variable name, "
+        "regression label, or other identifier you don't recognize from "
+        "the conversation — find which script defined it before asking "
+        "for an upload. Pairs naturally with list_session_files: list to "
+        "see what's there, search to find which file contains the term "
+        "you care about.\n\n"
+        "Searches scripts and logs only by default; never searches "
+        "datasets (the SDC layer owns dataset content). Files larger "
+        "than 256 KB are skipped with a 'too large' marker — read those "
+        "via read_attached_file directly.\n\n"
+        "Arguments:\n"
+        "  query: case-insensitive substring. Empty string is rejected.\n"
+        "  kinds: optional list — any subset of ['script', 'log']. "
+        "Default ['script', 'log']. 'graph' is never searchable.\n"
+        "  max_matches_per_file: optional cap on matches returned per "
+        "file (default 10, hard max 50)."
+    ),
+    {
+        "query": str,
+        "kinds": list,
+        "max_matches_per_file": int,
+    },
+)
+async def search_in_session_files(args: dict[str, Any]) -> dict[str, Any]:
+    """Substring search across session script + log files."""
+    from nora.text_safety import safe_text
+
+    query = args.get("query", "")
+    if not isinstance(query, str) or not query.strip():
+        return _as_mcp_text({
+            "status": "error",
+            "reason": (
+                "missing required argument: query (case-insensitive "
+                "substring; use list_session_files for an unfiltered "
+                "file list)"
+            ),
+        })
+    needle = query.strip().lower()
+
+    raw_kinds = args.get("kinds") or ["script", "log"]
+    if not isinstance(raw_kinds, list):
+        return _as_mcp_text({
+            "status": "error",
+            "reason": "kinds must be a list of strings",
+        })
+    allowed = {"script", "log"}
+    requested = {str(k).lower() for k in raw_kinds if isinstance(k, (str, int))}
+    if not requested.issubset(allowed):
+        bad = requested - allowed
+        return _as_mcp_text({
+            "status": "error",
+            "reason": (
+                f"unsupported kinds: {sorted(bad)!r}; valid: "
+                f"{sorted(allowed)!r} (datasets and graphs aren't "
+                f"text-searchable here)"
+            ),
+        })
+    keep_kinds = requested or allowed
+
+    requested_max = args.get("max_matches_per_file", 0) or _SEARCH_FILES_MATCH_DEFAULT
+    if not isinstance(requested_max, int) or requested_max <= 0:
+        max_per_file = _SEARCH_FILES_MATCH_DEFAULT
+    else:
+        max_per_file = min(requested_max, _SEARCH_FILES_MATCH_HARD_CAP)
+
+    cwd = get_cwd()
+    if cwd is None or not cwd.is_dir():
+        return _as_mcp_text({
+            "status": "error",
+            "reason": "no active session cwd",
+        })
+
+    results: list[dict[str, Any]] = []
+    skipped: list[dict[str, str]] = []
+    files_searched = 0
+    total_matches = 0
+    try:
+        children = list(cwd.iterdir())
+    except OSError as e:
+        return _as_mcp_text({
+            "status": "error",
+            "reason": f"could not list session cwd: {e}",
+        })
+    for child in sorted(children, key=lambda p: p.name):
+        try:
+            if not child.is_file():
+                continue
+        except OSError:
+            continue
+        ext = child.suffix.lower()
+        kind = _SESSION_FILE_KINDS.get(ext)
+        if kind not in keep_kinds:
+            continue
+        try:
+            st = child.stat()
+        except OSError:
+            continue
+        name = safe_text(child.name)
+        if not name:
+            continue
+        if st.st_size > _SEARCH_FILES_FILE_BYTE_CAP:
+            skipped.append({
+                "name": name,
+                "kind": kind,
+                "reason": (
+                    f"file too large for inline search "
+                    f"({st.st_size} bytes > "
+                    f"{_SEARCH_FILES_FILE_BYTE_CAP} cap); use "
+                    f"read_attached_file"
+                ),
+            })
+            continue
+        try:
+            text = child.read_text(encoding="utf-8", errors="replace")
+        except OSError as e:
+            skipped.append({
+                "name": name,
+                "kind": kind,
+                "reason": f"read failed: {e}",
+            })
+            continue
+        files_searched += 1
+        matches: list[dict[str, Any]] = []
+        for lineno, line in enumerate(text.splitlines(), start=1):
+            if needle in line.lower():
+                excerpt = line.strip()
+                if len(excerpt) > _SEARCH_FILES_LINE_EXCERPT_CAP:
+                    excerpt = excerpt[:_SEARCH_FILES_LINE_EXCERPT_CAP] + "…"
+                matches.append({"line": lineno, "text": safe_text(excerpt)})
+                if len(matches) >= max_per_file:
+                    break
+        if matches:
+            total_matches += len(matches)
+            results.append({
+                "name": name,
+                "kind": kind,
+                "matches": matches,
+                "truncated": len(matches) >= max_per_file,
+            })
+
+    return _as_mcp_text({
+        "status": "ok",
+        "query": query,
+        "files_searched": files_searched,
+        "total_matches": total_matches,
+        "results": results,
+        "skipped": skipped,
+    })
+
+
+# ---------------------------------------------------------------------------
 # Server registration
 # ---------------------------------------------------------------------------
 
@@ -2395,6 +2696,8 @@ REGISTERED_TOOLS: tuple[Any, ...] = (
     list_results_global,
     recall_conversation,
     read_attached_file,
+    list_session_files,
+    search_in_session_files,
 )
 
 # Tool names Claude will see are prefixed: mcp__<server>__<tool>.
@@ -2411,6 +2714,8 @@ ALLOWED_TOOL_NAMES: tuple[str, ...] = (
     f"mcp__{SERVER_NAME}__list_results_global",
     f"mcp__{SERVER_NAME}__recall_conversation",
     f"mcp__{SERVER_NAME}__read_attached_file",
+    f"mcp__{SERVER_NAME}__list_session_files",
+    f"mcp__{SERVER_NAME}__search_in_session_files",
 )
 
 

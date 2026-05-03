@@ -246,13 +246,14 @@ Three independent privacy layers. A break in any one is a bug; a
 break in two at the same time is a privacy incident.
 
 1. **Tool interface** (`src/nora/tools.py` + `provider/tool_schemas.py`)
-   — the model has exactly ten tools: `get_schema`,
+   — the model has exactly thirteen tools: `get_schema`,
    `search_schema`, `request_data`, `submit_script`,
-   `submit_script_file`, `expand_result`, `list_results`,
-   `list_results_global`, `recall_conversation`,
-   `read_attached_file`. Anthropic SDK built-ins (Bash, Read,
+   `submit_script_file`, `expand_result`, `compose_results`,
+   `list_results`, `list_results_global`, `recall_conversation`,
+   `read_attached_file`, `list_session_files`,
+   `search_in_session_files`. Anthropic SDK built-ins (Bash, Read,
    Write, …) are disabled via `disallowed_tools` + `can_use_tool`
-   catch-all + `setting_sources=[]`. OpenAI: only the ten
+   catch-all + `setting_sources=[]`. OpenAI: only the thirteen
    function tools are passed; built-ins (`web_search`,
    `code_interpreter`, `file_search`, `image_generation`, `mcp`)
    are explicitly forbidden — verified on every request by
