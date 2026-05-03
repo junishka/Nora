@@ -1746,20 +1746,10 @@ kbd {
   /* The pre's background is the dark code-bg even in light mode
    * (burgundy on cream). Native scrollbars on that surface render
    * as faint dark grooves against dark — easy to miss in light
-   * mode. Force a saturated-pink scrollbar so the affordance is
-   * visible regardless of OS theme.
-   *
-   * Use ``--pink`` (#ee8ba9, mid-pink) NOT ``--pink-light``
-   * (#f5c6d3, near-white pink). Earlier rules used pink-light,
-   * which on the dark code-bg looked nearly white — bright
-   * enough to read as a solid white bar at the bottom of every
-   * script card, especially after commit 79f0125 introduced a
-   * second (vertical) scrollbar that doubled the visible white
-   * surface and added an unstyled corner between horizontal and
-   * vertical. Pink (#ee8ba9) reads as distinctly pink against
-   * burgundy without disappearing in light mode. */
+   * mode. Force a light-on-dark scrollbar so the affordance is
+   * visible regardless of OS theme. */
   scrollbar-width: thin;
-  scrollbar-color: var(--pink) transparent;
+  scrollbar-color: var(--pink-light) transparent;
 }
 
 .tool-card .tool-body pre::-webkit-scrollbar {
@@ -1768,23 +1758,16 @@ kbd {
 }
 
 .tool-card .tool-body pre::-webkit-scrollbar-thumb {
-  background: var(--pink);
+  background: var(--pink-light);
   border-radius: 4px;
+  opacity: 0.6;
 }
 
 .tool-card .tool-body pre::-webkit-scrollbar-thumb:hover {
-  background: var(--accent);
+  background: var(--pink);
 }
 
 .tool-card .tool-body pre::-webkit-scrollbar-track {
-  background: transparent;
-}
-
-/* Without this, the corner where horizontal + vertical scrollbars
- * meet defaults to the user-agent fill (a bright white square in
- * WKWebView) — visible as a small white block in the bottom-right
- * of every script card whose code is both wide and tall. */
-.tool-card .tool-body pre::-webkit-scrollbar-corner {
   background: transparent;
 }
 
