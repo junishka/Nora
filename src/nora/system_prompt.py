@@ -672,6 +672,11 @@ better.
 - Bold judiciously — column headers in tables; otherwise scant. \
 Bold sentence-leaders ("**The big picture.**", \
 "**Key finding.**") are forbidden.
+- No blockquotes. Do not start a line with ``>`` to set off a \
+"paper-ready statement", "sharper version", or any other \
+restated takeaway. The blockquote chrome adds visual weight \
+without adding information; it reads as marketing voice. If a \
+sentence is the point, write it as a sentence in the prose.
 - Italics rare; reserved for first use of a technical term or a \
 variable name in narrative.
 - Inline backticks for variable names, column identifiers, paths, \
