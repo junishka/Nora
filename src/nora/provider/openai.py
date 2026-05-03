@@ -336,6 +336,20 @@ class OpenAISession:
                     # data-retention posture (governed separately by
                     # the account's API data-handling settings).
                     "store": True,
+                    # Surface context-window overruns as errors instead
+                    # of letting the server silently drop the oldest
+                    # items in the chain. With ``truncation="auto"``
+                    # (which is the API default in some SDK versions),
+                    # ``usage.input_tokens`` reports the truncated
+                    # prompt size — making the context chip read
+                    # smaller than the actual conversation, then
+                    # smaller still as more turns get truncated. The
+                    # chip's whole point is honesty about how full the
+                    # window is; silent truncation defeats it. If we
+                    # ever want to allow truncation as a UX choice,
+                    # surface it in settings rather than baking it in
+                    # at the request boundary.
+                    "truncation": "disabled",
                 }
                 if turn_response_id is not None:
                     request_kwargs["previous_response_id"] = turn_response_id
