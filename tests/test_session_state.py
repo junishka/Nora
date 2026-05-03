@@ -35,6 +35,7 @@ from nora.session_state import (
     RecentResult,
     SessionState,
     read_session_state,
+    set_custom_name,
     write_session_state,
 )
 
@@ -217,6 +218,70 @@ def test_round_trip(tmp_path: Path):
     assert len(loaded.recent_results) == 1
     assert loaded.recent_results[0].id == "r-1"
     assert loaded.recent_results[0].label == "OLS fit"
+
+
+def test_set_custom_name_round_trip(tmp_path: Path):
+    """``set_custom_name`` writes a state file (creating one if
+    needed) and the value reads back."""
+    state = set_custom_name(tmp_path, "Replication of Smith 2014")
+    assert state is not None
+    assert state.custom_name == "Replication of Smith 2014"
+    loaded = read_session_state(tmp_path)
+    assert loaded is not None
+    assert loaded.custom_name == "Replication of Smith 2014"
+
+
+def test_set_custom_name_strips_and_caps(tmp_path: Path):
+    """Whitespace is trimmed; long names are capped so the topbar
+    pill stays readable. An empty / whitespace-only value clears
+    the name back to None so the auto-derived title takes over."""
+    set_custom_name(tmp_path, "   padded name   ")
+    assert read_session_state(tmp_path).custom_name == "padded name"
+
+    set_custom_name(tmp_path, "x" * 500)
+    cn = read_session_state(tmp_path).custom_name
+    assert cn is not None
+    assert len(cn) == 120
+
+    set_custom_name(tmp_path, "")
+    assert read_session_state(tmp_path).custom_name is None
+
+    set_custom_name(tmp_path, "back again")
+    set_custom_name(tmp_path, "   ")
+    assert read_session_state(tmp_path).custom_name is None
+
+
+def test_custom_name_survives_per_turn_rewrite(tmp_path: Path):
+    """``write_session_state`` is called after every successful
+    turn and rebuilds the file from scratch. The researcher's
+    custom name must NOT be silently dropped on each rewrite —
+    it should be carried forward from the prior state file."""
+    _write_chat_log(tmp_path, [])
+    set_custom_name(tmp_path, "Income shock paper")
+    assert read_session_state(tmp_path).custom_name == "Income shock paper"
+
+    # Simulate a turn finishing — runner.py calls this with the
+    # active model. The custom name must still be there.
+    write_session_state(tmp_path, model="sonnet-4-6", store_list=[])
+    loaded = read_session_state(tmp_path)
+    assert loaded is not None
+    assert loaded.custom_name == "Income shock paper"
+    assert loaded.active_model == "sonnet-4-6"
+
+
+def test_custom_name_round_trip_via_writer(tmp_path: Path):
+    """Manually-set state with a custom_name reads back through
+    the standard serializer too."""
+    _write_chat_log(tmp_path, [])
+    write_session_state(tmp_path, model="opus", store_list=[])
+    set_custom_name(tmp_path, "thesis chapter 3")
+    raw = json.loads(_state_path(tmp_path).read_text())
+    assert raw["custom_name"] == "thesis chapter 3"
+
+
+def test_set_custom_name_refuses_bad_cwd(tmp_path: Path):
+    """A non-existent directory yields None rather than crashing."""
+    assert set_custom_name(tmp_path / "nope", "x") is None
 
 
 def test_read_handles_missing_optional_fields(tmp_path: Path):

@@ -27,6 +27,27 @@ const stopBtn = document.getElementById('stop-btn');
 const cwdEl = document.getElementById('cwd-display');
 const contextChip = document.getElementById('context-chip');
 
+// Topbar pill — click to rename. Researchers can override the
+// auto-derived session label (dataset name / timestamp) with a
+// custom name; an empty save clears it back to the default.
+if (cwdEl) {
+  cwdEl.title = 'Click to rename this session';
+  cwdEl.setAttribute('role', 'button');
+  cwdEl.setAttribute('tabindex', '0');
+  cwdEl.addEventListener('click', () => {
+    if (!currentCwd) return;
+    if (cwdEl.classList.contains('editing')) return;
+    beginRenameSession(cwdEl, currentCwd);
+  });
+  cwdEl.addEventListener('keydown', (e) => {
+    if (e.key !== 'Enter' && e.key !== ' ') return;
+    if (cwdEl.classList.contains('editing')) return;
+    if (!currentCwd) return;
+    e.preventDefault();
+    beginRenameSession(cwdEl, currentCwd);
+  });
+}
+
 // Context-window ceiling for the chip's ratio display. Updated
 // whenever the researcher picks a model (see updateModelChip) —
 // Sonnet 4.6 defaults to 1M, Opus 4.7 and Haiku 4.5 to 200k. The
@@ -3470,7 +3491,12 @@ function renderSessions(sessions, currentPath) {
     when.appendChild(dot);
     const whenText = document.createElement('span');
     whenText.className = 'session-when-text';
-    whenText.textContent = formatSessionWhen(s.timestamp);
+    // When the researcher has set a custom name, show it as the
+    // primary label (where the timestamp normally goes) and demote
+    // the timestamp into the meta line below. Default sessions
+    // keep the original timestamp-on-top layout.
+    const hasCustom = !!s.custom_name;
+    whenText.textContent = hasCustom ? s.custom_name : formatSessionWhen(s.timestamp);
     when.appendChild(whenText);
     btn.appendChild(when);
 
@@ -3480,13 +3506,41 @@ function renderSessions(sessions, currentPath) {
       ? s.datasets.join(', ')
       : '(no data files)';
     const sizeText = typeof s.size === 'number' ? formatBytes(s.size) : '';
-    meta.textContent = sizeText ? `${sizeText} · ${dsText}` : dsText;
+    // Renamed sessions: timestamp moves into the meta line (it's
+    // no longer the primary label), so order is date · datasets · size.
+    // Default sessions: timestamp is already the primary label above,
+    // so meta keeps the original size · datasets layout.
+    const baseMeta = sizeText ? `${dsText} · ${sizeText}` : dsText;
+    meta.textContent = hasCustom
+      ? `${formatSessionWhen(s.timestamp)} · ${baseMeta}`
+      : (sizeText ? `${sizeText} · ${dsText}` : dsText);
     btn.appendChild(meta);
 
     btn.addEventListener('click', () =>
       switchSession(s.path, s.path === currentPath)
     );
     row.appendChild(btn);
+
+    const rename = document.createElement('button');
+    rename.type = 'button';
+    rename.className = 'session-rename';
+    rename.setAttribute('aria-label', 'Rename session');
+    rename.title = 'Rename this session';
+    rename.textContent = '✎';
+    rename.addEventListener('click', (e) => {
+      e.stopPropagation();
+      // Putting an <input> inside the <button.session-item>
+      // would be invalid nesting (interactive in interactive),
+      // so swap the whole button for an edit container. On
+      // commit/cancel, beginRenameSession's loadSessions()
+      // refresh redraws the row from server state.
+      const editor = document.createElement('div');
+      editor.className = 'session-item session-item-editing';
+      editor.textContent = hasCustom ? s.custom_name : formatSessionWhen(s.timestamp);
+      row.replaceChild(editor, btn);
+      beginRenameSession(editor, s.path);
+    });
+    row.appendChild(rename);
 
     const del = document.createElement('button');
     del.type = 'button';
@@ -3555,6 +3609,104 @@ async function deleteSession(s, isCurrent) {
   }
 }
 
+function beginRenameSession(targetEl, path) {
+  /* Swap the static label for an inline <input>, focused and
+   * pre-filled with the current text. Save on Enter or blur,
+   * cancel on Escape. Used by the topbar pill and by sidebar
+   * rows — the call site passes whichever element should be
+   * replaced for the duration of the edit.
+   *
+   * Empty / whitespace-only saves are intentional: they clear the
+   * custom name and revert to the auto-derived label (single
+   * dataset filename, "+N more", or session timestamp).
+   */
+  if (!targetEl || !path) return;
+  if (targetEl.classList.contains('editing')) return;
+  if (!window.pywebview || !window.pywebview.api) return;
+  if (typeof window.pywebview.api.set_session_name !== 'function') {
+    toast('Restart Nora to enable session renaming.', 'info');
+    return;
+  }
+  const original = targetEl.textContent || '';
+  const input = document.createElement('input');
+  input.type = 'text';
+  input.className = 'session-rename-input';
+  input.value = original;
+  input.maxLength = 120;
+  input.setAttribute('aria-label', 'Session name');
+  // Cache layout context so we can put the static text back.
+  const placeholder = document.createElement('span');
+  placeholder.className = 'session-rename-placeholder';
+  targetEl.classList.add('editing');
+  targetEl.replaceChildren(placeholder, input);
+  input.focus();
+  input.select();
+
+  let done = false;
+  const restore = (text) => {
+    if (done) return;
+    done = true;
+    targetEl.classList.remove('editing');
+    targetEl.replaceChildren();
+    targetEl.textContent = text;
+    // Sidebar rows enter edit mode by swapping the row's button for
+    // a stand-in edit container — restoring that container's text
+    // alone won't bring back the rename/delete buttons. Re-rendering
+    // the sidebar from server state is harmless for the topbar case
+    // and necessary for the sidebar case.
+    if (typeof loadSessions === 'function') loadSessions();
+  };
+  const commit = async () => {
+    if (done) return;
+    const next = input.value;
+    // Block accidental double-fires (blur after Enter).
+    done = true;
+    targetEl.classList.remove('editing');
+    targetEl.replaceChildren();
+    // Show what the user typed immediately so the edit feels
+    // local; the bridge call below confirms or corrects it.
+    targetEl.textContent = next.trim() || original;
+    try {
+      const res = await window.pywebview.api.set_session_name(path, next);
+      if (!res || !res.ok) {
+        targetEl.textContent = original;
+        toast(
+          'Could not rename: ' + ((res && res.reason) || 'unknown'),
+          'error',
+        );
+        return;
+      }
+      // Server's resolved title is authoritative — it falls back
+      // to the auto-derived label when the input was empty.
+      if (res.title) targetEl.textContent = res.title;
+      // Sidebar rows also display the title; refresh so they
+      // stay in sync.
+      if (typeof loadSessions === 'function') loadSessions();
+    } catch (err) {
+      console.warn('set_session_name failed', err);
+      targetEl.textContent = original;
+      toast('Rename failed: ' + (err && err.message ? err.message : err), 'error');
+    }
+  };
+
+  input.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') {
+      e.preventDefault();
+      commit();
+    } else if (e.key === 'Escape') {
+      e.preventDefault();
+      restore(original);
+    }
+  });
+  input.addEventListener('blur', () => {
+    // Don't commit if Escape already restored.
+    if (!done) commit();
+  });
+  // Stop click bubbling so a sidebar-row rename doesn't also
+  // trigger the row's switch-session handler.
+  input.addEventListener('click', (e) => e.stopPropagation());
+}
+
 function formatSessionWhen(epochSeconds) {
   /* Human-friendly timestamp for a past session.
    * Today: "3:14 PM"
@@ -3606,6 +3758,16 @@ if (sidebarListEl) {
   sidebarListEl.addEventListener('keydown', (e) => {
     const focused = document.activeElement;
     if (!focused || !sidebarListEl.contains(focused)) return;
+    // Don't hijack typing keys when the user is inside the inline
+    // rename input — Backspace would otherwise trigger the row's
+    // delete confirm instead of erasing a character.
+    if (
+      focused.tagName === 'INPUT'
+      || focused.tagName === 'TEXTAREA'
+      || focused.isContentEditable
+    ) {
+      return;
+    }
     const buttons = Array.from(
       sidebarListEl.querySelectorAll('.session-item')
     );

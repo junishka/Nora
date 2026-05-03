@@ -1552,12 +1552,26 @@ class NoraBridge:
             except OSError:
                 pass
             datasets.sort()
+            # Pull the researcher-set name (if any) so the sidebar can
+            # show it as the primary label. ``title`` is the
+            # already-resolved label that respects custom_name; the
+            # raw ``custom_name`` lets the UI tell "user named this"
+            # apart from "auto-derived from datasets" without having
+            # to re-derive on the page side.
+            try:
+                from nora.session_state import read_session_state
+                state = read_session_state(child)
+            except Exception:  # noqa: BLE001
+                state = None
+            custom = state.custom_name if state is not None else None
             entries.append({
                 "path": str(child.resolve()),
                 "name": child.name,
                 "timestamp": ts,  # epoch seconds, JS formats
                 "datasets": datasets,
                 "size": _dir_size(child),
+                "title": _session_title(child),
+                "custom_name": custom,
             })
         entries.sort(key=lambda e: e["timestamp"], reverse=True)
         return {"ok": True, "sessions": entries, "current": current}
@@ -1664,6 +1678,43 @@ class NoraBridge:
             }
 
         return self._set_cwd(target)
+
+    def set_session_name(self, path: str, name: str) -> dict[str, Any]:
+        """Persist a researcher-set label for a session.
+
+        ``name`` is trimmed and capped; an empty (or whitespace-only)
+        string clears the custom name and falls back to the
+        auto-derived title (dataset filename / timestamp). The path
+        must live under ``~/.nora-sessions/``.
+
+        Returns the new resolved title so the page can update the
+        topbar pill and sidebar row in one round trip.
+        """
+        if not path:
+            return {"ok": False, "reason": "empty path"}
+        try:
+            target = Path(path).expanduser().resolve()
+        except OSError as e:
+            return {"ok": False, "reason": f"bad path: {e}"}
+        if not _is_within(target, SESSIONS_ROOT.resolve()):
+            return {
+                "ok": False,
+                "reason": "path is outside ~/.nora-sessions/",
+            }
+        if not target.is_dir():
+            return {"ok": False, "reason": f"not a directory: {target}"}
+        try:
+            from nora.session_state import set_custom_name
+            set_custom_name(target, name)
+        except Exception as e:  # noqa: BLE001 — surface, don't crash
+            return {"ok": False, "reason": f"could not save name: {e}"}
+        title = _session_title(target)
+        return {
+            "ok": True,
+            "path": str(target),
+            "title": title,
+            "custom_name": (name.strip() or None) if isinstance(name, str) else None,
+        }
 
     def interrupt_turn(self) -> dict[str, Any]:
         """Cancel the active session's in-flight turn, if any.
@@ -2451,6 +2502,7 @@ def _dir_size(path: Path) -> int:
 
 def _session_title(cwd: Path) -> str:
     """Human-friendly title for a session. Preference order:
+      0. A researcher-set ``custom_name`` from session_state.json.
       1. A single dataset's filename (most common case: one upload).
       2. "<first> +N more" when multiple datasets live in the dir.
       3. A "Session MMM DD, HH:MM" stamp derived from the dir name.
@@ -2458,6 +2510,13 @@ def _session_title(cwd: Path) -> str:
     The goal is that the topbar always shows something a researcher
     recognizes, never a raw absolute path.
     """
+    try:
+        from nora.session_state import read_session_state
+        state = read_session_state(cwd)
+        if state is not None and state.custom_name:
+            return state.custom_name
+    except Exception:  # noqa: BLE001 — never let title resolution crash the UI
+        pass
     from nora.schema import DATA_EXTENSIONS as _DATA_EXTS
     try:
         datasets = sorted(

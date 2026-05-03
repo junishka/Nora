@@ -45,6 +45,10 @@ SESSION_STATE_VERSION = 1
 # transcript. Callers who need the full exchange use chat_history.
 _LAST_MESSAGE_CAP = 800
 _RECENT_RESULTS_CAP = 10
+# Cap on the user-supplied session name. Long enough to fit a
+# descriptive sentence ("Replication of Smith 2014, table 3"), short
+# enough to keep the topbar pill and sidebar rows readable.
+_CUSTOM_NAME_CAP = 120
 # Imported from nora.schema so the catalog of recognised data files
 # stays in one place — adding .parquet there propagates here.
 from nora.schema import DATA_EXTENSIONS as _DATA_EXTS  # noqa: E402
@@ -75,6 +79,10 @@ class SessionState:
     recent_results: list[RecentResult] = field(default_factory=list)
     datasets: list[str] = field(default_factory=list)
     active_model: str | None = None
+    # Optional researcher-set label for the session. When set, the UI
+    # prefers this over the auto-derived title (dataset name /
+    # timestamp). ``None`` means "use the auto-derived title".
+    custom_name: str | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -164,6 +172,13 @@ def write_session_state(
     except OSError:
         pass
 
+    # Preserve the researcher-set custom name across rewrites. The
+    # writer is called after every successful turn and regenerates
+    # the file from scratch — without this read-and-carry, every turn
+    # would silently drop a name the researcher had typed earlier.
+    prior = read_session_state(cwd)
+    custom_name = prior.custom_name if prior is not None else None
+
     state = SessionState(
         version=SESSION_STATE_VERSION,
         last_active_at=datetime.now(timezone.utc).isoformat(timespec="seconds"),
@@ -173,8 +188,54 @@ def write_session_state(
         recent_results=recent,
         datasets=datasets,
         active_model=model,
+        custom_name=custom_name,
     )
 
+    _atomic_write(cwd / ".nora" / SESSION_STATE_FILENAME, state)
+    return state
+
+
+def set_custom_name(cwd: Path, name: str | None) -> SessionState | None:
+    """Update only the ``custom_name`` field on the session's state
+    file. ``None`` (or an empty/whitespace string) clears it back to
+    the auto-derived title. Returns the new ``SessionState`` or
+    ``None`` if the cwd is invalid or no state file existed yet.
+
+    This is a targeted edit — it does NOT regenerate the rest of the
+    snapshot. That keeps the rename cheap (no chat-history walk, no
+    store open) and avoids the rare race where regenerating would
+    pick up a partial in-flight turn.
+    """
+    if cwd is None or not cwd.is_dir():
+        return None
+    cleaned: str | None
+    if name is None:
+        cleaned = None
+    else:
+        s = name.strip()
+        cleaned = s[:_CUSTOM_NAME_CAP] if s else None
+
+    prior = read_session_state(cwd)
+    if prior is None:
+        # No state yet — seed a minimal one so the name sticks. The
+        # next successful turn will fill in turn_count etc.
+        state = SessionState(
+            version=SESSION_STATE_VERSION,
+            last_active_at=datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            custom_name=cleaned,
+        )
+    else:
+        state = SessionState(
+            version=prior.version,
+            last_active_at=prior.last_active_at,
+            turn_count=prior.turn_count,
+            last_user_message=prior.last_user_message,
+            last_assistant_summary=prior.last_assistant_summary,
+            recent_results=prior.recent_results,
+            datasets=prior.datasets,
+            active_model=prior.active_model,
+            custom_name=cleaned,
+        )
     _atomic_write(cwd / ".nora" / SESSION_STATE_FILENAME, state)
     return state
 
@@ -223,6 +284,7 @@ def read_session_state(cwd: Path | None) -> SessionState | None:
             ],
             datasets=[str(d) for d in (raw.get("datasets") or []) if d],
             active_model=raw.get("active_model"),
+            custom_name=(raw.get("custom_name") or None),
         )
     except (TypeError, ValueError):
         return None

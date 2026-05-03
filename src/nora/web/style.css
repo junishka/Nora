@@ -869,18 +869,47 @@ kbd {
   outline-offset: -2px;
 }
 
+.session-rename,
 .session-delete {
   flex: 0 0 auto;
-  width: 28px;
+  width: 24px;
   padding: 0;
   border: none;
-  border-radius: 0 7px 7px 0;
   background: transparent;
   color: var(--text-dim);
-  font-size: 18px;
   line-height: 1;
   cursor: pointer;
-  transition: color 0.15s, background 0.15s;
+  transition: color 0.15s, background 0.15s, opacity 0.15s;
+  opacity: 0;
+}
+
+.session-rename {
+  font-size: 13px;
+  border-radius: 0;
+}
+
+.session-delete {
+  width: 28px;
+  font-size: 18px;
+  border-radius: 0 7px 7px 0;
+}
+
+/* Reveal the row's secondary actions on hover, focus-within, or
+ * for the active session. Keeping them invisible by default cuts
+ * the row's visual noise when the researcher just wants to
+ * scan the list. */
+.session-row:hover .session-rename,
+.session-row:hover .session-delete,
+.session-row:focus-within .session-rename,
+.session-row:focus-within .session-delete,
+.session-row.active .session-rename,
+.session-row.active .session-delete {
+  opacity: 1;
+}
+
+.session-rename:hover {
+  color: var(--text);
+  background: rgba(0, 0, 0, 0.05);
 }
 
 .session-delete:hover {
@@ -889,9 +918,19 @@ kbd {
 }
 
 @media (prefers-color-scheme: dark) {
+  .session-rename:hover,
   .session-delete:hover {
     background: rgba(255, 255, 255, 0.05);
   }
+}
+
+/* Edit-mode container that temporarily replaces the row's button
+ * during rename. Same padding/typography as ``.session-item`` so
+ * the input lands in the same visual position. */
+.session-item-editing {
+  flex: 1 1 0;
+  min-width: 0;
+  padding: 8px 10px;
 }
 
 .session-when {
@@ -990,10 +1029,65 @@ kbd {
   text-overflow: ellipsis;
   white-space: nowrap;
   min-width: 0;
+  cursor: text;
+  border: 1px solid transparent;
+  transition: border-color 0.15s, opacity 0.15s;
+}
+
+#cwd-display:hover {
+  opacity: 1;
+  border-color: var(--border);
+}
+
+#cwd-display:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+#cwd-display.editing {
+  /* Let the input take the pill shape — don't double-pad. */
+  padding: 0;
+  border-color: var(--accent);
+  cursor: text;
+  opacity: 1;
 }
 
 #cwd-display:empty {
   display: none;  /* don't render the empty pill before cwd is set */
+}
+
+/* Inline rename input — used by the topbar pill and by sidebar
+ * rows. Inherits the host's typography so the swap-in feels
+ * seamless rather than dropping the user into a generic form
+ * field. */
+.session-rename-input {
+  width: 100%;
+  min-width: 0;
+  margin: 0;
+  padding: 4px 12px;
+  border: none;
+  border-radius: 999px;
+  background: var(--bg-surface);
+  color: var(--text);
+  font-family: inherit;
+  font-size: inherit;
+  line-height: inherit;
+}
+
+.session-rename-input:focus {
+  outline: none;
+}
+
+/* Sidebar rename uses the same input class but inside the
+ * row's edit container, which has different padding + corner
+ * shape than the topbar pill. */
+.session-item-editing .session-rename-input {
+  padding: 0;
+  background: transparent;
+  border-radius: 4px;
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--text);
 }
 
 .topbar-toggle {
