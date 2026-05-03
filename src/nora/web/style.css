@@ -2998,11 +2998,48 @@ kbd {
 .message.assistant .message-body ul,
 .message.assistant .message-body ol {
   margin: 0 0 10px 0;
-  padding-left: 24px;
+  padding-left: 0;
+  list-style: none;
+}
+
+.message.assistant .message-body ol {
+  counter-reset: chat-ol;
 }
 
 .message.assistant .message-body li {
+  /* Bullet is rendered inside the li's content box via ::before
+   * (not as a native ::marker outside it). The native marker lives
+   * in the parent's padding gutter, where WebKit paints text-
+   * selection background but does NOT repaint it on selection
+   * clear — leaving thin colored bars on the left of every li
+   * after a multi-bullet drag-select. Painting the bullet inside
+   * the content box keeps selection inside one rectangle that the
+   * compositor clears uniformly. */
   margin: 2px 0;
+  padding-left: 1.4em;
+  position: relative;
+}
+
+.message.assistant .message-body ul > li::before {
+  content: "\2022";  /* • */
+  position: absolute;
+  left: 0.4em;
+  top: 0;
+  color: inherit;
+}
+
+.message.assistant .message-body ol > li {
+  counter-increment: chat-ol;
+}
+
+.message.assistant .message-body ol > li::before {
+  content: counter(chat-ol) ".";
+  position: absolute;
+  left: 0;
+  top: 0;
+  width: 1.2em;
+  text-align: right;
+  color: inherit;
 }
 
 .message.assistant .message-body code {
