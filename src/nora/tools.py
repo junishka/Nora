@@ -299,34 +299,58 @@ def _compact_payload(sanitized: dict[str, Any]) -> dict[str, Any]:
     return dict(sanitized)
 
 
-# Per-call inline budget for the assembled ``submit_script`` envelope.
-# The Claude Agent SDK enforces a tool-result size cap (~56k chars in
-# practice) — over the cap, the inline body is replaced with an
-# "output saved to <path>" message and the JSON is persisted to
-# ``~/.claude/projects/<...>/tool-results/<id>``. Nora exposes no
-# Read/Bash, so the model can't fetch the persisted file and falls
-# back to ``list_results`` + N × ``expand_result``, defeating the
-# inline-payload optimization the model just lost. Budget is set
-# below the cap with margin for the wrapper (status, timings,
-# transformations_summary, plot summary, _run_dir).
-_INLINE_PAYLOAD_BUDGET = 35_000
+# Two-stage inline budget for the assembled ``submit_script``
+# envelope. Earlier behavior set a single threshold at 35k chars
+# (just below the Claude Agent SDK's ~56k tool-result cap) — that
+# only fired in the rare worst case, leaving every "moderate" multi-
+# regression turn shipping its full payload inline and bloating the
+# conversation faster than necessary.
+#
+# Stage 1 — payload trim, fires at ``_INLINE_PAYLOAD_BUDGET``: drop
+# the heavy ``payload`` (raw coefficient arrays, vcov, vif) from
+# each ok-status result. ``markdown`` (the canonical table) and the
+# small fields (label, type, n, summary, result_id) stay. This is
+# the right default for context economy — markdown carries the
+# numbers the model actually reasons over; payload is for cases the
+# model needs vcov / vif / raw arrays, which it can pull via
+# ``expand_result(view="full")`` per result_id. 12k is below most
+# multi-regression batches' total inline cost, so this fires often
+# enough to noticeably slow context growth without depriving the
+# model of the table view.
+#
+# Stage 2 — markdown summarization, fires at ``_INLINE_MARKDOWN_BUDGET``:
+# even after stripping payloads, very heavy turns (e.g., 20+
+# regression batch with verbose markdown) can still ship 30k+ chars
+# of tables inline. At this point we replace each entry's
+# ``markdown`` with a one-line summary noting the result_id and
+# instruction to call ``expand_result`` for the table. This is the
+# "pure handoff" mode — the model only sees handles, has to call
+# ``expand_result`` to see anything substantive. Used sparingly.
+#
+# Both stages still preserve every result's ``result_id``,
+# ``label``, ``type``, ``n``, ``summary``, and any error fields —
+# enough for the model to compare batches and decide which to
+# inspect deeper.
+_INLINE_PAYLOAD_BUDGET = 12_000
+_INLINE_MARKDOWN_BUDGET = 30_000
 
 
-def _trim_oversize_inline_payloads(results: list[dict[str, Any]]) -> bool:
-    """Drop ``payload`` from ok-status entries when the inline body
-    (sum of per-entry ``payload`` JSON + ``markdown``) would cross
-    ``_INLINE_PAYLOAD_BUDGET``. Returns True iff a trim happened.
+def _trim_oversize_inline_payloads(results: list[dict[str, Any]]) -> dict[str, bool]:
+    """Two-stage trim. Mutates ``results`` in place. Returns a dict
+    of which stages fired:
+        {"payload_omitted": bool, "markdown_omitted": bool}
 
-    ``markdown`` stays on every entry — it's what the UI's per-
-    result panels render from and the canonical table the model
-    reads from. For raw numbers the model still has
-    ``expand_result(view="full")`` per result_id; trimming converts
-    forced N × round-trips on big batches into a few targeted ones.
+    Stage 1 fires when the assembled envelope (payload + markdown
+    cost across ok results) exceeds ``_INLINE_PAYLOAD_BUDGET``: the
+    ``payload`` field is dropped from every ok entry. Stage 2 fires
+    when the markdown alone still exceeds ``_INLINE_MARKDOWN_BUDGET``
+    after stage 1: per-entry ``markdown`` is replaced with a single
+    line pointing at the result_id.
 
-    Mutates ``results`` in place. The caller (``submit_script``) is
-    expected to surface the boolean return value as
-    ``response["_inline_payload_omitted"] = True`` so the model
-    knows the inline shape changed for this turn.
+    The caller surfaces these in the response envelope as
+    ``_inline_payload_omitted`` / ``_inline_markdown_omitted`` so
+    the model knows the shape changed and can call
+    ``expand_result`` for the trimmed content.
     """
     payload_cost = sum(
         len(json.dumps(r.get("payload"), ensure_ascii=False))
@@ -337,14 +361,43 @@ def _trim_oversize_inline_payloads(results: list[dict[str, Any]]) -> bool:
         len(r.get("markdown", "")) for r in results
         if r.get("status") == "ok"
     )
-    if payload_cost + markdown_cost <= _INLINE_PAYLOAD_BUDGET:
-        return False
-    trimmed = False
-    for entry in results:
-        if entry.get("status") == "ok" and "payload" in entry:
-            del entry["payload"]
-            trimmed = True
-    return trimmed
+    flags = {"payload_omitted": False, "markdown_omitted": False}
+
+    # Stage 1: drop payloads if the combined inline body crosses the
+    # budget. We could be cleverer (drop payloads only from the
+    # heaviest entries) but uniform-drop keeps the contract simple
+    # — model sees either "all payloads inline" or "all payloads
+    # behind expand_result" for a given turn, never a mix.
+    if payload_cost + markdown_cost > _INLINE_PAYLOAD_BUDGET:
+        for entry in results:
+            if entry.get("status") == "ok" and "payload" in entry:
+                del entry["payload"]
+                flags["payload_omitted"] = True
+
+    # Stage 2: even with payloads dropped, markdown alone may still
+    # be heavy on big regression batches. Replace each ``markdown``
+    # with a stub. Recompute the markdown cost rather than reuse
+    # the pre-stage-1 number (markdown didn't change in stage 1, so
+    # the value is identical, but reading it explicitly here makes
+    # the staging contract clearer for future edits).
+    md_cost_post_s1 = sum(
+        len(r.get("markdown", "")) for r in results
+        if r.get("status") == "ok"
+    )
+    if md_cost_post_s1 > _INLINE_MARKDOWN_BUDGET:
+        for entry in results:
+            if entry.get("status") != "ok" or "markdown" not in entry:
+                continue
+            rid = entry.get("result_id", "?")
+            label = entry.get("label", "")
+            label_part = f" ({label})" if label else ""
+            entry["markdown"] = (
+                f"[Heavy result trimmed for context. result_id={rid}{label_part}; "
+                f"call expand_result(\"{rid}\", view=\"full\") to fetch the table.]"
+            )
+            flags["markdown_omitted"] = True
+
+    return flags
 
 
 def _shared_transformations(results: list[dict[str, Any]]) -> list[str]:
@@ -1175,7 +1228,13 @@ async def submit_script(args: dict[str, Any]) -> dict[str, Any]:
             ]
 
     # Envelope-size guard — see ``_trim_oversize_inline_payloads``.
-    inline_payload_omitted = _trim_oversize_inline_payloads(results)
+    # Two-stage now: payload-strip at the first threshold, markdown-
+    # summarize at the second. The flags propagate into the response
+    # envelope as ``_inline_payload_omitted`` / ``_inline_markdown_omitted``
+    # so the model knows whether to reach for ``expand_result``.
+    trim_flags = _trim_oversize_inline_payloads(results)
+    inline_payload_omitted = trim_flags["payload_omitted"]
+    inline_markdown_omitted = trim_flags["markdown_omitted"]
 
     # Phase timings: subprocess vs post-execution audit work. The
     # default ``duration_seconds`` only reports the subprocess, which
@@ -1212,6 +1271,8 @@ async def submit_script(args: dict[str, Any]) -> dict[str, Any]:
         response["transformations_summary"] = shared_transformations
     if inline_payload_omitted:
         response["_inline_payload_omitted"] = True
+    if inline_markdown_omitted:
+        response["_inline_markdown_omitted"] = True
 
     if overall_status == "rejected_by_sanitizer":
         response["hint"] = (
