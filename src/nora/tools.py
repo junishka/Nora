@@ -2581,6 +2581,18 @@ _SEARCH_FILES_FILE_BYTE_CAP = 256 * 1024
 # Per-line excerpt cap so a 5000-char line in a generated log doesn't
 # blow up the response payload.
 _SEARCH_FILES_LINE_EXCERPT_CAP = 240
+# Extensions whose lines can be returned verbatim to the model. These
+# are plain source files: the bytes ARE the model's mental model of
+# what the script does, and nothing in them was computed from the
+# dataset rows. Anything else (run logs, notebook outputs) gets line-
+# number-only matches because those files routinely contain raw
+# observations / regression rows from `list`, `summarize, detail`,
+# `print(df)`, notebook ``outputs[*].text`` blocks, etc. — content
+# that the SDC sanitizer would normally strip out of a result, and
+# that should not reach the model through a sibling search path.
+_SEARCH_FILES_EXCERPT_EXTS: frozenset[str] = frozenset({
+    ".py", ".do", ".r", ".rmd",
+})
 
 
 @tool(
@@ -2595,6 +2607,18 @@ _SEARCH_FILES_LINE_EXCERPT_CAP = 240
         "for an upload. Pairs naturally with list_session_files: list to "
         "see what's there, search to find which file contains the term "
         "you care about.\n\n"
+        "Disclosure control: log files (.log, .smcl) and notebook files "
+        "(.ipynb) routinely contain raw command output — `list`, "
+        "`summarize, detail`, regression-by-group rows, notebook cell "
+        "outputs. Returning those lines verbatim would route raw "
+        "observations around the SDC sanitizer that owns the 'no raw "
+        "rows' boundary. Matches in those files therefore come back as "
+        "line numbers WITHOUT excerpt text (``{line: N}`` only), with "
+        "``excerpts: false`` on the file's result entry. Plain source "
+        "scripts (.py, .do, .r, .rmd) return excerpts as before — "
+        "their bytes are code, not computed output. If you need the "
+        "actual content of a log/notebook line, ask the researcher to "
+        "share the snippet directly.\n\n"
         "Searches scripts and logs only by default; never searches "
         "datasets (the SDC layer owns dataset content). Files larger "
         "than 256 KB are skipped with a 'too large' marker — read those "
@@ -2711,13 +2735,21 @@ async def search_in_session_files(args: dict[str, Any]) -> dict[str, Any]:
             })
             continue
         files_searched += 1
+        # Only plain-source extensions return verbatim line excerpts.
+        # Logs and notebooks return ``{line: N}`` entries so the model
+        # can locate matches without seeing raw rows / cell outputs.
+        # See the disclosure-control note in the tool docstring.
+        excerpts_allowed = ext in _SEARCH_FILES_EXCERPT_EXTS
         matches: list[dict[str, Any]] = []
         for lineno, line in enumerate(text.splitlines(), start=1):
             if needle in line.lower():
-                excerpt = line.strip()
-                if len(excerpt) > _SEARCH_FILES_LINE_EXCERPT_CAP:
-                    excerpt = excerpt[:_SEARCH_FILES_LINE_EXCERPT_CAP] + "…"
-                matches.append({"line": lineno, "text": safe_text(excerpt)})
+                if excerpts_allowed:
+                    excerpt = line.strip()
+                    if len(excerpt) > _SEARCH_FILES_LINE_EXCERPT_CAP:
+                        excerpt = excerpt[:_SEARCH_FILES_LINE_EXCERPT_CAP] + "…"
+                    matches.append({"line": lineno, "text": safe_text(excerpt)})
+                else:
+                    matches.append({"line": lineno})
                 if len(matches) >= max_per_file:
                     break
         if matches:
@@ -2725,6 +2757,7 @@ async def search_in_session_files(args: dict[str, Any]) -> dict[str, Any]:
             results.append({
                 "name": name,
                 "kind": kind,
+                "excerpts": excerpts_allowed,
                 "matches": matches,
                 "truncated": len(matches) >= max_per_file,
             })
