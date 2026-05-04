@@ -284,10 +284,24 @@ def test_trim_oversize_inline_payloads_drops_payload_keeps_markdown() -> None:
     )
 
     trimmed = _trim_oversize_inline_payloads(results)
-    assert trimmed is True
+    # New contract (two-stage trim): returns a dict of which stages
+    # fired, not a single bool. Heavy payload + heavy markdown trips
+    # both stages; this test pins stage 1 (payload drop) — assertion
+    # is on payload_omitted, not on the whole dict shape, so a future
+    # third stage flag can be added without rewriting the test.
+    assert trimmed.get("payload_omitted") is True
     for entry in results:
         assert "payload" not in entry, f"payload should be dropped: {entry!r}"
-        assert entry.get("markdown") == bulky_markdown, "markdown must stay"
+        # When stage 2 also fires (heavy markdown after stage 1), each
+        # entry's markdown becomes a stub pointing at ``expand_result``.
+        # Confirm that case by checking for the stub marker — the bulky
+        # original is gone, but the result_id is still discoverable in
+        # the stub for round-tripping.
+        if trimmed.get("markdown_omitted"):
+            assert "expand_result" in entry["markdown"]
+            assert entry["result_id"] in entry["markdown"]
+        else:
+            assert entry.get("markdown") == bulky_markdown, "markdown must stay"
         assert entry["status"] == "ok"
         assert entry["result_id"].startswith("M")
 
@@ -310,7 +324,8 @@ def test_trim_oversize_inline_payloads_no_trim_below_budget() -> None:
         for i in range(3)
     ]
     trimmed = _trim_oversize_inline_payloads(results)
-    assert trimmed is False
+    # Two-stage contract: dict with both flags False = no trim fired.
+    assert trimmed == {"payload_omitted": False, "markdown_omitted": False}
     for entry in results:
         assert "payload" in entry
         assert isinstance(entry["payload"], dict)
