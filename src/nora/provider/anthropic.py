@@ -483,12 +483,23 @@ class AnthropicSession:
                     last_cost = msg.total_cost_usd
 
         if saw_result:
+            # Canonical "context occupied after this turn." Anthropic's
+            # input_tokens / cache_read / cache_creation cover the
+            # whole prompt-side window via the prompt cache; output
+            # joins it for the post-turn snapshot the chip wants.
+            post_turn = (
+                (last_input or 0)
+                + (last_cache_read or 0)
+                + (last_cache_creation or 0)
+                + (last_output or 0)
+            )
             yield TurnDone(
                 input_tokens=last_input,
                 output_tokens=last_output,
                 cache_read_input_tokens=last_cache_read,
                 cache_creation_input_tokens=last_cache_creation,
                 cost_usd=last_cost,
+                post_turn_tokens=post_turn,
             )
 
     # ---- async-context-manager sugar ------------------------------------

@@ -54,6 +54,14 @@ if (cwdEl) {
 // starting 1M matches the default model (Sonnet).
 const DEFAULT_CONTEXT_WINDOW = 1_000_000;
 let contextWindow = DEFAULT_CONTEXT_WINDOW;
+// Last value handed to ``updateContextChip``, retained so the chip
+// can be re-rendered against a freshly loaded ``contextWindow``
+// without waiting for the next turn_done. ``loadModels`` and
+// ``replayHistory`` race in ``showChat``: if turn_done arrives before
+// the model catalog resolves, the ratio prints against the default
+// 1M ceiling. When ``renderModelChip`` later sets the real window we
+// re-render so the ratio matches the active model.
+let lastOccupiedTokens = null;
 
 // (No high-water clamp on the context chip. Earlier we Math.max'd
 // each turn_done's reported usage against a per-cwd watermark so the
@@ -88,6 +96,70 @@ let contextWindow = DEFAULT_CONTEXT_WINDOW;
 //   arrives for that session.
 let currentCwd = null;
 const busySessions = new Set();
+
+// ---- Two-meter context tracking -----------------------------------------
+//
+// The chip used to show ONLY ``lastOccupiedTokens`` — what the provider
+// reported was the prompt size after the last turn. That's a
+// measurement of what was sent, not a prediction of what the next
+// request will weigh, and the two diverge whenever the researcher
+// has typed/sent a message but turn_done hasn't landed yet (queued
+// messages, in-flight turn, etc.). The reviewer's framing was right:
+// keep showing the last reported number AND show a separate estimate
+// for what's about to be sent, so the researcher knows both "what
+// the provider thinks I have" and "what the next request will weigh
+// before I get the actual measurement back."
+//
+// ``pendingMessageTokensByCwd`` is a per-cwd FIFO of rough token
+// estimates (chars/4 plus a per-image allowance) for user messages
+// that have been submitted or queued but whose turn_done hasn't yet
+// acknowledged them. We push on submit, shift on turn_done. The chip
+// reads this as ``lastOccupiedTokens + sum(queue)`` to render the
+// "next request" estimate.
+const pendingMessageTokensByCwd = new Map();
+function pendingTokensFor(cwd) {
+  if (!cwd) return [];
+  if (!pendingMessageTokensByCwd.has(cwd)) {
+    pendingMessageTokensByCwd.set(cwd, []);
+  }
+  return pendingMessageTokensByCwd.get(cwd);
+}
+function estimateMessageTokens(text, imageCount) {
+  // chars/4 is the conventional ballpark for English; both Anthropic
+  // and OpenAI tokenizers fall close to it on prose. For images we
+  // use a fixed allowance roughly matching Anthropic's per-image
+  // base (~1.5k tokens at default detail) and OpenAI's high-detail
+  // tile cost (~1.1-1.6k). The chip's job is to be honest about
+  // approximation — the provider's actual count overwrites this on
+  // turn_done.
+  const textTokens = Math.ceil((text || '').length / 4);
+  const imageTokens = (imageCount || 0) * 1500;
+  return textTokens + imageTokens;
+}
+function pushPendingMessage(cwd, text, imageCount) {
+  if (!cwd) return;
+  pendingTokensFor(cwd).push(estimateMessageTokens(text, imageCount));
+  // Re-render the chip if this is the focused session — researcher
+  // sees the next-request estimate immediately on send.
+  if (cwd === currentCwd) updateContextChip(lastOccupiedTokens);
+}
+function popPendingMessage(cwd) {
+  if (!cwd) return;
+  const q = pendingTokensFor(cwd);
+  if (q.length > 0) q.shift();
+}
+// Sessions whose in-flight turn the researcher just hit Stop on.
+// Cancellation is async — the bridge has to propagate it through the
+// asyncio task and the provider stream, which can leave tokens or
+// tool calls already in transit. Without this set, those latent
+// events keep painting into the transcript even though the
+// researcher signalled "stop". We add the cwd on Stop click and
+// remove it on the next terminal event for that session OR on the
+// next user send (whichever comes first, in case a terminal never
+// arrives because the SDK closed without one). While a cwd is in
+// the set, ``nora_event`` drops non-terminal events for that
+// session.
+const cancelledCwds = new Set();
 
 // Persisted model choice — survives restarts. Applied on boot after
 // (Model preference used to live in localStorage as a global default.
@@ -458,7 +530,10 @@ function showChat(payload) {
   loadSessions();
   loadModels();
   // Hide the chip until the first turn_done arrives — without a
-  // measurement we have nothing honest to display.
+  // measurement we have nothing honest to display. Reset the
+  // last-rendered count too so a fresh session doesn't re-render
+  // the previous session's number against the new model's window.
+  lastOccupiedTokens = null;
   if (contextChip) contextChip.classList.add('hidden');
 
   replayHistory();
@@ -519,13 +594,13 @@ async function replayHistory() {
     scrollToBottom();
     // Restore the context chip from the LAST persisted ``turn_done``,
     // if there is one. Each ``turn_done`` carries the provider's
-    // authoritative token counts (input + cache_read + cache_creation
-    // + output), so this is honest data, not a chars/4 estimate. The
-    // earlier behavior of staying hidden until the next live turn
-    // meant a session with valid prior measurements showed no context
-    // pressure across reload / session-switch / model-swap until
-    // another turn completed — which can be a long wait on idle
-    // resumes.
+    // authoritative token counts (``post_turn_tokens`` since the
+    // canonical-contract commit; sum of the granular fields for
+    // older sessions persisted before that field existed). This is
+    // honest data, not a chars/4 estimate. Without it, a session
+    // with valid prior measurements would show no context pressure
+    // across reload / session-switch / model-swap until another turn
+    // completed — which can be a long wait on idle resumes.
     let lastTurnDone = null;
     for (let i = events.length - 1; i >= 0; i--) {
       if (events[i].type === 'turn_done') {
@@ -534,12 +609,24 @@ async function replayHistory() {
       }
     }
     if (lastTurnDone) {
-      const occupied =
-        (lastTurnDone.input_tokens || 0) +
-        (lastTurnDone.cache_read_input_tokens || 0) +
-        (lastTurnDone.cache_creation_input_tokens || 0) +
-        (lastTurnDone.output_tokens || 0);
+      const occupied = (typeof lastTurnDone.post_turn_tokens === 'number')
+        ? lastTurnDone.post_turn_tokens
+        : ((lastTurnDone.input_tokens || 0) +
+           (lastTurnDone.cache_read_input_tokens || 0) +
+           (lastTurnDone.cache_creation_input_tokens || 0) +
+           (lastTurnDone.output_tokens || 0));
       if (occupied > 0) updateContextChip(occupied);
+    }
+    // Re-anchor the loading indicator if this session is still in
+    // flight. ``showChat → syncComposerToFocus`` already added it
+    // for a busy session, but the ``messagesEl.innerHTML = ''`` we
+    // just ran wiped that node. Without this, a refresh / focus
+    // switch into a session mid-turn loses the cat + label until
+    // the next event arrives. Check ``busySessions`` (not
+    // ``turnInFlight``) because turn_done may have landed mid-
+    // replay and flipped the focused-session bit off.
+    if (currentCwd && busySessions.has(currentCwd)) {
+      showLoadingIndicator();
     }
   } catch (err) {
     console.warn('get_chat_history failed', err);
@@ -1341,6 +1428,35 @@ window.addEventListener('resize', () => {
   if (mentionState) positionMentionPopup();
 });
 
+// ---- hard reload (Cmd/Ctrl+Shift+R) --------------------------------------
+//
+// In-app reload (Cmd+R) re-fetches the SAME ``index.bust-<id>.html``
+// URL the bridge wrote at startup, so ``style.css?v=<old-id>`` and
+// ``app.js?v=<old-id>`` hit WKWebView's persistent disk cache —
+// edits made while nora is running don't show up. Hard reload calls
+// the bridge's ``hard_reload``, which recomputes the build-id from
+// the current asset mtimes, writes a fresh ``.bust-*.html``, and
+// navigates the window to its file:// URL. New URL → cache miss →
+// fresh fetch → CSS/JS edits visible without quitting nora.
+//
+// Bound to Cmd+Shift+R (macOS convention) AND Ctrl+Shift+R (so a
+// keyboard with no Cmd, or future non-mac builds, keep working).
+// Both browsers and editors use this combo for "force-reload, ignore
+// cache," which is exactly the semantics here.
+document.addEventListener('keydown', (e) => {
+  if (!e.shiftKey) return;
+  if (!(e.metaKey || e.ctrlKey)) return;
+  if (e.key !== 'R' && e.key !== 'r') return;
+  e.preventDefault();
+  if (!window.pywebview || !window.pywebview.api) return;
+  if (typeof window.pywebview.api.hard_reload !== 'function') return;
+  // Fire-and-forget. The bridge calls load_url which navigates the
+  // window away from the current page, so any logging here would be
+  // racing against the navigation. The new page picks up logging on
+  // its own once it loads.
+  window.pywebview.api.hard_reload();
+});
+
 // ---- send-while-busy queue -----------------------------------------------
 //
 // When a turn is already in flight, the user can still type and Send.
@@ -1484,10 +1600,25 @@ form.addEventListener('submit', async (e) => {
       attachments: messageAttachments,
       userEl,
     });
+    // Track this queued message in the next-request estimate so the
+    // chip's "→ ~Nk next" indicator reflects what the conversation
+    // will weigh once this message fires.
+    pushPendingMessage(currentCwd, text, images.length);
     return;
   }
 
+  // Defensive: any prior Stop on this session leaves an entry in
+  // cancelledCwds. Clear it before firing a fresh turn so this
+  // turn's events render normally even if no terminal landed for
+  // the cancelled one (an SDK that closes silently can leave the
+  // flag stuck otherwise).
+  if (currentCwd) cancelledCwds.delete(currentCwd);
   activeLiveTurn = { nodes: [userEl], hasVisibleReply: false };
+  // Track this immediate-fire message in the next-request estimate.
+  // Same reason as the queued path above — chip's "→ ~Nk next"
+  // indicator should reflect what the next provider call will weigh
+  // until turn_done lands the actual measurement.
+  pushPendingMessage(currentCwd, text, images.length);
   setSending(true);
   try {
     // If images are attached, use the richer send method. The
@@ -1582,6 +1713,13 @@ function setSending(sending, cwd) {
   const target = cwd || currentCwd;
   if (target) {
     setSessionBusy(target, sending);
+    // A new turn starting on this session (sending=true) means any
+    // prior Stop has been resolved — clear the suppression flag so
+    // this turn's events render. Covers both the form-submit path
+    // and the queued-message auto-fire (``flushPendingFor``) which
+    // doesn't go through the form handler. Defensive: also fine to
+    // run when there's nothing in the set.
+    if (sending) cancelledCwds.delete(target);
   }
   // Composer state mirrors the FOCUSED session only.
   if (target && target !== currentCwd) return;
@@ -1732,12 +1870,36 @@ if (stopBtn) {
   stopBtn.addEventListener('click', async () => {
     if (!window.pywebview || !window.pywebview.api) return;
     stopBtn.disabled = true;
+    // Mark this session's events as suppressed BEFORE awaiting the
+    // bridge cancel. The cancel propagates asynchronously — the
+    // SDK may still emit a few tokens or a tool_call before it
+    // notices CancelledError. Setting this flag now means
+    // ``nora_event`` drops those latents instead of appending them
+    // to the transcript after the researcher hit Stop.
+    if (currentCwd) cancelledCwds.add(currentCwd);
+    // The terminal turn_error that the runner emits is now also
+    // dropped (see ``nora_event`` for why), so handle the activeLiveTurn
+    // cleanup the terminal handler used to do. If the cancelled
+    // turn produced no visible reply (the model hadn't written
+    // anything when Stop fired), queue the user-bubble nodes for
+    // the staleness sweep so they don't accumulate.
+    if (activeLiveTurn && !activeLiveTurn.hasVisibleReply) {
+      queueDisposableTurn(activeLiveTurn.nodes);
+    }
+    activeLiveTurn = null;
     // Stop = "stop everything for this session": cancel the
     // running turn AND drain any queued follow-ups. Cancelled
     // queued messages get marked ``.not-sent`` so the researcher
     // can see what they typed but didn't ship; silently removing
     // their text would be hostile UX.
     drainPendingFor(currentCwd);
+    // Also clear the next-request token estimate for this session
+    // — the in-flight message and any queued ones are no longer
+    // going to land, so their estimates shouldn't carry on the chip.
+    if (currentCwd) {
+      pendingTokensFor(currentCwd).length = 0;
+      updateContextChip(lastOccupiedTokens);
+    }
     // Visible acknowledgement: the cancellation cascades through
     // the SDK + the subprocess kill, which can take a beat. Without
     // this toast, a researcher who pressed Stop and immediately
@@ -1770,6 +1932,29 @@ window.nora_event = function (evt) {
   // apply to the focused session and pass through.
   const evtCwd = evt.session_cwd;
   const isFocused = !evtCwd || (currentCwd && evtCwd === currentCwd);
+
+  // Drop in-flight content for a session the researcher just stopped.
+  //
+  // Why ALL events drop, not "all except the terminal": cancellation
+  // is async at multiple levels — the asyncio task gets a cancel
+  // signal, the provider stream still has buffered tokens, and
+  // pywebview's evaluate_js queue has a tail of events from before
+  // the cancel. Earlier behavior was "let the terminal pass to
+  // signal the stop," but events still in those buffers arrived
+  // AFTER the terminal landed, the flag got cleared on the
+  // terminal, and those late events then rendered — exactly the
+  // "I see cancelled but the query keeps emitting answer" report.
+  //
+  // The cancel-side UI is already complete without the terminal:
+  // ``setSending(false)`` runs in Stop's own click handler (clears
+  // the cat + restores Send), and ``drainPendingFor`` empties the
+  // queued-message list. Letting the explicit "cancelled" error
+  // bubble through wasn't load-bearing — researchers know what
+  // they pressed. So drop everything until the next user send for
+  // this session clears the flag.
+  if (evtCwd && cancelledCwds.has(evtCwd)) {
+    return;
+  }
 
   switch (evt.type) {
     case 'ready':
@@ -1813,18 +1998,25 @@ window.nora_event = function (evt) {
       //
       // The chip tracks "context occupied AFTER this turn" — i.e.,
       // the prompt this turn loaded PLUS the response that just
-      // landed. Including ``output_tokens`` means a long reply
-      // shows up on the chip the instant it arrives, instead of
-      // only on the next turn (when the SDK folds it back into
-      // input/cache_read). The natural-language reading of "how
-      // full is my chat" wants the post-turn snapshot, not the
-      // pre-response one.
+      // landed. Each provider computes ``post_turn_tokens`` from its
+      // own usage fields (Anthropic sums input + cache_read +
+      // cache_creation + output; OpenAI sums input + output because
+      // its input_tokens already covers the cached prefix), so the
+      // chip just renders that number. Older sessions persisted
+      // before this field existed fall back to the legacy sum below.
+      // Pop one entry off the per-cwd pending-message queue — the
+      // turn that just completed corresponds to the OLDEST queued
+      // message. Done for both focused and background sessions so
+      // the chip's next-request estimate is accurate when the
+      // researcher switches focus to a different session mid-turn.
+      popPendingMessage(evtCwd);
       if (isFocused) {
-        const occupied =
-          (evt.input_tokens || 0) +
-          (evt.cache_read_input_tokens || 0) +
-          (evt.cache_creation_input_tokens || 0) +
-          (evt.output_tokens || 0);
+        const occupied = (typeof evt.post_turn_tokens === 'number')
+          ? evt.post_turn_tokens
+          : ((evt.input_tokens || 0) +
+             (evt.cache_read_input_tokens || 0) +
+             (evt.cache_creation_input_tokens || 0) +
+             (evt.output_tokens || 0));
         updateContextChip(occupied);
         if (activeLiveTurn && !activeLiveTurn.hasVisibleReply) {
           queueDisposableTurn(activeLiveTurn.nodes);
@@ -1861,7 +2053,12 @@ window.nora_event = function (evt) {
         activeLiveTurn = null;
       }
       drainPendingFor(evtCwd);
+      // Clear the next-request token estimate too — drainPendingFor
+      // dropped all queued user messages, so their estimates would
+      // otherwise stick on the chip until the next send.
+      pendingTokensFor(evtCwd).length = 0;
       setSending(false, evtCwd);
+      if (evtCwd === currentCwd) updateContextChip(lastOccupiedTokens);
       break;
     case 'turn_error':
       if (isFocused) {
@@ -1878,7 +2075,11 @@ window.nora_event = function (evt) {
       // succeeding, so firing them blindly is worse than asking
       // them to retry.
       drainPendingFor(evtCwd);
+      // Same reasoning as auth_failure: drained queue → drained
+      // estimates so the chip stops carrying them as "next".
+      pendingTokensFor(evtCwd).length = 0;
       setSending(false, evtCwd);
+      if (evtCwd === currentCwd) updateContextChip(lastOccupiedTokens);
       break;
     case 'policy_updated':
       updatePolicyChip(evt.policy);
@@ -2639,33 +2840,37 @@ let policyPopupBuiltFor = null;  // cached copy so we don't rebuild needlessly
 
 function updateContextChip(occupiedTokens) {
   /* Updates the "Context X / Y (Z%)" chip below the composer.
-   * ``occupiedTokens`` is "context occupied after this turn" —
-   * the prompt this turn loaded plus the response just produced
-   * (see the case 'turn_done' handler for the breakdown).
    *
-   * Provider semantics:
-   * - Anthropic: input_tokens + cache_read + cache_creation
-   *   together span the whole prompt-side window via the prompt
-   *   cache; output_tokens adds the just-produced reply.
-   * - OpenAI: with previous_response_id, the SDK reports
-   *   input_tokens for the FULL prompt at each round (cached
-   *   prefix included). The provider yields the LAST round's
-   *   value (= peak prompt size for the turn); cache fields stay
-   *   empty on this path because OpenAI's cached_tokens is a
-   *   subset of input_tokens, not additive.
+   * Two meters, separated:
+   * - ``occupiedTokens``: the LAST measurement — what the provider
+   *   reported was the prompt size after the most recent turn.
+   *   Authoritative for what was actually sent.
+   * - ``pendingDelta``: a LOCAL estimate of what the next request
+   *   will weigh on top of the last measurement. Computed from the
+   *   per-cwd FIFO of submitted-but-unacknowledged user messages
+   *   (see ``pendingMessageTokensByCwd``). chars/4 + 1500/image —
+   *   approximate, replaced by the provider's count when turn_done
+   *   lands.
    *
-   * Unhides the chip on first update and scales the ceiling up
-   * if the observed usage exceeds the default 200k window
-   * (Opus 4.7 1M variant, Sonnet 4.6, etc.) so the ratio stays
-   * meaningful. */
+   * Display:
+   *   - When pendingDelta == 0:  ``Context 47k / 200k (24%)``
+   *   - When pendingDelta  > 0:  ``Context 47k → ~52k / 200k (26%)``
+   *
+   * Why both: the last measurement tells the researcher what's
+   * already on the wire; the next-request estimate tells them what
+   * the next provider call will cost before it lands. They diverge
+   * any time a message has been submitted (typed + Send, or queued
+   * behind an in-flight turn) but turn_done hasn't yet acknowledged
+   * it. The chip is honest about which is which. */
   if (!contextChip) return;
   if (typeof occupiedTokens !== 'number' || occupiedTokens < 0) return;
+  lastOccupiedTokens = occupiedTokens;
 
-  // No clamp. The chip displays exactly what the last completed
-  // turn reported. Under normal use the conversation chain grows
-  // monotonically, so the chip will only rise; if it drops, that's
-  // an honest signal (reconnect that lost in-context state, model
-  // swap that opened a fresh session, truncation event) worth
+  // No clamp on ``occupiedTokens``. The chip displays exactly what
+  // the last completed turn reported. Under normal use the
+  // conversation chain grows monotonically, so the chip will only
+  // rise; if it drops, that's an honest signal (cache invalidation,
+  // model swap that opened a fresh session, truncation event) worth
   // showing rather than hiding.
 
   // Trust the authoritative ceiling set in updateModelChip (line ~3085)
@@ -2678,15 +2883,33 @@ function updateContextChip(occupiedTokens) {
   // 100% on a different model in the future, fix the model registry
   // (catalog.py / updateModelChip), not the chip.
 
+  // Pending-message delta for the focused session.
+  const pendingQueue = currentCwd ? pendingTokensFor(currentCwd) : [];
+  const pendingDelta = pendingQueue.reduce((a, b) => a + b, 0);
+  const projected = occupiedTokens + pendingDelta;
+
   const fmt = (n) => (n >= 10_000 ? (n / 1000).toFixed(1) + 'k' : n.toString());
   const ceilingLabel = contextWindow >= 1_000_000
     ? (contextWindow / 1_000_000) + 'M'
     : (contextWindow / 1000) + 'k';
-  const rawPct = Math.round((occupiedTokens / contextWindow) * 100);
-  // Show the real ratio uncapped so an over-window state is visible
-  // ("143%") instead of clamped to "100%" and blending into a normal
-  // full-but-fine state.
-  contextChip.textContent = `Context ${fmt(occupiedTokens)} / ${ceilingLabel} (${rawPct}%)`;
+  // Color severity is keyed off the PROJECTED size so the warning
+  // tones fire when the next request would push us over, not only
+  // after the over-the-window measurement comes back.
+  const rawPct = Math.round((projected / contextWindow) * 100);
+  if (pendingDelta > 0) {
+    contextChip.textContent =
+      `Context ${fmt(occupiedTokens)} → ~${fmt(projected)} / ${ceilingLabel} (${rawPct}%)`;
+    contextChip.title =
+      `Last measured by provider: ${occupiedTokens.toLocaleString()} tokens.\n` +
+      `Estimated for next request: ~${projected.toLocaleString()} tokens ` +
+      `(${pendingQueue.length} pending message${pendingQueue.length === 1 ? '' : 's'}, ` +
+      `chars/4 estimate; provider's count replaces this on next turn_done).`;
+  } else {
+    contextChip.textContent = `Context ${fmt(occupiedTokens)} / ${ceilingLabel} (${rawPct}%)`;
+    contextChip.title =
+      `Last measured by provider: ${occupiedTokens.toLocaleString()} tokens.\n` +
+      `No pending messages — next request weight will be measured on send.`;
+  }
   contextChip.classList.remove('hidden');
 
   // Visual warning as context fills up — dim at low use, warm as it
@@ -3213,9 +3436,16 @@ function renderModelChip() {
   const info = availableModels.find((m) => m.id === currentModelId);
   modelChipLabel.textContent = info ? info.label : 'Model';
   // Keep the context-chip ceiling in sync with the selected model
-  // so the X / Y ratio reflects that model's actual window.
+  // so the X / Y ratio reflects that model's actual window. If a
+  // turn_done already painted the chip against the default window
+  // (the loadModels / first-turn race in showChat), re-render so the
+  // ratio reflects the now-known ceiling.
   if (info && info.context_window) {
+    const changed = contextWindow !== info.context_window;
     contextWindow = info.context_window;
+    if (changed && lastOccupiedTokens !== null) {
+      updateContextChip(lastOccupiedTokens);
+    }
   }
   renderModelPopup();
 }
@@ -4125,6 +4355,47 @@ function whenReady(fn) {
   window.addEventListener('pywebviewready', fn, { once: true });
 }
 
+// Rebuild ``busySessions`` from the bridge's view of which runners
+// have a turn in flight. Called on every page boot — both initial
+// load and after a hard reload (Cmd+Shift+R) — because
+// ``busySessions`` is JS module-scope state that gets wiped on
+// every navigation. Without this, refreshing during a turn drops
+// the loading indicator AND the sidebar busy dot even though the
+// backend is still streaming events.
+//
+// Logs to the console so the researcher can verify the seed path
+// fired (DevTools → Console). If you see "seed: API method missing"
+// after a refresh, nora was started with an older Python image
+// that didn't have ``list_busy_sessions`` — fully quit and relaunch.
+async function seedBusySessions() {
+  if (!window.pywebview || !window.pywebview.api) {
+    console.log('[nora] seed: pywebview bridge not ready yet');
+    return;
+  }
+  if (typeof window.pywebview.api.list_busy_sessions !== 'function') {
+    console.log(
+      '[nora] seed: API method missing — bridge predates ' +
+      'list_busy_sessions; fully restart nora to pick it up'
+    );
+    return;
+  }
+  try {
+    const res = await window.pywebview.api.list_busy_sessions();
+    if (!res || !res.ok || !Array.isArray(res.cwds)) {
+      console.log('[nora] seed: bridge returned unexpected shape', res);
+      return;
+    }
+    busySessions.clear();
+    res.cwds.forEach((cwd) => busySessions.add(cwd));
+    console.log(
+      `[nora] seed: ${res.cwds.length} busy session(s) — `,
+      res.cwds,
+    );
+  } catch (err) {
+    console.warn('[nora] seed: list_busy_sessions failed', err);
+  }
+}
+
 whenReady(async () => {
   // Three-stage state machine on startup:
   //   needs_auth     → researcher hasn't configured any provider yet.
@@ -4137,6 +4408,13 @@ whenReady(async () => {
   // to be too permissive than to wedge the page on a hard error.
   try {
     const state = await window.pywebview.api.ui_ready();
+    // Seed the busy-set BEFORE branching into showChat / showLanding.
+    // showChat → syncComposerToFocus reads busySessions to decide
+    // whether to show the loading indicator + Stop button, and
+    // loadSessions reads it to decide whether to paint the sidebar
+    // dot. Both fire inside showChat, so the seed has to land first
+    // or the first paint shows an idle UI for a busy session.
+    await seedBusySessions();
     if (state && state.state === 'needs_auth') {
       showAuth(state.auth);
     } else if (state && state.state === 'ready') {

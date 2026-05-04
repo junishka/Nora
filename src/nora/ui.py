@@ -127,6 +127,58 @@ class NoraBridge:
     def attach(self, window: Any) -> None:
         self._window = window
 
+    def list_busy_sessions(self) -> dict[str, Any]:
+        """Return the set of session cwds whose runner currently has a
+        turn in flight. The web UI calls this on page load (initial
+        boot AND after a hard reload / Cmd+Shift+R) to rebuild its
+        ``busySessions`` Set — that state lives in JS module scope and
+        gets wiped on every page navigation, so without this call the
+        sidebar busy dot and the loading indicator both disappear
+        even though the backend turn is still streaming.
+
+        Returns ``{ok: True, cwds: [...]}``. Best-effort: a runner
+        whose ``is_busy()`` raises is treated as not busy rather than
+        crashing the whole call."""
+        cwds: list[str] = []
+        for cwd_str, runner in list(self._runners.items()):
+            try:
+                if runner.is_busy():
+                    cwds.append(cwd_str)
+            except Exception:  # noqa: BLE001 — defensive
+                continue
+        return {"ok": True, "cwds": cwds}
+
+    def hard_reload(self) -> dict[str, Any]:
+        """Recompute the cache-bust build-id from current asset mtimes,
+        write a fresh ``.index.bust-<id>.html``, and navigate the
+        window to its file:// URL. Bound to ``Cmd+Shift+R`` in
+        ``app.js``.
+
+        Why this exists: editing CSS / JS while nora is running and
+        then doing an in-app reload (Cmd+R) re-fetches the SAME
+        ``style.css?v=<old-build-id>`` URL — WKWebView's persistent
+        disk cache hits, and the researcher sees old rendering. Only
+        a full nora restart re-runs ``_materialize_cache_busted_index``
+        and produces a new URL. ``hard_reload`` does that work
+        in-place so iteration doesn't require quitting the app.
+
+        Returns the new build-id so the caller can verify the reload
+        actually rolled the cache key (useful in dev console)."""
+        if self._window is None:
+            return {"ok": False, "reason": "window not attached"}
+        try:
+            web_dir = Path(__file__).parent / "web"
+            index_path = web_dir / "index.html"
+            served = _materialize_cache_busted_index(web_dir, index_path)
+            self._window.load_url(str(served))
+            return {
+                "ok": True,
+                "build_id": served.stem.split(".")[-1],
+                "url": str(served),
+            }
+        except Exception as e:  # noqa: BLE001 — surface failure to JS
+            return {"ok": False, "reason": str(e)}
+
     def start_loop(self) -> None:
         """Start the asyncio worker thread. Called once, before the
         webview starts serving the page. Per-runner locks are created
@@ -2669,6 +2721,19 @@ def _materialize_cache_busted_index(web_dir: Path, index_path: Path) -> Path:
     """
     import hashlib
     try:
+        # Wipe stale ``.index.bust-*.html`` siblings before generating
+        # a fresh one. Without this, every launch leaves a new sibling
+        # in ``web/`` and the directory accumulates indefinitely
+        # (each iteration on app.js / style.css produced one). Also
+        # avoids confusion when reading mtimes during debugging — only
+        # the live bust-file should be present after startup.
+        for stale in web_dir.glob(".index.bust-*.html"):
+            try:
+                stale.unlink()
+            except OSError:
+                # Best-effort cleanup — don't crash the launch if a
+                # sibling is locked / read-only / already gone.
+                continue
         stamps: list[str] = []
         for child in sorted(web_dir.iterdir()):
             if child.suffix.lower() in {".js", ".css", ".html"}:
