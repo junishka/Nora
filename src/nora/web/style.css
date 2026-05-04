@@ -1743,49 +1743,65 @@ kbd {
   margin: 6px 0;
   font-size: 12px;
   position: relative;
-  /* Scrollbar styling, exposed by 79f01256 (which added a vertical
-   * scrollbar to .tool-code via max-height + overflow-y) and broken
-   * by af10ab6 (which set the thumb to ``--pink-light`` and left
-   * track / corner unspecified).
-   *
-   * Two things matter, both relearned the hard way:
-   *
-   * 1. ``background: transparent`` on ``::-webkit-scrollbar-track``
-   *    and ``::-webkit-scrollbar-corner`` does NOT suppress the
-   *    track in WKWebView when macOS is set to "Always show
-   *    scrollbars" (conventional, gutter-taking scrollbars). WebKit
-   *    paints a default WHITE under the transparent fill — exactly
-   *    the wide white bar in the screenshots. Set the track and
-   *    corner to an EXPLICIT color matching ``--code-bg`` so the
-   *    gutter blends into the dark code surface.
-   *
-   * 2. ``--pink-light`` (#f5c6d3) is light enough that on the dark
-   *    code-bg it reads as near-white. Use ``--pink`` (#ee8ba9)
-   *    instead — distinctly pink, doesn't disappear in light mode. */
+}
+
+/* Scrollbar styling, exposed by 79f01256 (which added a vertical
+ * scrollbar to .tool-code via max-height + overflow-y) and broken
+ * by af10ab6 (which set the thumb to ``--pink-light`` and left
+ * track / corner unspecified).
+ *
+ * Two things matter, both relearned the hard way:
+ *
+ * 1. ``background: transparent`` on ``::-webkit-scrollbar-track``
+ *    and ``::-webkit-scrollbar-corner`` does NOT suppress the
+ *    track in WKWebView when macOS is set to "Always show
+ *    scrollbars" (conventional, gutter-taking scrollbars). WebKit
+ *    paints a default WHITE under the transparent fill — exactly
+ *    the wide white bar in the screenshots. Set the track and
+ *    corner to an EXPLICIT color matching ``--code-bg`` so the
+ *    gutter blends into the dark code surface.
+ *
+ * 2. ``--pink-light`` (#f5c6d3) is light enough that on the dark
+ *    code-bg it reads as near-white. Use ``--pink`` (#ee8ba9)
+ *    instead — distinctly pink, doesn't disappear in light mode.
+ *
+ * Scope: ``.tool-code`` only. ``.tool-body`` ALSO contains
+ * ``pre.tool-output`` (raw R/Stata stdout, ``background:
+ * var(--bg)``); painting a code-bg track/corner on that surface
+ * would put a dark code-colored gutter on the page-bg pane. The
+ * ``.tool-output`` scrollbar therefore falls through to the
+ * theme-aware global ``.messages *`` rules later in this file —
+ * those use translucent burgundy / cream tuned for the page bg.
+ *
+ * Specificity: ``.tool-card .tool-body pre.tool-code`` is (0,3,1),
+ * which beats the broader ``.tool-card .tool-body pre`` (0,2,1)
+ * — the broader rule still defines pre chrome (padding, color),
+ * but the scrollbar properties below win where they overlap. */
+.tool-card .tool-body pre.tool-code {
   scrollbar-width: thin;
   scrollbar-color: var(--pink) var(--code-bg);
 }
 
-.tool-card .tool-body pre::-webkit-scrollbar {
+.tool-card .tool-body pre.tool-code::-webkit-scrollbar {
   height: 8px;
   width: 8px;
   background: var(--code-bg);
 }
 
-.tool-card .tool-body pre::-webkit-scrollbar-thumb {
+.tool-card .tool-body pre.tool-code::-webkit-scrollbar-thumb {
   background: var(--pink);
   border-radius: 4px;
 }
 
-.tool-card .tool-body pre::-webkit-scrollbar-thumb:hover {
+.tool-card .tool-body pre.tool-code::-webkit-scrollbar-thumb:hover {
   background: var(--accent);
 }
 
-.tool-card .tool-body pre::-webkit-scrollbar-track {
+.tool-card .tool-body pre.tool-code::-webkit-scrollbar-track {
   background: var(--code-bg);
 }
 
-.tool-card .tool-body pre::-webkit-scrollbar-corner {
+.tool-card .tool-body pre.tool-code::-webkit-scrollbar-corner {
   background: var(--code-bg);
 }
 
