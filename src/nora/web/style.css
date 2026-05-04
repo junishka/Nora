@@ -1743,6 +1743,22 @@ kbd {
   margin: 6px 0;
   font-size: 12px;
   position: relative;
+}
+
+/* Scrollbar styling is scoped to ``.tool-code`` — the script display
+ * sitting on the dark ``--code-bg`` surface. ``.tool-body`` ALSO
+ * contains ``pre.tool-output`` (raw R/Stata stdout, ``background:
+ * var(--bg)``); painting it with code-bg-toned scrollbars would put
+ * a code-colored rail/corner on a non-code surface. ``.tool-output``
+ * is left to inherit the theme-aware global ``.messages *``
+ * scrollbar rules below — those use translucent burgundy in light
+ * and translucent cream in dark, which match the ``--bg`` surface
+ * naturally.
+ *
+ * Specificity: ``.tool-card .tool-body pre.tool-code`` is (0,3,1),
+ * which beats the broader ``.tool-card .tool-body pre`` (0,2,1) and
+ * the global ``.messages *::-webkit-scrollbar-thumb`` (0,1,1+u). */
+.tool-card .tool-body pre.tool-code {
   /* The pre's background is the dark code-bg even in light mode
    * (burgundy on cream). Native scrollbars on that surface render
    * as faint dark grooves against dark — easy to miss in light
@@ -1752,22 +1768,22 @@ kbd {
   scrollbar-color: var(--pink-light) transparent;
 }
 
-.tool-card .tool-body pre::-webkit-scrollbar {
+.tool-card .tool-body pre.tool-code::-webkit-scrollbar {
   height: 8px;
   width: 8px;
 }
 
-.tool-card .tool-body pre::-webkit-scrollbar-thumb {
+.tool-card .tool-body pre.tool-code::-webkit-scrollbar-thumb {
   background: var(--pink-light);
   border-radius: 4px;
   opacity: 0.6;
 }
 
-.tool-card .tool-body pre::-webkit-scrollbar-thumb:hover {
+.tool-card .tool-body pre.tool-code::-webkit-scrollbar-thumb:hover {
   background: var(--pink);
 }
 
-.tool-card .tool-body pre::-webkit-scrollbar-track {
+.tool-card .tool-body pre.tool-code::-webkit-scrollbar-track {
   background: transparent;
 }
 
@@ -2995,16 +3011,18 @@ kbd {
 .message.assistant .message-body h2 { font-size: 1.15em; }
 .message.assistant .message-body h3 { font-size: 1.05em; }
 
-.message.assistant .message-body {
-  /* Reset the ordered-list counter once per assistant reply, not
-   * per <ol>. The markdown renderer closes and reopens an <ol>
-   * every time prose interrupts the list (Claude's common
-   * `1. **Heading.**` + body-paragraph idiom), which would
-   * otherwise restart numbering at 1 on every item. Scoping the
-   * counter to the message-body keeps numbering monotonic across
-   * those paragraph-separated blocks. */
-  counter-reset: chat-ol;
-}
+/* The ``chat-ol`` counter is reset per <ol> via an inline
+ * ``style="counter-reset: chat-ol N"`` emitted by the markdown
+ * renderer (see ``renderList`` in ``markdown.js``). N matches the
+ * source-text first-item number minus one, so the first li
+ * increments to exactly the number the markdown wrote. This means
+ * two distinct numbered lists in one assistant reply each restart
+ * at their own source numbers (1, 2, 3 then 1, 2 in source =
+ * 1, 2, 3 then 1, 2 on screen) — fixing the carry-over from the
+ * earlier message-body-scoped reset. The trade-off: Claude's
+ * loose-list idiom of ``1. **A.**\n\nbody\n\n1. **B.**\n\nbody``
+ * now renders both items as "1." literally. If you want sequential,
+ * write 1. then 2. */
 
 .message.assistant .message-body ul,
 .message.assistant .message-body ol {
