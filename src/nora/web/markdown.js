@@ -41,8 +41,14 @@
     s = s.replace(/`([^`]+)`/g, function (_, code) {
       return '<code>' + escapeHtml(code) + '</code>';
     });
-    // Bold before italic so **x** doesn't match as *_x_*.
-    s = s.replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>');
+    // Bold before italic so **x** doesn't match as *_x_*. The
+    // capture allows any character that isn't an unbalanced ``**``,
+    // so a single literal ``*`` inside the span survives — common
+    // when the model bolds a heading containing a glob/wildcard
+    // identifier like ``npd_y*``. Lazy match keeps the closing
+    // ``**`` aligned with the nearest opener; without it,
+    // ``**a** **b**`` would collapse into one big strong run.
+    s = s.replace(/\*\*((?:[^*]|\*(?!\*))+?)\*\*/g, '<strong>$1</strong>');
     // Italic with `*`: opening `*` must sit at a word boundary AND
     // not be followed by whitespace; closing `*` must not be
     // preceded by whitespace AND not be followed by a word char.
@@ -129,7 +135,24 @@
     }
 
     function renderList(list) {
-      const parts = ['<' + list.type + '>'];
+      const parts = [];
+      if (list.type === 'ol') {
+        // Respect the markdown source's first-item number. Two
+        // distinct numbered lists in one message would otherwise
+        // share the message-body counter and the second list's "1."
+        // in source would render as "4." (or wherever the previous
+        // list left off). The ``start`` attribute is for screen
+        // readers / native list-style fallback; the inline
+        // ``counter-reset`` is what the custom ``chat-ol`` counter
+        // actually uses. ``N - 1`` because the per-li
+        // ``counter-increment`` will bump it to ``N`` for the first
+        // item.
+        const startNum = list.start || 1;
+        const reset = startNum - 1;
+        parts.push('<ol start="' + startNum + '" style="counter-reset: chat-ol ' + reset + ';">');
+      } else {
+        parts.push('<ul>');
+      }
       for (let k = 0; k < list.items.length; k++) {
         const item = list.items[k];
         parts.push('<li>');
@@ -154,11 +177,13 @@
     }
 
     // Add a new list item at `indent` columns, of `type` ('ul'|'ol'),
-    // with `content` as its inline text. Maintains `listStack` so that
+    // with `content` as its inline text. ``startNum`` is the source
+    // number for ordered-list items (the digit the user wrote before
+    // the dot); ignored for ul. Maintains ``listStack`` so that
     // shallower indents continue parent lists rather than starting new
-    // ones (which would make every interrupted ordered list restart at
-    // 1 — the original bug).
-    function addListItem(type, indent, content) {
+    // ones (which would make every interrupted ordered list restart
+    // at 1 — the original bug).
+    function addListItem(type, indent, content, startNum) {
       // Close any lists deeper than the new item.
       while (listStack.length > 0 &&
              listStack[listStack.length - 1].indent > indent) {
@@ -177,7 +202,10 @@
         // at the root, flush the old list to output and begin a new
         // root; otherwise hang the sibling off the parent's last item.
         listStack.pop();
-        const newList = { type: type, indent: indent, items: [newItem] };
+        const newList = {
+          type: type, indent: indent, items: [newItem],
+          start: type === 'ol' ? startNum : undefined,
+        };
         if (listStack.length === 0) {
           out.push(renderList(top));
           listStack.push(newList);
@@ -188,7 +216,10 @@
         listStack.push(newList);
         return;
       }
-      const newList = { type: type, indent: indent, items: [newItem] };
+      const newList = {
+        type: type, indent: indent, items: [newItem],
+        start: type === 'ol' ? startNum : undefined,
+      };
       if (!top) {
         // Empty stack — new root list.
         listStack.push(newList);
@@ -321,11 +352,16 @@
         continue;
       }
 
-      // Ordered list item.
-      const ol = raw.match(/^(\s*)\d+\.\s+(.*)$/);
+      // Ordered list item. Capture the source number (the digits
+      // before the dot) so the renderer can emit a matching
+      // ``<ol start="N">`` with a per-list counter-reset — keeps two
+      // distinct numbered lists in one message from carrying their
+      // count across.
+      const ol = raw.match(/^(\s*)(\d+)\.\s+(.*)$/);
       if (ol) {
         flushPara();
-        addListItem('ol', ol[1].length, ol[2]);
+        const sourceNum = parseInt(ol[2], 10) || 1;
+        addListItem('ol', ol[1].length, ol[3], sourceNum);
         pendingBlankInList = false;
         continue;
       }
