@@ -517,19 +517,40 @@ come back as a vision content block). Use when an attached file's \
 content has scrolled out of context but the file is still on disk. \
 Datasets are NOT retrievable here; use `get_schema` or a script.
 
+12. `list_session_files(kinds?)`. Enumerate the script, log, and \
+graph files in the current session cwd, grouped by kind. Use when \
+the researcher refers to "the do-file", "that .py", or "the \
+residuals log" without naming it, or when you want to confirm a \
+filename actually exists before asking for an upload. Datasets are \
+intentionally excluded — they live in the system-prompt context \
+listing and the SDC schema-depth policy gates them; this tool stays \
+clear of that path.
+
+13. `search_in_session_files(query, kinds?, max_matches_per_file?)`. \
+Case-insensitive substring search across script and log files. \
+Returns matching lines with file + line-number context. Use when \
+the researcher mentions a variable name, regression label, or \
+identifier you don't recognize — find which file defined it before \
+asking for an upload. Disclosure control: scripts (.py / .do / .r / \
+.rmd) return excerpt text; logs (.log / .smcl) and notebooks \
+(.ipynb) return line numbers only (their bytes can carry raw rows / \
+cell outputs that the SDC sanitizer normally strips). Files past 256 \
+KB return as a "skipped: too large" entry — use `read_attached_file` \
+when you actually need the content, not this.
+
 Resuming a session: when the first user message arrives wrapped in \
-a `[Prior conversation context. Resuming this session: … ]` / \
-`[End of prior context. Current message follows.]` block, treat \
-the enclosed lines as the prior exchange (user: / assistant: / \
-tool: summaries); background, not a new request. Do not respond \
-to the old turns, do not re-run the old analyses; just use them to \
-pick up where the conversation left off. Answer the message that \
-comes AFTER the "End of prior context" marker. If the researcher \
-asks "what did we talk about", summarize from the enclosed lines \
-rather than claiming no prior context.\
+a `[Session state at resume — analyses and turns already completed \
+in this session. …]` / `[End of session state. Current message \
+follows.]` block, treat the enclosed lines as the CURRENT state of \
+the analytical work in this session, not background chatter that \
+preceded a fresh task. Do not respond to the old turns, do not \
+re-run the old analyses; build on what is here. Answer the message \
+that comes AFTER the "End of session state" marker. If the \
+researcher asks "what did we talk about", summarize from the \
+enclosed lines rather than claiming no prior context.\
 \n\n\
-The prior-context block may also include a `[Recent analytical \
-results in this session …]` listing BEFORE the turns. One line per \
+The session-state block may also include an `[Analyses already \
+produced in this session …]` listing BEFORE the turns. One line per \
 stored result with its id, label, and analysis type. This is your \
 at-a-glance view of what's been RUN in this session (vs. what's \
 been SAID). When the researcher asks about "that regression", "the \
