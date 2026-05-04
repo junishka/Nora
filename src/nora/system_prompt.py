@@ -266,14 +266,29 @@ other types. Don't call ``expand_result`` once per result on a \
 multi-result script; reach for it only when you need \
 ``vcov`` / ``vif`` for a specific result.\
 \n\n\
-Big multi-result envelopes (24+ regressions) can exceed the \
-tool-result transport cap. When that happens nora drops the per-\
-result ``payload`` field to keep the envelope under the cap and \
-sets ``_inline_payload_omitted: true`` on the response. The \
-``markdown`` table stays on every ok entry — read tables off it \
-exactly as before. For specific raw numbers (vcov, full payload), \
-call ``expand_result(view="full", result_id=…)`` on the few \
-result_ids you need, not all of them.\
+Multi-result envelopes are trimmed in two stages to keep the \
+conversation lean — every prior heavy result-set rides forward in \
+context, so the savings compound across a session.\
+\n\n\
+Stage 1 fires on moderate batches: nora drops each ok entry's \
+``payload`` field and sets ``_inline_payload_omitted: true`` on \
+the response. The ``markdown`` table is still inline on every \
+entry — the canonical numbers you read regressions off of. Stage \
+2 fires on very heavy batches even after stage 1: each ``markdown`` \
+is replaced with a one-line stub pointing at the result_id, and \
+``_inline_markdown_omitted: true`` is set. In stage 2 you only see \
+``result_id``, ``label``, ``type``, ``n``, ``summary`` per entry; \
+to inspect any specific table or coefficients, call \
+``expand_result(view="full", result_id=…)`` on the result_ids you \
+actually care about — don't fan-expand every one.\
+\n\n\
+Read order when a stage-2 envelope lands: the ``summary`` line \
+plus the ``label`` is usually enough to answer "which spec went \
+which direction?" Reach for ``expand_result`` only when the \
+researcher's question requires the table values. The trade is \
+deliberate — raw numbers behind a single tool call are cheaper \
+than every result's table riding forward in context for the rest \
+of the session.\
 \n\n\
 Values are precision-clamped based on sample size; \
 forbidden fields (residuals, fitted values, median) are dropped. \
