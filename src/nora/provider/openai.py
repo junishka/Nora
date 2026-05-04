@@ -450,11 +450,13 @@ class OpenAISession:
                         # ``cached_tokens`` is a subset of ``input_tokens``
                         # (not additive), so emitting it through
                         # ``cache_read_input_tokens`` would double-count
-                        # against any consumer that sums input + cache (the
-                        # web context chip does). ``input_tokens`` already
-                        # represents the full prompt size on the OpenAI
-                        # path. ``cost_usd`` is also None — Nora doesn't
-                        # compute OpenAI costs locally.
+                        # any consumer that reads the breakdown directly.
+                        # ``input_tokens`` already represents the full
+                        # prompt size on the OpenAI path; ``post_turn_tokens``
+                        # adds output for the canonical post-turn snapshot.
+                        # ``cost_usd`` is also None — Nora doesn't compute
+                        # OpenAI costs locally.
+                        post_turn_tokens=last_input_tokens + last_output_tokens,
                     )
                     return
 
