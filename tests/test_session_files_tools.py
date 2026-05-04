@@ -174,9 +174,11 @@ def test_search_honors_max_matches_per_file(tmp_path: Path):
 
 def test_search_truncates_long_lines(tmp_path: Path):
     set_cwd(tmp_path)
-    # One very long matching line (1000 chars).
-    long_line = "TARGET " + "x" * 1000
-    (tmp_path / "wide.log").write_text(long_line + "\n")
+    # One very long matching line (1000 chars). Use a .py file so the
+    # excerpt path runs (logs return line-numbers only — see the
+    # disclosure-control tests below).
+    long_line = "TARGET = " + "x" * 1000
+    (tmp_path / "wide.py").write_text(long_line + "\n")
     out = _search({"query": "TARGET"})
     excerpt = out["results"][0]["matches"][0]["text"]
     # Per-line cap is 240; safe_text adds its own [TRUNCATED] marker
@@ -197,6 +199,66 @@ def test_search_rejects_unsupported_kind(populated_session: Path):
     out = _search({"query": "x", "kinds": ["graph"]})
     assert out["status"] == "error"
     assert "graph" in out["reason"] or "unsupported" in out["reason"]
+
+
+def test_search_logs_return_line_numbers_only(populated_session: Path):
+    """Disclosure control: .log/.smcl files routinely contain raw
+    rows from `list`, `summarize, detail`, and per-group regression
+    output. Returning those lines verbatim would route raw
+    observations around the SDC sanitizer. Log matches must come
+    back as line numbers only — no excerpt text."""
+    out = _search({"query": "a_yp1"})
+    by_file = {r["name"]: r for r in out["results"]}
+    assert "output.log" in by_file
+    log_result = by_file["output.log"]
+    assert log_result["excerpts"] is False
+    for m in log_result["matches"]:
+        assert "line" in m
+        assert "text" not in m, (
+            "log file matches must NOT carry excerpt text; SDC line"
+        )
+    # Sibling case: a .py file searched in the SAME call still gets
+    # full excerpts. The behavior is per-file, not per-call.
+    py_result = by_file["robustness.py"]
+    assert py_result["excerpts"] is True
+    assert all("text" in m for m in py_result["matches"])
+
+
+def test_search_smcl_returns_line_numbers_only(tmp_path: Path):
+    """``.smcl`` (Stata's logged-output format) is the same risk
+    surface as ``.log`` — Stata writes regression-by-group rows and
+    `list` output into it directly."""
+    set_cwd(tmp_path)
+    (tmp_path / "session.smcl").write_text(
+        "{txt}{p 0 4 2}\n. list pid wage if treat==1\n"
+        "  +-------------------+\n"
+        "  | pid    wage |\n"
+        "  | 47291  120000 |\n"
+        "  | 47292  98500  |\n"
+    )
+    out = _search({"query": "wage"})
+    smcl_result = next(r for r in out["results"] if r["name"] == "session.smcl")
+    assert smcl_result["excerpts"] is False
+    assert all("text" not in m for m in smcl_result["matches"])
+
+
+def test_search_ipynb_returns_line_numbers_only(tmp_path: Path):
+    """``.ipynb`` is JSON containing both source cells and ``outputs``
+    cells. The output cells routinely hold ``print(df)`` dumps and
+    DataFrame repr text — raw rows by another name. Line-number-only
+    treatment matches the .log decision: don't ship that text back to
+    the model through a search side channel."""
+    set_cwd(tmp_path)
+    notebook = (
+        '{"cells": [{"cell_type": "code", "source": ["df.head()"], '
+        '"outputs": [{"output_type": "stream", "text": ['
+        '"   pid  wage_growth\\n0  47291  0.42\\n1  47292  0.31\\n"]}]}]}'
+    )
+    (tmp_path / "analysis.ipynb").write_text(notebook)
+    out = _search({"query": "wage_growth"})
+    ipynb_result = next(r for r in out["results"] if r["name"] == "analysis.ipynb")
+    assert ipynb_result["excerpts"] is False
+    assert all("text" not in m for m in ipynb_result["matches"])
 
 
 def test_search_kinds_default_is_script_and_log(populated_session: Path):
