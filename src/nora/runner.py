@@ -667,6 +667,7 @@ def _event_to_dict(evt: Any) -> dict[str, Any]:
             "cache_read_input_tokens": evt.cache_read_input_tokens,
             "cache_creation_input_tokens": evt.cache_creation_input_tokens,
             "cost_usd": evt.cost_usd,
+            "post_turn_tokens": evt.post_turn_tokens,
         }
     if isinstance(evt, AuthFailure):
         return {"type": "auth_failure", "reason": evt.reason}

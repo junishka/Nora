@@ -76,29 +76,48 @@ class TurnDone:
     Anthropic subscription path doesn't carry ``cost_usd``; the OpenAI
     path doesn't populate the cache fields (no equivalent concept).
 
-    Each field is a separate axis of the turn's token accounting; the
-    web "Context X / Y" chip sums all four to display "context
-    occupied after this turn." Consumers that care about the
-    pre-response prompt size only (cost estimation, billing-side
-    summaries) sum the three input-side fields and ignore output.
+    ``post_turn_tokens`` is the canonical "context window occupied
+    after this turn" the web chip displays. It is computed by each
+    provider from its own usage fields, so the UI doesn't have to
+    reconcile divergent provider semantics — see "field semantics"
+    below for why a single sum across providers wouldn't have worked.
+    Consumers that want the breakdown (cost attribution, cache
+    diagnostics) read the granular fields directly.
 
-    - ``input_tokens``: new tokens in this turn's prompt (not cached).
-    - ``cache_read_input_tokens``: prior context served from the
-      Anthropic prompt cache. Invisible to ``input_tokens`` but still
-      occupies the model's context window.
-    - ``cache_creation_input_tokens``: tokens written to the cache
-      this turn (also in the window).
+    Field semantics:
+
+    - ``input_tokens``: Anthropic emits "new tokens in this turn's
+      prompt, not cached" (matching the SDK's usage object). OpenAI's
+      Responses API instead reports the FULL prompt for the request
+      including any cached prefix served via ``previous_response_id``;
+      the OpenAI provider passes that through unchanged. The two
+      providers' values are therefore not directly comparable — read
+      ``post_turn_tokens`` for a comparable number.
+    - ``cache_read_input_tokens``: Anthropic only. Prior context
+      served from the prompt cache, invisible to ``input_tokens`` but
+      still occupies the window. OpenAI leaves this ``None`` (its
+      ``cached_tokens`` is a subset of ``input_tokens``, not
+      additive).
+    - ``cache_creation_input_tokens``: Anthropic only. Tokens written
+      to the cache this turn (also in the window). OpenAI leaves
+      this ``None``.
     - ``output_tokens``: what the model just produced. Folds back
-      into ``input_tokens`` / ``cache_read_input_tokens`` on the next
-      turn; the web chip adds it to the post-turn snapshot so a long
-      reply shows on the chip immediately rather than only after the
-      next turn.
+      into the next turn's prompt accounting; included in
+      ``post_turn_tokens`` so a long reply shows on the chip
+      immediately rather than only after the next turn.
+    - ``post_turn_tokens``: provider-canonical "context occupied
+      after this turn." Anthropic computes ``input + cache_read +
+      cache_creation + output``; OpenAI computes ``input + output``
+      (its ``input_tokens`` already covers the full prompt). Older
+      sessions persisted before this field existed leave it ``None``;
+      consumers fall back to summing the granular fields above.
     """
     input_tokens: int | None = None
     output_tokens: int | None = None
     cache_read_input_tokens: int | None = None
     cache_creation_input_tokens: int | None = None
     cost_usd: float | None = None
+    post_turn_tokens: int | None = None
 
 
 @dataclass
