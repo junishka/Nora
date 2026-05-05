@@ -173,8 +173,26 @@ class SanitizerResult:
 # --- Linear regression ------------------------------------------------------
 
 # Required fields — if missing, the payload is rejected as malformed.
+# Required fields. ``r_squared`` is intentionally NOT required: the
+# ``linear_regression`` bucket spans every regression-shape model the
+# runtime emits via ``nora_result_regress`` / ``from_lm`` (OLS, logit,
+# probit, Poisson, Cox PH, etc.), and many of those don't have an R²:
+#
+#   - Cox PH (``stcox``): partial-likelihood model, no R² at all.
+#     Fit is reported via log-likelihood, LR chi-squared, and
+#     concordance (Harrell's C, computed via ``estat concordance``).
+#   - Logit / probit / Poisson (``logit``, ``probit``, ``poisson``):
+#     populate ``e(r2_p)`` (McFadden pseudo-R²), not ``e(r2)``. Stata
+#     helper now emits this as ``pseudo_r_squared``.
+#
+# The previous required-set demanded ``r_squared`` and rejected every
+# Cox PH payload as malformed — researcher could fit a tenure-survival
+# model but couldn't read it back. Coefficients + SEs + n + variable
+# names are the structural minimum that makes a regression payload
+# meaningful and verifiable; fit metrics are model-family-specific
+# and pass through when present (see the allowed-numeric set below).
 _OLS_REQUIRED: frozenset[str] = frozenset(
-    ("type", "n", "coefficients", "standard_errors", "r_squared",
+    ("type", "n", "coefficients", "standard_errors",
      "response_variable", "predictor_variables")
 )
 
@@ -185,6 +203,23 @@ _OLS_REQUIRED: frozenset[str] = frozenset(
 _OLS_ALLOWED_NUMERIC_FIELDS: frozenset[str] = frozenset((
     "r_squared", "adj_r_squared", "f_statistic", "f_p_value",
     "residual_std_error",
+    # Non-OLS fit metrics. All aggregate scalars derived from the
+    # likelihood or design matrix; no per-observation leak. Allowed
+    # so logit / probit / Poisson / Cox PH payloads carry their
+    # natural fit indicators through to the model:
+    #   - pseudo_r_squared: McFadden's R² for logit / probit / Poisson
+    #     (``e(r2_p)`` in Stata; statsmodels ``.prsquared``).
+    #   - log_likelihood: final log-likelihood. Standard for any MLE.
+    #   - aic / bic: information criteria for model comparison.
+    #   - chi_squared / chi_squared_p_value: LR or Wald omnibus test
+    #     (``e(chi2)`` / ``e(p)`` in Stata MLE commands).
+    #   - concordance: Harrell's C-index for survival models. Only
+    #     populated after ``estat concordance`` (stcox doesn't put it
+    #     in e() automatically).
+    "pseudo_r_squared", "log_likelihood",
+    "aic", "bic",
+    "chi_squared", "chi_squared_p_value",
+    "concordance",
     # Aggregate diagnostics. All scalars derived from the design
     # matrix or residual sum-of-squares — no per-observation leak.
     # ``condition_number`` is kappa(X), the ratio of largest to
@@ -194,6 +229,12 @@ _OLS_ALLOWED_NUMERIC_FIELDS: frozenset[str] = frozenset((
 ))
 _OLS_ALLOWED_INT_FIELDS: frozenset[str] = frozenset((
     "n", "degrees_of_freedom",
+    # Survival-specific sample metadata. ``n`` for stcox is the number
+    # of records (post-stset, can include split episodes per subject);
+    # ``n_subjects`` and ``n_failures`` are what the researcher
+    # actually reads off a Cox table — "324 subjects, 178 events" — so
+    # they need to reach the model alongside the coefficients.
+    "n_subjects", "n_failures",
 ))
 _OLS_ALLOWED_STRING_FIELDS: frozenset[str] = frozenset((
     "type", "response_variable", "robust_se_type", "cluster_variable",

@@ -1492,6 +1492,14 @@ kbd {
 
 .message.user .message-body {
   background: var(--bg-user);
+  /* Shrink-wrap the bubble to its text up to 75% of the column.
+   * Without ``width: fit-content`` a short message ("ok", "yes")
+   * paints as a 75%-wide chip with empty bubble area to the left
+   * of the text — and selecting that text shows the highlight
+   * extending into the empty bubble area. fit-content makes the
+   * bubble exactly as wide as the text, so selection ends at the
+   * last glyph on each line. */
+  width: fit-content;
   max-width: 75%;
   /* Text inherits --text. Light-mode bubble is peach with burgundy
    * text (high contrast); dark-mode bubble is deep wine with warm
@@ -3089,6 +3097,15 @@ kbd {
   margin: 0 0 10px 0;
   padding-left: 0;
   list-style: none;
+  /* Each list item shrinks to its own text (see the li rule below).
+   * Without ``align-items: flex-start`` on the list, every li would
+   * still stretch to the list's content width and a 3-word bullet
+   * sitting next to a 30-word sibling would paint as wide as the
+   * sibling on selection. ``display: flex`` here gives us the
+   * per-item shrink-wrap inside the list. */
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
 }
 
 .message.assistant .message-body li {
@@ -3099,10 +3116,17 @@ kbd {
    * clear — leaving thin colored bars on the left of every li
    * after a multi-bullet drag-select. Painting the bullet inside
    * the content box keeps selection inside one rectangle that the
-   * compositor clears uniformly. */
+   * compositor clears uniformly.
+   *
+   * ``width: fit-content; max-width: 100%`` shrinks each li to its
+   * own text width so a short bullet doesn't paint a selection
+   * rectangle as wide as a long sibling. Bounded to the list's
+   * content width so very long single-line items wrap normally. */
   margin: 2px 0;
   padding-left: 1.4em;
   position: relative;
+  width: fit-content;
+  max-width: 100%;
 }
 
 .message.assistant .message-body ul > li::before {
@@ -3619,3 +3643,4 @@ kbd {
   text-decoration: none;
   opacity: 0.9;
 }
+

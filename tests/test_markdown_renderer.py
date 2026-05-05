@@ -169,3 +169,30 @@ def test_underscores_inside_code_span_stay_literal() -> None:
     out = _render("The H3 `mature_org` moderator")
     assert "<code>mature_org</code>" in out
     assert "<em>" not in out
+
+
+def test_asterisks_at_code_span_boundary_stay_literal() -> None:
+    """``*x*`` wrapped in backticks must NOT have the inner ``x``
+    italicised. The earlier renderInline did substitution-then-
+    bold/italic, so the resulting ``<code>*x*</code>`` HTML had its
+    asterisks at boundaries (``>`` before, ``<`` after) — the italic
+    regex matched right across the closing tag. Placeholder pattern
+    fixes it.
+    """
+    out = _render("The Stata glob `*y` matches every variable")
+    assert "<code>*y</code>" in out
+    assert "<em>" not in out
+
+    # ``a * b`` inside backticks: bare asterisk used as multiplication.
+    out2 = _render("Compute `max(charity_age * 0.5)` per row")
+    assert "<code>max(charity_age * 0.5)</code>" in out2
+    assert "<em>" not in out2
+
+
+def test_underscores_at_code_span_boundary_stay_literal() -> None:
+    """Mirror of the asterisk test for ``_``. ``_x_`` between
+    backticks must not become ``<code><em>x</em></code>``.
+    """
+    out = _render("The token `_cons` is Stata's intercept")
+    assert "<code>_cons</code>" in out
+    assert "<em>" not in out

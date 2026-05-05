@@ -193,6 +193,53 @@ program define nora_result_regress
         file write `fh' `","degrees_of_freedom":`=e(df_r)'"'
     }
 
+    * Non-OLS fit metrics. Emitted only when the underlying command
+    * populated them — guards mirror the r2 / F pattern above. Maps
+    * Stata's e() vocabulary to the sanitizer's field names so the
+    * model sees the right numbers regardless of which regression
+    * command produced them:
+    *
+    *   logit/probit/poisson  -> e(r2_p) -> pseudo_r_squared
+    *                            e(ll)   -> log_likelihood
+    *                            e(chi2) -> chi_squared
+    *                            e(p)    -> chi_squared_p_value
+    *   stcox                  -> e(ll)     -> log_likelihood
+    *                            e(chi2)   -> chi_squared
+    *                            e(p)      -> chi_squared_p_value
+    *                            e(N_sub)  -> n_subjects
+    *                            e(N_fail) -> n_failures
+    *
+    * Concordance for stcox isn't in e() automatically — it requires
+    * a follow-up `estat concordance` call. We don't emit it here;
+    * the researcher's script can call estat and stash the value into
+    * the next nora_result_regress invocation if they want it surfaced.
+    if "`e(r2_p)'" != "" & !missing(`=e(r2_p)') {
+        local _x = strofreal(`=e(r2_p)', "%21.17e")
+        file write `fh' `","pseudo_r_squared":`_x'"'
+    }
+    if "`e(ll)'" != "" & !missing(`=e(ll)') {
+        local _x = strofreal(`=e(ll)', "%21.17e")
+        file write `fh' `","log_likelihood":`_x'"'
+    }
+    if "`e(chi2)'" != "" & !missing(`=e(chi2)') {
+        local _x = strofreal(`=e(chi2)', "%21.17e")
+        file write `fh' `","chi_squared":`_x'"'
+    }
+    * For likelihood-ratio / Wald omnibus tests, e(p) is the chi2
+    * p-value. Guard separately: e(p) being populated means a chi2
+    * test ran; e(F) populated means an F test ran. They're mutually
+    * exclusive on every command we emit through.
+    if "`e(p)'" != "" & !missing(`=e(p)') {
+        local _x = strofreal(`=e(p)', "%21.17e")
+        file write `fh' `","chi_squared_p_value":`_x'"'
+    }
+    if "`e(N_sub)'" != "" & !missing(`=e(N_sub)') {
+        file write `fh' `","n_subjects":`=e(N_sub)'"'
+    }
+    if "`e(N_fail)'" != "" & !missing(`=e(N_fail)') {
+        file write `fh' `","n_failures":`=e(N_fail)'"'
+    }
+
     file write `fh' "}" _newline
     file close `fh'
 
