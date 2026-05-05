@@ -27,24 +27,48 @@ const stopBtn = document.getElementById('stop-btn');
 const cwdEl = document.getElementById('cwd-display');
 const contextChip = document.getElementById('context-chip');
 
-// Topbar pill — click to rename. Researchers can override the
-// auto-derived session label (dataset name / timestamp) with a
-// custom name; an empty save clears it back to the default.
+// Topbar pill — click to reveal the session folder in Finder. The
+// pill always shows the abbreviated cwd path (formatCwd) so the
+// researcher can see at a glance WHERE on disk Nora is writing
+// scripts, logs, generated data, and plots; clicking opens that
+// folder so they can inspect outputs in the OS file manager
+// directly. Renaming a session lives only on the sidebar's pencil
+// button — the topbar used to double as a rename trigger, but
+// because it shared display state with the auto-derived title,
+// renames flowed one way (topbar→sidebar) and not the other
+// (sidebar→topbar), which was confusing. Splitting the two
+// concerns — sidebar = name, topbar = path — fixes the asymmetry.
 if (cwdEl) {
-  cwdEl.title = 'Click to rename this session';
+  cwdEl.title = 'Click to open this session\'s folder in Finder';
   cwdEl.setAttribute('role', 'button');
   cwdEl.setAttribute('tabindex', '0');
-  cwdEl.addEventListener('click', () => {
+  const openSessionFolder = async () => {
     if (!currentCwd) return;
-    if (cwdEl.classList.contains('editing')) return;
-    beginRenameSession(cwdEl, currentCwd);
-  });
+    if (!window.pywebview || !window.pywebview.api) return;
+    if (typeof window.pywebview.api.open_path !== 'function') {
+      toast('Restart Nora to enable folder reveal.', 'info');
+      return;
+    }
+    try {
+      const res = await window.pywebview.api.open_path(currentCwd);
+      if (!res || !res.ok) {
+        const reason = (res && res.reason) || 'unknown';
+        toast('Could not open folder: ' + reason, 'error');
+      }
+    } catch (err) {
+      console.warn('open_path failed', err);
+      toast(
+        'Could not open folder: '
+        + (err && err.message ? err.message : err),
+        'error',
+      );
+    }
+  };
+  cwdEl.addEventListener('click', openSessionFolder);
   cwdEl.addEventListener('keydown', (e) => {
     if (e.key !== 'Enter' && e.key !== ' ') return;
-    if (cwdEl.classList.contains('editing')) return;
-    if (!currentCwd) return;
     e.preventDefault();
-    beginRenameSession(cwdEl, currentCwd);
+    openSessionFolder();
   });
 }
 
@@ -519,11 +543,18 @@ function showChat(payload) {
   messagesEl.appendChild(welcomeMsg);
   setWelcomeOnlyMode(true);
 
-  // Topbar shows a friendly session title (dataset name or a
-  // timestamped "Session ..." label), not the raw path. Full path
-  // is still available on hover via the `title` attribute.
-  cwdEl.textContent = payload.session_title || formatCwd(payload.cwd || '');
-  cwdEl.title = payload.cwd || '';
+  // Topbar shows the abbreviated session path (``~/.nora-sessions/
+  // <id>``) as a clickable handle to "reveal in Finder". The full
+  // path stays in the title-attribute tooltip; the pill's click
+  // handler hands the path to ``open_path`` so the researcher can
+  // inspect Nora's scripts / logs / generated data on disk. The
+  // session's friendly name (custom_name or auto-derived) lives on
+  // the sidebar row, not here — see the cwdEl click-handler comment
+  // above for the rationale.
+  cwdEl.textContent = formatCwd(payload.cwd || '');
+  cwdEl.title = payload.cwd
+    ? payload.cwd + ' — click to open in Finder'
+    : '';
 
   // Mark this session as the focused one. Subsequent
   // ``window.nora_event`` callbacks compare incoming
@@ -1064,7 +1095,11 @@ async function stageDataFile(file) {
       );
     }
     if (res.policy) updatePolicyChip(res.policy);
-    if (res.session_title && cwdEl) cwdEl.textContent = res.session_title;
+    // Topbar pill shows the cwd path now (not the auto-derived
+    // session title), so add_files no longer needs to repaint it —
+    // the path doesn't change on upload. The new dataset name
+    // surfaces in the sidebar row + Permission chip already.
+    refreshFilesChip();
     if (typeof loadSessions === 'function') loadSessions();
   } catch (err) {
     appendError(friendlyAddFilesError(err && err.message ? err.message : String(err)));
@@ -2029,15 +2064,15 @@ window.nora_event = function (evt) {
       if (!isFocused) return;
       const card = appendToolResult(evt);
       if (card && activeLiveTurn) activeLiveTurn.hasVisibleReply = true;
-      // A submit_script run can produce new plots that should
-      // accumulate in the topbar Files panel. Refresh after each
-      // tool_result so the right-corner panel stays the
-      // session-wide gallery — researcher scrolls back through
-      // every plot the analysis ever produced without leaving the
-      // chat.
-      if (evt.plots && evt.plots.length > 0) {
-        refreshFilesChip();
-      }
+      // Refresh the topbar Files panel after every tool_result, not
+      // only plot-producing ones. ``submit_script`` writes the do /
+      // R / Python script into the session and may also produce log
+      // files, generated datasets, or other artifacts that the panel
+      // is supposed to surface — until this fired unconditionally,
+      // researchers had to refresh the UI to see a script Nora just
+      // saved. ``list_session_files`` is a single non-recursive
+      // ``iterdir`` so the per-tool cost is cheap.
+      refreshFilesChip();
       break;
     }
     case 'turn_done':
@@ -3068,9 +3103,11 @@ async function refreshFilesChip() {
     const header = document.createElement('div');
     header.className = 'policy-popup-header';
     header.innerHTML =
-      '<strong>Files</strong>. Scripts, graphs, and logs uploaded to '
-      + 'this session. Click a script to attach its content to your '
-      + 'next message. Data files are listed in the Permission chip.';
+      '<strong>Files</strong>. Scripts, graphs, and logs from this '
+      + 'session. Click the copy icon to grab a file (text for '
+      + 'scripts and logs, image for plots) so you can paste it into '
+      + 'another chat or an external editor. Data files are listed '
+      + 'in the Permission chip.';
     wrap.appendChild(header);
     // Group by kind so scripts / graphs / logs land in their own
     // sections — same shape the model picker uses for providers.
@@ -3102,13 +3139,25 @@ async function refreshFilesChip() {
 
 function buildFilesRow(kind, f) {
   /* Build one row in the Files popup. Layout: [primary action]
-   * [title / thumbnail] [delete]. The primary action varies by
-   * kind:
-   *   - graph (image with thumbnail data): copy-to-clipboard
+   * [title / thumbnail] [delete]. Every actionable kind uses
+   * "copy to clipboard" — the verb stays consistent across rows
+   * so a researcher can grab any output and paste it into another
+   * chat or an external editor without context-switching to the
+   * folder. The clipboard payload varies with the file kind:
+   *   - graph (image with thumbnail data): copy as image
    *   - graph (no thumbnail data, e.g. .gph): open externally
-   *   - script: send (attach to next message)
-   *   - log: no primary action
+   *     (no meaningful clipboard representation for a Stata-
+   *     binary plot file)
+   *   - script: copy file text content
+   *   - log:    copy file text content
    * Delete is always on the right.
+   *
+   * Why copy instead of "send to next message" for scripts:
+   * scripts already get attached via the @-mention dropdown and
+   * via drag-drop, so the panel button doesn't need to duplicate
+   * that path. Copy-to-clipboard solves the OTHER common case —
+   * the researcher wants to take a do-file Nora wrote and use it
+   * elsewhere, or save it to their own filesystem.
    */
   const row = document.createElement('div');
   row.className = 'files-row files-row-actionable';
@@ -3142,13 +3191,18 @@ function buildFilesRow(kind, f) {
       }
     });
     primaryConfigured = true;
-  } else if (kind === 'script') {
-    leftAction.title = 'Send to next message';
-    leftAction.setAttribute('aria-label', 'Attach to next message');
-    leftAction.innerHTML = SEND_ICON_SVG;
+  } else if (kind === 'script' || kind === 'log') {
+    leftAction.title = 'Copy file contents to clipboard';
+    leftAction.setAttribute('aria-label', 'Copy contents');
+    leftAction.innerHTML = COPY_ICON_SVG;
     leftAction.addEventListener('click', (ev) => {
       ev.stopPropagation();
-      attachSessionFile(f.name);
+      // Pass the full path (not just f.name): submit_script-written
+      // scripts surface here with rewritten display names like
+      // ``script_a1b2c3d4.do`` while the actual file lives at
+      // ``.nora/runs/<id>/script.do`` — a basename-only lookup
+      // against cwd would 404 for every one of them.
+      copySessionFileText(f.path || f.name, f.name);
     });
     primaryConfigured = true;
   }
@@ -3213,13 +3267,6 @@ const COPY_ICON_SVG = (
   '</svg>'
 );
 
-const SEND_ICON_SVG = (
-  '<svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true">' +
-  '<path fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round" ' +
-  'd="M2 8L14 2l-3 12-3-5-6-1z"/>' +
-  '</svg>'
-);
-
 const OPEN_ICON_SVG = (
   '<svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true">' +
   '<path fill="none" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round" ' +
@@ -3248,6 +3295,60 @@ async function copyImageToClipboard(base64Data, mime, name) {
     toast('Copied ' + (name || 'image') + ' to clipboard.', 'success');
   } catch (err) {
     console.warn('copyImageToClipboard failed', err);
+    toast('Copy failed: ' + (err && err.message ? err.message : err), 'error');
+  }
+}
+
+async function copySessionFileText(path, displayName) {
+  /* Pull a script's or log's text content from the bridge and
+   * write it to the system clipboard so the researcher can paste
+   * it into another chat or an external editor. Sister of
+   * copyImageToClipboard for non-image kinds.
+   *
+   * Takes the full ``path`` (not just a name) so it works for
+   * both top-level uploads and run-dir scripts surfaced from
+   * ``.nora/runs/<id>/script.do`` under rewritten display names.
+   * ``displayName`` is what appears in the toast — the rewritten
+   * label, not the on-disk path — so the confirmation matches
+   * the row the researcher just clicked.
+   *
+   * The bridge enforces the size cap and the script/log
+   * extension allowlist; on the JS side we just relay the result
+   * to the clipboard and surface the bridge's "reason" verbatim
+   * if the read failed (so an over-the-cap log produces the
+   * researcher-actionable hint about opening the folder, not a
+   * generic "copy failed").
+   */
+  if (!path) return;
+  if (!window.pywebview || !window.pywebview.api) return;
+  if (typeof window.pywebview.api.read_session_file_text !== 'function') {
+    toast('Restart Nora to enable copy-from-Files.', 'info');
+    return;
+  }
+  let res;
+  try {
+    res = await window.pywebview.api.read_session_file_text(path);
+  } catch (err) {
+    console.warn('read_session_file_text failed', err);
+    toast(
+      'Copy failed: ' + (err && err.message ? err.message : err),
+      'error',
+    );
+    return;
+  }
+  if (!res || !res.ok) {
+    toast('Copy failed: ' + ((res && res.reason) || 'unknown'), 'error');
+    return;
+  }
+  try {
+    if (!navigator.clipboard || typeof navigator.clipboard.writeText !== 'function') {
+      toast('Clipboard API unavailable in this WebView.', 'info');
+      return;
+    }
+    await navigator.clipboard.writeText(res.text || '');
+    toast('Copied ' + (displayName || res.name || path) + ' to clipboard.', 'success');
+  } catch (err) {
+    console.warn('clipboard.writeText failed', err);
     toast('Copy failed: ' + (err && err.message ? err.message : err), 'error');
   }
 }
@@ -3285,40 +3386,6 @@ async function deleteSessionFile(path, displayName) {
   }
 }
 
-
-async function attachSessionFile(name) {
-  /* Stage a session-resident script as inline context for the next
-   * message. The bridge writes into ``_pending_script_attachments``
-   * (same list drag-drop populates) so the message-prefix builder
-   * picks it up automatically on send. JS-side, we mirror what the
-   * drag-drop path does: push the name onto ``stagedDataNotices``
-   * so the composer chip shows up too. */
-  if (!window.pywebview || !window.pywebview.api) return;
-  if (typeof window.pywebview.api.attach_session_file !== 'function') return;
-  try {
-    const res = await window.pywebview.api.attach_session_file(name);
-    if (!res || !res.ok) {
-      const reason = (res && res.reason) || 'unknown';
-      toast('Could not attach: ' + reason, 'error');
-      return;
-    }
-    if (res.already_attached) {
-      toast(name + ' is already attached to your next message.', 'info');
-    } else {
-      // Mirror the drag-drop chip so the researcher sees the same
-      // visual confirmation in both flows.
-      if (addStagedDataNotices([res.name || name])) renderAttachments();
-      toast(name + ' attached to your next message.', 'success');
-    }
-    // Close the popup so the composer becomes the obvious next
-    // surface to interact with.
-    if (filesPopup) filesPopup.classList.add('hidden');
-    if (filesChip) filesChip.classList.remove('open');
-  } catch (err) {
-    console.warn('attach_session_file failed', err);
-    toast('Could not attach: ' + err, 'error');
-  }
-}
 
 if (filesChip && filesPopup) {
   filesChip.addEventListener('click', (e) => {
@@ -4257,12 +4324,13 @@ if (addFilesBtn) {
         );
       }
 
-      // Refresh permission chip (new data files get default policy)
-      // and session title. Sidebar size also updates.
+      // Refresh permission chip (new data files get default
+      // policy) and the Files panel; sidebar size also updates. The
+      // topbar pill shows the cwd path now, not the auto-derived
+      // session title — uploads don't change cwd, so the pill
+      // doesn't need a repaint.
       if (res.policy) updatePolicyChip(res.policy);
-      if (res.session_title && cwdEl) {
-        cwdEl.textContent = res.session_title;
-      }
+      refreshFilesChip();
       loadSessions();
     } catch (err) {
       console.warn('add_files failed', err);

@@ -1066,22 +1066,86 @@ class NoraBridge:
 
         # Walk every run's _nora_plots/ subdir so helper-produced
         # plots (which live outside the session-cwd top level) show
-        # up alongside session-cwd plots.
+        # up alongside session-cwd plots. Also surface each run's
+        # ``script.{do,R,py,ipynb}`` — those are the do-files /
+        # R-scripts Nora wrote when she called ``submit_script``,
+        # and researchers want to copy that finished script back
+        # out to take into Stata or RStudio themselves. The file
+        # exists on disk after every run; until this loop walked
+        # it, the Files panel only ever saw uploads, leaving Nora-
+        # written scripts inaccessible without leaving the chat.
+        # Display name disambiguation: every run dir contains a
+        # bare ``script.do`` (or ``.R`` / ``.py``), so a flat list
+        # would show fifty rows all named "script.do". We rewrite
+        # the surfaced ``name`` to ``script_<short_id>.do`` using
+        # the 8-char hex tail of the run dir name; the full path
+        # stays in the row's ``path`` field for the copy / open
+        # actions, and the filesystem on disk is untouched.
+        # Cap: the 12 most recent submit_script runs, sorted by
+        # mtime desc. Without a cap, a long session (50+ runs)
+        # would bury uploaded scripts under generated ones; 12 is
+        # roughly "today's working set" and matches the typical
+        # number of result cards a researcher iterates on per
+        # session.
         runs_root = self.cwd / ".nora" / "runs"
         if runs_root.is_dir():
+            run_dirs: list[Path] = []
             try:
                 for run_dir in runs_root.iterdir():
                     plots_dir = run_dir / "_nora_plots"
-                    if not plots_dir.is_dir():
-                        continue
-                    try:
-                        for plot in plots_dir.iterdir():
-                            if plot.is_file() and not plot.is_symlink():
-                                _add(plot)
-                    except OSError:
-                        continue
+                    if plots_dir.is_dir():
+                        try:
+                            for plot in plots_dir.iterdir():
+                                if plot.is_file() and not plot.is_symlink():
+                                    _add(plot)
+                        except OSError:
+                            pass
+                    if run_dir.is_dir():
+                        run_dirs.append(run_dir)
             except OSError:
                 pass
+
+            # Collect candidate scripts across all run dirs, then
+            # cap to the 12 newest by mtime.
+            script_candidates: list[tuple[float, Path, str]] = []
+            for run_dir in run_dirs:
+                for ext in (".do", ".R", ".r", ".py", ".ipynb"):
+                    candidate = run_dir / f"script{ext}"
+                    if not candidate.is_file() or candidate.is_symlink():
+                        continue
+                    try:
+                        mtime = candidate.stat().st_mtime
+                    except OSError:
+                        continue
+                    short_id = run_dir.name.rsplit("_", 1)[-1][:8] or "run"
+                    display = f"script_{short_id}{ext}"
+                    script_candidates.append((mtime, candidate, display))
+                    break  # one script per run dir
+            script_candidates.sort(key=lambda t: -t[0])
+            for _, script_path, display in script_candidates[:12]:
+                ext = script_path.suffix.lower()
+                kind_pri = kind_for_ext.get(ext) or ("script", 1)
+                kind, priority = kind_pri
+                try:
+                    stat = script_path.stat()
+                except OSError:
+                    continue
+                try:
+                    resolved = script_path.resolve()
+                except OSError:
+                    continue
+                if resolved in seen_paths:
+                    continue
+                seen_paths.add(resolved)
+                rows.append({
+                    "name": display,
+                    "kind": kind,
+                    "priority": priority,
+                    "size": stat.st_size,
+                    "ext": ext,
+                    "mtime": stat.st_mtime,
+                    "path": str(script_path),
+                })
 
         # Newest-first within each kind so the most recent plots
         # bubble to the top of the panel.
@@ -1154,6 +1218,82 @@ class NoraBridge:
             except OSError:
                 pass
         return {"ok": True, "name": target.name}
+
+    def read_session_file_text(self, path: str) -> dict[str, Any]:
+        """Read a session-resident text file's UTF-8 contents so the
+        Files-panel "copy" button can hand them to the JS clipboard.
+
+        Replaces the old "send to next message" affordance for
+        scripts: researchers wanted to grab a do-file Nora wrote and
+        paste it into another chat (or an external editor) without
+        opening Finder, and "send" was a different verb that confused
+        the action. Logs are also copyable now — same flow.
+
+        Allowed kinds: scripts (``.py`` / ``.do`` / ``.r`` / ``.rmd``
+        / ``.ipynb``) and logs (``.log`` / ``.smcl``). Binary kinds
+        (data, graphs) are refused — the JS side has its own
+        copy-image path for raster graphs and there's no useful
+        text to put on the clipboard for a ``.dta`` or ``.gph``.
+
+        Takes a full ``path`` rather than a basename (mirroring
+        :meth:`delete_session_file`) because :meth:`list_session_files`
+        surfaces ``submit_script``-written scripts from
+        ``.nora/runs/<id>/`` with rewritten display names like
+        ``script_a1b2c3d4.do``. A basename lookup against cwd would
+        miss every one of those — the file on disk is plain
+        ``script.do`` in a run dir. Containment in cwd is verified
+        before any read.
+
+        Size cap: 4 MB. The clipboard can hold more, but multi-MB
+        log dumps don't paste cleanly into most editors and the
+        researcher's intent ("grab this script") is better served
+        by pointing them at the session folder via the topbar pill.
+        """
+        if self.cwd is None:
+            return {"ok": False, "reason": "no active session"}
+        if not path:
+            return {"ok": False, "reason": "no path"}
+        try:
+            target = Path(path).expanduser().resolve()
+        except OSError as e:
+            return {"ok": False, "reason": f"bad path: {e}"}
+        cwd_resolved = self.cwd.resolve()
+        if not _is_within(target, cwd_resolved) or not target.is_file():
+            return {"ok": False, "reason": f"not found: {Path(path).name}"}
+        ext = target.suffix.lower()
+        text_exts = _INLINE_SCRIPT_EXTS | {".ipynb", ".log", ".smcl"}
+        if ext not in text_exts:
+            return {
+                "ok": False,
+                "reason": (
+                    f"{target.name} isn't a text file Nora can copy "
+                    f"(scripts and logs only)."
+                ),
+            }
+        try:
+            size = target.stat().st_size
+        except OSError as e:
+            return {"ok": False, "reason": f"stat failed: {e}"}
+        copy_text_max = 4 * 1024 * 1024
+        if size > copy_text_max:
+            return {
+                "ok": False,
+                "reason": (
+                    f"{target.name} is {size // (1024 * 1024)} MB, "
+                    f"over the 4 MB copy-text cap. Open the session "
+                    f"folder via the topbar pill to grab the file."
+                ),
+            }
+        try:
+            text = target.read_text(encoding="utf-8", errors="replace")
+        except OSError as e:
+            return {"ok": False, "reason": f"read failed: {e}"}
+        return {
+            "ok": True,
+            "name": target.name,
+            "kind": _classify_kind(ext),
+            "text": text,
+        }
 
     def unstage_attachment(self, name: str) -> dict[str, Any]:
         """Remove a previously-staged script from
