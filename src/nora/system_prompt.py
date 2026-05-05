@@ -709,6 +709,18 @@ asking for an upload. `list_session_files` shows what's in the \
 session; `search_in_session_files` finds which file defines a \
 variable, regression label, or other identifier the researcher \
 mentioned. Ask only when discovery comes up empty or ambiguous.
+- "Write a do-file / R script / Python script" — call \
+`submit_script`. Do NOT render the script as a fenced code block \
+in your reply as the deliverable. `submit_script` runs the \
+analysis AND persists the script to disk under \
+`.nora/runs/<id>/script.do` (or `.R` / `.py`), where the \
+researcher can grab it from the session folder via the topbar \
+pill. Rendering inline produces a wall of code in the chat that \
+the researcher can't run, can't open in Stata, and has to \
+hand-copy out — every observed instance of "you wrote it in the \
+answer instead of writing the file" was this failure mode. The \
+only exception is when the researcher explicitly says "don't run \
+it, just show me the code" — then render inline.
 
 Be honest with the researcher about errors or rejections. When a script fails \
 or is rejected, a diagnostic row is still inserted in the store so the \

@@ -1046,7 +1046,11 @@ kbd {
   text-overflow: ellipsis;
   white-space: nowrap;
   min-width: 0;
-  cursor: text;
+  /* The pill is now an "open this session's folder in Finder"
+   * affordance, not a rename trigger — pointer cursor matches the
+   * click intent. (Was ``text`` when clicking swapped the label for
+   * an inline rename input.) */
+  cursor: pointer;
   border: 1px solid transparent;
   transition: border-color 0.15s, opacity 0.15s;
 }
@@ -1059,14 +1063,6 @@ kbd {
 #cwd-display:focus-visible {
   outline: 2px solid var(--accent);
   outline-offset: 2px;
-}
-
-#cwd-display.editing {
-  /* Let the input take the pill shape — don't double-pad. */
-  padding: 0;
-  border-color: var(--accent);
-  cursor: text;
-  opacity: 1;
 }
 
 #cwd-display:empty {
@@ -1459,6 +1455,18 @@ kbd {
   max-width: var(--max-width);
   width: 100%;
   margin: 0 auto;
+  /* As a flex item of ``.messages`` (column flex), ``.message`` has
+   * ``min-width: auto`` by default — meaning it cannot shrink below
+   * the intrinsic min-width of its content. A wide unwrappable child
+   * (a ``<pre>`` of an unbroken ``do``-file line, a long URL in a
+   * paragraph) then forces the message past its 1080px cap, the
+   * overflow propagates up to ``.messages``, and ``.messages`` paints
+   * a horizontal scrollbar — breaking the page layout. ``min-width:
+   * 0`` lets the message respect its ``max-width`` even when content
+   * has a huge intrinsic width; the wide child is then constrained
+   * by the per-element rules below (``pre`` gets its own internal
+   * ``overflow-x: auto`` scroll, tables go into ``.md-table``). */
+  min-width: 0;
 }
 
 .message-body {
@@ -1726,6 +1734,11 @@ kbd {
   padding: 10px 14px;
   font-size: 13px;
   font-family: var(--font-mono);
+  /* Same flex-item caveat as ``.message`` above — the card is a
+   * flex item of ``.messages``, and a wide ``pre.tool-code`` /
+   * ``pre.tool-output`` would otherwise push it past 1080px and
+   * leak the horizontal scrollbar up to ``.messages``. */
+  min-width: 0;
 }
 
 .tool-card .tool-header {
@@ -1764,6 +1777,14 @@ kbd {
   color: var(--code-text);
   padding: 10px 12px;
   border-radius: 8px;
+  /* Cap the pre at the card's width even when an unbroken line
+   * (long Stata command, raw stdout with no wrapping) has a huge
+   * intrinsic min-width. Without these the pre grows to content
+   * width, escapes the card, and the overflow paints a page-wide
+   * scrollbar in ``.messages``. With them ``overflow-x: auto``
+   * keeps the long line scrollable inside the pre itself. */
+  max-width: 100%;
+  min-width: 0;
   overflow-x: auto;
   margin: 6px 0;
   font-size: 12px;
@@ -3177,6 +3198,19 @@ kbd {
   color: var(--code-text);
   padding: 12px 14px;
   border-radius: 8px;
+  /* The pre is a flex item of ``.message-body`` (which is
+   * ``display: flex; flex-direction: column; align-items:
+   * flex-start``). With the default ``min-width: auto`` and
+   * ``align-items: flex-start``, the pre sizes to its content's
+   * intrinsic width — so a long unwrappable line (a ``do`` file
+   * with a 200-char esttab call, a base64 blob, a long URL) makes
+   * the pre wider than the message column and the overflow leaks
+   * up to ``.messages``, which paints a page-wide horizontal
+   * scrollbar. ``min-width: 0`` + ``max-width: 100%`` cap the pre
+   * at the body's width; ``overflow-x: auto`` then keeps the long
+   * line accessible via the pre's OWN scrollbar instead. */
+  max-width: 100%;
+  min-width: 0;
   overflow-x: auto;
   margin: 8px 0;
   font-size: 13px;

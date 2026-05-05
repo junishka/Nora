@@ -55,7 +55,35 @@ Language = Literal["R", "Stata", "Python"]
 # these is missing.
 _PYTHON_HARD_REQUIRED: frozenset[str] = frozenset({"pandas", "numpy"})
 
-DEFAULT_TIMEOUT_SECONDS = 120
+# Per-script wall-clock cap. 300s (5 min) is the working ceiling: a
+# Stata panel build plus a small batch of two-way-FE ``reghdfe``
+# regressions fits comfortably (the prior 120s default forced
+# researchers to artificially split scripts to stay under the wall),
+# while staying tight enough that a runaway loop fails fast. For
+# scripts that need more, the workflow Nora encourages is "split:
+# build and save the analysis panel first, then run regressions in
+# batches against the saved file" — that pattern keeps each call
+# well under the cap and makes failure modes localizable.
+#
+# Override via ``NORA_SCRIPT_TIMEOUT_SECONDS`` for the unusual case
+# where 5 min isn't enough (large simulations, bootstraps with many
+# replications) or where you want a tighter cap (CI smoke tests).
+# Bad values fall back to the default rather than crashing the
+# bridge — a malformed env var should never strand the user.
+def _resolve_default_timeout() -> int:
+    raw = os.environ.get("NORA_SCRIPT_TIMEOUT_SECONDS", "").strip()
+    if not raw:
+        return 300
+    try:
+        v = int(raw)
+    except ValueError:
+        return 300
+    if v <= 0:
+        return 300
+    return v
+
+
+DEFAULT_TIMEOUT_SECONDS = _resolve_default_timeout()
 
 # Where per-run scratch dirs live, relative to cwd.
 RUNS_SUBDIR = ".nora/runs"
@@ -463,7 +491,7 @@ def run_script(
     # when the asyncio task is cancelled. Without this, pressing
     # Stop while a long Stata regression / R fit / Python pipeline
     # is mid-run only cancels the Python coroutine; the subprocess
-    # keeps running to completion (or to the 120s timeout). From
+    # keeps running to completion (or to ``timeout_seconds``). From
     # the researcher's seat that looks identical to "Stop did
     # nothing".
     try:
