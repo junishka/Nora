@@ -163,12 +163,16 @@ def test_two_runners_observe_their_own_cwd_under_concurrent_send(
 
     async def drive(runner: SessionRunner) -> list[dict[str, Any]]:
         events: list[dict[str, Any]] = []
+        # Each runner gets its own turn id; parallel turns must not
+        # collide on the per-turn registry / cancellation set.
+        turn_id = f"t-{id(runner):x}"
         await runner.run_turn(
             "go",
             images=None,
             on_event=events.append,
             build_context_prefix=lambda cwd: "",
             build_script_prefix=lambda atts, cwd: "",
+            turn_id=turn_id,
         )
         return events
 
@@ -291,10 +295,19 @@ def test_interrupt_only_cancels_active_runner(tmp_path: Path) -> None:
             cancelled_b = False
 
             class _FakeTask:
-                def __init__(self, on_cancel):
+                def __init__(self, on_cancel, loop):
                     self._on_cancel = on_cancel
+                    self._loop = loop
                 def done(self) -> bool: return False
                 def cancel(self) -> None: self._on_cancel()
+                # ``cancel_turn`` schedules ``task.cancel`` via the
+                # task's own loop's ``call_soon_threadsafe`` so the
+                # cancellation lands on the worker thread that owns
+                # the task. The fake therefore needs a ``get_loop``
+                # too. We point it at the bridge's worker loop so
+                # the scheduled callable actually runs.
+                def get_loop(self):
+                    return self._loop
 
             def cancel_a():
                 nonlocal cancelled_a
@@ -304,8 +317,15 @@ def test_interrupt_only_cancels_active_runner(tmp_path: Path) -> None:
                 nonlocal cancelled_b
                 cancelled_b = True
 
-            runner_a._current_turn_task = _FakeTask(cancel_a)  # type: ignore[assignment]
-            runner_b._current_turn_task = _FakeTask(cancel_b)  # type: ignore[assignment]
+            runner_a._current_turn_task = _FakeTask(cancel_a, bridge._loop)  # type: ignore[assignment]
+            runner_b._current_turn_task = _FakeTask(cancel_b, bridge._loop)  # type: ignore[assignment]
+            # Companion field added in the turn-identity rewrite:
+            # ``cancel_turn`` keys off ``_current_turn_id`` to know
+            # which id to mark cancelled. Must be set in lockstep
+            # with ``_current_turn_task`` for the runner to recognise
+            # a turn as in-flight.
+            runner_a._current_turn_id = "t-fake-a"
+            runner_b._current_turn_id = "t-fake-b"
 
             # Bridge is focused on B → interrupt should hit B only.
             res = bridge.interrupt_turn()
@@ -315,6 +335,9 @@ def test_interrupt_only_cancels_active_runner(tmp_path: Path) -> None:
             time.sleep(0.05)
 
             assert res["ok"] is True
+            # Bridge surfaces the cancelled turn id so the JS filter
+            # can drop late events from it.
+            assert res.get("turn_id") == "t-fake-b"
             assert cancelled_b is True
             assert cancelled_a is False, (
                 "interrupt_turn must NOT cancel the background runner"
@@ -323,6 +346,7 @@ def test_interrupt_only_cancels_active_runner(tmp_path: Path) -> None:
             # Clear fake tasks before stop_loop tries to await runner.close().
             for r in bridge._runners.values():
                 r._current_turn_task = None
+                r._current_turn_id = None
             bridge.stop_loop()
     finally:
         ui_mod.SESSIONS_ROOT = real_root

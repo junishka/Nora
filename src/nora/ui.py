@@ -547,31 +547,49 @@ class NoraBridge:
             return {"ok": False, "reason": f"save failed: {e}"}
         return {"ok": True, "policy": self._policy_summary()}
 
-    def send_message(self, text: str) -> None:
-        """Schedule a turn on the active session's runner. Returns
-        immediately; events stream back via ``_dispatch_event``."""
-        self._send_to_active(text, images=None)
+    def send_message(self, text: str) -> str | None:
+        """Schedule a turn on the active session's runner.
+
+        Returns the new turn's id (a 16-char hex string), or ``None``
+        if the send couldn't be scheduled (no cwd, worker loop down).
+        Events stream back via ``_dispatch_event``, each stamped with
+        the same id so the JS event filter can drop late events from
+        a turn the researcher cancels later.
+        """
+        return self._send_to_active(text, images=None)
 
     def send_message_with_images(
         self, text: str, images: list[dict[str, Any]]
-    ) -> None:
+    ) -> str | None:
         """Schedule a turn with attached images on the active runner.
-        ``images[i] = {"data": <base64>, "mime": ...}``."""
-        self._send_to_active(text, images=images)
+
+        Same return contract as ``send_message``: the new turn id, or
+        ``None`` on early failure. ``images[i] = {"data": <base64>,
+        "mime": ...}``.
+        """
+        return self._send_to_active(text, images=images)
 
     def _send_to_active(
         self,
         text: str,
         images: list[dict[str, Any]] | None,
-    ) -> None:
+    ) -> str | None:
         """Find the active session's runner and start a turn on it.
 
         Each runner has its own send-lock, so kicking off a turn on
         runner A while runner B is still streaming does NOT block —
         they execute concurrently. The runner stamps every event
-        with ``session_cwd`` so the JS side can filter for the
-        active focus, while persistence always lands in the
-        runner's own ``chat_history.jsonl``.
+        with ``session_cwd`` AND ``turn_id`` so the JS side can
+        filter for the active focus AND drop late events from a
+        cancelled turn; persistence always lands in the runner's
+        own ``chat_history.jsonl``.
+
+        Generates the turn id here (synchronously, before scheduling
+        the coroutine) so it can be returned to the JS-side
+        ``send_message`` immediately. JS captures it on the awaited
+        Promise; if Stop fires before the first event arrives, the
+        bridge already knows which id is in flight on this runner
+        and the cancel path can mark it cancelled atomically.
         """
         if self._loop is None:
             self._dispatch_event({
@@ -579,7 +597,7 @@ class NoraBridge:
                 "message": "worker loop not running",
                 "session_cwd": str(self.cwd) if self.cwd else None,
             })
-            return
+            return None
         if self.cwd is None:
             self._dispatch_event({
                 "type": "turn_error",
@@ -589,17 +607,23 @@ class NoraBridge:
                 ),
                 "session_cwd": None,
             })
-            return
+            return None
         runner = self._ensure_runner_for_cwd(self.cwd)
         self._record_user_message(runner, text, image_count=len(images or []))
+        # 16 hex chars = 64 bits of entropy. Vastly more than enough
+        # for a per-session non-collision guarantee, short enough to
+        # log + paste comfortably when debugging cancellation issues.
+        turn_id = uuid.uuid4().hex[:16]
         coro = runner.run_turn(
             text,
             images=images,
             on_event=self._dispatch_event,
             build_context_prefix=_build_context_prefix,
             build_script_prefix=_build_script_attachment_prefix,
+            turn_id=turn_id,
         )
         asyncio.run_coroutine_threadsafe(coro, self._loop)
+        return turn_id
 
     def add_files(self) -> dict[str, Any]:
         """Open a native file picker that accepts both data files
@@ -1778,17 +1802,31 @@ class NoraBridge:
         bug: it killed the whole conversation rather than just the
         current turn, and SDK retry semantics are robust enough to
         not need a fresh socket per attempt.)
+
+        Returns ``{ok, turn_id}`` so the JS side can add ``turn_id``
+        to its ``cancelledTurnIds`` set. That set is the authoritative
+        drop list for late events: the runner stamps every event with
+        its turn id, the dispatcher drops events whose id is in the
+        runner's cancelled set, and the JS filter drops anything that
+        slipped through. Returning the id here guarantees JS knows
+        about the cancellation even if no ``activeLiveTurn`` was
+        recorded yet (e.g., Stop fires immediately after Send, before
+        any event lands).
         """
         if self._loop is None:
             return {"ok": False, "reason": "worker loop not running"}
         runner = self._active_runner()
         if runner is None or not runner.is_busy():
             return {"ok": False, "reason": "no turn in flight"}
-        # Cancel on the worker loop; safe from this thread.
-        task = runner._current_turn_task
-        if task is not None:
-            self._loop.call_soon_threadsafe(task.cancel)
-        return {"ok": True}
+        # ``cancel_turn`` synchronously marks the turn cancelled and
+        # kills any registered subprocesses under the runner's lock.
+        # The asyncio cancellation it then triggers needs to land on
+        # the worker loop; ``cancel_turn`` itself does the
+        # ``task.cancel`` call, but ``Task.cancel`` is loop-thread
+        # safe in modern Python so we don't need ``call_soon_threadsafe``
+        # here.
+        turn_id = runner.cancel_turn()
+        return {"ok": True, "turn_id": turn_id}
 
     # -------- internals --------
 
@@ -2083,6 +2121,17 @@ class NoraBridge:
         session B. The frontend is then responsible for filtering
         which events it renders based on the focused session.
 
+        Cancellation drop. If the event carries a ``turn_id`` AND that
+        id is in the originating runner's cancelled set, drop the
+        event ENTIRELY: no persist, no JS dispatch. The runner stamps
+        every event with its turn id; ``cancel_turn`` adds the id to
+        the set the moment Stop fires; so any late event the SDK or
+        a subprocess emits after the cancel reaches us here and
+        terminates without polluting chat history or the rendered
+        transcript. This is the backend boundary the user-pressed-Stop
+        contract leans on; the JS-side filter is best-effort defense
+        in depth, not the authoritative drop.
+
         For tool-result events we enrich the payload with the raw
         stdout/stderr from the run dir so the JS can render the
         native R/Stata/Python output panel. The enrichment runs here
@@ -2090,6 +2139,12 @@ class NoraBridge:
         researcher sees raw logs; the model sees only the sanitized
         payload).
         """
+        turn_id = payload.get("turn_id")
+        cwd_str = payload.get("session_cwd")
+        if turn_id and cwd_str:
+            runner = self._runners.get(str(Path(cwd_str).resolve()))
+            if runner is not None and runner.is_turn_cancelled(turn_id):
+                return
         if payload.get("type") == "tool_result":
             run_dir = payload.get("run_dir")
             if run_dir:

@@ -295,6 +295,7 @@ def test_tool_result_with_run_dir_triggers_capture_and_next_turn_attaches(
         on_event=lambda e: None,
         build_context_prefix=lambda cwd: "",
         build_script_prefix=lambda atts, cwd: "",
+        turn_id="t-plot-vision",
     ))
     assert len(runner.pending_plot_images) == 1
     assert runner.pending_plot_images[0]["name"] == "residuals.png"
@@ -307,6 +308,7 @@ def test_tool_result_with_run_dir_triggers_capture_and_next_turn_attaches(
         on_event=lambda e: None,
         build_context_prefix=lambda cwd: "",
         build_script_prefix=lambda atts, cwd: "",
+        turn_id="t-plot-vision",
     ))
     assert second.last_images is not None
     assert len(second.last_images) == 1
@@ -338,6 +340,7 @@ def test_user_supplied_images_merge_with_pending_plots(tmp_path: Path) -> None:
         on_event=lambda e: None,
         build_context_prefix=lambda cwd: "",
         build_script_prefix=lambda atts, cwd: "",
+        turn_id="t-plot-vision",
     ))
     assert rec.last_images is not None
     assert len(rec.last_images) == 2
@@ -371,6 +374,7 @@ def test_cancel_during_send_restores_pending_plots(tmp_path: Path) -> None:
         on_event=lambda e: None,
         build_context_prefix=lambda cwd: "",
         build_script_prefix=lambda atts, cwd: "",
+        turn_id="t-plot-vision",
     ))
     # Restored — same image is still staged.
     assert len(runner.pending_plot_images) == 1

@@ -3,12 +3,15 @@
 What changed from step 1 (the spine):
 - The Claude Agent SDK's built-in tools (Bash, Read, Write, Edit, Glob, Grep,
   WebFetch, WebSearch, etc.) are disallowed. Claude reaches the local machine
-  only through the six custom tools defined in `nora.tools`.
+  only through the custom tools defined in `nora.tools` (see
+  ``ALLOWED_TOOL_NAMES`` for the current set; the count grows as new tools
+  ship — discovery, recall, search — so any single hardcoded number here
+  drifts).
 - `can_use_tool` is a catch-all deny: any tool not on the explicit allowlist
   is rejected, including tools added by future SDK versions we haven't heard
   of yet. This is belt-and-suspenders on top of `disallowed_tools`.
 - The system prompt replaces Claude Code's default with a researcher-oriented
-  one that introduces the six tools and the constraints.
+  one that introduces those tools and the constraints.
 - The renderer now shows tool calls and tool results inline so the researcher
   can see what Claude is doing.
 
@@ -77,7 +80,12 @@ from nora.system_prompt import (
     dataset_listing as _dataset_listing_new,
     scan_datasets as _scan_datasets_new,
 )
-from nora.tools import ALLOWED_TOOL_NAMES, SERVER_NAME, build_server
+from nora.tools import (
+    ALLOWED_TOOL_NAMES,
+    SERVER_NAME,
+    build_server,
+    friendly_tool_names,
+)
 
 
 console = Console()
@@ -755,17 +763,15 @@ async def _gate_tool_use(
             style="red dim",
         )
     )
+    available = ", ".join(friendly_tool_names(prefixed=False))
     return PermissionResultDeny(
         behavior="deny",
         message=(
-            f"Tool '{tool_name}' is not available in Nora. Use one of the "
-            f"ten custom tools described in the system prompt "
-            f"(mcp__{SERVER_NAME}__get_schema, search_schema, "
-            f"request_data, submit_script, submit_script_file, "
-            f"expand_result, list_results, list_results_global, "
-            f"recall_conversation, read_attached_file). Nora does not "
-            f"expose Bash, Read, Write, Edit, Glob, Grep, or any other "
-            f"general tool."
+            f"Tool '{tool_name}' is not available in Nora. Use one of "
+            f"the {len(ALLOWED_TOOL_NAMES)} custom tools described in "
+            f"the system prompt (all prefixed mcp__{SERVER_NAME}__): "
+            f"{available}. Nora does not expose Bash, Read, Write, "
+            f"Edit, Glob, Grep, or any other general tool."
         ),
         interrupt=False,
     )
@@ -857,7 +863,8 @@ def _build_options(
         # Don't load the user's / project's / local CLAUDE.md or settings.
         # Those can introduce hooks, tools, and slash-commands we don't
         # control, and we want Nora's tool surface to be exactly the
-        # six tools above — no more, no less, regardless of the machine.
+        # ALLOWED_TOOL_NAMES set above — no more, no less, regardless
+        # of the machine.
         setting_sources=[],
     )
 

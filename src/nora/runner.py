@@ -40,6 +40,9 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+import subprocess
+import threading
+from collections import OrderedDict
 from pathlib import Path
 from typing import Any, Awaitable, Callable
 
@@ -51,9 +54,21 @@ from nora.provider import (
     TurnError,
     open_session,
 )
+from nora.runtime.turn_context import use_turn_context
 from nora.system_prompt import build_system_prompt, scan_datasets
 from nora.text_safety import safe_text
 from nora.tools import SERVER_NAME
+
+
+# Cap on the per-runner cancelled-turn-id set. Bounded so a long-lived
+# session that's cancelled often doesn't grow the set without limit.
+# The set's only job is to drop late events from cancelled turns; once
+# the model is far enough past a turn that no SDK / subprocess can
+# still emit for it, dropping the id from the set is fine — any
+# straggler that arrives after eviction passes through the dispatcher
+# and renders, at worst as a brief flash before the staleness sweep
+# clears it. 256 covers ~weeks of normal use.
+_CANCELLED_TURN_ID_HISTORY = 256
 
 
 # Plot vision: caps and allowed kinds. Plots that exceed the byte cap
@@ -119,6 +134,37 @@ class SessionRunner:
         # ``interrupt`` (called from another thread via the bridge)
         # can cancel it.
         self._current_turn_task: asyncio.Task[None] | None = None
+        # Turn identity. Each call to ``run_turn`` is assigned a
+        # unique id by the bridge; the runner stamps every event with
+        # that id so the dispatcher (and the JS event filter) can
+        # drop late events from a turn the researcher cancelled —
+        # even after a fresh send starts on the same session.
+        # ``_current_turn_id`` is the in-flight one (or None when no
+        # turn is running). ``_cancelled_turn_ids`` records ids the
+        # researcher hit Stop on; events stamped with one of those
+        # ids are dropped at the dispatcher and never reach the JS
+        # / chat history. Bounded LRU so a long-lived session can't
+        # grow the set without limit.
+        self._current_turn_id: str | None = None
+        self._cancelled_turn_ids: "OrderedDict[str, None]" = OrderedDict()
+        # Per-turn subprocess registry. Keyed on turn id; each entry
+        # holds the Popen handles ``submit_script`` spawned during
+        # the turn. ``cancel_turn`` walks this under the lock and
+        # kills any survivors so the script actually halts when
+        # Stop fires (closes the prior race where the asyncio task
+        # was cancelled but the subprocess kept running because the
+        # cancellation propagated through the asyncio queue while
+        # the thread was still inside Popen.communicate).
+        self._turn_processes: dict[str, list[subprocess.Popen[Any]]] = {}
+        # Lock guarding the cancellation set + process registry as a
+        # single atomic unit. interrupt() acquires it, marks the
+        # turn cancelled, and pops the proc list out for killing —
+        # so any concurrent ``register_turn_process`` call either
+        # sees the cancellation flag (and kills the proc on the
+        # spot) or appends to a list that ``interrupt`` already took.
+        # Either way the proc gets killed; neither thread can hide
+        # a live subprocess from the cancellation path.
+        self._turn_lock: threading.Lock = threading.Lock()
         # Warm-start: the next turn after a fresh session open
         # prepends prior-turn memory. Set whenever we open a session
         # (initial or after a model swap that closes/reopens).
@@ -360,17 +406,122 @@ class SessionRunner:
         except OSError:
             pass
 
-    def interrupt(self) -> bool:
-        """Cancel this runner's in-flight turn, if any.
+    def current_turn_id(self) -> str | None:
+        """Return the id of the in-flight turn, or ``None`` if idle.
 
-        Returns True if a task was cancelled. Safe to call from any
-        thread that has access to the runner's task.
+        Used by the bridge's ``interrupt_turn`` to capture the id
+        that's about to be cancelled, then surface it in the JS
+        response so the frontend can add it to ``cancelledTurnIds``.
         """
+        return self._current_turn_id
+
+    def is_turn_cancelled(self, turn_id: str) -> bool:
+        """True iff ``turn_id`` has been marked cancelled on this runner.
+
+        Cheap to call — the lookup is on a small bounded ordered dict.
+        Used by the dispatcher (drop late events) and by
+        ``submit_script`` after a long subprocess returns (skip
+        sanitize / persist for cancelled-turn output).
+        """
+        # ``in`` on an OrderedDict is O(1), and we don't need the
+        # lock for a read-only contains check: even a stale read
+        # just defers the drop to the next event from the same turn.
+        return turn_id in self._cancelled_turn_ids
+
+    def register_turn_process(
+        self, turn_id: str, proc: subprocess.Popen[Any],
+    ) -> None:
+        """Add ``proc`` to the registry for ``turn_id``, OR kill it
+        immediately if the turn was cancelled before this call landed.
+
+        The lock-protected check + append closes the race where Stop
+        fires after ``Popen()`` returns but before the registration
+        completes. Two interleavings:
+
+        - Stop wins: ``cancel_turn`` set the cancel flag and emptied
+          ``_turn_processes[turn_id]`` first. We see the flag and
+          kill ``proc`` ourselves.
+        - Register wins: we append before the cancel flag is set.
+          ``cancel_turn`` will pop the list under the lock and kill
+          everything inside it.
+
+        Either path leaves the subprocess dead. Without the lock the
+        prior code had a window where Stop's pop returned an empty
+        list while the executor was about to append a Popen handle
+        a microsecond later, and the subprocess survived.
+        """
+        kill_now = False
+        with self._turn_lock:
+            if turn_id in self._cancelled_turn_ids:
+                kill_now = True
+            else:
+                self._turn_processes.setdefault(turn_id, []).append(proc)
+        if kill_now:
+            _kill_proc_quietly(proc)
+
+    def cancel_turn(self, turn_id: str | None = None) -> str | None:
+        """Mark ``turn_id`` cancelled, kill its registered subprocesses,
+        and request asyncio cancellation of the in-flight task.
+
+        Returns the id that was cancelled (or ``None`` if no turn was
+        in flight). The bridge surfaces the returned id to the JS
+        event filter so late events stamped with it get dropped.
+
+        ``turn_id=None`` cancels whichever turn is currently running.
+        Pass an explicit id only when cancelling cross-thread (e.g.,
+        from a deferred handler that captured the id earlier).
+        """
+        target = turn_id if turn_id is not None else self._current_turn_id
+        if target is None:
+            return None
+
+        # Atomically mark cancelled + extract the proc list. Once the
+        # flag is set, any concurrent ``register_turn_process`` call
+        # for the same id will see the flag and self-kill instead of
+        # appending; so popping here gives us every proc we need to
+        # touch.
+        with self._turn_lock:
+            self._cancelled_turn_ids[target] = None
+            # Bounded LRU eviction: keep at most _CANCELLED_TURN_ID_HISTORY.
+            while len(self._cancelled_turn_ids) > _CANCELLED_TURN_ID_HISTORY:
+                self._cancelled_turn_ids.popitem(last=False)
+            procs = self._turn_processes.pop(target, [])
+
+        # Kill outside the lock so a stuck ``proc.kill`` / ``wait``
+        # can't block another thread's ``register_turn_process``.
+        for proc in procs:
+            _kill_proc_quietly(proc)
+
+        # Cancel the asyncio task last. The asyncio cancellation
+        # unblocks the runner's ``await session.send(...)`` so it
+        # exits the event loop and runs its ``except CancelledError``
+        # cleanup. By the time it gets there, the subprocess kills
+        # above have already landed — so the cancel branch doesn't
+        # have to reproduce the kill logic the prior code carried.
+        #
+        # ``cancel_turn`` is called from the bridge thread (not the
+        # worker loop thread), so ``Task.cancel`` has to be scheduled
+        # via the task's own loop's ``call_soon_threadsafe``. Reading
+        # the loop off the task itself avoids a parameter every call
+        # site would otherwise have to thread through.
         t = self._current_turn_task
-        if t is None or t.done():
-            return False
-        t.cancel()
-        return True
+        if t is not None and not t.done():
+            try:
+                loop = t.get_loop()
+                loop.call_soon_threadsafe(t.cancel)
+            except RuntimeError:
+                # Loop closed between the read and the schedule;
+                # nothing left to cancel.
+                pass
+        return target
+
+    def interrupt(self) -> bool:
+        """Backwards-compat alias for ``cancel_turn(None)``.
+
+        Returns True iff a turn was actually cancelled. Kept because
+        external call sites and tests reference this name.
+        """
+        return self.cancel_turn() is not None
 
     # -------- turn execution --------
 
@@ -383,6 +534,7 @@ class SessionRunner:
         build_script_prefix: Callable[
             [list[dict[str, Any]], Path], str
         ],
+        turn_id: str,
     ) -> None:
         """Drive one chat turn for THIS session.
 
@@ -391,27 +543,50 @@ class SessionRunner:
         proceed in parallel because they hold different locks.
 
         Every event is stamped with ``session_cwd`` (this runner's
-        cwd) before being handed to ``on_event``. The dispatcher
-        decides whether to render (compare against active focus) and
-        always persists to the runner's own ``chat_history.jsonl``.
+        cwd) AND ``turn_id`` before being handed to ``on_event``. The
+        dispatcher uses the turn id to drop late events from a
+        cancelled turn before they reach the JS / chat history; it
+        always persists to the runner's own ``chat_history.jsonl`` for
+        events from non-cancelled turns.
 
-        Wraps the entire await pipeline in :func:`use_cwd` so tool
-        handlers see THIS runner's cwd, not whichever session is
-        currently focused in the UI.
+        Wraps the entire await pipeline in :func:`use_cwd` AND
+        :func:`use_turn_context` so tool handlers see THIS runner's
+        cwd + turn id, not whichever session is currently focused
+        in the UI. ``submit_script`` reads ``current_turn_id()`` /
+        ``register_turn_process`` from the turn context to register
+        its subprocess into the runner's per-turn registry — that's
+        what closes the Popen-vs-register race the prior local
+        ``proc_box`` had.
+
+        ``turn_id`` is generated by the bridge before the call so it
+        can be returned to the JS-side ``send_message`` synchronously,
+        and so a Stop fired before the first event arrives still has
+        a stable id to mark cancelled.
         """
         self._current_turn_task = asyncio.current_task()
+        self._current_turn_id = turn_id
         cwd = self.cwd
 
-        with use_cwd(cwd):
+        # Wrap every emitted event so the dispatcher and JS filter
+        # see the turn id alongside the cwd. Local lambda rather
+        # than mutating ``_stamp`` to avoid touching every other
+        # ``_stamp`` call site in a refactor — the closure here is
+        # cheap and keeps the runner's events tagged consistently.
+        def emit(payload: dict[str, Any]) -> None:
+            payload["turn_id"] = turn_id
+            on_event(_stamp(payload, cwd))
+
+        with use_cwd(cwd), use_turn_context(turn_id, self):
             async with self._send_lock:
                 try:
                     session = await self.ensure_session()
                 except Exception as e:  # noqa: BLE001
-                    on_event(_stamp({
+                    emit({
                         "type": "turn_error",
                         "message": f"session setup failed: {e}",
-                    }, cwd))
+                    })
                     self._current_turn_task = None
+                    self._current_turn_id = None
                     return
 
                 # Memory: warm-start prefix on first turn after open.
@@ -541,16 +716,16 @@ class SessionRunner:
                         from nora.provider import ToolCallResult
                         if isinstance(evt, ToolCallResult) and evt.run_dir:
                             self._capture_plots(Path(evt.run_dir))
-                        on_event(_stamp(_event_to_dict(evt), cwd))
+                        emit(_event_to_dict(evt))
                     if not saw_terminal:
-                        on_event(_stamp({
+                        emit({
                             "type": "turn_error",
                             "message": (
                                 "the provider stream ended without a "
                                 "result — try again, or use Stop and "
                                 "resend if the chat feels stuck"
                             ),
-                        }, cwd))
+                        })
                     # Persist the durable session snapshot.
                     try:
                         from nora.session_state import write_session_state
@@ -580,11 +755,12 @@ class SessionRunner:
                         self.pending_plot_images = (
                             attached_plots + self.pending_plot_images
                         )
-                    on_event(_stamp({
+                    emit({
                         "type": "turn_error",
                         "message": "cancelled",
-                    }, cwd))
+                    })
                     self._current_turn_task = None
+                    self._current_turn_id = None
                     return
                 except Exception as e:  # noqa: BLE001
                     # Same posture as the cancel branch above: prefix
@@ -602,17 +778,48 @@ class SessionRunner:
                         self.pending_plot_images = (
                             attached_plots + self.pending_plot_images
                         )
-                    on_event(_stamp({
+                    emit({
                         "type": "turn_error",
                         "message": f"turn failed: {e}",
-                    }, cwd))
+                    })
                 finally:
                     self._current_turn_task = None
+                    self._current_turn_id = None
+                    # Drop the per-turn process registry slot so the
+                    # dict doesn't accumulate entries from completed
+                    # turns. ``cancel_turn`` already pops the slot for
+                    # cancelled turns; here we cover the success /
+                    # natural-error path.
+                    with self._turn_lock:
+                        self._turn_processes.pop(turn_id, None)
 
 
 # ---------------------------------------------------------------------------
-# Event helpers
+# Event + subprocess helpers
 # ---------------------------------------------------------------------------
+
+
+def _kill_proc_quietly(proc: subprocess.Popen[Any]) -> None:
+    """Kill ``proc`` if it's still running, swallowing all errors.
+
+    Used by ``cancel_turn`` and ``register_turn_process`` — both call
+    sites are in the cancellation path where any kill failure is
+    advisory (the process either died, never started, or will die on
+    its own); raising would propagate to the bridge thread and could
+    wedge other sessions' turns. Bounded ``wait`` so a stuck process
+    doesn't hold the cancellation thread indefinitely.
+    """
+    try:
+        if proc.poll() is None:
+            proc.kill()
+    except Exception:  # noqa: BLE001
+        return
+    try:
+        proc.wait(timeout=2)
+    except Exception:  # noqa: BLE001
+        # The kill went through but the wait is failing or timing
+        # out; leave the process to be reaped by the OS.
+        pass
 
 
 def _stamp(payload: dict[str, Any], cwd: Path) -> dict[str, Any]:

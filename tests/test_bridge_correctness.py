@@ -203,6 +203,7 @@ def test_run_turn_synthesises_terminal_event_when_stream_silent(
         on_event=pushed.append,
         build_context_prefix=lambda cwd: "",
         build_script_prefix=lambda atts, cwd: "",
+        turn_id="t-test-bridge",
     ))
 
     types = [p.get("type") for p in pushed]
