@@ -997,37 +997,56 @@ async def submit_script(args: dict[str, Any]) -> dict[str, Any]:
     # --- Execution ---------------------------------------------------------
     cwd = get_cwd()
     # Run the executor in a worker thread (it uses synchronous Popen)
-    # while keeping a handle to the spawned process. If the asyncio
-    # task is cancelled mid-run (researcher pressed Stop), kill the
-    # subprocess explicitly so the script actually halts. Without
-    # this, the subprocess kept running to completion or to the
-    # 120s timeout while the cancellation was waiting in the
-    # asyncio queue, and "Stop" felt like a no-op.
+    # while registering the spawned process into the runner's per-turn
+    # registry. If Stop fires mid-run, the runner has already marked
+    # the turn cancelled and either:
+    #   (a) ``register_turn_process`` saw the cancel flag and killed
+    #       the subprocess on the spot (closes the race where the
+    #       prior local ``proc_box`` saw a ``None`` because Stop fired
+    #       between Popen returning and the register call landing), or
+    #   (b) the registration completed first, in which case the
+    #       runner's ``cancel_turn`` walked the registry under its
+    #       lock and killed the proc.
+    # Either way the subprocess actually halts when Stop fires; "Stop"
+    # never feels like a no-op the way it did with the prior pattern.
     import asyncio as _asyncio
     import subprocess as _subprocess
-    proc_box: list[_subprocess.Popen[str] | None] = [None]
-
-    def _register(p: _subprocess.Popen[str]) -> None:
-        proc_box[0] = p
+    from nora.runtime.turn_context import (
+        is_current_turn_cancelled,
+        register_turn_process,
+    )
 
     try:
         exec_result = await _asyncio.to_thread(
             executor.run_script,
             language, code, cwd,
-            proc_register=_register,
+            proc_register=register_turn_process,
         )
     except _asyncio.CancelledError:
-        p = proc_box[0]
-        if p is not None and p.poll() is None:
-            try:
-                p.kill()
-            except Exception:  # noqa: BLE001 — best-effort cleanup
-                pass
-            try:
-                p.wait(timeout=2)
-            except Exception:  # noqa: BLE001
-                pass
+        # The runner's ``cancel_turn`` already killed any registered
+        # subprocess synchronously before scheduling the asyncio
+        # cancel that lands here. Nothing to clean up at this layer;
+        # propagate so the runner's outer cancel branch runs.
         raise
+
+    # Drop the result entirely if the turn was cancelled while the
+    # subprocess was still running. The Popen finished naturally (or
+    # got killed) and we now hold an ExecutionResult, but persisting
+    # it as a chat-visible result would surface a tool answer for a
+    # turn the researcher cancelled — exactly the leak the new turn
+    # identity contract is designed to prevent. The raw run_dir
+    # stays on disk for debugging; we just don't sanitize, store,
+    # or return a structured payload.
+    if is_current_turn_cancelled():
+        return _as_mcp_text({
+            "status": "cancelled",
+            "reason": (
+                "turn was cancelled while the script was running; "
+                "raw stdout/stderr remain on disk in the run_dir but "
+                "are not surfaced as a result"
+            ),
+            "run_dir": str(exec_result.run_dir),
+        })
 
     # The executor returns zero or more raw payloads (JSONL, one per
     # nora_result_* helper call inside the script). Sanitize each
@@ -2621,8 +2640,14 @@ _SEARCH_FILES_EXCERPT_EXTS: frozenset[str] = frozenset({
         "share the snippet directly.\n\n"
         "Searches scripts and logs only by default; never searches "
         "datasets (the SDC layer owns dataset content). Files larger "
-        "than 256 KB are skipped with a 'too large' marker — read those "
-        "via read_attached_file directly.\n\n"
+        "than 256 KB are skipped with a 'too large' marker. The skip "
+        "entry's ``reason`` field carries the right recovery path for "
+        "that file type: source scripts (.py / .do / .r / .rmd) say "
+        "'use read_attached_file'; logs / notebooks (.log / .smcl / "
+        ".ipynb) say 'ask the researcher for the snippet' — "
+        "read_attached_file refuses those by privacy contract, so a "
+        "blanket 'use read_attached_file' would be a guaranteed failed "
+        "follow-up.\n\n"
         "Arguments:\n"
         "  query: case-insensitive substring. Empty string is rejected.\n"
         "  kinds: optional list — any subset of ['script', 'log']. "
@@ -2714,14 +2739,32 @@ async def search_in_session_files(args: dict[str, Any]) -> dict[str, Any]:
         if not name:
             continue
         if st.st_size > _SEARCH_FILES_FILE_BYTE_CAP:
+            # Recovery hint depends on whether read_attached_file
+            # actually accepts this file type. The earlier message
+            # said "use read_attached_file" universally, but that
+            # tool refuses .log / .smcl / .ipynb (their bytes can
+            # carry raw rows or cell outputs the SDC sanitizer
+            # normally strips, so they're outside the recall
+            # contract). Telling the model to call read_attached_file
+            # on a 256 KB+ log produced a guaranteed failed follow-up
+            # in a common path. For those, the right move is to ask
+            # the researcher for the relevant snippet directly.
+            if ext in _RECALL_SCRIPT_EXTS:
+                recover_hint = "use read_attached_file to fetch it"
+            else:
+                recover_hint = (
+                    "ask the researcher to paste the relevant snippet "
+                    "(read_attached_file refuses .log / .smcl / .ipynb "
+                    "to keep raw rows and cell outputs out of context)"
+                )
             skipped.append({
                 "name": name,
                 "kind": kind,
                 "reason": (
                     f"file too large for inline search "
                     f"({st.st_size} bytes > "
-                    f"{_SEARCH_FILES_FILE_BYTE_CAP} cap); use "
-                    f"read_attached_file"
+                    f"{_SEARCH_FILES_FILE_BYTE_CAP} cap); "
+                    f"{recover_hint}"
                 ),
             })
             continue
@@ -2811,6 +2854,30 @@ ALLOWED_TOOL_NAMES: tuple[str, ...] = (
     f"mcp__{SERVER_NAME}__list_session_files",
     f"mcp__{SERVER_NAME}__search_in_session_files",
 )
+
+
+def friendly_tool_names(prefixed: bool = True) -> tuple[str, ...]:
+    """Return tool names for human-facing messages (denial hints, etc.).
+
+    Derived from ``ALLOWED_TOOL_NAMES`` so any new tool added to the
+    registry shows up automatically in recovery hints. Prior versions
+    hardcoded a comma-separated list in two places (the catch-all
+    permission deny in ``provider/anthropic.py`` and the terminal
+    catch-all in ``app.py``). Both drifted — the Anthropic copy got
+    stuck at six names while the registry grew to thirteen, and the
+    terminal copy stalled at ten. Drift is bad here because the
+    denial message is exactly the recovery path the model needs to
+    discover new tools like ``list_session_files`` and
+    ``search_in_session_files``.
+
+    ``prefixed=True`` keeps the ``mcp__<server>__`` prefix that Claude
+    actually sees in its tool list. ``prefixed=False`` strips it for
+    display contexts (terminal banners) where the prefix is noise.
+    """
+    if prefixed:
+        return ALLOWED_TOOL_NAMES
+    cut = len(f"mcp__{SERVER_NAME}__")
+    return tuple(name[cut:] for name in ALLOWED_TOOL_NAMES)
 
 
 # Provider-neutral dispatch table. The Anthropic path goes through the

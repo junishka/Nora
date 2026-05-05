@@ -159,7 +159,37 @@ function popPendingMessage(cwd) {
 // arrives because the SDK closed without one). While a cwd is in
 // the set, ``nora_event`` drops non-terminal events for that
 // session.
-const cancelledCwds = new Set();
+// Cancelled-turn drop list. The runner stamps every event with a
+// per-turn id; when Stop fires we add the in-flight id here and
+// keep dropping any late events that carry it. Crucially, this set
+// is NEVER cleared when a new message starts — that was the prior
+// bug: ``cancelledCwds.delete(currentCwd)`` on send let late events
+// from the previous (cancelled) turn slip through after the new
+// turn started, because the suppression key was a cwd rather than
+// a turn id. Each new turn gets a fresh id, so the new turn's
+// events naturally pass the filter without anyone having to clear
+// state. The backend dispatcher applies the same drop authoritatively
+// (see ``_dispatch_event`` in ui.py) — this set is best-effort
+// defense in depth.
+//
+// Bounded growth: oldest ids are evicted past ~CANCELLED_TURN_ID_CAP
+// entries. After eviction a stray late event can render, but by
+// then the turn is far enough back in history that a brief flash
+// before the staleness sweep is acceptable.
+const CANCELLED_TURN_ID_CAP = 256;
+const cancelledTurnIds = new Set();
+const cancelledTurnIdOrder = [];
+
+function markTurnCancelled(turnId) {
+  if (!turnId) return;
+  if (cancelledTurnIds.has(turnId)) return;
+  cancelledTurnIds.add(turnId);
+  cancelledTurnIdOrder.push(turnId);
+  while (cancelledTurnIdOrder.length > CANCELLED_TURN_ID_CAP) {
+    const evicted = cancelledTurnIdOrder.shift();
+    cancelledTurnIds.delete(evicted);
+  }
+}
 
 // Persisted model choice — survives restarts. Applied on boot after
 // (Model preference used to live in localStorage as a global default.
@@ -1483,11 +1513,12 @@ function pendingFor(cwd) {
 
 async function fireQueuedMessage(cwd, item) {
   item.userEl.classList.remove('queued');
-  activeLiveTurn = { nodes: [item.userEl], hasVisibleReply: false };
+  activeLiveTurn = { id: null, nodes: [item.userEl], hasVisibleReply: false };
   try {
+    let turnId = null;
     if (item.images.length > 0 && typeof window.pywebview.api.send_message_with_images === 'function') {
       const payload = item.images.map((img) => ({ data: img.data, mime: img.mime }));
-      await window.pywebview.api.send_message_with_images(item.text, payload);
+      turnId = await window.pywebview.api.send_message_with_images(item.text, payload);
     } else if (item.images.length > 0) {
       const errEl = appendError('Restart Nora to send images.');
       if (activeLiveTurn) {
@@ -1497,8 +1528,9 @@ async function fireQueuedMessage(cwd, item) {
       activeLiveTurn = null;
       setSending(false, cwd);
     } else {
-      await window.pywebview.api.send_message(item.text);
+      turnId = await window.pywebview.api.send_message(item.text);
     }
+    if (activeLiveTurn) activeLiveTurn.id = turnId;
   } catch (err) {
     const errEl = appendError('send failed: ' + err);
     if (activeLiveTurn) {
@@ -1601,31 +1633,31 @@ form.addEventListener('submit', async (e) => {
       userEl,
     });
     // Track this queued message in the next-request estimate so the
-    // chip's "→ ~Nk next" indicator reflects what the conversation
+    // chip's projected "~Nk" weight reflects what the conversation
     // will weigh once this message fires.
     pushPendingMessage(currentCwd, text, images.length);
     return;
   }
 
-  // Defensive: any prior Stop on this session leaves an entry in
-  // cancelledCwds. Clear it before firing a fresh turn so this
-  // turn's events render normally even if no terminal landed for
-  // the cancelled one (an SDK that closes silently can leave the
-  // flag stuck otherwise).
-  if (currentCwd) cancelledCwds.delete(currentCwd);
-  activeLiveTurn = { nodes: [userEl], hasVisibleReply: false };
+  // No "clear cancelled state" step: each turn has its own id, and
+  // the new turn's id won't be in ``cancelledTurnIds``. Late events
+  // from the previously-cancelled turn keep getting dropped because
+  // they carry the OLD id; new events flow because they carry the
+  // NEW id. That's the whole point of the turn-identity rewrite.
+  activeLiveTurn = { id: null, nodes: [userEl], hasVisibleReply: false };
   // Track this immediate-fire message in the next-request estimate.
-  // Same reason as the queued path above — chip's "→ ~Nk next"
-  // indicator should reflect what the next provider call will weigh
+  // Same reason as the queued path above — chip's projected "~Nk"
+  // weight should reflect what the next provider call will cost
   // until turn_done lands the actual measurement.
   pushPendingMessage(currentCwd, text, images.length);
   setSending(true);
   try {
     // If images are attached, use the richer send method. The
     // simpler string send stays as the fast path for text-only.
+    let turnId = null;
     if (images.length > 0 && typeof window.pywebview.api.send_message_with_images === 'function') {
       const payload = images.map((img) => ({ data: img.data, mime: img.mime }));
-      await window.pywebview.api.send_message_with_images(text, payload);
+      turnId = await window.pywebview.api.send_message_with_images(text, payload);
     } else if (images.length > 0) {
       const errEl = appendError('Restart Nora to send images.');
       if (activeLiveTurn && !activeLiveTurn.hasVisibleReply) {
@@ -1636,8 +1668,14 @@ form.addEventListener('submit', async (e) => {
       setSending(false);
       return;
     } else {
-      await window.pywebview.api.send_message(text);
+      turnId = await window.pywebview.api.send_message(text);
     }
+    // Capture the turn id the bridge assigned. Stop reads this to
+    // mark the turn cancelled. If the await resolved with no id
+    // (unexpected: the bridge returns null only on early failure
+    // paths that already dispatched a turn_error), leave id null
+    // and let the turn_error event clean up.
+    if (activeLiveTurn) activeLiveTurn.id = turnId;
     // Don't clear setSending here — the await resolves as soon as
     // the turn is QUEUED on the Python side, not when it finishes.
     // The turn_done / turn_error / auth_failure event handler
@@ -1713,13 +1751,13 @@ function setSending(sending, cwd) {
   const target = cwd || currentCwd;
   if (target) {
     setSessionBusy(target, sending);
-    // A new turn starting on this session (sending=true) means any
-    // prior Stop has been resolved — clear the suppression flag so
-    // this turn's events render. Covers both the form-submit path
-    // and the queued-message auto-fire (``flushPendingFor``) which
-    // doesn't go through the form handler. Defensive: also fine to
-    // run when there's nothing in the set.
-    if (sending) cancelledCwds.delete(target);
+    // No cancelled-state clearing here. Each turn has its own id
+    // and the new turn's events naturally pass the
+    // ``cancelledTurnIds`` filter without needing a per-cwd reset
+    // (that reset was the prior leak: it allowed late events from
+    // the previous, cancelled turn to render after a fresh send
+    // started). The cancelled set is only mutated by Stop, never
+    // by Send.
   }
   // Composer state mirrors the FOCUSED session only.
   if (target && target !== currentCwd) return;
@@ -1870,13 +1908,19 @@ if (stopBtn) {
   stopBtn.addEventListener('click', async () => {
     if (!window.pywebview || !window.pywebview.api) return;
     stopBtn.disabled = true;
-    // Mark this session's events as suppressed BEFORE awaiting the
-    // bridge cancel. The cancel propagates asynchronously — the
-    // SDK may still emit a few tokens or a tool_call before it
-    // notices CancelledError. Setting this flag now means
-    // ``nora_event`` drops those latents instead of appending them
-    // to the transcript after the researcher hit Stop.
-    if (currentCwd) cancelledCwds.add(currentCwd);
+    // Mark this turn's events as suppressed BEFORE awaiting the
+    // bridge cancel. Two ids go into ``cancelledTurnIds``, belt and
+    // suspenders:
+    //   1. ``activeLiveTurn?.id`` — the id we captured when the send
+    //      Promise resolved. Available unless Stop fires in the
+    //      tiny window between Send and the await returning.
+    //   2. The id the bridge returns from ``interrupt_turn``. The
+    //      bridge knows which turn it just cancelled and surfaces
+    //      the id explicitly. Covers the race above.
+    // Either path alone would usually be enough; together they
+    // guarantee the JS-side filter has the cancelled id no matter
+    // when Stop fires relative to the send Promise.
+    if (activeLiveTurn) markTurnCancelled(activeLiveTurn.id);
     // The terminal turn_error that the runner emits is now also
     // dropped (see ``nora_event`` for why), so handle the activeLiveTurn
     // cleanup the terminal handler used to do. If the cancelled
@@ -1907,7 +1951,13 @@ if (stopBtn) {
     // the cancellation cleanup and assume "Stop did nothing".
     toast('Stopping…', 'info');
     try {
-      await window.pywebview.api.interrupt_turn();
+      const res = await window.pywebview.api.interrupt_turn();
+      // Belt-and-suspenders: if the bridge tells us which turn id
+      // it cancelled, add that to the drop set too. Covers the
+      // case where ``activeLiveTurn`` was null at click time
+      // (e.g., Stop fired between fireQueuedMessage clearing the
+      // turn and the next message starting).
+      if (res && res.turn_id) markTurnCancelled(res.turn_id);
     } catch (_) {
       // swallow: the bridge may have nothing to cancel; we still
       // want to clear the UI state below.
@@ -1933,26 +1983,25 @@ window.nora_event = function (evt) {
   const evtCwd = evt.session_cwd;
   const isFocused = !evtCwd || (currentCwd && evtCwd === currentCwd);
 
-  // Drop in-flight content for a session the researcher just stopped.
+  // Drop late events from any turn the researcher cancelled.
   //
-  // Why ALL events drop, not "all except the terminal": cancellation
-  // is async at multiple levels — the asyncio task gets a cancel
-  // signal, the provider stream still has buffered tokens, and
-  // pywebview's evaluate_js queue has a tail of events from before
-  // the cancel. Earlier behavior was "let the terminal pass to
-  // signal the stop," but events still in those buffers arrived
-  // AFTER the terminal landed, the flag got cleared on the
-  // terminal, and those late events then rendered — exactly the
-  // "I see cancelled but the query keeps emitting answer" report.
+  // Why drop ALL events from the cancelled turn (not "all except the
+  // terminal"): cancellation is async at multiple levels — the
+  // asyncio task gets a cancel signal, the provider stream still
+  // has buffered tokens, and pywebview's evaluate_js queue has a
+  // tail of events from before the cancel. Earlier behavior keyed
+  // suppression on the cwd, then cleared it the moment a new
+  // message started — late events from the previous turn then
+  // slipped through and rendered after the new turn began. The
+  // turn-id key fixes that: each turn has a unique id, the
+  // cancelled set is never cleared by Send, and a new turn's
+  // events naturally pass because they carry a fresh id.
   //
-  // The cancel-side UI is already complete without the terminal:
-  // ``setSending(false)`` runs in Stop's own click handler (clears
-  // the cat + restores Send), and ``drainPendingFor`` empties the
-  // queued-message list. Letting the explicit "cancelled" error
-  // bubble through wasn't load-bearing — researchers know what
-  // they pressed. So drop everything until the next user send for
-  // this session clears the flag.
-  if (evtCwd && cancelledCwds.has(evtCwd)) {
+  // The backend dispatcher (``_dispatch_event`` in ui.py) applies
+  // the same drop authoritatively — this filter is best-effort
+  // defense in depth. If both layers ever disagree, the backend
+  // wins (events that don't reach JS were never persisted).
+  if (evt.turn_id && cancelledTurnIds.has(evt.turn_id)) {
     return;
   }
 
@@ -2794,6 +2843,12 @@ const SCROLL_TO_BOTTOM_THRESHOLD = 100;
 
 function updateScrollToBottomVisibility() {
   if (!scrollToBottomBtn || !messagesEl) return;
+  // Welcome screen has no transcript to scroll through, so the
+  // button would just be visual noise above the composer.
+  if (messagesEl.classList.contains('welcome-only')) {
+    scrollToBottomBtn.classList.add('hidden');
+    return;
+  }
   const distanceFromBottom = (
     messagesEl.scrollHeight - messagesEl.scrollTop - messagesEl.clientHeight
   );
@@ -2829,6 +2884,7 @@ if (scrollToBottomBtn) {
 function setWelcomeOnlyMode(enabled) {
   if (!messagesEl) return;
   messagesEl.classList.toggle('welcome-only', !!enabled);
+  updateScrollToBottomVisibility();
 }
 
 // ----- policy chip + popup (next to composer) ----------------------------
@@ -2854,14 +2910,16 @@ function updateContextChip(occupiedTokens) {
    *
    * Display:
    *   - When pendingDelta == 0:  ``Context 47k / 200k (24%)``
-   *   - When pendingDelta  > 0:  ``Context 47k → ~52k / 200k (26%)``
+   *   - When pendingDelta  > 0:  ``Context ~52k / 200k (26%)``
    *
-   * Why both: the last measurement tells the researcher what's
-   * already on the wire; the next-request estimate tells them what
-   * the next provider call will cost before it lands. They diverge
-   * any time a message has been submitted (typed + Send, or queued
-   * behind an in-flight turn) but turn_done hasn't yet acknowledged
-   * it. The chip is honest about which is which. */
+   * The single-number form replaces an earlier "47k → ~52k" arrow
+   * that researchers found confusing — the two numbers usually
+   * differ by < 1% (chars/4 estimate of a single typed message),
+   * so the arrow added visual noise without much information. The
+   * ``~`` prefix is the kept signal: it means "this is a projected
+   * weight that includes pending unsent messages, not the last
+   * provider-measured value". The tooltip below carries the full
+   * breakdown for anyone who wants it. */
   if (!contextChip) return;
   if (typeof occupiedTokens !== 'number' || occupiedTokens < 0) return;
   lastOccupiedTokens = occupiedTokens;
@@ -2897,8 +2955,11 @@ function updateContextChip(occupiedTokens) {
   // after the over-the-window measurement comes back.
   const rawPct = Math.round((projected / contextWindow) * 100);
   if (pendingDelta > 0) {
+    // Single projected number with a leading ``~`` so researchers
+    // know it's an estimate that folds in unsent messages. Tooltip
+    // still spells out both the last-measured and projected values.
     contextChip.textContent =
-      `Context ${fmt(occupiedTokens)} → ~${fmt(projected)} / ${ceilingLabel} (${rawPct}%)`;
+      `Context ~${fmt(projected)} / ${ceilingLabel} (${rawPct}%)`;
     contextChip.title =
       `Last measured by provider: ${occupiedTokens.toLocaleString()} tokens.\n` +
       `Estimated for next request: ~${projected.toLocaleString()} tokens ` +

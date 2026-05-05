@@ -45,7 +45,12 @@ from nora.provider.base import (
     TurnDone,
     TurnError,
 )
-from nora.tools import ALLOWED_TOOL_NAMES, SERVER_NAME, build_server
+from nora.tools import (
+    ALLOWED_TOOL_NAMES,
+    SERVER_NAME,
+    build_server,
+    friendly_tool_names,
+)
 
 
 PROVIDER_ID = "anthropic"
@@ -55,6 +60,56 @@ PROVIDER_ID = "anthropic"
 # auth / billing trouble. Kept verbatim from the original app.py.
 _AUTH_FAILURE = "authentication_failed"
 _BILLING_FAILURE = "billing_error"
+
+
+# Per-turn style rider, appended to every user message right before
+# the SDK forwards it to Claude. Sits adjacent to the generation
+# cursor, where Anthropic's published prompting guidance says recent
+# tokens carry the most weight. The same rules in the system prompt
+# (line ~39 of system_prompt.py) are diluted across ~14k cached
+# tokens of tool documentation, and Claude (notably Opus) ignores
+# them in practice. GPT-5.5 honors the system-prompt-only version
+# fine on the OpenAI path, so this rider is intentionally
+# Anthropic-only.
+#
+# Cost accounting. Adds ~70 uncached tokens per user turn. The
+# 14k-token cached prefix (system prompt + tool schemas) stays
+# untouched, so the cache-discount path is preserved.
+#
+# Style: bracketed framing so the model parses this as instructions
+# rather than continuation of the user's question. No em-dashes
+# in the rider itself (lead by example).
+#
+# Opt out for A/B testing: set ``NORA_DISABLE_STYLE_RIDER=1``.
+_STYLE_RIDER = (
+    "\n\n[Reply formatting reminder. These rules bind the response "
+    "you are about to produce. Hold them through every paragraph, "
+    "not just the opening.\n"
+    "1. No em-dashes (—) or en-dashes (–). Use periods, semicolons, "
+    "commas, parentheses, or colons.\n"
+    "2. One idea per sentence. Split long compound sentences.\n"
+    "3. Open with the analytic point. No preamble, no restating the "
+    "question, no meta-commentary on what the table shows.\n"
+    "4. Reader is an applied-stats colleague. Be concise.]"
+)
+
+
+def _wrap_with_style_rider(prompt: str) -> str:
+    """Append the per-turn style rider to a user prompt.
+
+    Returns ``prompt`` unchanged if the rider is disabled via env, if
+    the prompt is empty (no message to attach to), or if the prompt
+    already contains the rider (defensive: prevents accidental
+    double-application by upstream callers that wrap the prompt
+    themselves).
+    """
+    if not prompt:
+        return prompt
+    if os.environ.get("NORA_DISABLE_STYLE_RIDER") == "1":
+        return prompt
+    if "[Reply formatting reminder" in prompt:
+        return prompt
+    return prompt + _STYLE_RIDER
 
 
 # Every SDK built-in we know of. ``can_use_tool`` catches anything the
@@ -192,23 +247,27 @@ async def _gate_tool_use(
 ) -> PermissionResultAllow | PermissionResultDeny:
     """Catch-all permission hook.
 
-    Allow only the six Nora MCP tools by name. Anything else (a future
+    Allow only the Nora MCP tools by name. Anything else (a future
     SDK built-in, an alias, a sub-tool the disallowed list misses)
     gets a denial that names the legitimate alternatives so the model
-    can recover gracefully.
+    can recover gracefully. The list is derived from
+    ``ALLOWED_TOOL_NAMES`` rather than hardcoded — earlier copies of
+    this message drifted (six names vs. thirteen), which silently
+    hid new tools like ``list_session_files`` /
+    ``search_in_session_files`` from the model's recovery path.
     """
     del tool_input, ctx  # signature-required, unused
     if tool_name in ALLOWED_TOOL_NAMES:
         return PermissionResultAllow()
+    available = ", ".join(friendly_tool_names(prefixed=False))
     return PermissionResultDeny(
         behavior="deny",
         message=(
             f"Tool '{tool_name}' is not available in Nora. Use one of the "
-            f"six custom tools described in the system prompt "
-            f"(mcp__{SERVER_NAME}__get_schema, request_data, submit_script, "
-            f"expand_result, list_results, recall_conversation). Nora "
-            f"does not expose Bash, Read, Write, Edit, Glob, Grep, or any "
-            f"other general tool."
+            f"{len(ALLOWED_TOOL_NAMES)} custom tools described in the "
+            f"system prompt (all prefixed mcp__{SERVER_NAME}__): "
+            f"{available}. Nora does not expose Bash, Read, Write, "
+            f"Edit, Glob, Grep, or any other general tool."
         ),
         interrupt=False,
     )
@@ -385,11 +444,17 @@ class AnthropicSession:
         client = self._client
         assert client is not None
 
+        # Wrap the user's prompt with the per-turn style rider before
+        # forwarding to the SDK. This puts the formatting rules
+        # adjacent to the generation cursor, where Claude weights
+        # them most. See the ``_STYLE_RIDER`` block for rationale.
+        wrapped_prompt = _wrap_with_style_rider(prompt)
+
         try:
             if images:
-                await client.query(_image_message_iter(prompt, images))
+                await client.query(_image_message_iter(wrapped_prompt, images))
             else:
-                await client.query(prompt)
+                await client.query(wrapped_prompt)
         except Exception as e:  # noqa: BLE001 — SDK may raise various things
             yield TurnError(message=f"failed to send prompt: {e}")
             return

@@ -13,6 +13,13 @@
  * peachy pink rides between them; teal appears only as a secondary
  * accent (cwd pill, info states) so it doesn't fight the pinks. */
 :root {
+  /* Tell WebKit/WKWebView the page uses a light native control
+   * scheme. Without this, native fallbacks (e.g. the scrollbar
+   * gutter that WKWebView sometimes paints despite our CSS rules)
+   * are free to pick a default that doesn't match our palette. The
+   * dark blocks below override this to ``dark`` so native chrome
+   * flips with the rest of the theme. */
+  color-scheme: light;
   --burgundy:      #5d2c3e;   /* deep burgundy — text, code bg */
   --wine:          #8e3a52;   /* wine/mauve — focus, tool-name */
   --mauve:         #a87382;   /* dusty mauve — dim text, border */
@@ -60,6 +67,12 @@
  * both selectors so theme toggle doesn't produce drift. */
 @media (prefers-color-scheme: dark) {
   :root:not([data-theme="light"]) {
+    /* Match the CSS palette switch with the native control scheme so
+     * WKWebView's native scrollbar (used when our ::-webkit-scrollbar
+     * rules don't fully take over) paints with a dark track + gray
+     * thumb instead of the default white track / light thumb that
+     * clashes with the dark code panel. */
+    color-scheme: dark;
     --bg: #1a1416;               /* near-black, faint warm red */
     --bg-surface: #251c1f;       /* warm charcoal — sidebar, cards */
     --bg-user: #4a2e36;           /* deep wine — user bubble, muted */
@@ -77,6 +90,10 @@
 }
 
 :root[data-theme="dark"] {
+  /* See the @media block above — same rationale. Forced-dark via
+   * the topbar toggle also needs the native control scheme to flip,
+   * even when the OS is in light mode. */
+  color-scheme: dark;
   --bg: #1a1416;
   --bg-surface: #251c1f;
   --bg-user: #4a2e36;
@@ -1475,6 +1492,14 @@ kbd {
 
 .message.user .message-body {
   background: var(--bg-user);
+  /* Shrink-wrap the bubble to its text up to 75% of the column.
+   * Without ``width: fit-content`` a short message ("ok", "yes")
+   * paints as a 75%-wide chip with empty bubble area to the left
+   * of the text — and selecting that text shows the highlight
+   * extending into the empty bubble area. fit-content makes the
+   * bubble exactly as wide as the text, so selection ends at the
+   * last glyph on each line. */
+  width: fit-content;
   max-width: 75%;
   /* Text inherits --text. Light-mode bubble is peach with burgundy
    * text (high contrast); dark-mode bubble is deep wine with warm
@@ -1745,27 +1770,33 @@ kbd {
   position: relative;
 }
 
-/* Scrollbar styling on the script-display pre. Two concerns combined:
+/* Scrollbar styling on the script-display pre. Three concerns combined:
  *
  * Scope — ``.tool-code`` only. ``.tool-body`` also contains
  * ``pre.tool-output`` (raw R/Stata stdout, ``background: var(--bg)``);
- * painting code-bg-toned scrollbars onto that surface would put a
- * dark code-colored rail/corner on a light output panel. .tool-output
+ * painting tool-card-toned scrollbars onto that surface would put a
+ * card-colored rail on a different-toned output panel. .tool-output
  * is left to inherit the theme-aware global ``.messages *::-webkit-
  * scrollbar-thumb`` rules below — those use translucent burgundy
  * (light) and translucent cream (dark), matching --bg naturally.
  *
- * Colors — relearned the hard way through several iterations:
- *   1. ``background: transparent`` on track/corner does NOT
- *      suppress the gutter in WKWebView when macOS is set to
- *      "Always show scrollbars". WebKit paints a default white
- *      fill under the transparent — visible as a wide white bar.
- *      Set track + corner to ``var(--code-bg)`` so the gutter
- *      blends into the dark code surface.
- *   2. ``--pink-light`` (#f5c6d3) reads as near-white on the dark
- *      code-bg. Use ``--pink`` (#ee8ba9) for the thumb — distinctly
- *      pink, doesn't disappear in light mode. ``--accent`` on hover
- *      gives a clear theme-aware affordance (teal / pink switch).
+ * Track color — ``var(--bg-tool)`` (the wrapping .tool-card surface)
+ * rather than ``var(--code-bg)``. The rail then visually merges with
+ * the card around the code panel and the gutter "disappears" into
+ * the card edge instead of reading as a colored strip on the dark
+ * code surface. ``transparent`` is intentionally avoided here: in
+ * WKWebView with macOS "Always show scrollbars", a transparent
+ * track can fall through to a default light native fill (we have
+ * ``color-scheme: dark`` declared as a backstop, but an explicit
+ * theme color is belt-and-suspenders).
+ *
+ * Thumb — darker fill, brighter outer ring. The fill uses
+ * ``var(--code-bg)`` (the deep code-panel tone) and an inset
+ * ``box-shadow`` paints a 1px ``var(--pink)`` halo around it. We use
+ * ``box-shadow: inset`` rather than ``border`` because a real border
+ * would shrink the thumb's hit area and fight ``background-clip``;
+ * the inset shadow gives the same ring without those side effects.
+ * Hover swaps the ring to ``--accent`` for a theme-aware affordance.
  *
  * Specificity: ``.tool-card .tool-body pre.tool-code`` is (0,3,1),
  * which beats the broader ``.tool-card .tool-body pre`` (0,2,1)
@@ -1773,30 +1804,44 @@ kbd {
  * scrollbar rules (0,1,1 + universal). */
 .tool-card .tool-body pre.tool-code {
   scrollbar-width: thin;
-  scrollbar-color: var(--pink) var(--code-bg);
+  /* Firefox: thumb / track. ``--accent`` flips with the theme tokens
+   * (teal in light, pink in dark) so the thumb stays in-palette in
+   * both modes; the track matches the card surface. We can't paint
+   * the inset ring in Firefox (no equivalent property), so Firefox
+   * gets a solid accent-colored thumb — same intent, less detail. */
+  scrollbar-color: var(--accent) var(--bg-tool);
 }
 
 .tool-card .tool-body pre.tool-code::-webkit-scrollbar {
   height: 8px;
   width: 8px;
-  background: var(--code-bg);
+  background: var(--bg-tool);
 }
 
+/* Thumb: darker inside, brighter outside, both theme-aware. The fill
+ * uses ``--accent-soft`` (blue-gray light / dusty-mauve dark) so it
+ * reads as a soft body, and the inset ring uses ``--accent`` (teal
+ * light / pink dark) for a brighter highlight rim. Both tokens flip
+ * with the rest of the palette, so the thumb tracks the theme in
+ * either mode. ``--pink`` / ``--code-bg`` were swatch references
+ * that didn't flip (loud in dark, off-key in light). */
 .tool-card .tool-body pre.tool-code::-webkit-scrollbar-thumb {
-  background: var(--pink);
+  background: var(--accent-soft);
+  box-shadow: inset 0 0 0 1px var(--accent);
   border-radius: 4px;
 }
 
 .tool-card .tool-body pre.tool-code::-webkit-scrollbar-thumb:hover {
   background: var(--accent);
+  box-shadow: inset 0 0 0 1px var(--accent);
 }
 
 .tool-card .tool-body pre.tool-code::-webkit-scrollbar-track {
-  background: var(--code-bg);
+  background: var(--bg-tool);
 }
 
 .tool-card .tool-body pre.tool-code::-webkit-scrollbar-corner {
-  background: var(--code-bg);
+  background: var(--bg-tool);
 }
 
 .tool-card .tool-label {
@@ -3052,6 +3097,15 @@ kbd {
   margin: 0 0 10px 0;
   padding-left: 0;
   list-style: none;
+  /* Each list item shrinks to its own text (see the li rule below).
+   * Without ``align-items: flex-start`` on the list, every li would
+   * still stretch to the list's content width and a 3-word bullet
+   * sitting next to a 30-word sibling would paint as wide as the
+   * sibling on selection. ``display: flex`` here gives us the
+   * per-item shrink-wrap inside the list. */
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
 }
 
 .message.assistant .message-body li {
@@ -3062,10 +3116,17 @@ kbd {
    * clear — leaving thin colored bars on the left of every li
    * after a multi-bullet drag-select. Painting the bullet inside
    * the content box keeps selection inside one rectangle that the
-   * compositor clears uniformly. */
+   * compositor clears uniformly.
+   *
+   * ``width: fit-content; max-width: 100%`` shrinks each li to its
+   * own text width so a short bullet doesn't paint a selection
+   * rectangle as wide as a long sibling. Bounded to the list's
+   * content width so very long single-line items wrap normally. */
   margin: 2px 0;
   padding-left: 1.4em;
   position: relative;
+  width: fit-content;
+  max-width: 100%;
 }
 
 .message.assistant .message-body ul > li::before {
@@ -3384,19 +3445,29 @@ kbd {
   height: 10px;   /* horizontal scrollbar (e.g. wide tables) gets the same treatment */
 }
 
+/* Was ``transparent`` everywhere — but in WKWebView a transparent
+ * track can fall through to the browser's default native fill, which
+ * paints white in dark mode (the bug researchers hit on the
+ * .tool-code code pane once it overflowed). Painting an explicit
+ * themed color closes that hole. We use each container's own bg so
+ * the rail blends in: messages sit on --bg, the sidebar sits on
+ * --bg-surface. */
 .messages::-webkit-scrollbar-track,
-.sidebar-list::-webkit-scrollbar-track,
 .messages *::-webkit-scrollbar-track {
-  background: transparent;
+  background: var(--bg);
+}
+
+.sidebar-list::-webkit-scrollbar-track {
+  background: var(--bg-surface);
 }
 
 .messages::-webkit-scrollbar-corner,
-.sidebar-list::-webkit-scrollbar-corner,
 .messages *::-webkit-scrollbar-corner {
-  /* WebKit draws a square at the intersection of horizontal +
-   * vertical scrollbars in default chrome (white in dark mode).
-   * Match the surrounding bg so it doesn't pop. */
-  background: transparent;
+  background: var(--bg);
+}
+
+.sidebar-list::-webkit-scrollbar-corner {
+  background: var(--bg-surface);
 }
 
 /* Default (light) scrollbar — burgundy at enough opacity to stay
@@ -3572,3 +3643,4 @@ kbd {
   text-decoration: none;
   opacity: 0.9;
 }
+
