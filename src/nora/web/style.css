@@ -2423,6 +2423,192 @@ kbd {
  * receipt — visually comparable to an image thumbnail attached to
  * the same bubble (researcher feedback: "I cannot see if it
  * traveled with the next chat or not, like image"). */
+/* Per-bubble actions row (copy, in the future: edit / rerun).
+ *
+ * Hides by default and reveals on bubble hover so the chat doesn't
+ * carry visual clutter when the researcher is reading. ``opacity``
+ * drives the transition rather than ``display`` so the button keeps
+ * its layout box and the copy / paste keyboard shortcut path can
+ * still resolve focus to it via tab navigation.
+ *
+ * Touch / no-hover devices keep the actions visible — a trackpad
+ * researcher hovers; an iPad-only researcher can't, so the row
+ * unhides via the ``@media (hover: none)`` rule below. The actions
+ * stay outside the bubble (sit beside it) so they don't push the
+ * text reflow on hover. */
+.message-actions {
+  display: flex;
+  gap: 4px;
+  align-items: center;
+  margin-top: 2px;
+  opacity: 0;
+  transition: opacity 0.12s ease-out;
+  pointer-events: none;
+}
+
+.message:hover .message-actions,
+.message-actions:focus-within {
+  opacity: 1;
+  pointer-events: auto;
+}
+
+@media (hover: none) {
+  .message-actions {
+    opacity: 0.65;
+    pointer-events: auto;
+  }
+}
+
+/* User bubbles right-align; their action row should follow. */
+.message.user .message-actions {
+  justify-content: flex-end;
+}
+
+.message.assistant .message-actions {
+  justify-content: flex-start;
+  /* The assistant bubble has no left padding (sits flush with the
+   * column edge), so align the action row to the same edge. */
+  padding-left: 0;
+}
+
+.message-action-btn {
+  /* Frame-less icon — just the glyph floats next to the bubble. No
+   * border / no background, so it reads as an inline action affordance
+   * the way GitHub / Linear / Slack render their per-message copy
+   * icons. The bubble itself is the visual container; a second box
+   * around the icon would compete with it.
+   *
+   * ``currentColor`` on the SVG stroke means the icon inherits this
+   * button's ``color``, so dark / light mode each pick the right
+   * ink without per-mode rules. */
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 22px;
+  height: 22px;
+  padding: 0;
+  border: none;
+  background: transparent;
+  color: var(--text-dim);
+  cursor: pointer;
+  border-radius: 4px;
+  transition: color 0.12s, transform 0.12s;
+}
+
+.message-action-btn:hover,
+.message-action-btn:focus-visible {
+  /* Hover lifts to the theme's primary text color. Subtle scale so
+   * the affordance is felt without a box appearing under it. */
+  color: var(--text);
+  transform: scale(1.08);
+  outline: none;
+}
+
+/* "Copied" confirmation — pulse to the theme's highlight color so
+ * the receipt stays inside the existing palette (teal in light mode,
+ * pink in dark mode) rather than introducing a green that doesn't
+ * appear anywhere else in the UI. The icon swap (copy → checkmark)
+ * is the primary signal; the color change reinforces it. */
+.message-action-btn.copied {
+  color: var(--accent);
+}
+
+/* Inline edit mode on a user bubble. The bubble's body is replaced
+ * with a textarea + Run / Cancel; the wrapper keeps the same
+ * right-aligned layout, image row above and attachments row below
+ * (if any) sit untouched. The textarea picks up the bubble's pink
+ * fill so the edit mode reads as a continuation of the bubble,
+ * not a separate input form. */
+.message-edit-mode {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  width: 100%;
+  /* Force a sensible minimum width so a short edited message
+   * doesn't shrink the editor to a chip. ``.message.user`` is a
+   * flex column with ``align-items: flex-end``; align-self keeps
+   * the editor on the right edge. */
+  min-width: 320px;
+  max-width: 75%;
+  align-self: flex-end;
+}
+
+.message-edit-textarea {
+  width: 100%;
+  padding: 10px 14px;
+  border-radius: var(--radius);
+  border: 1px solid var(--accent);
+  background: var(--bg-user);
+  color: var(--text);
+  font-family: inherit;
+  font-size: inherit;
+  line-height: 1.6;
+  resize: vertical;
+  min-height: 60px;
+  outline: none;
+  /* Subtle accent ring so an active editor is unambiguous when
+   * there are static bubbles around it. */
+  box-shadow: 0 0 0 2px var(--accent-soft, rgba(214, 99, 122, 0.18));
+}
+
+.message-edit-textarea:focus {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px var(--accent-soft, rgba(214, 99, 122, 0.28));
+}
+
+.message-edit-buttons {
+  display: flex;
+  gap: 8px;
+  justify-content: flex-end;
+}
+
+.message-edit-btn-cancel,
+.message-edit-btn-run {
+  padding: 6px 14px;
+  border-radius: 8px;
+  font-family: inherit;
+  font-size: 13px;
+  font-weight: 500;
+  cursor: pointer;
+  transition: background 0.12s, color 0.12s, border-color 0.12s,
+              transform 0.12s, box-shadow 0.12s;
+}
+
+.message-edit-btn-cancel {
+  background: transparent;
+  color: var(--text-dim);
+  border: 1px solid var(--border);
+}
+
+.message-edit-btn-cancel:hover:not(:disabled) {
+  color: var(--text);
+  border-color: var(--text-dim);
+}
+
+.message-edit-btn-run {
+  background: var(--accent);
+  color: var(--bg);
+  border: 1px solid var(--accent);
+}
+
+.message-edit-btn-run:hover:not(:disabled) {
+  transform: translateY(-1px);
+  box-shadow: 0 2px 6px rgba(0, 0, 0, 0.12);
+}
+
+.message-edit-btn-cancel:disabled,
+.message-edit-btn-run:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+/* Hide the per-bubble actions row while THIS bubble is in edit
+ * mode — the textarea has its own Run / Cancel; a hovering copy
+ * icon over an active editor would just be visual noise. */
+.message.editing .message-actions {
+  display: none;
+}
+
 .message-attachments {
   display: flex;
   flex-wrap: wrap;

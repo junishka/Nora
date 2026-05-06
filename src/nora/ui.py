@@ -1288,6 +1288,19 @@ class NoraBridge:
             text = target.read_text(encoding="utf-8", errors="replace")
         except OSError as e:
             return {"ok": False, "reason": f"read failed: {e}"}
+        # Strip the executor's bootstrap (adopath / sys.path insert /
+        # cd) before handing the script to the clipboard. The
+        # preamble depends on ``NORA_LIB_DIR`` / ``NORA_CWD`` and a
+        # run-dir-specific ``sys.path`` entry — outside Nora those
+        # references don't resolve, and the stated purpose of this
+        # button ("grab the script and use it in Stata/RStudio") is
+        # only well-served if what lands on the clipboard is the
+        # researcher's code, not Nora's plumbing. Detection is by
+        # the unique separator line the executor writes
+        # (``executor._write_script``); files that don't have it
+        # (R scripts, researcher-uploaded scripts) pass through
+        # unchanged.
+        text = _strip_executor_preamble(text)
         return {
             "ok": True,
             "name": target.name,
@@ -2460,6 +2473,131 @@ class NoraBridge:
             # include this event.
             pass
 
+    def rewind_to(self, turn_index: int) -> dict[str, Any]:
+        """Truncate this session's chat history at the ``turn_index``-th
+        user message, hide every result row no longer referenced in
+        the kept prefix, clear pending attachments, and drop the
+        provider session — but do NOT send a new message.
+
+        After this returns ok, the JS side calls ``get_chat_history()``
+        to re-render the trimmed transcript and then ``send_message``
+        as usual to fire the revised turn. Splitting the operation in
+        two avoids a double-render race: if the bridge fired the new
+        send itself, the live ``user_message`` event would land
+        alongside the same record JS just pulled out of the truncated
+        history.
+
+        Returns ``{ok, truncated_from_index, hidden_count}`` on
+        success. Refused (``ok=false``) when:
+          - no active session,
+          - the active runner is busy (researcher must Stop first),
+          - ``turn_index`` is out of range,
+          - the chat-history file can't be read or written.
+
+        Stored result rows from the dropped branch stay in SQLite
+        for audit but are stamped with ``hidden_at`` so the warm-
+        start prefix, ``list_results`` / ``list_results_global``
+        tools, and ``expand_result`` no longer surface them to the
+        model.
+
+        Crash safety: SQL hide commits before file truncate. If the
+        process dies between, history still references hidden rows
+        but ``expand_result`` returns ``not_found`` — the model
+        handles that gracefully on retry. The reverse order would
+        leave model-visible rows that the audit position no longer
+        points to.
+        """
+        runner = self._active_runner()
+        if runner is None or self.cwd is None:
+            return {"ok": False, "reason": "no active session"}
+        if runner.is_busy():
+            return {
+                "ok": False,
+                "reason": (
+                    "a turn is still running on this session — stop "
+                    "it first, then try the edit again"
+                ),
+            }
+        if not isinstance(turn_index, int) or turn_index < 0:
+            return {
+                "ok": False,
+                "reason": f"turn_index must be a non-negative int, got {turn_index!r}",
+            }
+
+        history_path = self.cwd / ".nora" / "chat_history.jsonl"
+        if not history_path.exists():
+            return {
+                "ok": False,
+                "reason": "no chat history to rewind",
+            }
+
+        # 1. Locate the byte offset of the N-th user_message. Binary
+        # mode so the offset matches what we'll truncate at — text-
+        # mode reads on a UTF-8 file with non-ASCII user messages
+        # would mis-account for multi-byte characters and produce a
+        # corrupt file on truncate.
+        offset = _find_user_message_offset(history_path, turn_index)
+        if offset is None:
+            return {
+                "ok": False,
+                "reason": f"no user message at index {turn_index}",
+            }
+
+        # 2. Collect every ``result_id`` referenced in the kept
+        # prefix. Everything not in this set will be hidden.
+        kept_ids = _result_ids_in_history_prefix(history_path, offset)
+
+        # 3. SQL hide first (crash safety — see docstring).
+        # ``get_store`` is imported locally to match the pattern used
+        # elsewhere in this module (``_build_context_prefix``,
+        # ``close_store``); the store package isn't pulled into module
+        # scope because most ui.py methods don't touch it, and a top-
+        # level import would resurrect a circular-import risk that
+        # the local-import pattern was set up to avoid.
+        try:
+            from nora.store import get_store
+            store = get_store(self.cwd)
+            hidden_count = store.hide_results_not_in(kept_ids, reason="rewind")
+        except Exception as e:  # noqa: BLE001 — surface store errors to JS
+            return {
+                "ok": False,
+                "reason": f"could not update result store: {e}",
+            }
+
+        # 4. Truncate the chat-history file at the offset.
+        try:
+            _truncate_at_offset(history_path, offset)
+        except OSError as e:
+            return {
+                "ok": False,
+                "reason": f"could not truncate chat history: {e}",
+            }
+
+        # 5. Clear runner pending state. Anything queued for the
+        # original next turn is no longer relevant — the rewind
+        # creates a new branch.
+        runner.clear_pending_attachments()
+
+        # 6. Drop the provider session so the next ``send_message``
+        # opens a fresh one against the truncated history; flag
+        # ``needs_context_prefix`` so the warm-start replay rebuilds
+        # the model's view from what's left in chat_history.jsonl.
+        if self._loop is not None:
+            try:
+                fut = asyncio.run_coroutine_threadsafe(
+                    runner.close(), self._loop,
+                )
+                fut.result(timeout=5.0)
+            except Exception:  # noqa: BLE001 — close errors aren't fatal here
+                pass
+        runner.needs_context_prefix = True
+
+        return {
+            "ok": True,
+            "truncated_from_index": turn_index,
+            "hidden_count": hidden_count,
+        }
+
     def get_chat_history(self) -> dict[str, Any]:
         """Return the persisted chat log for the active session so
         the UI can replay past messages after a session switch.
@@ -2503,6 +2641,109 @@ class NoraBridge:
                 for p in _scan_datasets(self.cwd)
             ],
         }
+
+
+def _find_user_message_offset(
+    history_path: Path, turn_index: int,
+) -> int | None:
+    """Return the byte offset of the ``turn_index``-th ``user_message``
+    line in ``history_path``, or ``None`` if there are fewer
+    user_messages than that.
+
+    Walks the file in binary mode so the returned offset matches what
+    ``os.truncate`` would cut at — even with multi-byte UTF-8 user
+    messages. ``turn_index`` is 0-based; passing ``0`` returns the
+    offset of the very first user message.
+
+    Best-effort on parse errors: a malformed line is treated as "not
+    a user_message" rather than aborting the scan, so a single
+    corrupted record can't make a rewind unreachable.
+    """
+    if turn_index < 0:
+        return None
+    seen = 0
+    offset = 0
+    try:
+        with history_path.open("rb") as f:
+            for raw in f:
+                line_start = offset
+                offset += len(raw)
+                # Strip newline + whitespace before parse. The trailing
+                # ``\n`` byte is included in ``len(raw)`` so ``offset``
+                # correctly points at the START of the next line.
+                stripped = raw.strip()
+                if not stripped:
+                    continue
+                try:
+                    rec = json.loads(stripped)
+                except json.JSONDecodeError:
+                    continue
+                if not isinstance(rec, dict):
+                    continue
+                if rec.get("type") != "user_message":
+                    continue
+                if seen == turn_index:
+                    return line_start
+                seen += 1
+    except OSError:
+        return None
+    return None
+
+
+def _result_ids_in_history_prefix(
+    history_path: Path, offset: int,
+) -> set[str]:
+    """Collect every ``result_id`` referenced in the chat-history
+    bytes BEFORE ``offset``.
+
+    The kept prefix is what survives a rewind; this set is the model-
+    visible result_ids the rewind must preserve. Everything not in
+    this set gets hidden from the store on the rewind path.
+
+    Reads tool_result events (the canonical site for result_ids,
+    via :func:`nora.chat_history._extract_result_ids`). Tool_call
+    audit events that pre-quote an id in their input are not a
+    primary source — the matching tool_result will carry the same
+    id when present — but we tolerate them defensively.
+    """
+    from nora.chat_history import _extract_result_ids
+
+    kept: set[str] = set()
+    if offset <= 0:
+        return kept
+    try:
+        with history_path.open("rb") as f:
+            chunk = f.read(offset)
+    except OSError:
+        return kept
+    for raw in chunk.splitlines():
+        stripped = raw.strip()
+        if not stripped:
+            continue
+        try:
+            rec = json.loads(stripped)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(rec, dict):
+            continue
+        if rec.get("type") == "tool_result":
+            for rid in _extract_result_ids(rec.get("text", "") or ""):
+                kept.add(rid)
+    return kept
+
+
+def _truncate_at_offset(history_path: Path, offset: int) -> None:
+    """Truncate ``history_path`` to exactly ``offset`` bytes.
+
+    Wraps ``os.truncate`` so the caller doesn't have to manage a file
+    handle. The offset must come from
+    :func:`_find_user_message_offset` so it lands at a record
+    boundary; truncating mid-line would leave a malformed JSONL line
+    that the next ``read_turns`` would skip with a parse error
+    (recoverable, but we'd rather not).
+    """
+    import os
+    os.truncate(str(history_path), offset)
 
 
 def _build_context_prefix(cwd: Path | None) -> str:
@@ -2574,6 +2815,51 @@ def _classify_kind(ext: str) -> str:
     if ext in (".log", ".smcl"):
         return "log"
     return "data"
+
+
+# Exact marker lines the executor writes between its bootstrap and
+# the researcher's code (see ``executor._write_script``). Stata uses
+# ``*!`` and Python uses ``#`` as the comment prefix; both are
+# anchored to start-of-line and verbose enough that no researcher
+# would write either form by accident.
+_EXECUTOR_PREAMBLE_MARKERS = (
+    "*! ----- Nora preamble above; researcher code below -----",
+    "# ----- Nora preamble above; researcher code below -----",
+)
+
+
+def _strip_executor_preamble(text: str) -> str:
+    """Drop the executor's bootstrap from a Stata / Python ``script.do``
+    or ``script.py`` so the body the researcher gets on their
+    clipboard is portable.
+
+    The on-disk script that the runner executes opens with
+    ``adopath +`` / ``cd`` (Stata) or a ``sys.path.insert`` (Python)
+    that resolves against the run dir's ``lib/`` and the per-session
+    ``NORA_CWD`` / ``NORA_LIB_DIR`` env vars. Outside Nora those names
+    don't exist, so a copied raw file fails on the first line. The
+    stated purpose of the Files-panel "copy" button is "grab the
+    script and use it in Stata/RStudio," which only works if the
+    bootstrap is gone.
+
+    Detection is by the exact marker line the executor writes between
+    bootstrap and user code, anchored to the start of a line. If
+    none of the markers match (R scripts have no preamble;
+    researcher-uploaded ``.py`` / ``.do`` files won't either), the
+    text is returned unchanged.
+    """
+    lines = text.split("\n")
+    for i, line in enumerate(lines):
+        if line in _EXECUTOR_PREAMBLE_MARKERS:
+            # Drop everything up through this marker line, plus a
+            # single trailing blank that the executor pads in for
+            # readability. ``"\n".join`` reconstructs the rest with
+            # original line endings preserved.
+            rest = lines[i + 1:]
+            if rest and rest[0] == "":
+                rest = rest[1:]
+            return "\n".join(rest)
+    return text
 
 
 def _attach_as_announcement(

@@ -928,76 +928,35 @@ async def request_data(args: dict[str, Any]) -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 # Tool: submit_script
 # ---------------------------------------------------------------------------
+#
+# ``submit_script`` is a pipeline. The body below is a thin coordinator
+# over five helpers, each handling one phase. The split mirrors the
+# data flow: execute → resolve SDC + source-row count → sanitize +
+# store → build the base envelope → attach status / debug / plot
+# metadata. Same observable behaviour as the prior single-function
+# implementation; the helpers exist to make each phase readable and
+# testable in isolation.
 
-@tool(
-    "submit_script",
-    (
-        "Run an R, Stata, or Python analysis script against the researcher's "
-        "data. The script must emit structured results via the nora runtime "
-        "library (nora$result(...) / nora$from_* in R, nora_result_* in "
-        "Stata, nora.result(...) / nora.from_* in Python). Raw stdout/stderr "
-        "is shown to the researcher in their TUI but is not returned to you "
-        "; you receive only sanitized structured payloads.\n\n"
-        "A script can call helpers more than once; each call appends a "
-        "payload that comes back to you. The response carries a ``results`` "
-        "list (one entry per helper call, in emission order, each with its "
-        "own ``result_id``, ``label``, ``analysis_type``, and ``summary``) "
-        "plus a shared ``script_run_id`` so the group can be retrieved "
-        "together for audit. For parameterized batches (the same model "
-        "across N specifications, subgroups, outcomes, or sensitivity "
-        "perturbations), use ONE looping script over N separate scripts "
-        "to avoid repeated data preparation and a fragmented audit. If "
-        "the script aborts mid-loop, status becomes "
-        "``execution_failed_partial`` and the helpers that emitted "
-        "before the abort are returned in ``results`` alongside a "
-        "``debug_excerpt`` of the abort cause.\n\n"
-        "Arguments:\n"
-        "  language: 'R', 'Stata', or 'Python'.\n"
-        "  code: the full script source as a single string.\n"
-        "  label: short description of what the script is doing (e.g., "
-        "'OLS of outcome on predictors'). Used as the fallback row label "
-        "for any helper call that didn't pass its own label(\"...\").\n"
-        "  source_dataset: path (relative to cwd) of the dataset the "
-        "script reads. When set, Nora compares each analysis's "
-        "effective N to the dataset's row count and flags silent "
-        "filtering (NA-drops, subset conditions, listwise deletion) "
-        "in the transformations log. PASS THIS whenever the script "
-        "reads a known file. This is how researchers catch analyses "
-        "that quietly ran on a subset. Empty string is fine if the "
-        "script generates its own data or touches multiple files."
-    ),
-    {"language": str, "code": str, "label": str, "source_dataset": str},
-)
-async def submit_script(args: dict[str, Any]) -> dict[str, Any]:
-    """Run an R / Stata script end-to-end: execute → sanitize → store.
 
-    The researcher's raw stdout / stderr is captured and stashed on the
-    stored row (available via expand_result). Claude only ever sees the
-    sanitizer's output — never the raw log.
+async def _execute_script_for_submit(
+    language: str, code: str, cwd: Path,
+) -> tuple[Any, dict[str, Any] | None]:
+    """Run the executor in a worker thread, with cancellation handling.
+
+    Returns ``(exec_result, None)`` on completion, or
+    ``(exec_result, early_payload)`` when the turn was cancelled
+    mid-run — the caller short-circuits with ``early_payload`` and
+    skips sanitize / store / response assembly. ``CancelledError`` is
+    re-raised so the runner's outer cancel branch handles teardown.
     """
-    language = args.get("language", "")
-    code = args.get("code", "")
-    label = args.get("label", "(unlabeled)")
-    source_dataset = args.get("source_dataset", "") or ""
+    import asyncio as _asyncio
+    from nora.runtime.turn_context import (
+        is_current_turn_cancelled,
+        register_turn_process,
+    )
 
-    if language not in {"R", "Stata", "Python"}:
-        return _as_mcp_text({
-            "status": "error",
-            "reason": (
-                f"unsupported language: {language!r}. Nora runs R "
-                f"(via Rscript), Stata, and Python (3.x with pandas)."
-            ),
-        })
-    if not code.strip():
-        return _as_mcp_text({
-            "status": "error",
-            "reason": "code argument is empty",
-        })
-
-    # --- Execution ---------------------------------------------------------
-    cwd = get_cwd()
-    # Run the executor in a worker thread (it uses synchronous Popen)
-    # while registering the spawned process into the runner's per-turn
+    # Run the executor (synchronous Popen) in a worker thread while
+    # registering the spawned process into the runner's per-turn
     # registry. If Stop fires mid-run, the runner has already marked
     # the turn cancelled and either:
     #   (a) ``register_turn_process`` saw the cancel flag and killed
@@ -1009,36 +968,22 @@ async def submit_script(args: dict[str, Any]) -> dict[str, Any]:
     #       lock and killed the proc.
     # Either way the subprocess actually halts when Stop fires; "Stop"
     # never feels like a no-op the way it did with the prior pattern.
-    import asyncio as _asyncio
-    import subprocess as _subprocess
-    from nora.runtime.turn_context import (
-        is_current_turn_cancelled,
-        register_turn_process,
+    exec_result = await _asyncio.to_thread(
+        executor.run_script,
+        language, code, cwd,
+        proc_register=register_turn_process,
     )
 
-    try:
-        exec_result = await _asyncio.to_thread(
-            executor.run_script,
-            language, code, cwd,
-            proc_register=register_turn_process,
-        )
-    except _asyncio.CancelledError:
-        # The runner's ``cancel_turn`` already killed any registered
-        # subprocess synchronously before scheduling the asyncio
-        # cancel that lands here. Nothing to clean up at this layer;
-        # propagate so the runner's outer cancel branch runs.
-        raise
-
-    # Drop the result entirely if the turn was cancelled while the
-    # subprocess was still running. The Popen finished naturally (or
-    # got killed) and we now hold an ExecutionResult, but persisting
-    # it as a chat-visible result would surface a tool answer for a
-    # turn the researcher cancelled — exactly the leak the new turn
-    # identity contract is designed to prevent. The raw run_dir
-    # stays on disk for debugging; we just don't sanitize, store,
-    # or return a structured payload.
     if is_current_turn_cancelled():
-        return _as_mcp_text({
+        # Drop the result entirely if the turn was cancelled while the
+        # subprocess was still running. The Popen finished naturally
+        # (or got killed) and we now hold an ExecutionResult, but
+        # persisting it as a chat-visible result would surface a tool
+        # answer for a turn the researcher cancelled — exactly the
+        # leak the turn-identity contract is designed to prevent. The
+        # raw run_dir stays on disk for debugging; we just don't
+        # sanitize, store, or return a structured payload.
+        early = {
             "status": "cancelled",
             "reason": (
                 "turn was cancelled while the script was running; "
@@ -1046,19 +991,27 @@ async def submit_script(args: dict[str, Any]) -> dict[str, Any]:
                 "are not surfaced as a result"
             ),
             "run_dir": str(exec_result.run_dir),
-        })
+        }
+        return exec_result, early
+    return exec_result, None
 
-    # The executor returns zero or more raw payloads (JSONL, one per
-    # nora_result_* helper call inside the script). Sanitize each
-    # independently and store one row per payload, all tagged with a
-    # shared script_run_id so the researcher can fetch them as a
-    # group. The same loop runs on the success path AND on the
-    # partial-success path (script aborted mid-loop after emitting
-    # some helpers); the difference is the overall envelope status.
-    #
-    # SDC config depends only on source_dataset (a per-call argument),
-    # so resolve it once outside the loop.
+
+def _resolve_sdc_and_source_n(
+    cwd: Path, source_dataset: str | None,
+) -> tuple[sanitizer.SDCConfig, int | None, float]:
+    """Load the dataset's SDC config and count its rows once per call.
+
+    Returns ``(sdc_cfg, source_n, audit_seconds)``. ``source_n`` is
+    used downstream by ``_check_row_count`` to flag silent filtering
+    (NA-drops, subset conditions) and is computed once outside the
+    sanitize loop — the file doesn't change between iterations, and
+    the previous behaviour (re-reading the dataset every iteration)
+    cost ~60 s per loop pass on a 3 GB ``.dta``. Policy-load failures
+    are non-fatal: SDC degrades to ``DEFAULT_CONFIG``.
+    """
     import time as _time
+    from dataclasses import replace
+
     sdc_cfg = sanitizer.DEFAULT_CONFIG
     if source_dataset:
         try:
@@ -1069,38 +1022,54 @@ async def submit_script(args: dict[str, Any]) -> dict[str, Any]:
         except Exception:  # noqa: BLE001 — policy load must never block sanitization
             non_disclosive = frozenset()
         if non_disclosive:
-            from dataclasses import replace
             sdc_cfg = replace(
                 sanitizer.DEFAULT_CONFIG,
                 non_disclosive_variables=non_disclosive,
             )
 
-    # Source-dataset row count for the per-payload audit. Compute ONCE
-    # per submit_script call — the file doesn't change between
-    # sanitize iterations. The previous behavior re-read the dataset
-    # on every iteration via _check_row_count, which on a multi-GB
-    # .dta with N emitted results meant N full pyreadstat loads (~60s
-    # each on a 3 GB file). schema.row_count() uses metadata-only
-    # paths where available (.dta / .parquet / line-counted .csv).
     audit_t0 = _time.monotonic()
     source_n = _resolve_source_row_count(source_dataset or None)
-    row_count_audit_seconds = _time.monotonic() - audit_t0
+    audit_seconds = _time.monotonic() - audit_t0
+    return sdc_cfg, source_n, audit_seconds
 
-    # One id per submit_script call; every row produced by this call
-    # is tagged with it so an audit can pull them together.
-    script_run_id = "R-" + secrets.token_hex(4)
 
-    store = get_store(cwd)
+def _sanitize_and_store_payloads(
+    raw_payloads: list[Any],
+    *,
+    cwd: Path,
+    label: str,
+    language: str,
+    code: str,
+    source_dataset: str | None,
+    source_n: int | None,
+    sdc_cfg: sanitizer.SDCConfig,
+    run_dir: Any,
+    script_run_id: str,
+    store: Any,
+) -> tuple[list[dict[str, Any]], bool, float, float]:
+    """Run sanitize + store for each emitted payload.
+
+    Returns ``(results, any_ok, sanitize_seconds, store_seconds)``.
+    ``results`` carries one entry per raw payload, with two shapes:
+    successful entries (``status="ok"``) include the inline compact
+    payload, the markdown table, and the per-result transformations;
+    rejected entries (``status="rejected_by_sanitizer"``) carry the
+    rejection reason and the diagnostic-row id. Both shapes are
+    stored — even rejections keep an audit trail tagged with
+    ``script_run_id``.
+    """
+    import time as _time
+
     results: list[dict[str, Any]] = []
     any_ok = False
-    sanitize_t0 = _time.monotonic()
     sanitize_seconds = 0.0
     store_seconds = 0.0
 
-    for raw_payload in exec_result.result_payloads:
-        # Prefer the per-helper label (each nora_result_* takes its own
-        # label("...") argument and embeds it in the payload). Fall
-        # back to the script-level label when a helper didn't pass one.
+    for raw_payload in raw_payloads:
+        # Prefer the per-helper label (each ``nora_result_*`` takes
+        # its own ``label("...")`` argument and embeds it in the
+        # payload). Fall back to the script-level label when a helper
+        # didn't pass one.
         helper_label = (
             raw_payload.get("label")
             if isinstance(raw_payload, dict) else None
@@ -1125,7 +1094,7 @@ async def submit_script(args: dict[str, Any]) -> dict[str, Any]:
                 language=language,
                 script_code=code,
                 transformations=[],
-                raw_log_path=exec_result.run_dir,
+                raw_log_path=run_dir,
                 script_run_id=script_run_id,
             )
             store_seconds += _time.monotonic() - i0
@@ -1140,8 +1109,8 @@ async def submit_script(args: dict[str, Any]) -> dict[str, Any]:
 
         # Row-count check runs AFTER sanitize (operates on sanitized
         # structure; row counts themselves aren't disclosive). Uses
-        # the ``source_n`` we resolved once above so the per-payload
-        # loop never re-reads the dataset.
+        # the ``source_n`` resolved once by the caller so the
+        # per-payload loop never re-reads the dataset.
         row_count_msg = _check_row_count(
             sanitized.sanitized or {}, source_dataset or None, source_n,
         )
@@ -1157,7 +1126,7 @@ async def submit_script(args: dict[str, Any]) -> dict[str, Any]:
             language=language,
             script_code=code,
             transformations=transformations,
-            raw_log_path=exec_result.run_dir,
+            raw_log_path=run_dir,
             script_run_id=script_run_id,
         )
         store_seconds += _time.monotonic() - i0
@@ -1196,36 +1165,32 @@ async def submit_script(args: dict[str, Any]) -> dict[str, Any]:
             result_entry["markdown"] = md_table
         results.append(result_entry)
 
-    # Decide the envelope status. The decision keys on whether ANY
-    # payload survived sanitization (``any_ok``), not just whether
-    # raw payloads were emitted, because a "partial" envelope that
-    # carries only sanitizer rejections would mislead the model into
-    # treating disclosure rejections as usable partial results.
-    #
-    # Five outcomes; the "all-rejected then aborted" case is the one
-    # that's easy to get wrong:
-    #
-    #   exec ok | raw payloads | any_ok | envelope status
-    #   --------+--------------+--------+-----------------------------
-    #     yes   |    any       |  yes   | "ok"
-    #     yes   |    any       |  no    | "rejected_by_sanitizer"
-    #     no    |    any       |  yes   | "execution_failed_partial"
-    #     no    |    any       |  no    | "execution_failed"  (rejection rows visible in results)
-    #     no    |    none      |   -    | "execution_failed"  (no rows, diag row only)
-    #
-    # "execution_failed_partial" is reserved for partial SUCCESS:
-    # at least one payload made it through SDC despite the abort.
-    # When every emitted payload was rejected AND the script also
-    # aborted, status is "execution_failed" — but the rejection rows
-    # remain in ``results`` so the model still sees the per-payload
-    # reasons alongside the abort context.
-    if exec_result.ok:
-        overall_status = "ok" if any_ok else "rejected_by_sanitizer"
-    else:
-        overall_status = (
-            "execution_failed_partial" if any_ok else "execution_failed"
-        )
+    return results, any_ok, sanitize_seconds, store_seconds
 
+
+def _build_response_envelope(
+    *,
+    overall_status: str,
+    script_run_id: str,
+    results: list[dict[str, Any]],
+    exec_result: Any,
+    language: str,
+    sanitize_seconds: float,
+    store_seconds: float,
+    row_count_audit_seconds: float,
+) -> dict[str, Any]:
+    """Assemble the base response envelope (pre status-specific fields).
+
+    Three things happen here that all mutate the visible response:
+    transformation hoisting (dedupe shared SDC notes across multi-
+    result responses into one envelope-level field), inline-payload
+    trimming (two-stage cap so a wide multi-spec response doesn't
+    blow the tool-result size budget), and phase timings (subprocess
+    vs post-execution audit work, kept under ``_phase_timings`` so
+    the model can read or ignore it). Returned envelope still needs
+    ``_attach_status_metadata`` for hint / debug_excerpt / plots
+    before going on the wire.
+    """
     # Dedupe transformations that repeat across multi-result responses.
     # A 24-spec script typically generates 24 identical SDC entries
     # ("clamped coefficient SEs to 3 sig figs at N=…"); hoisting the
@@ -1248,8 +1213,7 @@ async def submit_script(args: dict[str, Any]) -> dict[str, Any]:
 
     # Envelope-size guard — see ``_trim_oversize_inline_payloads``.
     # Two-stage now: payload-strip at the first threshold, markdown-
-    # summarize at the second. The flags propagate into the response
-    # envelope as ``_inline_payload_omitted`` / ``_inline_markdown_omitted``
+    # summarize at the second. The flags propagate into the envelope
     # so the model knows whether to reach for ``expand_result``.
     trim_flags = _trim_oversize_inline_payloads(results)
     inline_payload_omitted = trim_flags["payload_omitted"]
@@ -1261,8 +1225,7 @@ async def submit_script(args: dict[str, Any]) -> dict[str, Any]:
     # was re-reading a 3 GB .dta on every iteration of the multi-
     # result loop, costing 20+ minutes after Stata had already
     # finished in seconds. ``_phase_timings`` makes that visible
-    # without bloating the default response (the model can read or
-    # ignore it).
+    # without bloating the default response.
     phase_timings = {
         "executor_seconds": round(exec_result.duration_seconds, 3),
         "row_count_audit_seconds": round(row_count_audit_seconds, 3),
@@ -1292,7 +1255,33 @@ async def submit_script(args: dict[str, Any]) -> dict[str, Any]:
         response["_inline_payload_omitted"] = True
     if inline_markdown_omitted:
         response["_inline_markdown_omitted"] = True
+    return response
 
+
+def _attach_status_metadata(
+    response: dict[str, Any],
+    *,
+    overall_status: str,
+    exec_result: Any,
+    language: str,
+    label: str,
+    code: str,
+    script_run_id: str,
+    results: list[dict[str, Any]],
+    store: Any,
+) -> None:
+    """Attach status-specific fields to ``response`` in place.
+
+    Three branches: ``rejected_by_sanitizer`` gets a fix-up hint;
+    ``execution_failed`` and ``execution_failed_partial`` get a
+    debug excerpt + reason + exit code, plus a status-specific
+    hint; the bare ``execution_failed`` branch additionally inserts
+    a diagnostic row tagged with the same ``script_run_id`` so the
+    researcher's audit path always finds the run dir from the store
+    even when ``results`` carries only rejection rows. Plot-helper
+    summary is attached last regardless of status — plots produced
+    on a partial-success run are still useful.
+    """
     if overall_status == "rejected_by_sanitizer":
         response["hint"] = (
             "Every payload this script emitted was rejected by the "
@@ -1383,6 +1372,179 @@ async def submit_script(args: dict[str, Any]) -> dict[str, Any]:
     plot_summary = _summarize_plot_helpers(exec_result.run_dir)
     if plot_summary is not None:
         response["plots"] = plot_summary
+
+
+@tool(
+    "submit_script",
+    (
+        "Run an R, Stata, or Python analysis script against the researcher's "
+        "data. The script must emit structured results via the nora runtime "
+        "library (nora$result(...) / nora$from_* in R, nora_result_* in "
+        "Stata, nora.result(...) / nora.from_* in Python). Raw stdout/stderr "
+        "is shown to the researcher in their TUI but is not returned to you "
+        "; you receive only sanitized structured payloads.\n\n"
+        "A script can call helpers more than once; each call appends a "
+        "payload that comes back to you. The response carries a ``results`` "
+        "list (one entry per helper call, in emission order, each with its "
+        "own ``result_id``, ``label``, ``analysis_type``, and ``summary``) "
+        "plus a shared ``script_run_id`` so the group can be retrieved "
+        "together for audit. For parameterized batches (the same model "
+        "across N specifications, subgroups, outcomes, or sensitivity "
+        "perturbations), use ONE looping script over N separate scripts "
+        "to avoid repeated data preparation and a fragmented audit. If "
+        "the script aborts mid-loop, status becomes "
+        "``execution_failed_partial`` and the helpers that emitted "
+        "before the abort are returned in ``results`` alongside a "
+        "``debug_excerpt`` of the abort cause.\n\n"
+        "Arguments:\n"
+        "  language: 'R', 'Stata', or 'Python'.\n"
+        "  code: the full script source as a single string.\n"
+        "  label: short description of what the script is doing (e.g., "
+        "'OLS of outcome on predictors'). Used as the fallback row label "
+        "for any helper call that didn't pass its own label(\"...\").\n"
+        "  source_dataset: path (relative to cwd) of the dataset the "
+        "script reads. When set, Nora compares each analysis's "
+        "effective N to the dataset's row count and flags silent "
+        "filtering (NA-drops, subset conditions, listwise deletion) "
+        "in the transformations log. PASS THIS whenever the script "
+        "reads a known file. This is how researchers catch analyses "
+        "that quietly ran on a subset. Empty string is fine if the "
+        "script generates its own data or touches multiple files."
+    ),
+    {"language": str, "code": str, "label": str, "source_dataset": str},
+)
+async def submit_script(args: dict[str, Any]) -> dict[str, Any]:
+    """Run an R / Stata / Python script end-to-end: execute → sanitize → store.
+
+    The researcher's raw stdout / stderr is captured and stashed on the
+    stored row (available via ``expand_result``). Claude only ever sees
+    the sanitizer's output — never the raw log.
+
+    Pipeline (each phase in its own helper above):
+      1. ``_execute_script_for_submit`` — run the subprocess with
+         per-turn cancellation handling.
+      2. ``_resolve_sdc_and_source_n`` — load the dataset's SDC
+         config and count its rows once per call.
+      3. ``_sanitize_and_store_payloads`` — sanitize and persist each
+         emitted payload, recording rejections alongside successes.
+      4. ``_build_response_envelope`` — assemble the base response
+         (status decision, transformation hoisting, size trimming,
+         phase timings).
+      5. ``_attach_status_metadata`` — attach hint / debug_excerpt /
+         diagnostic row / plot summary.
+
+    Behaviour is identical to the prior single-function implementation;
+    extracting these phases makes each one independently readable and
+    testable.
+    """
+    language = args.get("language", "")
+    code = args.get("code", "")
+    label = args.get("label", "(unlabeled)")
+    source_dataset = args.get("source_dataset", "") or ""
+
+    if language not in {"R", "Stata", "Python"}:
+        return _as_mcp_text({
+            "status": "error",
+            "reason": (
+                f"unsupported language: {language!r}. Nora runs R "
+                f"(via Rscript), Stata, and Python (3.x with pandas)."
+            ),
+        })
+    if not code.strip():
+        return _as_mcp_text({
+            "status": "error",
+            "reason": "code argument is empty",
+        })
+
+    cwd = get_cwd()
+
+    # 1. Execute. Cancellation surfaces here as either ``CancelledError``
+    # (re-raised so the runner's outer cancel branch handles teardown)
+    # or as ``early_payload`` set when the turn was cancelled mid-run.
+    exec_result, early_payload = await _execute_script_for_submit(
+        language, code, cwd,
+    )
+    if early_payload is not None:
+        return _as_mcp_text(early_payload)
+
+    # 2. SDC config + source-dataset row count, both resolved once.
+    sdc_cfg, source_n, row_count_audit_seconds = _resolve_sdc_and_source_n(
+        cwd, source_dataset or None,
+    )
+
+    # One id per submit_script call; every row produced is tagged with
+    # it so an audit can pull them together. ``run-`` prefix (not
+    # ``R-``) avoids the misread as the R language in Stata / Python
+    # sessions.
+    script_run_id = "run-" + secrets.token_hex(4)
+
+    # 3. Sanitize + store every emitted payload (rejections kept).
+    store = get_store(cwd)
+    results, any_ok, sanitize_seconds, store_seconds = (
+        _sanitize_and_store_payloads(
+            exec_result.result_payloads,
+            cwd=cwd,
+            label=label,
+            language=language,
+            code=code,
+            source_dataset=source_dataset or None,
+            source_n=source_n,
+            sdc_cfg=sdc_cfg,
+            run_dir=exec_result.run_dir,
+            script_run_id=script_run_id,
+            store=store,
+        )
+    )
+
+    # Envelope-status decision. Five outcomes; the "all-rejected then
+    # aborted" case is the one that's easy to get wrong:
+    #
+    #   exec ok | raw payloads | any_ok | envelope status
+    #   --------+--------------+--------+-----------------------------
+    #     yes   |    any       |  yes   | "ok"
+    #     yes   |    any       |  no    | "rejected_by_sanitizer"
+    #     no    |    any       |  yes   | "execution_failed_partial"
+    #     no    |    any       |  no    | "execution_failed"  (rejection rows visible in results)
+    #     no    |    none      |   -    | "execution_failed"  (no rows, diag row only)
+    #
+    # "execution_failed_partial" is reserved for partial SUCCESS: at
+    # least one payload made it through SDC despite the abort. When
+    # every emitted payload was rejected AND the script also aborted,
+    # status is "execution_failed" — rejection rows still appear in
+    # ``results`` alongside the abort context.
+    if exec_result.ok:
+        overall_status = "ok" if any_ok else "rejected_by_sanitizer"
+    else:
+        overall_status = (
+            "execution_failed_partial" if any_ok else "execution_failed"
+        )
+
+    # 4. Build the base envelope (transformations hoist, size trim,
+    # phase timings, base response dict).
+    response = _build_response_envelope(
+        overall_status=overall_status,
+        script_run_id=script_run_id,
+        results=results,
+        exec_result=exec_result,
+        language=language,
+        sanitize_seconds=sanitize_seconds,
+        store_seconds=store_seconds,
+        row_count_audit_seconds=row_count_audit_seconds,
+    )
+
+    # 5. Attach status-specific fields (hint, debug excerpt, diagnostic
+    # row for bare-failure, plot summary).
+    _attach_status_metadata(
+        response,
+        overall_status=overall_status,
+        exec_result=exec_result,
+        language=language,
+        label=label,
+        code=code,
+        script_run_id=script_run_id,
+        results=results,
+        store=store,
+    )
     return _as_mcp_text(response)
 
 
