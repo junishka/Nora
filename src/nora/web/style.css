@@ -435,7 +435,7 @@ kbd {
 }
 
 .landing-card {
-  max-width: 560px;
+  max-width: 760px;
   width: 100%;
   text-align: center;
 }
@@ -589,17 +589,6 @@ kbd {
   text-transform: uppercase;
   margin-bottom: 10px;
   text-align: center;
-}
-
-.landing-sessions-hint {
-  /* Soft note above the list — not a section header, not body
-   * copy. Researcher should be able to skim past it but read it
-   * if they pause on the choice. */
-  font-size: 12px;
-  color: var(--text-dim);
-  text-align: center;
-  margin: 0 0 12px 0;
-  line-height: 1.45;
 }
 
 .landing-sessions-list {

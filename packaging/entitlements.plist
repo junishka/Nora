@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!-- CPython writes to executable memory pages (ctypes / cffi paths). -->
+    <key>com.apple.security.cs.allow-unsigned-executable-memory</key>
+    <true/>
+    <!-- PyInstaller ships third-party dylibs we don't re-sign as system libs. -->
+    <key>com.apple.security.cs.disable-library-validation</key>
+    <true/>
+    <!-- PyInstaller's bootloader uses DYLD_* to locate _internal/. -->
+    <key>com.apple.security.cs.allow-dyld-environment-variables</key>
+    <true/>
+</dict>
+</plist>

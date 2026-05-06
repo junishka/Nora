@@ -20,14 +20,18 @@
 #   4. Write an Info.plist marking it a normal GUI app (LSUIElement
 #      false → dock icon visible, Cmd-Q works as expected).
 #
-# Gatekeeper note: the resulting .app is unsigned. First-run workaround
-# (right-click → Open, or `xattr -cr Nora.app`) is documented in
-# docs/install.md. Proper code-signing is deferred until wider
-# distribution justifies paying for the Apple Developer Program; until
-# then the .dmg pipeline is mostly developer-internal.
+# Gatekeeper / signing:
+#   - If $NORA_SIGN_IDENTITY is set (e.g. "Developer ID Application: ...
+#     (TEAMID)"), every Mach-O inside the bundle is signed with the
+#     hardened runtime, and the bundle itself is signed with the
+#     entitlements in packaging/entitlements.plist. This is the
+#     prerequisite for build_dmg.sh's notarization step.
+#   - If unset, the .app is unsigned and researchers need the right-click
+#     → Open workaround documented in docs/install.md.
 #
 # Usage (from repo root):
 #   bash packaging/build_app.sh
+#   NORA_SIGN_IDENTITY="Developer ID Application: ..." bash packaging/build_app.sh
 #
 # Produces:
 #   dist/Nora.app      — the macOS application bundle (web UI)
@@ -99,6 +103,38 @@ cat > "$APP_BUNDLE/Contents/Info.plist" <<'PLIST'
 </dict>
 </plist>
 PLIST
+
+if [[ -n "${NORA_SIGN_IDENTITY:-}" ]]; then
+    ENTITLEMENTS="$REPO_ROOT/packaging/entitlements.plist"
+    if [[ ! -f "$ENTITLEMENTS" ]]; then
+        echo "Missing $ENTITLEMENTS — required when NORA_SIGN_IDENTITY is set." >&2
+        exit 1
+    fi
+
+    echo "==> Signing nested Mach-O binaries"
+    # `find -depth` walks deepest-first so each binary is signed before
+    # its enclosing bundle. We use `file` to skip shell scripts and other
+    # non-Mach-O executables that would otherwise trip codesign.
+    while IFS= read -r -d '' candidate; do
+        if /usr/bin/file -b "$candidate" | grep -q "Mach-O"; then
+            /usr/bin/codesign --force --options runtime --timestamp \
+                --sign "$NORA_SIGN_IDENTITY" "$candidate"
+        fi
+    done < <(/usr/bin/find "$APP_BUNDLE" -depth -type f \
+                \( -name "*.dylib" -o -name "*.so" -o -perm -u+x \) -print0)
+
+    echo "==> Signing app bundle"
+    /usr/bin/codesign --force --options runtime --timestamp \
+        --entitlements "$ENTITLEMENTS" \
+        --sign "$NORA_SIGN_IDENTITY" \
+        "$APP_BUNDLE"
+
+    echo "==> Verifying signature"
+    /usr/bin/codesign --verify --deep --strict --verbose=2 "$APP_BUNDLE"
+    echo "Signed with: $NORA_SIGN_IDENTITY"
+else
+    echo "==> Skipping codesign (NORA_SIGN_IDENTITY unset)"
+fi
 
 echo
 echo "Built: $APP_BUNDLE"
