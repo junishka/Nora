@@ -2064,15 +2064,21 @@ window.nora_event = function (evt) {
       if (!isFocused) return;
       const card = appendToolResult(evt);
       if (card && activeLiveTurn) activeLiveTurn.hasVisibleReply = true;
-      // Refresh the topbar Files panel after every tool_result, not
-      // only plot-producing ones. ``submit_script`` writes the do /
-      // R / Python script into the session and may also produce log
-      // files, generated datasets, or other artifacts that the panel
-      // is supposed to surface — until this fired unconditionally,
-      // researchers had to refresh the UI to see a script Nora just
-      // saved. ``list_session_files`` is a single non-recursive
-      // ``iterdir`` so the per-tool cost is cheap.
-      refreshFilesChip();
+      // Refresh the Files panel only when the tool that just finished
+      // could plausibly have written to disk. ``run_dir`` is populated
+      // by the provider layer iff this result came from
+      // ``submit_script`` / ``submit_script_file`` — the only tools
+      // that stage a script, log, or plot. Plumbing tools
+      // (``get_schema``, ``expand_result``, ``list_results``,
+      // ``request_data``) leave it ``null`` and don't need a refresh.
+      //
+      // The cost matters: ``list_session_files`` walks every run
+      // dir under ``.nora/runs``, stats each ``script.{do,R,py}``,
+      // recurses into every ``_nora_plots/`` subdir, and base64-
+      // encodes thumbnails up to 3 MB each. In a long session that
+      // adds up fast, and firing it on every plumbing tool turned
+      // the chat loop into a steady drip of heavy IPC.
+      if (evt.run_dir) refreshFilesChip();
       break;
     }
     case 'turn_done':
@@ -2331,6 +2337,15 @@ function append(kind, text, markdown, attachments, images) {
   finalizeActiveTypewriter();
   const wrapper = document.createElement('div');
   wrapper.className = 'message ' + kind;
+  // Stash the original (pre-render) text on the wrapper so the
+  // per-bubble copy button can hand the markdown source — not the
+  // rendered HTML — to the clipboard. Researchers paste these into
+  // other chats / editors and want the literal text they sent or
+  // received, not a transformed version with HTML entities decoded
+  // / list bullets converted to glyphs / etc. Stored as a property
+  // (not a dataset attribute) to avoid a large stringify on every
+  // long assistant turn.
+  wrapper.__noraRawText = text || '';
   // Image thumbnails render ABOVE the bubble — same vertical order
   // they appeared in the composer, easier to scan. Clicking opens
   // the full-resolution image in a new browser tab so the
@@ -2360,6 +2375,69 @@ function append(kind, text, markdown, attachments, images) {
     body.textContent = text;
   }
   wrapper.appendChild(body);
+  // Copy button — only on user and assistant bubbles. System / error
+  // / thinking messages don't get one: system + error are rare status
+  // lines (clipboard isn't useful), and thinking traces are already
+  // in a collapsible card with their own controls. The button hides
+  // by default and reveals on bubble hover via the ``.message-actions``
+  // / ``.message:hover .message-actions`` rules in style.css; on
+  // touch / no-hover devices the action row is always visible (a
+  // matching ``@media (hover: none)`` rule keeps it on those clients).
+  if (kind === 'user' || kind === 'assistant') {
+    const actions = document.createElement('div');
+    actions.className = 'message-actions';
+    const copyBtn = document.createElement('button');
+    copyBtn.type = 'button';
+    copyBtn.className = 'message-action-btn message-copy-btn';
+    copyBtn.title = 'Copy message to clipboard';
+    copyBtn.setAttribute('aria-label', 'Copy message');
+    // Inline SVG so the icon doesn't depend on a font load. Two
+    // overlapping rounded rects — the universal "copy" glyph the
+    // researcher will recognise from every other chat client.
+    copyBtn.innerHTML =
+      '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" '
+      + 'stroke="currentColor" stroke-width="2" stroke-linecap="round" '
+      + 'stroke-linejoin="round" aria-hidden="true">'
+      + '<rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect>'
+      + '<path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path>'
+      + '</svg>';
+    copyBtn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      copyMessageBubble(wrapper, copyBtn);
+    });
+    actions.appendChild(copyBtn);
+    // Edit button — user bubbles only. Provenance boundary: editing
+    // an assistant bubble would let the researcher put words in
+    // the model's mouth, then have the chat continue from there as
+    // if the model had said them. That's a shape we deliberately
+    // refuse. User-message edit is the supported "revisit and try
+    // a different question" affordance; the rewind path truncates
+    // the chat at THIS user message, hides results from the dropped
+    // branch in the store, and re-fires the bubble's new text as a
+    // fresh turn with a warm-start replay over the truncated log.
+    if (kind === 'user') {
+      const editBtn = document.createElement('button');
+      editBtn.type = 'button';
+      editBtn.className = 'message-action-btn message-edit-btn';
+      editBtn.title = 'Edit and re-run from this message';
+      editBtn.setAttribute('aria-label', 'Edit message');
+      // Pencil glyph — same stroke style as the copy icon for
+      // visual rhythm in the actions row.
+      editBtn.innerHTML =
+        '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" '
+        + 'stroke="currentColor" stroke-width="2" stroke-linecap="round" '
+        + 'stroke-linejoin="round" aria-hidden="true">'
+        + '<path d="M12 20h9"></path>'
+        + '<path d="M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4L16.5 3.5z"></path>'
+        + '</svg>';
+      editBtn.addEventListener('click', (e) => {
+        e.stopPropagation();
+        enterEditMode(wrapper);
+      });
+      actions.appendChild(editBtn);
+    }
+    wrapper.appendChild(actions);
+  }
   // Attachment chips render as a small row beneath the user bubble
   // (only shown when the caller passes a non-empty list). This is
   // the "I uploaded a script and Nora can see it" affordance the
@@ -3104,10 +3182,7 @@ async function refreshFilesChip() {
     header.className = 'policy-popup-header';
     header.innerHTML =
       '<strong>Files</strong>. Scripts, graphs, and logs from this '
-      + 'session. Click the copy icon to grab a file (text for '
-      + 'scripts and logs, image for plots) so you can paste it into '
-      + 'another chat or an external editor. Data files are listed '
-      + 'in the Permission chip.';
+      + 'session.';
     wrap.appendChild(header);
     // Group by kind so scripts / graphs / logs land in their own
     // sections — same shape the model picker uses for providers.
@@ -3259,11 +3334,21 @@ function buildFilesRow(kind, f) {
 
 // Inline SVG icons. Small, monochrome — color is set via CSS so
 // the icon picks up the row's hover/focus colors.
+//
+// COPY_ICON_SVG is shared with the chat-bubble copy button so the
+// Files panel and the per-bubble action read as the same affordance:
+// two overlapping rounded rects (the universal "copy" glyph from
+// GitHub / Linear / Slack), 24×24 viewBox at 14×14 render. If you
+// change the path here, change it in the bubble copy button too
+// (``append()``'s copy SVG block) — they're meant to match
+// pixel-for-pixel so a researcher who learned one recognises the
+// other instantly.
 const COPY_ICON_SVG = (
-  '<svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true">' +
-  '<path fill="none" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round" ' +
-  'd="M5 5V2.5A.5.5 0 0 1 5.5 2h7a.5.5 0 0 1 .5.5v9a.5.5 0 0 1-.5.5H10' +
-  'M3.5 5h7a.5.5 0 0 1 .5.5v9a.5.5 0 0 1-.5.5h-7a.5.5 0 0 1-.5-.5v-9a.5.5 0 0 1 .5-.5z"/>' +
+  '<svg viewBox="0 0 24 24" width="14" height="14" fill="none" ' +
+  'stroke="currentColor" stroke-width="2" stroke-linecap="round" ' +
+  'stroke-linejoin="round" aria-hidden="true">' +
+  '<rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect>' +
+  '<path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path>' +
   '</svg>'
 );
 
@@ -3298,6 +3383,292 @@ async function copyImageToClipboard(base64Data, mime, name) {
     toast('Copy failed: ' + (err && err.message ? err.message : err), 'error');
   }
 }
+
+// ----- edit & rewind ----------------------------------------------------
+//
+// Researcher clicks the pencil on a user bubble → that bubble flips into
+// edit mode (textarea + Run / Cancel). Run calls
+// ``window.pywebview.api.rewind_to(turn_index)`` on the bridge — which
+// truncates ``chat_history.jsonl`` at that user message, hides every
+// dropped result row in the store, clears the runner's pending
+// attachments, and resets the provider session. JS then calls
+// ``replayHistory()`` to repaint the trimmed transcript and ``send_message``
+// to fire the revised text as a fresh turn — events stream in normally
+// on top.
+//
+// One bubble may be in edit mode at a time; entering edit on a second
+// bubble cancels the first. Edit is refused while the session is busy
+// (``busySessions.has(currentCwd)``); the researcher must Stop the
+// running turn first, which the toast spells out.
+
+let activeEditWrapper = null;
+
+function enterEditMode(wrapper) {
+  if (!wrapper) return;
+  if (currentCwd && busySessions.has(currentCwd)) {
+    toast(
+      'Stop the running turn first, then click edit again.',
+      'info',
+    );
+    return;
+  }
+  // Cancel any other in-progress edit. Two open editors would let a
+  // researcher accidentally rewind through both, with the second
+  // landing on a transcript that already started shifting under the
+  // first.
+  if (activeEditWrapper && activeEditWrapper !== wrapper) {
+    cancelEditMode(activeEditWrapper);
+  }
+  if (wrapper.classList.contains('editing')) return;
+  activeEditWrapper = wrapper;
+  wrapper.classList.add('editing');
+
+  const body = wrapper.querySelector('.message-body');
+  if (!body) return;
+  // Stash the original DOM so Cancel restores exactly what was
+  // there (rendered markdown, attachments hidden by their own row,
+  // etc.). textContent + innerHTML aren't enough because some
+  // bubbles carry image rows above and chip rows below — those
+  // siblings stay put; only the body swaps.
+  wrapper.__noraEditOriginalBody = body;
+
+  const editor = document.createElement('div');
+  editor.className = 'message-edit-mode';
+  const textarea = document.createElement('textarea');
+  textarea.className = 'message-edit-textarea';
+  textarea.value = wrapper.__noraRawText || '';
+  textarea.rows = Math.min(12, Math.max(2, textarea.value.split('\n').length + 1));
+  textarea.addEventListener('keydown', (e) => {
+    // Enter (no shift) submits — same affordance as the composer.
+    // Shift+Enter / Cmd+Enter newline.
+    if (e.key === 'Enter' && !e.shiftKey && !e.metaKey && !e.ctrlKey) {
+      e.preventDefault();
+      runEditedMessage(wrapper);
+    } else if (e.key === 'Escape') {
+      e.preventDefault();
+      cancelEditMode(wrapper);
+    }
+  });
+
+  const buttonRow = document.createElement('div');
+  buttonRow.className = 'message-edit-buttons';
+  const cancelBtn = document.createElement('button');
+  cancelBtn.type = 'button';
+  cancelBtn.className = 'message-edit-btn-cancel';
+  cancelBtn.textContent = 'Cancel';
+  cancelBtn.addEventListener('click', (e) => {
+    e.stopPropagation();
+    cancelEditMode(wrapper);
+  });
+  const runBtn = document.createElement('button');
+  runBtn.type = 'button';
+  runBtn.className = 'message-edit-btn-run';
+  runBtn.textContent = 'Run';
+  runBtn.addEventListener('click', (e) => {
+    e.stopPropagation();
+    runEditedMessage(wrapper);
+  });
+  buttonRow.appendChild(cancelBtn);
+  buttonRow.appendChild(runBtn);
+
+  editor.appendChild(textarea);
+  editor.appendChild(buttonRow);
+
+  // Replace the body in place with the editor; Cancel reverses this.
+  body.replaceWith(editor);
+  wrapper.__noraEditEditor = editor;
+  textarea.focus();
+  // Place the cursor at the end so the researcher can extend
+  // immediately rather than overwriting.
+  textarea.setSelectionRange(textarea.value.length, textarea.value.length);
+}
+
+function cancelEditMode(wrapper) {
+  if (!wrapper || !wrapper.classList.contains('editing')) return;
+  const editor = wrapper.__noraEditEditor;
+  const original = wrapper.__noraEditOriginalBody;
+  if (editor && original) {
+    editor.replaceWith(original);
+  }
+  wrapper.__noraEditEditor = null;
+  wrapper.__noraEditOriginalBody = null;
+  wrapper.classList.remove('editing');
+  if (activeEditWrapper === wrapper) activeEditWrapper = null;
+}
+
+function userMessageIndex(wrapper) {
+  /* The bubble's 0-based position among ``.message.user`` bubbles in
+   * DOM order — this matches the index of the corresponding
+   * ``user_message`` event in ``chat_history.jsonl`` because the
+   * persistence path appends one record per appended user bubble.
+   * No counter to maintain; we just count siblings.
+   */
+  const all = Array.from(messagesEl.querySelectorAll('.message.user'));
+  return all.indexOf(wrapper);
+}
+
+async function runEditedMessage(wrapper) {
+  if (!wrapper) return;
+  const editor = wrapper.__noraEditEditor;
+  if (!editor) return;
+  const textarea = editor.querySelector('.message-edit-textarea');
+  if (!textarea) return;
+  const newText = textarea.value.trim();
+  if (!newText) {
+    toast('Edited message is empty — type something or click Cancel.', 'info');
+    return;
+  }
+  if (!window.pywebview || !window.pywebview.api) return;
+  if (typeof window.pywebview.api.rewind_to !== 'function') {
+    toast('Restart Nora to enable message edit.', 'info');
+    return;
+  }
+
+  const turnIndex = userMessageIndex(wrapper);
+  if (turnIndex < 0) {
+    toast('Could not locate this message in the transcript.', 'error');
+    return;
+  }
+
+  // Disable the editor's buttons so a double-click doesn't fire
+  // the rewind twice. The composer / send button stays as-is —
+  // the next user_message is what actually re-fires the turn, and
+  // we want it to come from the live send path with the same
+  // codepath any other message would.
+  const buttons = editor.querySelectorAll('button');
+  buttons.forEach((b) => { b.disabled = true; });
+
+  let res;
+  try {
+    res = await window.pywebview.api.rewind_to(turnIndex);
+  } catch (err) {
+    console.warn('rewind_to failed', err);
+    toast(
+      'Rewind failed: ' + (err && err.message ? err.message : err),
+      'error',
+    );
+    buttons.forEach((b) => { b.disabled = false; });
+    return;
+  }
+  if (!res || !res.ok) {
+    const reason = (res && res.reason) || 'unknown';
+    toast('Rewind refused: ' + reason, 'error');
+    buttons.forEach((b) => { b.disabled = false; });
+    return;
+  }
+
+  // Rewind committed. Repaint the transcript from the truncated log
+  // (which no longer includes this user message or anything after
+  // it), THEN render the new user bubble, THEN fire the send. The
+  // bubble has to be rendered JS-side here for the same reason the
+  // composer does it on submit: the bridge persists ``user_message``
+  // to ``chat_history.jsonl`` but does NOT dispatch a live
+  // ``user_message`` event back to JS — there's no event to render
+  // off of, so the composer always paints its own bubble. Without
+  // this explicit ``appendUser`` call, the rewind path would leave
+  // the researcher staring at a transcript that ends one message
+  // before the one they just submitted, with no bubble for the
+  // edit until ``assistant_text`` started streaming.
+  activeEditWrapper = null;
+  await replayHistory();
+
+  // Render the new user bubble + busy state, mirroring the
+  // composer's submit handler. ``activeLiveTurn`` carries the
+  // bubble nodes so disposable-turn cleanup recognises it; the
+  // ``pushPendingMessage`` call lets the context chip's projected
+  // weight reflect this turn until ``turn_done`` lands the
+  // authoritative count.
+  const userEl = appendUser(newText, [], []);
+  activeLiveTurn = { id: null, nodes: [userEl], hasVisibleReply: false };
+  pushPendingMessage(currentCwd, newText, 0);
+  setSending(true);
+
+  if (typeof window.pywebview.api.send_message === 'function') {
+    try {
+      const turnId = await window.pywebview.api.send_message(newText);
+      // Stop reads this id to mark the turn cancelled. Same
+      // capture pattern as the composer's submit handler.
+      if (activeLiveTurn && typeof turnId === 'string' && turnId) {
+        activeLiveTurn.id = turnId;
+      }
+    } catch (err) {
+      console.warn('send_message after rewind failed', err);
+      toast(
+        'Rewind succeeded but send failed: '
+        + (err && err.message ? err.message : err),
+        'error',
+      );
+      // Roll back the busy state — the send didn't take, so the
+      // composer should be ready to accept another attempt.
+      setSending(false);
+      activeLiveTurn = null;
+      return;
+    }
+  }
+
+  if (res.hidden_count > 0) {
+    toast(
+      'Edited message — ' + res.hidden_count + ' prior result'
+      + (res.hidden_count === 1 ? '' : 's')
+      + ' hidden from model context.',
+      'success',
+    );
+  }
+}
+
+
+async function copyMessageBubble(wrapper, btnEl) {
+  /* Copy a chat bubble's text to the clipboard. Source is the
+   * pre-render markdown / raw text the bubble was created with —
+   * stored on ``wrapper.__noraRawText`` by ``append()``. We
+   * deliberately don't read ``message-body.textContent`` because the
+   * markdown renderer transforms inline math, smartens punctuation,
+   * and collapses adjacent whitespace on lists, so a round-trip
+   * through the DOM differs from the literal turn the model
+   * generated or the user typed. Researchers pasting into another
+   * chat or an editor want the source they sent / received.
+   *
+   * Visual feedback on success: swap the icon to a checkmark for
+   * 1.4 s. The toast bus handles failure cases with the same
+   * semantics as the Files-panel copy button.
+   */
+  if (!wrapper) return;
+  const raw = wrapper.__noraRawText || '';
+  if (!raw) {
+    toast('Nothing to copy from this message.', 'info');
+    return;
+  }
+  try {
+    if (!navigator.clipboard || typeof navigator.clipboard.writeText !== 'function') {
+      toast('Clipboard API unavailable in this WebView.', 'info');
+      return;
+    }
+    await navigator.clipboard.writeText(raw);
+  } catch (err) {
+    console.warn('copyMessageBubble failed', err);
+    toast('Copy failed: ' + (err && err.message ? err.message : err), 'error');
+    return;
+  }
+  // Inline visual confirmation — a 1.4 s state swap on the button —
+  // is less disruptive than a toast on every copy. The researcher
+  // gets the receipt right where their cursor is. Toast is reserved
+  // for failures, where attention DOES need to leave the bubble.
+  if (btnEl) {
+    const original = btnEl.innerHTML;
+    btnEl.innerHTML =
+      '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" '
+      + 'stroke="currentColor" stroke-width="2.5" stroke-linecap="round" '
+      + 'stroke-linejoin="round" aria-hidden="true">'
+      + '<polyline points="20 6 9 17 4 12"></polyline>'
+      + '</svg>';
+    btnEl.classList.add('copied');
+    setTimeout(() => {
+      btnEl.innerHTML = original;
+      btnEl.classList.remove('copied');
+    }, 1400);
+  }
+}
+
 
 async function copySessionFileText(path, displayName) {
   /* Pull a script's or log's text content from the bridge and
@@ -3424,9 +3795,10 @@ function buildPolicyPopup(policy) {
   // Compact but informative: names the control, the unit it acts on,
   // and the one-way semantic (ceiling, not target). Drops the
   // "default: …" crutch. The active tier is visible in the row
-  // selection itself.
+  // selection itself. Period separator matches the Files / Model
+  // popups so the three top-bar chips read identically.
   header.innerHTML =
-    '<strong>Permission</strong>: ceiling on variable details ' +
+    '<strong>Permission</strong>. Ceiling on variable details ' +
     'Nora sees per dataset. It can ask for less, never more.';
   wrapper.appendChild(header);
 

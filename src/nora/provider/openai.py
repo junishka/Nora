@@ -483,8 +483,29 @@ class OpenAISession:
                             "output": out_text,
                         })
                         continue
+                    args, parse_error = _parse_tool_args(args_json)
+                    if parse_error is not None:
+                        # Malformed args — surface as an explicit tool
+                        # error so the model fixes its JSON instead of
+                        # being told "missing required arg X" by the
+                        # handler's schema layer (which is what
+                        # happened when we silently coerced bad JSON
+                        # to ``{}``). The handler is NOT invoked in
+                        # this branch.
+                        out_text = json.dumps({
+                            "status": "error",
+                            "reason": parse_error,
+                        })
+                        yield ToolCallResult(
+                            call_id=call_id, text=out_text, is_error=True,
+                        )
+                        next_input.append({
+                            "type": "function_call_output",
+                            "call_id": call_id,
+                            "output": out_text,
+                        })
+                        continue
                     try:
-                        args = _safe_json(args_json)
                         result = await handler(args)
                         out_text = _mcp_payload_to_text(result)
                         is_error = False
@@ -584,6 +605,16 @@ def _extract_message_text(item: Any) -> str:
 
 
 def _safe_json(s: str) -> dict[str, Any]:
+    """Best-effort decode used for the ``ToolCall`` audit event.
+
+    Display-side only — the audit event renders whatever args the
+    model thought it was sending, and a non-empty malformed string
+    degrades to ``{}`` so the chat panel still shows the call. The
+    actual handler dispatch goes through :func:`_parse_tool_args`,
+    which surfaces malformed JSON as an explicit tool error so the
+    model isn't told "missing required arg" when its real problem
+    was bad JSON.
+    """
     if not s:
         return {}
     try:
@@ -593,6 +624,51 @@ def _safe_json(s: str) -> dict[str, Any]:
     if not isinstance(out, dict):
         return {}
     return out
+
+
+def _parse_tool_args(s: str) -> tuple[dict[str, Any] | None, str | None]:
+    """Decode a ``function_call.arguments`` string for handler dispatch.
+
+    Returns ``(args, None)`` on success and ``(None, reason)`` when
+    the string is non-empty but not a valid JSON object. The empty
+    string maps to ``({}, None)`` because OpenAI emits ``""`` for
+    zero-arg calls, and that's a legitimate shape for the small
+    handful of Nora tools that take no arguments.
+
+    The previous behaviour silently coerced malformed JSON to ``{}``
+    and dispatched the handler anyway. The handler's required-arg
+    validator then complained about missing fields, which told the
+    model the wrong story: it thought it had forgotten ``code`` /
+    ``language`` when the real failure was that its JSON didn't
+    parse. The model retried with the same broken serialiser and
+    burned a turn. Returning a parse error here lets the caller
+    emit an explicit "tool arguments were not valid JSON" result so
+    the model fixes the actual problem on the next round.
+
+    Non-dict top-level values (a bare list, string, or number from
+    the model's perspective is "I sent some args" without a key, so
+    we still call out the shape mismatch.
+    """
+    if not s:
+        return {}, None
+    try:
+        out = json.loads(s)
+    except (ValueError, TypeError) as e:
+        # Truncate the offending payload so a model that emitted a
+        # multi-MB malformed blob doesn't blow up the error-message
+        # context. ``json.JSONDecodeError`` carries position info
+        # that helps the model self-correct on the retry.
+        snippet = s[:120] + ("…" if len(s) > 120 else "")
+        return None, (
+            f"tool arguments were not valid JSON: {e}; received "
+            f"{snippet!r}"
+        )
+    if not isinstance(out, dict):
+        return None, (
+            f"tool arguments must be a JSON object, got "
+            f"{type(out).__name__}"
+        )
+    return out, None
 
 
 def _mcp_payload_to_text(payload: Any) -> str:

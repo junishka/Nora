@@ -447,6 +447,22 @@ def _is_finite_number(x: Any) -> bool:
     return isinstance(x, (int, float)) and not isinstance(x, bool) and math.isfinite(x)
 
 
+# Hard cap on transformation-log entries a single ``_collect_allowed``
+# invocation may emit. The transformations list rides into the
+# tool_result payload and is read by the model, so any loop that
+# appends one entry per dropped key is a model-visible channel whose
+# size is controlled by the payload author. Two such loops exist in
+# this function: the outer ``for k in raw.items()`` (one entry per
+# unknown field) and the inner ``for kk in v.items()`` inside the
+# ``dict_numeric`` branch (one entry per malformed nested key).
+# Without a cap, a payload with thousands of arbitrary keys would
+# fill the model's context with megabytes of "dropped …" lines.
+# 50 is enough that realistic shape-mismatch debugging is still
+# legible; the trailing summary tells the model how many drops it
+# isn't seeing in detail.
+_COLLECT_ALLOWED_LOG_CAP = 50
+
+
 def _collect_allowed(
     raw: dict[str, Any],
     *,
@@ -471,44 +487,65 @@ def _collect_allowed(
     returned as output keys — otherwise a maliciously-named variable
     could inject text into Claude's context through the transformations
     log or through a coefficient dict key.
+
+    Per-invocation cap: at most ``_COLLECT_ALLOWED_LOG_CAP`` drop
+    entries land in ``transformations``; surplus drops are summarised
+    in a single tail line. See ``_COLLECT_ALLOWED_LOG_CAP`` for why.
     """
     t = transformations if transformations is not None else []
     out: dict[str, Any] = {}
     allowed = numeric | integer | string | dict_numeric | list_string | list_numeric
+
+    # Track how many entries this call has emitted, separately from
+    # ``len(t)`` — the caller may have prefilled ``t`` with notes from
+    # earlier sanitiser stages, and we only want to bound THIS call's
+    # contribution. ``surplus`` is appended once at the end as a
+    # human-readable tail.
+    emitted = 0
+    surplus = 0
+
+    def _log(msg: str) -> None:
+        nonlocal emitted, surplus
+        if emitted < _COLLECT_ALLOWED_LOG_CAP:
+            t.append(msg)
+            emitted += 1
+        else:
+            surplus += 1
+
     for k, v in raw.items():
         if k not in allowed:
             # safe_key on the field name before it's echoed back to Claude.
-            t.append(f"dropped unknown/forbidden field {safe_key(str(k))!r}")
+            _log(f"dropped unknown/forbidden field {safe_key(str(k))!r}")
             continue
         if k in integer:
             if not isinstance(v, int) or isinstance(v, bool):
-                t.append(f"dropped {k!r}: expected int, got {type(v).__name__}")
+                _log(f"dropped {k!r}: expected int, got {type(v).__name__}")
                 continue
             out[k] = v
         elif k in numeric:
             if not _is_finite_number(v):
-                t.append(f"dropped {k!r}: not a finite number")
+                _log(f"dropped {k!r}: not a finite number")
                 continue
             out[k] = float(v)
         elif k in string:
             if not isinstance(v, str):
-                t.append(f"dropped {k!r}: expected str, got {type(v).__name__}")
+                _log(f"dropped {k!r}: expected str, got {type(v).__name__}")
                 continue
             cleaned = safe_text(v)
             if cleaned != v:
-                t.append(f"sanitized scalar string field {k!r}")
+                _log(f"sanitized scalar string field {k!r}")
             out[k] = cleaned
         elif k in dict_numeric:
             if not isinstance(v, dict):
-                t.append(f"dropped {k!r}: expected dict, got {type(v).__name__}")
+                _log(f"dropped {k!r}: expected dict, got {type(v).__name__}")
                 continue
             clean: dict[str, float] = {}
             for kk, vv in v.items():
                 if not isinstance(kk, str):
-                    t.append(f"dropped {k!r}[{safe_key(str(kk))!r}]: key not a string")
+                    _log(f"dropped {k!r}[{safe_key(str(kk))!r}]: key not a string")
                     continue
                 if not _is_finite_number(vv):
-                    t.append(f"dropped {k!r}[{safe_key(kk)!r}]: not a finite number")
+                    _log(f"dropped {k!r}[{safe_key(kk)!r}]: not a finite number")
                     continue
                 # safe_key on the key — e.g. coefficient names, which
                 # originate in the data's variable names, cross to Claude.
@@ -516,15 +553,23 @@ def _collect_allowed(
             out[k] = clean
         elif k in list_string:
             if not isinstance(v, list) or not all(isinstance(x, str) for x in v):
-                t.append(f"dropped {k!r}: not a list[str]")
+                _log(f"dropped {k!r}: not a list[str]")
                 continue
             # Each string element originates in the data — sanitize all.
             out[k] = [safe_key(x) for x in v]
         elif k in list_numeric:
             if not isinstance(v, list) or not all(_is_finite_number(x) for x in v):
-                t.append(f"dropped {k!r}: not a list of finite numbers")
+                _log(f"dropped {k!r}: not a list of finite numbers")
                 continue
             out[k] = [float(x) for x in v]
+
+    if surplus:
+        # Single line that bounds the total log size at
+        # ``_COLLECT_ALLOWED_LOG_CAP + 1`` regardless of payload size.
+        t.append(
+            f"… and {surplus} more drops omitted from this payload's log "
+            f"(cap {_COLLECT_ALLOWED_LOG_CAP})"
+        )
     return out
 
 

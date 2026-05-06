@@ -58,6 +58,12 @@ class StoredResult:
     # Today's submit_script generates one script_run_id per invocation
     # and tags every row produced by that invocation with it.
     script_run_id: str | None = None
+    # Visibility — populated when a rewind hides this row. NULL means
+    # the row is visible to the model (default for every freshly-
+    # inserted result). Audit code that opts into ``include_hidden=True``
+    # sees these populated.
+    hidden_at: str | None = None
+    hidden_reason: str | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -83,7 +89,9 @@ class ResultStore:
         transformations   TEXT NOT NULL,  -- JSON array
         raw_log_path      TEXT,
         created_at        TEXT NOT NULL,
-        script_run_id     TEXT             -- groups multi-result submit_script calls; NULL on legacy rows
+        script_run_id     TEXT,            -- groups multi-result submit_script calls; NULL on legacy rows
+        hidden_at         TEXT,            -- ISO 8601; NULL = visible to model. Set by hide_results_not_in
+        hidden_reason     TEXT             -- short tag, e.g. "rewind". NULL while hidden_at is NULL
     );
     CREATE INDEX IF NOT EXISTS idx_results_created_at ON results (created_at);
     """
@@ -131,9 +139,34 @@ class ResultStore:
             self._conn.execute(
                 "ALTER TABLE results ADD COLUMN script_run_id TEXT"
             )
+        # Visibility columns added with the rewind feature. ``hidden_at``
+        # NULL means the row is visible to the model (default for every
+        # row inserted at submit_script time); a populated timestamp
+        # means the row was hidden by a rewind operation. Hidden rows
+        # remain in the database for audit but are filtered out of the
+        # default ``list_all`` / ``get`` query paths so the model
+        # doesn't see them in warm-start prefixes, ``list_results``,
+        # ``list_results_global``, or ``expand_result``. Audit callers
+        # opt back in via ``include_hidden=True``.
+        if "hidden_at" not in cols:
+            self._conn.execute(
+                "ALTER TABLE results ADD COLUMN hidden_at TEXT"
+            )
+        if "hidden_reason" not in cols:
+            self._conn.execute(
+                "ALTER TABLE results ADD COLUMN hidden_reason TEXT"
+            )
         self._conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_results_script_run_id "
             "ON results (script_run_id)"
+        )
+        # Partial index over visible rows only — list_all / get with the
+        # default visibility filter benefits when the table accumulates
+        # many hidden rows from repeated rewinds. Cheap to maintain
+        # because the WHERE clause keeps it sparse.
+        self._conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_results_visible "
+            "ON results (created_at) WHERE hidden_at IS NULL"
         )
 
     def close(self) -> None:
@@ -191,20 +224,102 @@ class ResultStore:
 
     # -- Read ---------------------------------------------------------------
 
-    def get(self, result_id: str) -> StoredResult | None:
-        cur = self._conn.execute(
-            "SELECT * FROM results WHERE id = ?", (result_id,)
-        )
+    def get(
+        self, result_id: str, *, include_hidden: bool = False,
+    ) -> StoredResult | None:
+        """Fetch a stored row by id.
+
+        Returns ``None`` for unknown ids AND for ids whose row has
+        been hidden by a rewind, unless ``include_hidden=True`` is
+        passed. Tool handlers (``expand_result``) call with the
+        default so the model can't reach into rows that were
+        invalidated by a rewind; audit / debug paths can opt in.
+        """
+        if include_hidden:
+            cur = self._conn.execute(
+                "SELECT * FROM results WHERE id = ?", (result_id,)
+            )
+        else:
+            cur = self._conn.execute(
+                "SELECT * FROM results WHERE id = ? AND hidden_at IS NULL",
+                (result_id,),
+            )
         row = cur.fetchone()
         if row is None:
             return None
         return self._hydrate(row)
 
-    def list_all(self) -> list[StoredResult]:
-        cur = self._conn.execute(
-            "SELECT * FROM results ORDER BY created_at ASC"
-        )
+    def list_all(self, *, include_hidden: bool = False) -> list[StoredResult]:
+        """List rows in chronological-ascending order.
+
+        Defaults to visible rows only — rows hidden by a rewind are
+        filtered out so warm-start prefixes, ``list_results`` /
+        ``list_results_global`` tool calls, and any other model-
+        visible enumeration don't surface them. Audit code paths
+        pass ``include_hidden=True`` to see the whole history.
+        """
+        if include_hidden:
+            cur = self._conn.execute(
+                "SELECT * FROM results ORDER BY created_at ASC"
+            )
+        else:
+            cur = self._conn.execute(
+                "SELECT * FROM results WHERE hidden_at IS NULL "
+                "ORDER BY created_at ASC"
+            )
         return [self._hydrate(r) for r in cur.fetchall()]
+
+    def hide_results_not_in(
+        self, kept_ids: set[str], *, reason: str,
+    ) -> int:
+        """Mark every currently-visible row whose id is NOT in
+        ``kept_ids`` as hidden, with the given reason and the current
+        timestamp. Returns the count of rows newly hidden.
+
+        Used by the rewind path: after the chat history is truncated
+        to a cut-point, the bridge collects the result_ids still
+        referenced in the kept prefix and passes that set here. Every
+        other visible row gets hidden in a single transaction so the
+        model's view of the store stays consistent with the truncated
+        chat.
+
+        Already-hidden rows are left alone — their ``hidden_at`` and
+        ``hidden_reason`` reflect the rewind that hid them; a second
+        rewind shouldn't overwrite that with a fresh timestamp. A
+        rewind that would hide nothing returns 0 cleanly.
+
+        Implementation: read all currently-visible ids in Python,
+        diff against ``kept_ids`` to compute the to-hide set, then
+        UPDATE in batches sized below SQLite's 999-parameter limit.
+        Doing the diff in Python avoids the temp-table dance a single
+        ``id NOT IN (large list)`` would otherwise need; the visible-
+        row count for a Nora session is in the low thousands at most,
+        so the in-memory diff is cheap.
+        """
+        now = datetime.now(timezone.utc).isoformat()
+        with self._txn():
+            visible_rows = self._conn.execute(
+                "SELECT id FROM results WHERE hidden_at IS NULL"
+            ).fetchall()
+            visible_ids = [r["id"] for r in visible_rows]
+            to_hide = [vid for vid in visible_ids if vid not in kept_ids]
+            if not to_hide:
+                return 0
+            # SQLite's default parameter limit is 999. Batch at 500
+            # to leave headroom for the two leading parameters
+            # (``now``, ``reason``) and any future schema growth.
+            BATCH = 500
+            for i in range(0, len(to_hide), BATCH):
+                chunk = to_hide[i:i + BATCH]
+                placeholders = ",".join("?" * len(chunk))
+                self._conn.execute(
+                    f"UPDATE results SET hidden_at = ?, "
+                    f"hidden_reason = ? "
+                    f"WHERE hidden_at IS NULL AND id IN "
+                    f"({placeholders})",
+                    (now, reason, *chunk),
+                )
+            return len(to_hide)
 
     def list_by_script_run(self, script_run_id: str) -> list[StoredResult]:
         """All rows produced by one ``submit_script`` invocation, in
@@ -242,9 +357,13 @@ class ResultStore:
 
     def _hydrate(self, row: sqlite3.Row) -> StoredResult:
         keys = row.keys() if hasattr(row, "keys") else None
-        run_id = row["script_run_id"] if (
-            keys is None or "script_run_id" in keys
-        ) else None
+
+        def _opt(name: str) -> Any:
+            # Tolerate legacy schemas where a column doesn't exist yet
+            # (the migration runs at __init__ time, but tests that
+            # construct rows from raw fixtures may skip migration).
+            return row[name] if (keys is None or name in keys) else None
+
         return StoredResult(
             id=row["id"],
             label=row["label"],
@@ -255,7 +374,9 @@ class ResultStore:
             transformations=json.loads(row["transformations"]),
             raw_log_path=row["raw_log_path"],
             created_at=row["created_at"],
-            script_run_id=run_id,
+            script_run_id=_opt("script_run_id"),
+            hidden_at=_opt("hidden_at"),
+            hidden_reason=_opt("hidden_reason"),
         )
 
     # Minimal transaction helper — we don't have complex write patterns yet.

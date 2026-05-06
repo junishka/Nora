@@ -199,6 +199,27 @@ class SessionRunner:
         self.pending_mentioned_files: list[str] = []
         self.pending_mentioned_images: list[dict[str, Any]] = []
 
+    def clear_pending_attachments(self) -> None:
+        """Drop everything staged for the next turn.
+
+        Called by the rewind path: the researcher revised an earlier
+        message, so any attachments / @-mentions / plot images they
+        had queued up for the *original* next turn are no longer
+        relevant. Without this, the truncated chat would still inline
+        a script the researcher attached three turns ago, which would
+        confuse both the model (why is this script here?) and the
+        researcher (didn't I delete that?).
+
+        All four pending lists are reset together because they all
+        ride the same next-turn boundary; a partial reset would leave
+        the runner in a state where some prior staging survives and
+        some doesn't, with no visible signal to the researcher.
+        """
+        self.pending_script_attachments.clear()
+        self.pending_mentioned_files.clear()
+        self.pending_mentioned_images.clear()
+        self.pending_plot_images.clear()
+
     # -------- session lifecycle --------
 
     def is_busy(self) -> bool:
@@ -563,8 +584,6 @@ class SessionRunner:
         and so a Stop fired before the first event arrives still has
         a stable id to mark cancelled.
         """
-        self._current_turn_task = asyncio.current_task()
-        self._current_turn_id = turn_id
         cwd = self.cwd
 
         # Wrap every emitted event so the dispatcher and JS filter
@@ -578,6 +597,27 @@ class SessionRunner:
 
         with use_cwd(cwd), use_turn_context(turn_id, self):
             async with self._send_lock:
+                # Claim the in-flight pointer only after winning the
+                # send lock. Earlier this happened at function entry,
+                # outside the lock — which meant a second
+                # ``run_turn`` for the same session, scheduled while
+                # the first was still running, would overwrite
+                # ``_current_turn_task`` / ``_current_turn_id`` with
+                # its own values while waiting on the lock. A Stop
+                # call would then read the queued id and cancel the
+                # task that wasn't actually doing anything yet,
+                # leaving the in-flight turn untouched. Setting the
+                # pointers here means at most one turn ever owns
+                # them at a time and ``cancel_turn(None)`` always
+                # targets the running one. The web UI's JS-side
+                # ``pendingMessages`` queue (``app.js`` ~1541)
+                # serialises sends one level up so the bug rarely
+                # surfaced through the chat path, but the runner's
+                # contract advertises lock-based serialisation —
+                # other call sites (programmatic embeds, future API
+                # surfaces) deserve to rely on it.
+                self._current_turn_task = asyncio.current_task()
+                self._current_turn_id = turn_id
                 try:
                     session = await self.ensure_session()
                 except Exception as e:  # noqa: BLE001
