@@ -37,6 +37,14 @@ class _FakeKeyring:
         del self.store[(service, username)]
 
 
+@pytest.fixture(autouse=True)
+def _clear_cred_cache() -> None:
+    """The auth module caches credential reads across the process to
+    avoid redundant Keychain prompts. Tests need a fresh cache each
+    case or fakes from the previous test bleed through."""
+    auth._CRED_CACHE.clear()
+
+
 @pytest.fixture
 def fake_keyring(monkeypatch: pytest.MonkeyPatch) -> _FakeKeyring:
     fake = _FakeKeyring()
