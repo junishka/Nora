@@ -271,10 +271,10 @@ class ResultStore:
 
     def hide_results_not_in(
         self, kept_ids: set[str], *, reason: str,
-    ) -> int:
+    ) -> list[str]:
         """Mark every currently-visible row whose id is NOT in
         ``kept_ids`` as hidden, with the given reason and the current
-        timestamp. Returns the count of rows newly hidden.
+        timestamp. Returns the list of ids newly hidden.
 
         Used by the rewind path: after the chat history is truncated
         to a cut-point, the bridge collects the result_ids still
@@ -286,7 +286,14 @@ class ResultStore:
         Already-hidden rows are left alone — their ``hidden_at`` and
         ``hidden_reason`` reflect the rewind that hid them; a second
         rewind shouldn't overwrite that with a fresh timestamp. A
-        rewind that would hide nothing returns 0 cleanly.
+        rewind that would hide nothing returns ``[]`` cleanly.
+
+        The return value is a list (not just a count) so callers can
+        roll back: if the broader rewind operation fails downstream
+        (e.g., the chat-history truncate raises ``OSError``), the
+        bridge passes this list to ``unhide_results`` to restore the
+        rows. Without that, a failed rewind would leave the store
+        partially mutated while the JS side reports "rewind failed".
 
         Implementation: read all currently-visible ids in Python,
         diff against ``kept_ids`` to compute the to-hide set, then
@@ -304,7 +311,7 @@ class ResultStore:
             visible_ids = [r["id"] for r in visible_rows]
             to_hide = [vid for vid in visible_ids if vid not in kept_ids]
             if not to_hide:
-                return 0
+                return []
             # SQLite's default parameter limit is 999. Batch at 500
             # to leave headroom for the two leading parameters
             # (``now``, ``reason``) and any future schema growth.
@@ -319,7 +326,38 @@ class ResultStore:
                     f"({placeholders})",
                     (now, reason, *chunk),
                 )
-            return len(to_hide)
+            return list(to_hide)
+
+    def unhide_results(self, ids: list[str]) -> int:
+        """Clear ``hidden_at`` / ``hidden_reason`` on the given rows.
+
+        Rollback path for ``hide_results_not_in``: when a rewind's
+        downstream step fails (chat-history truncate raises), the
+        bridge calls this with the ids the hide step just returned.
+        Restoring exactly those ids — not "every hidden row" — keeps
+        any unrelated prior rewinds intact.
+
+        Returns the number of rows actually unhidden (rows already
+        visible are no-ops; rows that don't exist also no-op). A
+        best-effort rollback caller can ignore the count.
+        """
+        if not ids:
+            return 0
+        with self._txn():
+            BATCH = 500
+            total = 0
+            for i in range(0, len(ids), BATCH):
+                chunk = ids[i:i + BATCH]
+                placeholders = ",".join("?" * len(chunk))
+                cur = self._conn.execute(
+                    f"UPDATE results SET hidden_at = NULL, "
+                    f"hidden_reason = NULL "
+                    f"WHERE hidden_at IS NOT NULL AND id IN "
+                    f"({placeholders})",
+                    tuple(chunk),
+                )
+                total += cur.rowcount or 0
+            return total
 
     def list_by_script_run(self, script_run_id: str) -> list[StoredResult]:
         """All rows produced by one ``submit_script`` invocation, in

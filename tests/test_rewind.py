@@ -102,10 +102,10 @@ def test_hide_results_not_in_idempotent(tmp_path: Path) -> None:
     store = _fresh_store(tmp_path)
     _insert_n(store, 4)
     first = store.hide_results_not_in({"M1"}, reason="rewind")
-    assert first == 3
+    assert sorted(first) == ["M2", "M3", "M4"]
     first_ts = store.get("M2", include_hidden=True).hidden_at
     second = store.hide_results_not_in({"M1"}, reason="rewind")
-    assert second == 0
+    assert second == []
     second_ts = store.get("M2", include_hidden=True).hidden_at
     assert first_ts == second_ts  # not re-stamped
 
@@ -113,16 +113,52 @@ def test_hide_results_not_in_idempotent(tmp_path: Path) -> None:
 def test_hide_with_empty_kept_set(tmp_path: Path) -> None:
     store = _fresh_store(tmp_path)
     _insert_n(store, 3)
-    n = store.hide_results_not_in(set(), reason="rewind")
-    assert n == 3
+    hidden = store.hide_results_not_in(set(), reason="rewind")
+    assert sorted(hidden) == ["M1", "M2", "M3"]
     assert len(store.list_all()) == 0
 
 
-def test_hide_with_no_hidings_returns_zero(tmp_path: Path) -> None:
+def test_hide_with_no_hidings_returns_empty(tmp_path: Path) -> None:
     store = _fresh_store(tmp_path)
     _insert_n(store, 3)
-    n = store.hide_results_not_in({"M1", "M2", "M3"}, reason="rewind")
-    assert n == 0
+    hidden = store.hide_results_not_in({"M1", "M2", "M3"}, reason="rewind")
+    assert hidden == []
+
+
+def test_unhide_results_restores_specific_rows(tmp_path: Path) -> None:
+    """The rollback path: ``hide_results_not_in`` returns the ids
+    it just hid; ``unhide_results`` restores exactly those, leaving
+    any unrelated prior rewinds intact."""
+    store = _fresh_store(tmp_path)
+    _insert_n(store, 4)
+    # First rewind hides M2-M4 (M1 kept).
+    first = store.hide_results_not_in({"M1"}, reason="rewind")
+    assert sorted(first) == ["M2", "M3", "M4"]
+
+    # Now simulate a SECOND rewind that hides nothing more (M1 still
+    # kept), then a rollback. unhide_results(first) should restore
+    # M2-M4 only, NOT touch any unrelated rows.
+    restored = store.unhide_results(first)
+    assert restored == 3
+    visible_ids = {r.id for r in store.list_all()}
+    assert visible_ids == {"M1", "M2", "M3", "M4"}
+
+
+def test_unhide_results_no_op_on_already_visible(tmp_path: Path) -> None:
+    """``unhide_results`` is safe to call on rows that are already
+    visible — the WHERE clause includes ``hidden_at IS NOT NULL``
+    so it never re-clears or re-stamps anything."""
+    store = _fresh_store(tmp_path)
+    _insert_n(store, 3)
+    # Nothing hidden. unhide_results should no-op cleanly.
+    restored = store.unhide_results(["M1", "M2", "M3"])
+    assert restored == 0
+
+
+def test_unhide_results_empty_input_no_op(tmp_path: Path) -> None:
+    store = _fresh_store(tmp_path)
+    _insert_n(store, 2)
+    assert store.unhide_results([]) == 0
 
 
 # ---------------------------------------------------------------------------
@@ -301,13 +337,13 @@ def test_rewind_round_trip_preserves_kept_results(tmp_path: Path) -> None:
     off = _find_user_message_offset(history_path, 1)
     kept_ids = _result_ids_in_history_prefix(history_path, off)
     assert kept_ids == {"M1"}
-    n_hidden = store.hide_results_not_in(kept_ids, reason="rewind")
+    hidden_ids = store.hide_results_not_in(kept_ids, reason="rewind")
     _truncate_at_offset(history_path, off)
 
     # Visibility: M1 alone visible.
     visible = store.list_all()
     assert {r.id for r in visible} == {"M1"}
-    assert n_hidden == 2
+    assert sorted(hidden_ids) == ["M2", "M3"]
 
     # Audit path still sees the full set.
     audit = store.list_all(include_hidden=True)
@@ -399,6 +435,65 @@ def test_rewind_to_endpoint_happy_path(tmp_path: Path) -> None:
     assert runner.pending_mentioned_images == []
     assert runner.pending_plot_images == []
     assert runner.needs_context_prefix is True
+
+
+def test_rewind_to_rolls_back_hide_when_truncate_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """If ``_truncate_at_offset`` raises mid-rewind, the rows that
+    ``hide_results_not_in`` already marked must be restored. Without
+    the rollback, the bridge returns ok=false to JS while the store
+    has silently moved on — the model would see hidden rows on the
+    next turn even though the UI says the rewind failed."""
+    from nora.ui import NoraBridge
+    from nora.store import get_store
+    import nora.ui as ui_module
+
+    bridge = NoraBridge(cwd=tmp_path)
+    runner = bridge._active_runner()
+    assert runner is not None
+
+    store = get_store(tmp_path)
+    store.insert(
+        label="kept", analysis_type="t",
+        sanitized_payload={"i": 1}, language="Python",
+        script_code="x=1", transformations=[],
+    )
+    store.insert(
+        label="dropped", analysis_type="t",
+        sanitized_payload={"i": 2}, language="Python",
+        script_code="x=2", transformations=[],
+    )
+    history_path = tmp_path / ".nora" / "chat_history.jsonl"
+    _write_history(history_path, [
+        {"type": "user_message", "text": "first"},
+        {"type": "tool_result", "text": json.dumps({"result_id": "M1"})},
+        {"type": "assistant_text", "text": "ok"},
+        {"type": "user_message", "text": "second"},
+        {"type": "tool_result", "text": json.dumps({"result_id": "M2"})},
+    ])
+
+    # Force truncate to fail. The rewind path should detect this,
+    # roll the hide back, and surface ok=false.
+    def _boom(*args, **kwargs):
+        raise OSError("disk full (simulated)")
+
+    monkeypatch.setattr(ui_module, "_truncate_at_offset", _boom)
+
+    res = bridge.rewind_to(1)
+
+    assert res["ok"] is False
+    assert "could not truncate" in res["reason"]
+
+    # Both rows must be visible again — the hide was rolled back.
+    visible_ids = {r.id for r in store.list_all()}
+    assert visible_ids == {"M1", "M2"}, (
+        "rewind rollback failed: store mutated despite ok=false"
+    )
+
+    # And the chat history file is untouched.
+    raw_lines = history_path.read_bytes().splitlines()
+    assert len(raw_lines) == 5
 
 
 def test_rewind_to_refuses_when_no_active_session(tmp_path: Path) -> None:

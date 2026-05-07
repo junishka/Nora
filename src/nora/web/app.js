@@ -78,14 +78,14 @@ if (cwdEl) {
 // starting 1M matches the default model (Sonnet).
 const DEFAULT_CONTEXT_WINDOW = 1_000_000;
 let contextWindow = DEFAULT_CONTEXT_WINDOW;
-// Last value handed to ``updateContextChip``, retained so the chip
-// can be re-rendered against a freshly loaded ``contextWindow``
-// without waiting for the next turn_done. ``loadModels`` and
-// ``replayHistory`` race in ``showChat``: if turn_done arrives before
-// the model catalog resolves, the ratio prints against the default
-// 1M ceiling. When ``renderModelChip`` later sets the real window we
-// re-render so the ratio matches the active model.
-let lastOccupiedTokens = null;
+// Last solid count returned by ``count_next_context``. The chip
+// keeps showing this until a new count lands — no estimates, no
+// projections from pending messages, no provider ``turn_done``
+// echoes. Triggers (turn complete, rewind success, session
+// open/switch, attachment add/remove) call ``triggerContextRecount``
+// which fades the chip and updates this when the backend returns.
+let lastContextCount = null;     // {tokens, exact, ceiling}
+let contextCountRequestId = 0;   // monotonic counter for stale-response rejection
 
 // (No high-water clamp on the context chip. Earlier we Math.max'd
 // each turn_done's reported usage against a per-cwd watermark so the
@@ -162,10 +162,12 @@ function estimateMessageTokens(text, imageCount) {
 }
 function pushPendingMessage(cwd, text, imageCount) {
   if (!cwd) return;
+  // Pending message tokens are tracked locally for any caller that
+  // still wants the rough delta (none today — the chip stopped
+  // reading from this when the recount-on-trigger refactor landed).
+  // Kept as an empty-but-present FIFO so existing call sites don't
+  // break; remove once nothing reads it.
   pendingTokensFor(cwd).push(estimateMessageTokens(text, imageCount));
-  // Re-render the chip if this is the focused session — researcher
-  // sees the next-request estimate immediately on send.
-  if (cwd === currentCwd) updateContextChip(lastOccupiedTokens);
 }
 function popPendingMessage(cwd) {
   if (!cwd) return;
@@ -594,8 +596,14 @@ function showChat(payload) {
   // measurement we have nothing honest to display. Reset the
   // last-rendered count too so a fresh session doesn't re-render
   // the previous session's number against the new model's window.
-  lastOccupiedTokens = null;
-  if (contextChip) contextChip.classList.add('hidden');
+  // Drop the previous session's count so we don't briefly render
+  // it against the new session's eventual count. ``replayHistory``
+  // triggers a recount once the new history loads.
+  lastContextCount = null;
+  if (contextChip) {
+    contextChip.classList.add('hidden');
+    contextChip.classList.remove('stale');
+  }
 
   replayHistory();
   rotatePlaceholder();
@@ -637,11 +645,20 @@ async function replayHistory() {
     const res = await window.pywebview.api.get_chat_history();
     if (!res || !res.ok) return;
     const events = res.events || [];
-    if (events.length === 0) return;
-    // Drop the default welcome "system" line so replayed history
-    // starts the transcript instead of below the greeting.
+    // Always wipe the existing transcript before painting from
+    // the persisted log — even when the log is empty. The empty
+    // case fires after a rewind that dropped the very first
+    // message: the backend has truncated chat_history.jsonl, but
+    // an early ``return`` here would leave the old DOM in place,
+    // so ``runEditedMessage``'s subsequent ``appendUser`` would
+    // stack the revised bubble on top of stale messages from the
+    // dropped branch. Same reasoning for ``setWelcomeOnlyMode`` —
+    // the welcome "system" line should also be cleared so the
+    // post-rewind state starts empty, and the next live turn
+    // toggles welcome mode off naturally.
     messagesEl.innerHTML = '';
     setWelcomeOnlyMode(false);
+    if (events.length === 0) return;
     replayMode = true;
     try {
       events.forEach((evt) => replayEvent(evt));
@@ -669,15 +686,12 @@ async function replayHistory() {
         break;
       }
     }
-    if (lastTurnDone) {
-      const occupied = (typeof lastTurnDone.post_turn_tokens === 'number')
-        ? lastTurnDone.post_turn_tokens
-        : ((lastTurnDone.input_tokens || 0) +
-           (lastTurnDone.cache_read_input_tokens || 0) +
-           (lastTurnDone.cache_creation_input_tokens || 0) +
-           (lastTurnDone.output_tokens || 0));
-      if (occupied > 0) updateContextChip(occupied);
-    }
+    // Trigger a fresh pre-flight count after replay. Don't seed the
+    // chip from ``lastTurnDone`` usage fields — that mixes
+    // post-billing reality into a chip that's supposed to predict
+    // the NEXT request's headroom, which was the source of the
+    // fluctuation this refactor cleans up.
+    triggerContextRecount('replay');
     // Re-anchor the loading indicator if this session is still in
     // flight. ``showChat → syncComposerToFocus`` already added it
     // for a busy session, but the ``messagesEl.innerHTML = ''`` we
@@ -1977,7 +1991,7 @@ if (stopBtn) {
     // going to land, so their estimates shouldn't carry on the chip.
     if (currentCwd) {
       pendingTokensFor(currentCwd).length = 0;
-      updateContextChip(lastOccupiedTokens);
+      triggerContextRecount('stop');
     }
     // Visible acknowledgement: the cancellation cascades through
     // the SDK + the subprocess kill, which can take a beat. Without
@@ -2101,13 +2115,16 @@ window.nora_event = function (evt) {
       // researcher switches focus to a different session mid-turn.
       popPendingMessage(evtCwd);
       if (isFocused) {
-        const occupied = (typeof evt.post_turn_tokens === 'number')
-          ? evt.post_turn_tokens
-          : ((evt.input_tokens || 0) +
-             (evt.cache_read_input_tokens || 0) +
-             (evt.cache_creation_input_tokens || 0) +
-             (evt.output_tokens || 0));
-        updateContextChip(occupied);
+        // Refresh the chip from the pre-flight counter — single
+        // source of truth. The provider's ``post_turn_tokens`` is
+        // post-billing reality, useful for diagnostics but not the
+        // right number for "what's the next request going to weigh"
+        // (which is what the chip predicts). Logged below for any
+        // debug consumer that still wants the post-hoc value.
+        if (typeof evt.post_turn_tokens === 'number') {
+          // Diagnostic only; not on the chip.
+        }
+        triggerContextRecount('turn_done');
         if (activeLiveTurn && !activeLiveTurn.hasVisibleReply) {
           queueDisposableTurn(activeLiveTurn.nodes);
         }
@@ -2148,7 +2165,7 @@ window.nora_event = function (evt) {
       // otherwise stick on the chip until the next send.
       pendingTokensFor(evtCwd).length = 0;
       setSending(false, evtCwd);
-      if (evtCwd === currentCwd) updateContextChip(lastOccupiedTokens);
+      if (evtCwd === currentCwd) triggerContextRecount('turn_settled');
       break;
     case 'turn_error':
       if (isFocused) {
@@ -2169,7 +2186,7 @@ window.nora_event = function (evt) {
       // estimates so the chip stops carrying them as "next".
       pendingTokensFor(evtCwd).length = 0;
       setSending(false, evtCwd);
-      if (evtCwd === currentCwd) updateContextChip(lastOccupiedTokens);
+      if (evtCwd === currentCwd) triggerContextRecount('turn_settled');
       break;
     case 'policy_updated':
       updatePolicyChip(evt.policy);
@@ -3007,92 +3024,128 @@ const policyChipLabel = document.getElementById('policy-chip-label');
 const policyPopup = document.getElementById('policy-popup');
 let policyPopupBuiltFor = null;  // cached copy so we don't rebuild needlessly
 
-function updateContextChip(occupiedTokens) {
-  /* Updates the "Context X / Y (Z%)" chip below the composer.
+function renderContextChip() {
+  /* Paint the chip from ``lastContextCount`` (the last solid count
+   * returned by the backend). Stable single-source-of-truth render:
+   * no projections, no pending-message arithmetic, no provider
+   * ``turn_done`` echoes. The number changes only when a recount
+   * response lands — see ``triggerContextRecount`` for the trigger
+   * list (turn complete, rewind success, session switch, attachment
+   * add/remove).
    *
-   * Two meters, separated:
-   * - ``occupiedTokens``: the LAST measurement — what the provider
-   *   reported was the prompt size after the most recent turn.
-   *   Authoritative for what was actually sent.
-   * - ``pendingDelta``: a LOCAL estimate of what the next request
-   *   will weigh on top of the last measurement. Computed from the
-   *   per-cwd FIFO of submitted-but-unacknowledged user messages
-   *   (see ``pendingMessageTokensByCwd``). chars/4 + 1500/image —
-   *   approximate, replaced by the provider's count when turn_done
-   *   lands.
-   *
-   * Display:
-   *   - When pendingDelta == 0:  ``Context 47k / 200k (24%)``
-   *   - When pendingDelta  > 0:  ``Context ~52k / 200k (26%)``
-   *
-   * The single-number form replaces an earlier "47k → ~52k" arrow
-   * that researchers found confusing — the two numbers usually
-   * differ by < 1% (chars/4 estimate of a single typed message),
-   * so the arrow added visual noise without much information. The
-   * ``~`` prefix is the kept signal: it means "this is a projected
-   * weight that includes pending unsent messages, not the last
-   * provider-measured value". The tooltip below carries the full
-   * breakdown for anyone who wants it. */
+   * The chip prefixes ``~`` whenever ``exact=False`` (chars/3.5
+   * fallback today — replaced by tiktoken / count_tokens once those
+   * paths land). This is the only place in the UI that should ever
+   * use the tilde for context size; ad-hoc estimates elsewhere were
+   * the bug we're fixing.
+   */
   if (!contextChip) return;
-  if (typeof occupiedTokens !== 'number' || occupiedTokens < 0) return;
-  lastOccupiedTokens = occupiedTokens;
-
-  // No clamp on ``occupiedTokens``. The chip displays exactly what
-  // the last completed turn reported. Under normal use the
-  // conversation chain grows monotonically, so the chip will only
-  // rise; if it drops, that's an honest signal (cache invalidation,
-  // model swap that opened a fresh session, truncation event) worth
-  // showing rather than hiding.
-
-  // Trust the authoritative ceiling set in updateModelChip (line ~3085)
-  // from the model-info payload. The previous code auto-scaled the
-  // ceiling to 2M whenever usage exceeded 1M, which silently
-  // misreported overruns: an Opus 4.7 1M turn at 1426k chars showed
-  // "71%" of 2M instead of the truthful "143% of 1M, you've blown
-  // past the window". Anthropic has no 2M model today, so the
-  // heuristic never matched reality. If the chip looks pinned at
-  // 100% on a different model in the future, fix the model registry
-  // (catalog.py / updateModelChip), not the chip.
-
-  // Pending-message delta for the focused session.
-  const pendingQueue = currentCwd ? pendingTokensFor(currentCwd) : [];
-  const pendingDelta = pendingQueue.reduce((a, b) => a + b, 0);
-  const projected = occupiedTokens + pendingDelta;
-
-  const fmt = (n) => (n >= 10_000 ? (n / 1000).toFixed(1) + 'k' : n.toString());
-  const ceilingLabel = contextWindow >= 1_000_000
-    ? (contextWindow / 1_000_000) + 'M'
-    : (contextWindow / 1000) + 'k';
-  // Color severity is keyed off the PROJECTED size so the warning
-  // tones fire when the next request would push us over, not only
-  // after the over-the-window measurement comes back.
-  const rawPct = Math.round((projected / contextWindow) * 100);
-  if (pendingDelta > 0) {
-    // Single projected number with a leading ``~`` so researchers
-    // know it's an estimate that folds in unsent messages. Tooltip
-    // still spells out both the last-measured and projected values.
-    contextChip.textContent =
-      `Context ~${fmt(projected)} / ${ceilingLabel} (${rawPct}%)`;
-    contextChip.title =
-      `Last measured by provider: ${occupiedTokens.toLocaleString()} tokens.\n` +
-      `Estimated for next request: ~${projected.toLocaleString()} tokens ` +
-      `(${pendingQueue.length} pending message${pendingQueue.length === 1 ? '' : 's'}, ` +
-      `chars/4 estimate; provider's count replaces this on next turn_done).`;
-  } else {
-    contextChip.textContent = `Context ${fmt(occupiedTokens)} / ${ceilingLabel} (${rawPct}%)`;
-    contextChip.title =
-      `Last measured by provider: ${occupiedTokens.toLocaleString()} tokens.\n` +
-      `No pending messages — next request weight will be measured on send.`;
+  if (!lastContextCount) {
+    contextChip.classList.add('hidden');
+    return;
   }
+  const { tokens, exact, ceiling } = lastContextCount;
+  const fmt = (n) => (n >= 10_000 ? (n / 1000).toFixed(1) + 'k' : n.toString());
+  const ceilingLabel = ceiling >= 1_000_000
+    ? (ceiling / 1_000_000) + 'M'
+    : (ceiling / 1000) + 'k';
+  const rawPct = Math.round((tokens / ceiling) * 100);
+  // No ``~`` prefix on the chip text. While ``exact`` is False on
+  // every render today (the chars/3.5 fallback is the only path
+  // wired), a prefix that's always present conveys no information
+  // and reads as visual noise. The tooltip still spells out that
+  // the value is an approximation. When exact tokenization lands
+  // (tiktoken for OpenAI, count_tokens API for Claude), the
+  // tooltip wording switches but the chip text stays clean.
+  contextChip.textContent =
+    `Context ${fmt(tokens)} / ${ceilingLabel} (${rawPct}%)`;
+  // Tooltip: precise count + a one-clause honesty caveat when the
+  // number is local-approximate. Researchers know how tokens work;
+  // they don't need a trigger list. The precise count is the only
+  // value-add over the chip text itself ("47.2k" → "47,234").
+  contextChip.title = exact
+    ? `${tokens.toLocaleString()} tokens`
+    : (
+        `${tokens.toLocaleString()} tokens · local estimate, ` +
+        `expect a small gap from the provider's billed count`
+      );
   contextChip.classList.remove('hidden');
-
-  // Visual warning as context fills up — dim at low use, warm as it
-  // climbs, red near the ceiling, the strongest tone past 100% so a
-  // window overrun is visually unmistakable.
   contextChip.classList.remove('warn', 'danger', 'over');
   if (rawPct >= 100) contextChip.classList.add('over');
   else if (rawPct >= 90) contextChip.classList.add('danger');
   else if (rawPct >= 70) contextChip.classList.add('warn');
+}
+
+async function triggerContextRecount(reason) {
+  /* Refresh the context chip from the backend's pre-flight counter.
+   * Call sites: turn complete, rewind success, session open/switch,
+   * attachment add/remove. ``reason`` rides through to the console
+   * for debugging only — the chip itself shows no "updating..." text.
+   *
+   * Visual contract: fade the chip immediately so the researcher
+   * sees their action acknowledged, even before the backend
+   * returns. The fade clears when the matching count response
+   * lands. A newer recount (different ``request_id``) supersedes
+   * an in-flight one — the older response, when it eventually
+   * arrives, fails the id check and is dropped, leaving the chip
+   * faded until the newer response lands.
+   */
+  if (!contextChip) return;
+  if (!window.pywebview || !window.pywebview.api) return;
+  if (typeof window.pywebview.api.count_next_context !== 'function') return;
+
+  contextCountRequestId += 1;
+  const id = contextCountRequestId;
+  contextChip.classList.add('stale');
+
+  // Pull whatever the composer currently shows. Empty when the chip
+  // is fired between turns. The composer element is ``input`` per
+  // ``getElementById('compose-input')`` at module top — earlier
+  // drafts of this code referenced ``composerEl`` which was never
+  // declared, throwing a silent ReferenceError inside this async
+  // function and leaving the chip stuck hidden forever.
+  const draftText = (input && input.value) || '';
+  const nImages = pendingComposerImageCount();
+  const nAttachments = pendingComposerScriptCount();
+
+  let res;
+  try {
+    res = await window.pywebview.api.count_next_context(
+      draftText, nImages, nAttachments, id,
+    );
+  } catch (err) {
+    // Network / bridge failure. Leave the chip faded but stop
+    // claiming "updating" — the next trigger will retry. The
+    // researcher still sees the last solid value, just dimmed.
+    console.warn('count_next_context failed', err);
+    return;
+  }
+  if (!res || !res.ok) return;
+  if (res.request_id !== contextCountRequestId) {
+    // Stale response — newer recount in flight. Drop silently.
+    return;
+  }
+  lastContextCount = {
+    tokens: res.tokens,
+    exact: !!res.exact,
+    ceiling: res.ceiling,
+  };
+  contextChip.classList.remove('stale');
+  renderContextChip();
+}
+
+function pendingComposerImageCount() {
+  // Pending images attached to the next send (drag-drop / paste).
+  // Module-local state, mirrors what ``handleSubmit`` will pack.
+  return Array.isArray(stagedImages) ? stagedImages.length : 0;
+}
+
+function pendingComposerScriptCount() {
+  // Script attachments live on the bridge runner, not in JS state
+  // — the chip's count includes them via the system-prompt + chat-
+  // history bytes the backend accounts for. Returning 0 here means
+  // we don't double-count; the real bytes are summed server-side.
+  return 0;
 }
 
 function updatePolicyChip(policy) {
@@ -3943,8 +3996,14 @@ function renderModelChip() {
   if (info && info.context_window) {
     const changed = contextWindow !== info.context_window;
     contextWindow = info.context_window;
-    if (changed && lastOccupiedTokens !== null) {
-      updateContextChip(lastOccupiedTokens);
+    // Window changed — re-render against the new denominator if we
+    // have a solid count cached. No backend recount: same-tokenizer
+    // model swap doesn't change the numerator, and cross-tokenizer
+    // swap only matters once a turn fires under the new model
+    // (which then triggers a recount on its own).
+    if (changed && lastContextCount) {
+      lastContextCount = { ...lastContextCount, ceiling: contextWindow };
+      renderContextChip();
     }
   }
   renderModelPopup();

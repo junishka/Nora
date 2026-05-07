@@ -112,11 +112,36 @@ if [[ -n "${NORA_SIGN_IDENTITY:-}" ]]; then
     fi
 
     echo "==> Signing nested Mach-O binaries"
+    # The .app's CFBundleExecutable is the shell launcher at
+    # Contents/MacOS/Nora; it ``exec``s the nested PyInstaller
+    # binary at Contents/Resources/nora/nora. The nested binary is
+    # what becomes the running process — and exec does NOT propagate
+    # entitlements from the parent. So the hardened-runtime
+    # allowances (allow-unsigned-executable-memory,
+    # disable-library-validation, allow-dyld-environment-variables)
+    # have to be embedded into THAT binary's signature too, not just
+    # the outer bundle's. Without this, codesign verification still
+    # passes but the running image launches under hardened-runtime
+    # without the exemptions and aborts on the first ctypes / cffi /
+    # unsigned-dylib path PyInstaller exercises at startup.
+    NESTED_MAIN="$APP_BUNDLE/Contents/Resources/nora/nora"
+
     # `find -depth` walks deepest-first so each binary is signed before
     # its enclosing bundle. We use `file` to skip shell scripts and other
     # non-Mach-O executables that would otherwise trip codesign.
     while IFS= read -r -d '' candidate; do
-        if /usr/bin/file -b "$candidate" | grep -q "Mach-O"; then
+        if ! /usr/bin/file -b "$candidate" | grep -q "Mach-O"; then
+            continue
+        fi
+        if [[ "$candidate" == "$NESTED_MAIN" ]]; then
+            # Sign the running process image with entitlements so
+            # hardened-runtime exemptions actually apply at launch.
+            /usr/bin/codesign --force --options runtime --timestamp \
+                --entitlements "$ENTITLEMENTS" \
+                --sign "$NORA_SIGN_IDENTITY" "$candidate"
+        else
+            # Dylibs / extension modules: hardened runtime + timestamp,
+            # but no entitlements (they don't become processes).
             /usr/bin/codesign --force --options runtime --timestamp \
                 --sign "$NORA_SIGN_IDENTITY" "$candidate"
         fi
@@ -124,6 +149,9 @@ if [[ -n "${NORA_SIGN_IDENTITY:-}" ]]; then
                 \( -name "*.dylib" -o -name "*.so" -o -perm -u+x \) -print0)
 
     echo "==> Signing app bundle"
+    # Outer bundle still gets --entitlements so codesign metadata is
+    # consistent at every level a verifier might inspect (the bundle,
+    # the CFBundleExecutable, and the nested running binary).
     /usr/bin/codesign --force --options runtime --timestamp \
         --entitlements "$ENTITLEMENTS" \
         --sign "$NORA_SIGN_IDENTITY" \
@@ -131,6 +159,18 @@ if [[ -n "${NORA_SIGN_IDENTITY:-}" ]]; then
 
     echo "==> Verifying signature"
     /usr/bin/codesign --verify --deep --strict --verbose=2 "$APP_BUNDLE"
+    # Confirm the entitlements actually landed on the nested running
+    # binary — this is the guard against future refactors that move
+    # the entitlements step around and silently drop them from the
+    # process image. ``codesign -d --entitlements -`` prints the
+    # embedded plist; we grep for one of the keys we expect to see.
+    if ! /usr/bin/codesign -d --entitlements - "$NESTED_MAIN" 2>/dev/null \
+            | grep -q "com.apple.security.cs.disable-library-validation"; then
+        echo "ERROR: nested binary $NESTED_MAIN is missing hardened-runtime entitlements." >&2
+        echo "       This means the running process won't have the exemptions and" >&2
+        echo "       will abort at launch despite passing codesign --verify." >&2
+        exit 1
+    fi
     echo "Signed with: $NORA_SIGN_IDENTITY"
 else
     echo "==> Skipping codesign (NORA_SIGN_IDENTITY unset)"

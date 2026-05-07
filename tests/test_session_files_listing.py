@@ -198,6 +198,250 @@ def test_list_session_files_walks_run_dir_nora_plots(tmp_path: Path) -> None:
     assert "residuals.png" in names
 
 
+def test_list_session_files_surfaces_script_with_label(tmp_path: Path) -> None:
+    """``submit_script`` writes ``<cwd>/.nora/runs/<id>/script.do`` and
+    inserts a result row whose ``label`` describes the analytic intent
+    ("reg_v12 2v common sample"). The Files panel surfaces the script
+    under that label so the researcher can identify which script is
+    which without opening each one. Falls back to ``script_<short_id>``
+    when no row exists for the run dir (script crashed before any
+    helper fired)."""
+    cwd = tmp_path / "session"
+    runs = cwd / ".nora" / "runs"
+    labeled_run = runs / "20260507T120000Z_aaaaaaaa"
+    labeled_run.mkdir(parents=True)
+    (labeled_run / "script.do").write_text("// labeled", encoding="utf-8")
+    bare_run = runs / "20260507T120100Z_bbbbbbbb"
+    bare_run.mkdir(parents=True)
+    (bare_run / "script.do").write_text("// no label", encoding="utf-8")
+
+    from nora.store import get_store
+    get_store(cwd).insert(
+        label="reg_v12 2v common sample: op_margin + ln_employees only",
+        analysis_type="linear_regression",
+        sanitized_payload={"type": "linear_regression"},
+        language="Stata",
+        script_code="// labeled",
+        transformations=[],
+        raw_log_path=str(labeled_run),
+        script_run_id="run-aaaaaaaa",
+    )
+
+    bridge = NoraBridge(cwd=cwd)
+    res = bridge.list_session_files()
+    names = [f["name"] for f in res["files"]]
+    assert (
+        "reg_v12 2v common sample: op_margin + ln_employees only.do" in names
+    ), names
+    assert "script_bbbbbbbb.do" in names, names
+
+
+def test_list_session_files_label_lookup_survives_resolved_cwd(
+    tmp_path: Path,
+) -> None:
+    """The store records ``raw_log_path`` as ``str(run_dir)`` from
+    whatever cwd representation the executor held. If the bridge is
+    later constructed with a resolved (or unresolved) cwd that differs
+    by a symlink prefix, a full-path key would silently miss every
+    row. Keying by the run dir's basename insulates the panel from
+    that drift — exercise the case explicitly."""
+    real_cwd = (tmp_path / "real").resolve()
+    real_cwd.mkdir()
+    link_cwd = tmp_path / "session_link"
+    link_cwd.symlink_to(real_cwd)
+
+    runs = real_cwd / ".nora" / "runs"
+    run_dir = runs / "20260507T120000Z_cccccccc"
+    run_dir.mkdir(parents=True)
+    (run_dir / "script.do").write_text("// via real path", encoding="utf-8")
+
+    # Insert via the resolved path...
+    from nora.store import get_store
+    get_store(real_cwd).insert(
+        label="H2 panel main",
+        analysis_type="linear_regression",
+        sanitized_payload={"type": "linear_regression"},
+        language="Stata",
+        script_code="// real",
+        transformations=[],
+        raw_log_path=str(run_dir),  # resolved cwd
+        script_run_id="run-cccccccc",
+    )
+    # ...but list via the symlinked cwd. The bridge would otherwise
+    # see "/tmp/.../session_link/.nora/runs/<id>" which doesn't match
+    # the stored "/tmp/.../real/.nora/runs/<id>".
+    bridge = NoraBridge(cwd=link_cwd)
+    res = bridge.list_session_files()
+    names = [f["name"] for f in res["files"]]
+    assert "H2 panel main.do" in names, names
+
+
+def test_list_session_files_prefers_run_dir_label_txt_over_per_helper(
+    tmp_path: Path,
+) -> None:
+    """A multi-result ``submit_script`` writes umbrella + per-helper
+    labels — the umbrella to ``<run_dir>/label.txt``, each per-helper
+    label as the row's ``label`` in ``results.db``. The Files panel
+    must surface the umbrella, not the first per-helper label.
+
+    Without this, a 20-regression script labeled
+    ``reg_v16: H1/H2/H3, Path A and Path B`` shows up as
+    ``Path A H1: operating_margin.do`` (the first cell), which
+    misleads the researcher about what the script does."""
+    cwd = tmp_path / "session"
+    runs = cwd / ".nora" / "runs"
+    run_dir = runs / "20260507T120000Z_eeeeeeee"
+    run_dir.mkdir(parents=True)
+    (run_dir / "script.do").write_text("// 20 specs", encoding="utf-8")
+    (run_dir / "label.txt").write_text(
+        "reg_v16: H1/H2/H3, Path A and Path B", encoding="utf-8",
+    )
+
+    from nora.store import get_store
+    store = get_store(cwd)
+    # Per-helper labels — what each cell would carry. None of these
+    # should land in the file panel as the script name.
+    for label in (
+        "Path A H1: operating_margin",
+        "Path A H1: asset_turnover",
+        "Path A H2: ln_employees",
+    ):
+        store.insert(
+            label=label,
+            analysis_type="linear_regression",
+            sanitized_payload={"type": "linear_regression"},
+            language="Stata",
+            script_code="// 20 specs",
+            transformations=[],
+            raw_log_path=str(run_dir),
+            script_run_id="run-eeeeeeee",
+        )
+
+    bridge = NoraBridge(cwd=cwd)
+    res = bridge.list_session_files()
+    names = [f["name"] for f in res["files"]]
+    # Forward slashes in the umbrella label collapse to spaces under
+    # ``label_to_filename_stem`` (path-character hygiene) — that's
+    # expected. The umbrella structure survives, which is what the
+    # researcher actually reads.
+    assert "reg_v16: H1 H2 H3, Path A and Path B.do" in names, names
+    # And the per-helper labels must NOT be the surfaced file name.
+    for cell_label in (
+        "Path A H1: operating_margin.do",
+        "Path A H1: asset_turnover.do",
+    ):
+        assert cell_label not in names, (
+            f"per-helper label {cell_label!r} surfaced as script name"
+        )
+
+
+def test_list_session_files_falls_back_to_store_when_no_label_txt(
+    tmp_path: Path,
+) -> None:
+    """Backwards compat: runs created before label.txt was written
+    have no umbrella file, so the panel still uses the first
+    per-helper row label as the name. Without this fallback, every
+    pre-existing session would show only ``script_<short_id>.do``
+    after a Nora upgrade."""
+    cwd = tmp_path / "session"
+    runs = cwd / ".nora" / "runs"
+    run_dir = runs / "20260507T120100Z_ffffffff"
+    run_dir.mkdir(parents=True)
+    (run_dir / "script.do").write_text("// legacy", encoding="utf-8")
+    # No label.txt — the legacy path.
+
+    from nora.store import get_store
+    get_store(cwd).insert(
+        label="OLS log salary on female",
+        analysis_type="linear_regression",
+        sanitized_payload={"type": "linear_regression"},
+        language="Stata",
+        script_code="// legacy",
+        transformations=[],
+        raw_log_path=str(run_dir),
+        script_run_id="run-ffffffff",
+    )
+
+    bridge = NoraBridge(cwd=cwd)
+    res = bridge.list_session_files()
+    names = [f["name"] for f in res["files"]]
+    assert "OLS log salary on female.do" in names, names
+
+
+def test_list_session_files_skips_only_truly_empty_labels_for_first_pick(
+    tmp_path: Path,
+) -> None:
+    """A run can produce an ``(unlabeled)`` row before a real helper
+    label lands; the cleaning step strips that placeholder to empty,
+    so the map-build walks past it and picks up the next row's label.
+    Diagnostic prefixes that carry real content (``[rejected] X``)
+    are kept as-is — the bracket tag is informative and stripping
+    both would leave a crashed run indistinguishable from any other.
+    This test pins both behaviors at once: ``(unlabeled)`` is skipped,
+    a real label following it surfaces."""
+    cwd = tmp_path / "session"
+    runs = cwd / ".nora" / "runs"
+    run_dir = runs / "20260507T120000Z_dddddddd"
+    run_dir.mkdir(parents=True)
+    (run_dir / "script.do").write_text("// mixed", encoding="utf-8")
+
+    from nora.store import get_store
+    store = get_store(cwd)
+    # First row: placeholder (model omitted ``label`` and the helper
+    # didn't pass its own). Cleans to empty, so it's skipped.
+    # Second row: a real helper label. This is what should show.
+    for label in ("(unlabeled)", "H1a Path A: op margin, FP-only"):
+        store.insert(
+            label=label,
+            analysis_type="linear_regression",
+            sanitized_payload={"type": "linear_regression"},
+            language="Stata",
+            script_code="// mixed",
+            transformations=[],
+            raw_log_path=str(run_dir),
+            script_run_id="run-dddddddd",
+        )
+
+    bridge = NoraBridge(cwd=cwd)
+    res = bridge.list_session_files()
+    names = [f["name"] for f in res["files"]]
+    assert "H1a Path A: op margin, FP-only.do" in names, names
+
+
+def test_list_session_files_disambiguates_label_collisions(
+    tmp_path: Path,
+) -> None:
+    """Two runs sharing a label still need to be distinguishable in
+    the panel. Collisions get the run's short_id appended in
+    parens before the extension."""
+    cwd = tmp_path / "session"
+    runs = cwd / ".nora" / "runs"
+    run_a = runs / "20260507T120000Z_aaaaaaaa"
+    run_b = runs / "20260507T120100Z_bbbbbbbb"
+    for r in (run_a, run_b):
+        r.mkdir(parents=True)
+        (r / "script.do").write_text("// dup label", encoding="utf-8")
+
+    from nora.store import get_store
+    store = get_store(cwd)
+    for r, sid in ((run_a, "run-aaaaaaaa"), (run_b, "run-bbbbbbbb")):
+        store.insert(
+            label="H1 panel",
+            analysis_type="linear_regression",
+            sanitized_payload={"type": "linear_regression"},
+            language="Stata",
+            script_code="// dup",
+            transformations=[],
+            raw_log_path=str(r),
+            script_run_id=sid,
+        )
+
+    bridge = NoraBridge(cwd=cwd)
+    res = bridge.list_session_files()
+    names = sorted(f["name"] for f in res["files"])
+    assert names == ["H1 panel (aaaaaaaa).do", "H1 panel (bbbbbbbb).do"], names
+
+
 def test_list_session_files_inlines_thumbnail_for_small_images(
     tmp_path: Path,
 ) -> None:

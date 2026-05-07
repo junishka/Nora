@@ -226,3 +226,103 @@ def test_resolves_files_under_helper_plot_dir(tmp_path: Path) -> None:
     text = _text_payload(result)
     assert text["status"] == "ok"
     assert text["kind"] == "image"
+
+
+# ---------------------------------------------------------------------------
+# Run-dir script resolution — the recovery path after a rewind clears
+# the chat history. Scripts Nora wrote on prior submit_script calls
+# live at ``<cwd>/.nora/runs/<id>/script.{do,R,py}`` and surface in
+# the Files panel under labeled or fallback names; ``read_attached_file``
+# must resolve those same names.
+# ---------------------------------------------------------------------------
+
+def test_resolves_run_dir_script_by_label(tmp_path: Path) -> None:
+    """A script Nora wrote with ``submit_script(label="H1a Path A...")``
+    is on disk at ``<run_dir>/script.do``. The Files panel shows it as
+    ``H1a Path A: op margin, FP-only.do`` (the cleaned label). The
+    model must be able to pass that same name to ``read_attached_file``
+    and get the script back — otherwise a rewound conversation leaves
+    the script visible but unfetchable."""
+    set_cwd(tmp_path)
+    run_dir = tmp_path / ".nora" / "runs" / "20260507T120000Z_aaaaaaaa"
+    run_dir.mkdir(parents=True)
+    (run_dir / "script.do").write_text(
+        "use \"data.dta\", clear\nregress y x\n", encoding="utf-8",
+    )
+
+    from nora.store import get_store
+    get_store(tmp_path).insert(
+        label="H1a Path A: op margin, FP-only",
+        analysis_type="linear_regression",
+        sanitized_payload={"type": "linear_regression"},
+        language="Stata",
+        script_code="use \"data.dta\", clear\nregress y x\n",
+        transformations=[],
+        raw_log_path=str(run_dir),
+        script_run_id="run-aaaaaaaa",
+    )
+
+    payload = _text_payload(_call("H1a Path A: op margin, FP-only.do"))
+    assert payload["status"] == "ok"
+    assert payload["kind"] == "script"
+    assert payload["language"] == "Stata"
+    assert "use \"data.dta\", clear" in payload["content"]
+
+
+def test_resolves_run_dir_script_by_short_id_fallback(
+    tmp_path: Path,
+) -> None:
+    """When the model omitted ``label`` on ``submit_script``, the
+    panel surfaces the script as ``script_<short_id>.do``. The recall
+    path must accept the same name."""
+    set_cwd(tmp_path)
+    run_dir = tmp_path / ".nora" / "runs" / "20260507T120100Z_bbbbbbbb"
+    run_dir.mkdir(parents=True)
+    (run_dir / "script.do").write_text(
+        "use \"data.dta\", clear\n", encoding="utf-8",
+    )
+    # No store row inserted — simulates the script-crashed-before-any-
+    # helper-fired path. Display name falls back to script_<short_id>.
+
+    payload = _text_payload(_call("script_bbbbbbbb.do"))
+    assert payload["status"] == "ok"
+    assert payload["kind"] == "script"
+    assert "use \"data.dta\"" in payload["content"]
+
+
+def test_run_dir_script_lookup_survives_rewind_hidden_label(
+    tmp_path: Path,
+) -> None:
+    """A rewind marks the result row's ``hidden_at`` timestamp but
+    leaves the row in the store and the script.do on disk. The
+    Files panel uses ``include_hidden=True`` so the labeled name
+    still surfaces; the recall path must do the same so the model
+    can fetch the script after a rewind clears the chat history."""
+    set_cwd(tmp_path)
+    run_dir = tmp_path / ".nora" / "runs" / "20260507T120200Z_cccccccc"
+    run_dir.mkdir(parents=True)
+    (run_dir / "script.do").write_text(
+        "regress y x\n", encoding="utf-8",
+    )
+
+    from nora.store import get_store
+    store = get_store(tmp_path)
+    row = store.insert(
+        label="M27-M38 base spec",
+        analysis_type="linear_regression",
+        sanitized_payload={"type": "linear_regression"},
+        language="Stata",
+        script_code="regress y x\n",
+        transformations=[],
+        raw_log_path=str(run_dir),
+        script_run_id="run-cccccccc",
+    )
+    # Simulate a rewind: hide the row.
+    store.hide_results_not_in(set(), reason="rewind")
+
+    payload = _text_payload(_call("M27-M38 base spec.do"))
+    assert payload["status"] == "ok"
+    assert payload["kind"] == "script"
+    assert "regress y x" in payload["content"]
+    # And confirm hide actually fired (otherwise the test is trivial).
+    assert store.get(row.id) is None  # default include_hidden=False
