@@ -68,6 +68,18 @@ chmod +x "$APP_BUNDLE/Contents/MacOS/Nora"
 # `cp -R` preserves the _internal/ layout PyInstaller generates.
 cp -R "$PYINSTALLER_OUT/." "$APP_BUNDLE/Contents/Resources/nora/"
 
+# App icon — `Nora.icns` lives at the bundle's Resources root and is
+# referenced by CFBundleIconFile in Info.plist below. Finder, Dock,
+# Cmd-Tab, and the About window all pick it up from there. Generate
+# the .icns from packaging/icon-source.png with:
+#   ./packaging/make_icns.sh   (regenerates packaging/Nora.icns)
+ICON_SRC="$REPO_ROOT/packaging/Nora.icns"
+if [[ ! -f "$ICON_SRC" ]]; then
+    echo "Missing $ICON_SRC — run packaging/make_icns.sh to regenerate." >&2
+    exit 1
+fi
+cp "$ICON_SRC" "$APP_BUNDLE/Contents/Resources/Nora.icns"
+
 echo "==> Writing Info.plist"
 cat > "$APP_BUNDLE/Contents/Info.plist" <<'PLIST'
 <?xml version="1.0" encoding="UTF-8"?>
@@ -85,6 +97,8 @@ cat > "$APP_BUNDLE/Contents/Info.plist" <<'PLIST'
     <key>CFBundleShortVersionString</key>
     <string>0.0.1</string>
     <key>CFBundleExecutable</key>
+    <string>Nora</string>
+    <key>CFBundleIconFile</key>
     <string>Nora</string>
     <key>CFBundlePackageType</key>
     <string>APPL</string>

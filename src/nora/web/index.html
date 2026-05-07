@@ -34,7 +34,15 @@
        can land on the data picker. -->
   <div id="auth" class="auth hidden">
     <div class="auth-card">
-      <div class="landing-logo">Nora</div>
+      <picture class="landing-hero">
+        <!-- The wordmark's burgundy ink is too dark to read against
+             the dark theme's plum background, so a recoloured PNG
+             ships alongside it. ``data-theme`` (set by the topbar
+             toggle) swaps the visible variant; the ``prefers-color-scheme``
+             fallback covers researchers who never toggle. -->
+        <img class="landing-hero-img landing-hero-img--light" src="nora-wordmark.png" alt="Nora — No raw access" />
+        <img class="landing-hero-img landing-hero-img--dark" src="nora-wordmark-dark.png" alt="" aria-hidden="true" />
+      </picture>
       <h1>Connect a model</h1>
       <p class="auth-lead">
         Nora drives a frontier model against your data. Pick at least
@@ -104,8 +112,15 @@
        The researcher drops files or clicks a button to pick them. -->
   <div id="landing" class="landing hidden">
     <div class="landing-card">
-      <div class="landing-logo">Nora</div>
-      <h1>No raw access</h1>
+      <picture class="landing-hero">
+        <!-- The wordmark's burgundy ink is too dark to read against
+             the dark theme's plum background, so a recoloured PNG
+             ships alongside it. ``data-theme`` (set by the topbar
+             toggle) swaps the visible variant; the ``prefers-color-scheme``
+             fallback covers researchers who never toggle. -->
+        <img class="landing-hero-img landing-hero-img--light" src="nora-wordmark.png" alt="Nora — No raw access" />
+        <img class="landing-hero-img landing-hero-img--dark" src="nora-wordmark-dark.png" alt="" aria-hidden="true" />
+      </picture>
       <p class="landing-lead">
         Choose the data files you want Nora to help you analyze.
         They stay on this machine. Nora only sees schema and

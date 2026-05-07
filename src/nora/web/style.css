@@ -440,14 +440,39 @@ kbd {
   text-align: center;
 }
 
-.landing-logo {
-  font-size: 14px;
-  font-weight: 600;
-  letter-spacing: 0.6px;
-  color: var(--text-dim);
-  margin-bottom: 16px;
-  text-transform: uppercase;
+.landing-hero {
+  display: block;
+  width: 320px;
+  max-width: 100%;
+  /* Top margin pushes the wordmark down off the card's top edge so
+   * the image's bounding box stops crowding the heading / lead
+   * paragraph that follows. The source PNG has a few rows of
+   * whitespace built into its canvas, so this margin stacks with
+   * that for a comfortable vertical rhythm. */
+  margin: 16px auto 28px;
 }
+
+.landing-hero-img {
+  display: block;
+  width: 100%;
+  height: auto;
+}
+
+/* Two prebaked wordmark PNGs — light (burgundy ink) and dark (cream
+ * + mauve ink). Show one, hide the other, based on the active theme.
+ * Default state is light visible / dark hidden; dark-mode rules below
+ * flip it. Two <img>s + CSS toggle is simpler than a JS swap and
+ * still works when the topbar toggle forces a theme that fights the
+ * OS preference. */
+.landing-hero-img--dark { display: none; }
+
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) .landing-hero-img--light { display: none; }
+  :root:not([data-theme="light"]) .landing-hero-img--dark { display: block; }
+}
+
+:root[data-theme="dark"] .landing-hero-img--light { display: none; }
+:root[data-theme="dark"] .landing-hero-img--dark { display: block; }
 
 .landing h1 {
   margin: 0 0 12px;
