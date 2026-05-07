@@ -1074,13 +1074,17 @@ class NoraBridge:
         # exists on disk after every run; until this loop walked
         # it, the Files panel only ever saw uploads, leaving Nora-
         # written scripts inaccessible without leaving the chat.
-        # Display name disambiguation: every run dir contains a
-        # bare ``script.do`` (or ``.R`` / ``.py``), so a flat list
-        # would show fifty rows all named "script.do". We rewrite
-        # the surfaced ``name`` to ``script_<short_id>.do`` using
-        # the 8-char hex tail of the run dir name; the full path
-        # stays in the row's ``path`` field for the copy / open
-        # actions, and the filesystem on disk is untouched.
+        # Display name: prefer the analytic label the model passed
+        # to ``submit_script`` ("reg_v12 2v common sample") so the
+        # researcher can identify which script is which without
+        # opening each one. Looked up via the run-dir-basename →
+        # label map built from ``results.db`` below. Falls back to
+        # ``script_<short_id>.do`` when the run produced no stored
+        # rows (e.g., the script crashed before any helper fired)
+        # or the model passed the default ``(unlabeled)``.
+        # Collisions get the short_id appended in parens. The actual
+        # file path on disk (``script.do`` etc.) is never renamed;
+        # only the surfaced ``name`` is rewritten.
         # Cap: the 12 most recent submit_script runs, sorted by
         # mtime desc. Without a cap, a long session (50+ runs)
         # would bury uploaded scripts under generated ones; 12 is
@@ -1105,46 +1109,33 @@ class NoraBridge:
             except OSError:
                 pass
 
-            # Collect candidate scripts across all run dirs, then
-            # cap to the 12 newest by mtime.
-            script_candidates: list[tuple[float, Path, str]] = []
-            for run_dir in run_dirs:
-                for ext in (".do", ".R", ".r", ".py", ".ipynb"):
-                    candidate = run_dir / f"script{ext}"
-                    if not candidate.is_file() or candidate.is_symlink():
-                        continue
-                    try:
-                        mtime = candidate.stat().st_mtime
-                    except OSError:
-                        continue
-                    short_id = run_dir.name.rsplit("_", 1)[-1][:8] or "run"
-                    display = f"script_{short_id}{ext}"
-                    script_candidates.append((mtime, candidate, display))
-                    break  # one script per run dir
-            script_candidates.sort(key=lambda t: -t[0])
-            for _, script_path, display in script_candidates[:12]:
-                ext = script_path.suffix.lower()
+            # Surface the script Nora wrote on each ``submit_script``
+            # — they live at ``<run_dir>/script.{do,R,py,ipynb}`` and
+            # the panel is the only path back to them once the chat
+            # history has scrolled away (or been rewound). The same
+            # enumeration drives the model-facing tools, so what the
+            # researcher sees here is exactly what the model can ask
+            # back for by name.
+            from nora.run_files import enumerate_run_dir_scripts
+            for entry in enumerate_run_dir_scripts(self.cwd):
+                ext = entry.path.suffix.lower()
                 kind_pri = kind_for_ext.get(ext) or ("script", 1)
                 kind, priority = kind_pri
                 try:
-                    stat = script_path.stat()
-                except OSError:
-                    continue
-                try:
-                    resolved = script_path.resolve()
+                    resolved = entry.path.resolve()
                 except OSError:
                     continue
                 if resolved in seen_paths:
                     continue
                 seen_paths.add(resolved)
                 rows.append({
-                    "name": display,
+                    "name": entry.display_name,
                     "kind": kind,
                     "priority": priority,
-                    "size": stat.st_size,
+                    "size": entry.size_bytes,
                     "ext": ext,
-                    "mtime": stat.st_mtime,
-                    "path": str(script_path),
+                    "mtime": entry.mtime,
+                    "path": str(entry.path),
                 })
 
         # Newest-first within each kind so the most recent plots
@@ -2557,7 +2548,7 @@ class NoraBridge:
         try:
             from nora.store import get_store
             store = get_store(self.cwd)
-            hidden_count = store.hide_results_not_in(kept_ids, reason="rewind")
+            hidden_ids = store.hide_results_not_in(kept_ids, reason="rewind")
         except Exception as e:  # noqa: BLE001 — surface store errors to JS
             return {
                 "ok": False,
@@ -2565,13 +2556,27 @@ class NoraBridge:
             }
 
         # 4. Truncate the chat-history file at the offset.
+        # On failure, roll back the hide. Without this, the bridge
+        # returns ok=false to JS while the store has already mutated
+        # — the model would see different result visibility than the
+        # chat history reflects, and the researcher's UI would say
+        # the rewind failed even as the model's next turn surfaced
+        # the half-applied state. Crash safety from the docstring is
+        # preserved: a process death between hide and truncate still
+        # leaves the documented "hidden rows + intact history" state;
+        # only the explicit-failure path rolls back.
         try:
             _truncate_at_offset(history_path, offset)
         except OSError as e:
+            try:
+                store.unhide_results(hidden_ids)
+            except Exception:  # noqa: BLE001 — best-effort rollback
+                pass
             return {
                 "ok": False,
                 "reason": f"could not truncate chat history: {e}",
             }
+        hidden_count = len(hidden_ids)
 
         # 5. Clear runner pending state. Anything queued for the
         # original next turn is no longer relevant — the rewind
@@ -2621,6 +2626,112 @@ class NoraBridge:
         except OSError as e:
             return {"ok": False, "reason": str(e)}
         return {"ok": True, "events": events}
+
+    def count_next_context(
+        self,
+        draft_text: str = "",
+        n_images: int = 0,
+        n_pending_attachments: int = 0,
+        request_id: int = 0,
+    ) -> dict[str, Any]:
+        """Pre-flight count of the next request's size, in tokens.
+
+        Single source of truth for the context chip. JS calls this
+        on a small set of triggers (session open/switch, rewind
+        success, turn complete, attachment add/remove) and renders
+        the returned ``tokens / ceiling`` directly. The chip never
+        derives its own number from ``turn_done`` usage,
+        ``post_turn_tokens``, cache fields, or chars/4 of pending
+        messages — those produced visible fluctuation that didn't
+        correspond to any single useful question.
+
+        ``request_id`` rides through the response so JS can reject
+        responses landing after a newer request — recounts triggered
+        in quick succession (e.g., model swap during a rewind) won't
+        let an old draft's count overwrite a newer one.
+
+        Returns ``{ok, tokens, exact, ceiling, request_id}``. Today
+        ``exact=False`` for both providers (chars/3.5 approximation);
+        the chip prefixes ``~`` whenever it sees ``exact=False`` so
+        the researcher never mistakes an estimate for a measurement.
+        """
+        if self.cwd is None:
+            return {
+                "ok": False,
+                "reason": "no active session",
+                "request_id": request_id,
+            }
+
+        from nora.context_count import count_next_context, to_payload
+        from nora.system_prompt import build_system_prompt
+
+        # Provider-specific lengths. Building the system prompt is
+        # the one expensive piece (a few hundred KB of template +
+        # dataset listing + runtime probe), but it's cached at
+        # session level and the call is cheap on warm runs.
+        provider = self._provider_id() if hasattr(self, "_provider_id") else "anthropic"
+        try:
+            sys_prompt = build_system_prompt(
+                self.cwd, "nora", provider=provider,
+            )
+            system_prompt_chars = len(sys_prompt)
+        except Exception:  # noqa: BLE001
+            system_prompt_chars = 0
+
+        # Tool schemas: rough estimate. The full JSON-rendered tool
+        # array sits at ~14k tokens (~50KB) on Anthropic with the
+        # current set; on OpenAI the description bodies are leaner.
+        # Using a single value matters less than the chat history
+        # bytes (which dominate after a few turns) and the
+        # caller-provided draft / image counts; refine later.
+        tool_schema_chars = 50_000
+
+        ceiling = self._context_ceiling_for_active_model()
+
+        count = count_next_context(
+            cwd=self.cwd,
+            draft_text=draft_text,
+            n_images=n_images,
+            n_pending_attachments=n_pending_attachments,
+            system_prompt_chars=system_prompt_chars,
+            tool_schema_chars=tool_schema_chars,
+            ceiling=ceiling,
+            request_id=request_id,
+        )
+        return {"ok": True, **to_payload(count)}
+
+    def _context_ceiling_for_active_model(self) -> int:
+        """Resolve the active model's context window in tokens.
+
+        Falls back to 1M when the runner / model registry can't be
+        consulted — every frontier model on both providers is in
+        the 1M-ish band, so a missing-ceiling default of 1M is
+        honest rather than a placeholder.
+        """
+        try:
+            from nora.provider.catalog import ALL_MODELS
+            runner = self._active_runner()
+            if runner is None:
+                return 1_000_000
+            model = getattr(runner, "model", None)
+            if model:
+                for info in ALL_MODELS:
+                    if info.id == model:
+                        return info.context_window
+        except Exception:  # noqa: BLE001
+            pass
+        return 1_000_000
+
+    def _provider_id(self) -> str:
+        """Active provider name ('anthropic' / 'openai'), defaulting
+        to 'anthropic' when the runner can't be consulted."""
+        try:
+            runner = self._active_runner()
+            if runner is None:
+                return "anthropic"
+            return getattr(runner, "provider", "anthropic") or "anthropic"
+        except Exception:  # noqa: BLE001
+            return "anthropic"
 
     def _policy_summary(self) -> dict[str, Any]:
         """Compact JSON-serializable summary of the current policy +

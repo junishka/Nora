@@ -1372,6 +1372,26 @@ kbd {
   text-overflow: ellipsis;
 }
 
+/* Script and log rows in the Files panel show the analytic label
+ * Nora passed to ``submit_script`` ("H1a Path A: op margin,
+ * np_only_within_cancer_type"). Those labels are routinely longer
+ * than fits on one line at the popup's width, and a single-line
+ * ellipsis hides the part that distinguishes one run from another.
+ * Allow up to two lines with the same monospace face; clamp at
+ * two so a pathological 200-char label doesn't blow up the row.
+ * Image rows keep the single-line caption — the thumbnail above
+ * is the real identifier; the caption is just a filename hint. */
+.files-row-actionable[data-kind="script"] .files-row-caption,
+.files-row-actionable[data-kind="log"] .files-row-caption {
+  white-space: normal;
+  text-overflow: clip;
+  overflow-wrap: anywhere;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  line-height: 1.35;
+}
+
 .topbar-toggle:hover {
   opacity: 1;
   border-color: var(--border);
@@ -2870,6 +2890,21 @@ kbd {
    * usage climbs. Matches Claude Code's "Context X / Y" footer. */
   cursor: default;
   font-variant-numeric: tabular-nums;  /* digits don't jitter as count changes */
+  opacity: 1;
+  transition: opacity 0.15s ease-out;
+}
+
+/* In-flight recount: fade the value so the researcher knows the
+ * displayed number is from before their last action (rewind, turn
+ * complete, attachment add/remove, session switch). The number
+ * stays readable rather than blanking out — a stale-but-visible
+ * value beats no value during the ~200ms-1s round-trip. Snaps back
+ * to full opacity when the matching count response lands. A newer
+ * recount supersedes an older one via the request-id check, so a
+ * slow response from a stale state never gets to flip the chip
+ * back to solid. */
+.context-chip.stale {
+  opacity: 0.4;
 }
 
 
@@ -3093,7 +3128,12 @@ kbd {
   border-radius: var(--radius);
   padding: 12px 14px;
   min-width: 320px;
-  max-width: 480px;
+  /* 560px (was 480) buys ~50 chars per line at 12px monospace
+   * for the Files panel — long but realistic labels like
+   * "H1a Path A: op margin, np_only_within_cancer_type" fit on
+   * one line, the rest wraps to a second line under the
+   * actionable-row rule below. */
+  max-width: 560px;
   max-height: 300px;
   overflow-y: auto;
   box-shadow: 0 8px 24px rgba(0, 0, 0, 0.15);

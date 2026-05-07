@@ -1467,6 +1467,24 @@ async def submit_script(args: dict[str, Any]) -> dict[str, Any]:
     if early_payload is not None:
         return _as_mcp_text(early_payload)
 
+    # 2a. Persist the script-level label to the run dir so the Files
+    # panel can name the SCRIPT after what the model called the whole
+    # invocation, not after the first per-helper label that happens
+    # to land in the store. For a 20-regression script labeled
+    # "reg_v16: H1/H2/H3, Path A and Path B", the per-helper rows
+    # carry per-cell names like "Path A H1: operating_margin" — fine
+    # for individual result lookup, wrong as the file name. Writing
+    # the umbrella here keeps the panel pointed at the script's
+    # purpose. Best-effort: a write failure leaves the panel falling
+    # back to the per-helper-label path it used before this change.
+    try:
+        if exec_result.run_dir is not None:
+            (exec_result.run_dir / "label.txt").write_text(
+                label, encoding="utf-8",
+            )
+    except OSError:
+        pass
+
     # 2. SDC config + source-dataset row count, both resolved once.
     sdc_cfg, source_n, row_count_audit_seconds = _resolve_sdc_and_source_n(
         cwd, source_dataset or None,
@@ -2380,14 +2398,18 @@ _RECALL_IMAGE_MAX_BYTES = 5 * 1024 * 1024
 @tool(
     "read_attached_file",
     (
-        "Re-read a file the researcher attached to this session. "
-        "Scripts (.py / .do / .r / .rmd) and images (.png / .jpg / "
-        ".jpeg / .pdf / .eps). Use this when a file's content was in "
-        "your context earlier (because the researcher @-mentioned or "
-        "uploaded it) but has since scrolled out as the conversation "
-        "grew. The bytes are still on disk in the session cwd; this "
-        "tool fetches them again on demand so you don't have to ask "
-        "the researcher to re-attach.\n\n"
+        "Re-read a file the researcher attached to this session, OR a "
+        "script you wrote on a prior ``submit_script`` call. Scripts "
+        "(.py / .do / .r / .rmd) and images (.png / .jpg / .jpeg / "
+        ".pdf / .eps). Use this when a file's content was in your "
+        "context earlier but has since scrolled out as the "
+        "conversation grew, or when a rewind cleared the chat history "
+        "and ``recall_conversation`` no longer surfaces it. The bytes "
+        "are still on disk; this tool fetches them again on demand. "
+        "For your own past scripts, pass the display name you see in "
+        "``list_session_files`` output (the labeled name like "
+        "``H1a Path A: op margin, FP-only.do``, or ``script_<short_id>"
+        ".do`` when no label was passed).\n\n"
         "Behaviour:\n"
         "  - Scripts: full text returned inline (capped at 96 KB; "
         "longer files come back head+tail-truncated with an explicit "
@@ -2468,6 +2490,21 @@ async def read_attached_file(args: dict[str, Any]) -> dict[str, Any]:
                             break
                 except OSError:
                     pass
+    # Third fallback: scripts Nora wrote on prior ``submit_script``
+    # calls. Each lives at ``<cwd>/.nora/runs/<id>/script.{do,R,py}``;
+    # the panel surfaces them under labeled or ``script_<short_id>``
+    # display names. Resolve by exactly that display name so the
+    # model can pass back what it saw in ``list_session_files``
+    # output. Containment back into cwd is implicit — the helper
+    # only walks ``<cwd>/.nora/runs``.
+    if target is None or not target.is_file():
+        try:
+            from nora.run_files import find_run_dir_script_by_name
+            candidate = find_run_dir_script_by_name(cwd, safe_name)
+        except Exception:  # noqa: BLE001
+            candidate = None
+        if candidate is not None and candidate.is_file():
+            target = candidate
     if target is None or not target.is_file():
         return _as_mcp_text({
             "status": "not_found",
@@ -2648,15 +2685,21 @@ _SESSION_FILE_KIND_VALUES: frozenset[str] = frozenset({"script", "log", "graph"}
 @tool(
     "list_session_files",
     (
-        "List script, log, and graph files the researcher has uploaded "
-        "or generated in the current session directory. Datasets are "
-        "NOT included — those are already in your system-prompt context "
-        "listing and gated by the SDC schema-depth policy.\n\n"
-        "Use this when the researcher refers to a script or log without "
-        "naming it explicitly ('the do-file', 'that .py', 'the residuals "
-        "log'), when you need to discover what's been uploaded before "
-        "asking for an upload, or to confirm a referenced filename "
-        "actually exists in the session.\n\n"
+        "List script, log, and graph files in the current session — "
+        "both researcher uploads in cwd top-level AND scripts you "
+        "wrote on prior ``submit_script`` calls (those live under "
+        "``<cwd>/.nora/runs/<id>/``). Datasets are NOT included — "
+        "those are already in your system-prompt context listing and "
+        "gated by the SDC schema-depth policy.\n\n"
+        "Use this when the researcher refers to a script or log "
+        "without naming it explicitly ('the do-file', 'that .py'), "
+        "when you need to recall a script you wrote earlier in this "
+        "session (especially after a rewind clears the chat history), "
+        "or to confirm a referenced filename actually exists.\n\n"
+        "Your past scripts surface under their analytic label (the "
+        "``label`` arg you passed to ``submit_script``), or under "
+        "``script_<short_id>.do`` when no label was passed. Pass the "
+        "same name back to ``read_attached_file`` to fetch contents.\n\n"
         "Each entry carries name, kind (script / log / graph), size in "
         "bytes, and last-modified mtime (ISO 8601 UTC). Newest first "
         "within each kind.\n\n"
@@ -2735,6 +2778,30 @@ async def list_session_files(args: dict[str, Any]) -> dict[str, Any]:
                 st.st_mtime, tz=timezone.utc,
             ).isoformat(timespec="seconds"),
         })
+    # Surface the scripts Nora wrote on prior ``submit_script`` calls.
+    # They live at ``<cwd>/.nora/runs/<id>/script.{do,R,py,ipynb}``,
+    # outside the cwd top-level scan above. Without this, the model
+    # has no way to find a script she wrote earlier in the session
+    # — the chat history may have scrolled away or been rewound, and
+    # the Files panel surfaces them but the model's own tool view
+    # didn't. The display name matches what the panel shows.
+    if "script" in keep_kinds:
+        from datetime import datetime as _dt, timezone as _tz
+        from nora.run_files import enumerate_run_dir_scripts
+        seen_paths = {r.get("name") for r in rows}
+        for entry in enumerate_run_dir_scripts(cwd):
+            name = safe_text(entry.display_name)
+            if not name or name in seen_paths:
+                continue
+            rows.append({
+                "name": name,
+                "kind": "script",
+                "size_bytes": entry.size_bytes,
+                "mtime": _dt.fromtimestamp(
+                    entry.mtime, tz=_tz.utc,
+                ).isoformat(timespec="seconds"),
+            })
+            seen_paths.add(name)
     rows.sort(key=lambda r: (r["kind"], -r["size_bytes"]))
     rows.sort(key=lambda r: r["mtime"], reverse=True)
     counts = {k: 0 for k in _SESSION_FILE_KIND_VALUES}

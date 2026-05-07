@@ -42,6 +42,29 @@ if [[ ! -d "$APP_BUNDLE" ]]; then
     exit 1
 fi
 
+# When the caller asks for a signed and/or notarized .dmg, the .app
+# inside MUST already be signed. This script consumes a pre-built
+# dist/Nora.app, so an easy mistake is to build the app unsigned, then
+# rerun only this script with the signing variables set — Apple's
+# notary service may even accept the submission, leaving you with a
+# signed .dmg that wraps an unsigned app. Catch that here, before
+# staging, so the failure is immediate and local. ``codesign --verify
+# --deep --strict`` walks every nested Mach-O too, so a partial sign
+# (where the bundle is signed but a nested binary isn't) is also
+# rejected at this gate.
+if [[ -n "${NORA_SIGN_IDENTITY:-}" ]] || [[ -n "${NORA_NOTARIZE_PROFILE:-}" ]]; then
+    echo "==> Verifying $APP_BUNDLE is signed"
+    if ! /usr/bin/codesign --verify --deep --strict "$APP_BUNDLE" 2>/dev/null; then
+        echo "ERROR: $APP_BUNDLE is not signed (or its signature is invalid)." >&2
+        echo "       Run build_app.sh with NORA_SIGN_IDENTITY set, e.g.:" >&2
+        echo "         NORA_SIGN_IDENTITY=\"Developer ID Application: ... (TEAMID)\" \\" >&2
+        echo "             bash packaging/build_app.sh" >&2
+        echo "       then rerun this script. Notarizing an unsigned .app produces" >&2
+        echo "       a release artifact that fails Gatekeeper at first launch." >&2
+        exit 1
+    fi
+fi
+
 echo "==> Preparing staging directory"
 rm -rf "$STAGING" "$DMG_OUT"
 mkdir -p "$STAGING"

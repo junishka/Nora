@@ -108,6 +108,54 @@ def test_list_handles_empty_session(tmp_path: Path):
     assert out["total"] == 0
 
 
+def test_list_surfaces_run_dir_scripts_with_label(tmp_path: Path):
+    """Scripts Nora wrote on prior ``submit_script`` calls live at
+    ``<cwd>/.nora/runs/<id>/script.do`` — outside the cwd top-level
+    scan. ``list_session_files`` must surface them so the model can
+    discover its own past scripts after a rewind clears the chat
+    history. The display name follows the same labeled-or-fallback
+    rule the Files panel uses."""
+    set_cwd(tmp_path)
+    run_dir = tmp_path / ".nora" / "runs" / "20260507T120000Z_aaaaaaaa"
+    run_dir.mkdir(parents=True)
+    (run_dir / "script.do").write_text(
+        "regress y x\n", encoding="utf-8",
+    )
+
+    from nora.store import get_store
+    get_store(tmp_path).insert(
+        label="M27-M38 base spec",
+        analysis_type="linear_regression",
+        sanitized_payload={"type": "linear_regression"},
+        language="Stata",
+        script_code="regress y x\n",
+        transformations=[],
+        raw_log_path=str(run_dir),
+        script_run_id="run-aaaaaaaa",
+    )
+
+    out = _list({})
+    assert out["status"] == "ok"
+    names = {row["name"] for row in out["files"]}
+    assert "M27-M38 base spec.do" in names, names
+
+
+def test_list_surfaces_run_dir_scripts_with_short_id_fallback(
+    tmp_path: Path,
+):
+    """When the model omitted ``label``, the panel and tool surface
+    the script as ``script_<short_id>.do`` so the model can still
+    point ``read_attached_file`` at it."""
+    set_cwd(tmp_path)
+    run_dir = tmp_path / ".nora" / "runs" / "20260507T120100Z_bbbbbbbb"
+    run_dir.mkdir(parents=True)
+    (run_dir / "script.do").write_text("// no label\n", encoding="utf-8")
+
+    out = _list({})
+    names = {row["name"] for row in out["files"]}
+    assert "script_bbbbbbbb.do" in names, names
+
+
 # ---------------------------------------------------------------------------
 # search_in_session_files
 # ---------------------------------------------------------------------------
