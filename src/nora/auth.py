@@ -33,6 +33,20 @@ KEYRING_SERVICE = "nora"
 # import cycle (``auth`` is imported from ``provider/__init__.py``).
 KNOWN_PROVIDERS: tuple[str, ...] = ("anthropic", "openai")
 
+# Process-lifetime cache of resolved credentials. The auth screen's
+# payload builder calls ``has_credential`` and ``detect_auth`` per
+# provider per render, and ``detect_auth`` itself calls
+# ``has_credential`` internally — without this cache an unsigned build
+# triggers a fresh macOS Keychain prompt on every redundant lookup,
+# which on first launch presents as 4+ "allow access" dialogs in a row.
+# A signed build's Keychain ACL covers all reads from the same binary,
+# but the cache helps even there by avoiding repeated IPC to securityd.
+#
+# Mutations (set/delete) write through to the cache so callers see a
+# coherent view immediately; otherwise the auth screen would show
+# stale "configured" badges right after a save until the next launch.
+_CRED_CACHE: dict[str, str | None] = {}
+
 
 def get_credential(provider: str) -> str | None:
     """Return the stored API key for ``provider``, or ``None`` if no
@@ -42,15 +56,19 @@ def get_credential(provider: str) -> str | None:
     (set / unset) so callers can route to the right UI without a
     try/except dance.
     """
+    if provider in _CRED_CACHE:
+        return _CRED_CACHE[provider]
     if _keyring is None:
+        _CRED_CACHE[provider] = None
         return None
     try:
         value = _keyring.get_password(KEYRING_SERVICE, provider)
     except Exception:  # noqa: BLE001 — backend errors mean "no creds"
+        _CRED_CACHE[provider] = None
         return None
-    if not value:
-        return None
-    return value
+    resolved = value if value else None
+    _CRED_CACHE[provider] = resolved
+    return resolved
 
 
 def set_credential(provider: str, api_key: str) -> dict[str, object]:
@@ -67,10 +85,12 @@ def set_credential(provider: str, api_key: str) -> dict[str, object]:
         return {"ok": False, "reason": "API key is empty"}
     if _keyring is None:
         return {"ok": False, "reason": "keyring backend not available"}
+    cleaned = api_key.strip()
     try:
-        _keyring.set_password(KEYRING_SERVICE, provider, api_key.strip())
+        _keyring.set_password(KEYRING_SERVICE, provider, cleaned)
     except Exception as e:  # noqa: BLE001 — surface to caller
         return {"ok": False, "reason": f"keyring write failed: {e}"}
+    _CRED_CACHE[provider] = cleaned
     return {"ok": True, "provider": provider}
 
 
@@ -78,11 +98,13 @@ def delete_credential(provider: str) -> dict[str, object]:
     """Remove the stored credential for ``provider``. Idempotent —
     deleting a missing entry is success, not failure."""
     if _keyring is None:
+        _CRED_CACHE[provider] = None
         return {"ok": True, "provider": provider}
     try:
         _keyring.delete_password(KEYRING_SERVICE, provider)
     except Exception:  # noqa: BLE001 — typically "no such entry"; idempotent OK
         pass
+    _CRED_CACHE[provider] = None
     return {"ok": True, "provider": provider}
 
 
