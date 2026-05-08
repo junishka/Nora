@@ -3287,28 +3287,6 @@ kbd {
   white-space: normal;  /* override the default pre-wrap — we render blocks */
 }
 
-/* While the typewriter animation is running we're showing plain
- * textContent, not rendered markdown yet. Keep pre-wrap so newlines
- * visually break the same way they will once markdown takes over,
- * avoiding a reflow jolt at the swap. The caret gives the classic
- * "typing" cue. */
-.message.assistant .message-body.typing {
-  white-space: pre-wrap;
-}
-
-.message.assistant .message-body.typing::after {
-  content: "\2582";  /* lower one-eighth block — reads as a caret */
-  display: inline-block;
-  margin-left: 1px;
-  color: var(--text-dim);
-  animation: typing-caret 0.9s steps(1, end) infinite;
-}
-
-@keyframes typing-caret {
-  0%, 55% { opacity: 1; }
-  56%, 100% { opacity: 0; }
-}
-
 .message.assistant .message-body p {
   margin: 0 0 10px 0;
 }

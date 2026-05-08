@@ -137,9 +137,9 @@ As of 2026-04-25, the implementation covers:
   failures.
 - Web UI: pywebview shell, sessions sidebar with per-session
   busy dot, theme toggle, model
-  picker, drag-drop file/image upload, typewriter assistant, Lottie
-  cat loading indicator, status line, Permission/Model chips with
-  popups, image-paste support.
+  picker, drag-drop file/image upload, Lottie cat loading indicator,
+  status line, Permission/Model chips with popups, image-paste
+  support.
 - Packaging: `.app` launches the web UI directly (no Terminal popup),
   `.dmg` build pipeline. Local-only until Apple Developer Program
   signing is in place.
