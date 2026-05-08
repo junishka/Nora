@@ -804,11 +804,26 @@ landingEl.addEventListener('drop', async (e) => {
     );
     return;
   }
+  // Size gate: reject before FileReader runs. Without this, a
+  // researcher who drops a multi-GB .dta sees the app freeze for
+  // tens of seconds (and possibly OOM) before the Python side
+  // returns "too large." The native picker is one click away and
+  // copies straight from disk.
+  const oversize = accepted.find((f) => f.size > MAX_DRAG_DROP_BYTES);
+  if (oversize) {
+    setLandingError(
+      formatDragDropOversizeReason(
+        oversize,
+        'Use Choose Files… below — it copies directly from disk ' +
+          'with no memory overhead, so there is no size limit.',
+      ),
+    );
+    return;
+  }
   try {
     // Read serially with a progress message so large drops don't
     // look frozen. readAsDataURL loads the whole file into memory —
-    // fine up to the 2 GB per-file cap, above which "Choose files…"
-    // is the right path (see the landing fineprint).
+    // size gated above, so the worst case here is one ~512 MB read.
     const payload = [];
     for (let i = 0; i < accepted.length; i++) {
       const file = accepted[i];
@@ -876,6 +891,31 @@ const ALLOWED_IMAGE_MIMES = new Set([
   'image/png', 'image/jpeg', 'image/webp', 'image/gif',
 ]);
 const MAX_IMAGE_BYTES = 5 * 1024 * 1024;  // 5 MB per image (Anthropic limit ballpark)
+
+// Drag-drop / paste cap on data and script files. The Python backend
+// caps the same path at 2 GB, but the FileReader → base64 → bridge →
+// decode chain peaks at roughly 3–4× the file size in memory. A 1 GB
+// drop would peak around 3.4 GB on the JS heap alone, which the
+// pywebview bridge handles slowly and which can swap a 16 GB Mac
+// while we're holding it. 512 MB keeps the peak under ~2 GB even in
+// the worst case (base64 string + decoded bytes coexisting in memory
+// during the bridge transfer) — comfortable on any modern Mac. Above
+// this, the native file picker (Choose Files… / + button) uses
+// ``shutil.copy2`` and avoids the round-trip entirely; the user
+// switches paths with one click. Picked over the backend's 2 GB cap
+// because rejecting AFTER allocating multiple GB defeats the whole
+// point of a cap.
+const MAX_DRAG_DROP_BYTES = 512 * 1024 * 1024;
+
+function formatDragDropOversizeReason(file, hint) {
+  const mb = Math.round(file.size / (1024 * 1024));
+  return (
+    `${file.name} is ${mb} MB — drag-drop is capped at ` +
+    `${Math.round(MAX_DRAG_DROP_BYTES / (1024 * 1024))} MB ` +
+    `because the file is read fully into memory (peak ~3–4× the ` +
+    `file size). ${hint}`
+  );
+}
 
 function renderAttachments() {
   if (!attachmentsEl) return;
@@ -1023,6 +1063,23 @@ async function stageDataFile(file) {
   if (!window.pywebview || !window.pywebview.api) return;
   if (typeof window.pywebview.api.add_files_from_blobs !== 'function') {
     appendError('Restart Nora to drop files into the chat.');
+    return;
+  }
+  // Size gate (see MAX_DRAG_DROP_BYTES at the top of this section).
+  // The composer drop / paste path also goes through FileReader →
+  // base64 → bridge → decode, so a multi-GB drop here would freeze
+  // the chat the same way it freezes the landing page. The "+"
+  // button next to the composer uses the native picker and has no
+  // size limit.
+  if (file.size > MAX_DRAG_DROP_BYTES) {
+    appendError(
+      formatDragDropOversizeReason(
+        file,
+        'Use the + button next to the composer instead — it opens ' +
+          'the native picker and copies directly from disk with no ' +
+          'size limit.',
+      ),
+    );
     return;
   }
   const data = await new Promise((resolve, reject) => {
