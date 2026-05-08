@@ -6,8 +6,8 @@ Wraps ``ClaudeSDKClient`` with the Nora-specific configuration
 into the provider-neutral ``Event`` stream defined in
 ``provider/base.py``.
 
-Auth detection follows the original ``app.py`` rules: ``ANTHROPIC_API_KEY``
-in env → ``api_key``; ``~/.claude.json`` with an OAuth account → ``subscription``;
+Auth detection: ``ANTHROPIC_API_KEY`` in env → ``api_key``;
+``~/.claude.json`` with an OAuth account → ``subscription``;
 otherwise ``unknown``. The keyring path (added later for OpenAI) does NOT
 overwrite this — the Claude SDK is the only thing that reads
 ``ANTHROPIC_API_KEY``, so cred storage for Anthropic continues to flow
@@ -57,7 +57,7 @@ PROVIDER_ID = "anthropic"
 
 
 # Sentinels the Claude SDK uses on AssistantMessage.error to signal
-# auth / billing trouble. Kept verbatim from the original app.py.
+# auth / billing trouble.
 _AUTH_FAILURE = "authentication_failed"
 _BILLING_FAILURE = "billing_error"
 

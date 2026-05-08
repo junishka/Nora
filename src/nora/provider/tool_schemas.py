@@ -485,7 +485,7 @@ _SEARCH_IN_SESSION_FILES_DESC = (
 # The seven tools.
 # ---------------------------------------------------------------------------
 # Order matches the order in which they appear to the model in the
-# system-prompt enumeration in ``app.py``.
+# system-prompt enumeration in ``system_prompt.py``.
 
 def _spec(
     name: str,

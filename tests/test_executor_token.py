@@ -276,3 +276,80 @@ def test_legitimate_script_with_token_succeeds(tmp_path: Path):
     assert r.result_payloads[0]["type"] == "linear_regression"
     # The token must be stripped from what the caller receives.
     assert RESULT_TOKEN_FIELD not in r.result_payloads[0]
+
+
+# ---------------------------------------------------------------------------
+# ``ok`` / ``warnings`` semantics across run_script
+# ---------------------------------------------------------------------------
+
+
+@requires_sandbox_apply
+@requires_rscript
+def test_run_script_ok_true_with_warning_when_bad_line_alongside_valid(
+    tmp_path: Path,
+):
+    """A clean-exit script that writes ONE valid token-stamped payload
+    AND ONE malformed JSONL line must come back with ``ok=True`` and
+    a non-empty ``warnings`` list — the prior behavior flipped
+    ``ok=False`` and routed the bad-line summary into ``error``,
+    which demoted the envelope to ``execution_failed_partial`` even
+    though the subprocess exited 0.
+
+    Bypasses the runtime library on purpose so the test pins the
+    executor's parser path independently of the helper modules. Uses
+    the same ``Sys.getenv`` shape as the existing bypass test.
+    """
+    # ``nora$.run_token`` is captured at runtime-library load (the
+    # ``source(nora.R)`` bootstrap that wraps every R run). The env
+    # var itself is unset right after, so reading
+    # ``Sys.getenv("NORA_RUN_TOKEN")`` here returns "". Using the
+    # in-memory copy is the same path the helpers themselves take.
+    code = (
+        'token <- nora$.run_token\n'
+        'path <- Sys.getenv("NORA_RESULT_PATH")\n'
+        'con <- file(path, open = "w", encoding = "UTF-8")\n'
+        'valid <- paste0(\n'
+        '  \'{"type":"linear_regression","n":100,\',\n'
+        '  \'"response_variable":"y","predictor_variables":["x"],\',\n'
+        '  \'"coefficients":{"x":0.5},"standard_errors":{"x":0.05},\',\n'
+        '  \'"_token":"\', token, \'"}\'\n'
+        ')\n'
+        'writeLines(valid, con)\n'
+        'writeLines("{not valid json,}", con)\n'
+        'close(con)\n'
+    )
+    r = run_script("R", code, tmp_path)
+
+    assert r.ok, (
+        f"clean-exit run with one valid + one bad line should stay ok=True; "
+        f"got ok={r.ok}, error={r.error!r}"
+    )
+    assert r.exit_code == 0
+    assert len(r.result_payloads) == 1, r.result_payloads
+    assert r.error is None, r.error
+    assert r.warnings, "expected a malformed-line warning"
+    assert any(
+        "malformed result line" in w.lower() for w in r.warnings
+    ), r.warnings
+
+
+@requires_sandbox_apply
+@requires_rscript
+def test_run_script_ok_false_when_only_bad_lines_no_survivors(tmp_path: Path):
+    """When NO payload survives — every line is malformed or fails
+    token validation — the bad-line message is upgraded into
+    ``error`` and ``ok=False``. The bypass-attempt case (a forged
+    line with no legitimate output to keep) must still surface as a
+    fatal-shaped response so the security signal isn't buried."""
+    code = (
+        'path <- Sys.getenv("NORA_RESULT_PATH")\n'
+        'con <- file(path, open = "w", encoding = "UTF-8")\n'
+        'writeLines("{not json,}", con)\n'
+        'close(con)\n'
+    )
+    r = run_script("R", code, tmp_path)
+
+    assert not r.ok
+    assert r.error is not None
+    assert "malformed" in r.error.lower(), r.error
+    assert r.result_payloads == []

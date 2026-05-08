@@ -2969,11 +2969,15 @@ function renderContextChip() {
    * list (turn complete, rewind success, session switch, attachment
    * add/remove).
    *
-   * The chip prefixes ``~`` whenever ``exact=False`` (chars/3.5
-   * fallback today — replaced by tiktoken / count_tokens once those
-   * paths land). This is the only place in the UI that should ever
-   * use the tilde for context size; ad-hoc estimates elsewhere were
-   * the bug we're fixing.
+   * The chip text itself carries NO ``~`` prefix even when
+   * ``exact=False`` (chars/3.5 fallback today — replaced by
+   * tiktoken / count_tokens once those paths land). The
+   * approximate-vs-exact distinction lives in the chip's tooltip
+   * instead: an exact count shows just ``"N tokens"``, an
+   * approximate count shows ``"N tokens · local estimate, expect
+   * a small gap from the provider's billed count"``. This is the
+   * only place in the UI that should display a context-size
+   * number; ad-hoc estimates elsewhere were the bug we're fixing.
    */
   if (!contextChip) return;
   if (!lastContextCount) {
