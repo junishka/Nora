@@ -27,6 +27,18 @@ from nora.ui import NoraBridge
 
 
 @pytest.fixture(autouse=True)
+def _clear_cred_cache() -> None:
+    """The auth module caches credential reads across the process to
+    avoid redundant Keychain prompts on unsigned builds. Tests need
+    a fresh cache each case or fakes from the previous test bleed
+    through (a ``has_credential`` call in test 1 caches ``None``,
+    test 2's ``fake_keyring.set_password`` writes to the fake but
+    the cache short-circuits the read back to None — looks like
+    test-order flakiness)."""
+    auth._CRED_CACHE.clear()
+
+
+@pytest.fixture(autouse=True)
 def isolate_env(monkeypatch: pytest.MonkeyPatch) -> None:
     """Each test runs without ANTHROPIC_API_KEY / OPENAI_API_KEY in
     the parent shell, so detect_auth's behaviour is determined

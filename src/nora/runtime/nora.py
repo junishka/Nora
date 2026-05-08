@@ -810,6 +810,30 @@ def _append_plot_helper_error(helper: str, exc: BaseException) -> None:
         pass
 
 
+def _helper_failed(
+    helper: str,
+    message: str,
+    exc: BaseException | None = None,
+) -> None:
+    """Record a graceful plot-helper failure: human-readable stderr
+    line for the researcher's raw log AND a structured jsonl entry
+    so the model's tool result surfaces the failure cause.
+
+    The plot helpers wrap their bodies in ``try/except Exception``,
+    but they ALSO have several early-return paths for shape problems
+    (no ``.params``, malformed ``models`` dict, etc.). Those paths
+    used to write only stderr — the model saw "no plots produced"
+    with no hint why, then guessed and looped. Calling this helper
+    at each early-return keeps both audiences informed without
+    forcing the caller to raise (which would also unwind the
+    surrounding analysis script's own bookkeeping).
+    """
+    sys.stderr.write(f"nora.{helper}: {message}\n")
+    _append_plot_helper_error(
+        helper, exc if exc is not None else RuntimeError(message)
+    )
+
+
 def plot_residuals(fitted: Any, label: str | None = None) -> None:
     """Write the four standard residual diagnostic panels for a
     statsmodels fit and register them with the plot manifest.
@@ -832,9 +856,9 @@ def plot_residuals(fitted: Any, label: str | None = None) -> None:
         resid = getattr(fitted, "resid", None)
         fitted_vals = getattr(fitted, "fittedvalues", None)
         if resid is None or fitted_vals is None:
-            sys.stderr.write(
-                "nora.plot_residuals: fitted object has no .resid / "
-                ".fittedvalues; skipping\n"
+            _helper_failed(
+                "plot_residuals",
+                "fitted object has no .resid / .fittedvalues; skipping",
             )
             return
 
@@ -842,8 +866,8 @@ def plot_residuals(fitted: Any, label: str | None = None) -> None:
             import numpy as _np
             resid_arr = _np.asarray(resid, dtype=float)
             fitted_arr = _np.asarray(fitted_vals, dtype=float)
-        except ImportError:
-            sys.stderr.write("nora.plot_residuals: numpy missing\n")
+        except ImportError as e:
+            _helper_failed("plot_residuals", "numpy missing", exc=e)
             return
 
         fig, axes = plt.subplots(2, 2, figsize=(9, 7))
@@ -913,15 +937,17 @@ def plot_coefficients(fitted: Any, label: str | None = None) -> None:
 
         params = getattr(fitted, "params", None)
         if params is None:
-            sys.stderr.write(
-                "nora.plot_coefficients: fitted object has no "
-                ".params; need a statsmodels-style fit\n"
+            _helper_failed(
+                "plot_coefficients",
+                "fitted object has no .params; need a statsmodels-style fit",
             )
             return
         try:
             ci = fitted.conf_int(alpha=0.05)
         except Exception as e:  # noqa: BLE001
-            sys.stderr.write(f"nora.plot_coefficients: conf_int failed: {e}\n")
+            _helper_failed(
+                "plot_coefficients", f"conf_int failed: {e}", exc=e,
+            )
             return
 
         # Drop intercept by default — researchers almost never want
@@ -946,9 +972,9 @@ def plot_coefficients(fitted: Any, label: str | None = None) -> None:
             if str(n).lower() not in ("intercept", "const", "_cons")
         ]
         if not keep:
-            sys.stderr.write(
-                "nora.plot_coefficients: nothing to plot after "
-                "dropping intercept term\n"
+            _helper_failed(
+                "plot_coefficients",
+                "nothing to plot after dropping intercept term",
             )
             return
         names = [str(names[i]) for i in keep]
@@ -1003,15 +1029,15 @@ def plot_estimate_comparison(
         if d is None:
             return
         if not isinstance(models, dict) or len(models) < 2:
-            sys.stderr.write(
-                "nora.plot_estimate_comparison: `models` must be a "
-                "dict of at least 2 fits keyed by label\n"
+            _helper_failed(
+                "plot_estimate_comparison",
+                "`models` must be a dict of at least 2 fits keyed by label",
             )
             return
         if not isinstance(coef, str) or not coef:
-            sys.stderr.write(
-                "nora.plot_estimate_comparison: `coef` must be a "
-                "coefficient name string\n"
+            _helper_failed(
+                "plot_estimate_comparison",
+                "`coef` must be a coefficient name string",
             )
             return
         import matplotlib
@@ -1025,9 +1051,9 @@ def plot_estimate_comparison(
         for nm, fit in models.items():
             params = getattr(fit, "params", None)
             if params is None:
-                sys.stderr.write(
-                    f"nora.plot_estimate_comparison: model {nm!r} "
-                    f"has no .params; need a statsmodels-style fit\n"
+                _helper_failed(
+                    "plot_estimate_comparison",
+                    f"model {nm!r} has no .params; need a statsmodels-style fit",
                 )
                 return
             try:
@@ -1035,9 +1061,9 @@ def plot_estimate_comparison(
             except AttributeError:
                 idx = [str(i) for i in range(len(params))]
             if coef not in idx:
-                sys.stderr.write(
-                    f"nora.plot_estimate_comparison: coef "
-                    f"{coef!r} not in model {nm!r}\n"
+                _helper_failed(
+                    "plot_estimate_comparison",
+                    f"coef {coef!r} not in model {nm!r}",
                 )
                 return
             est = float(params[coef])
@@ -1120,9 +1146,10 @@ def plot_interaction(
             data = getattr(fitted.model, "data", None)
             data = getattr(data, "frame", None) if data is not None else None
         if data is None or var not in getattr(data, "columns", []):
-            sys.stderr.write(
-                f"nora.plot_interaction: pass data=... that contains "
-                f"column {var!r}; couldn't derive it from the fit\n"
+            _helper_failed(
+                "plot_interaction",
+                f"pass data=... that contains column {var!r}; "
+                f"couldn't derive it from the fit",
             )
             return
 

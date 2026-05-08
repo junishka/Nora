@@ -100,8 +100,20 @@ def test_language_choice_guidance_pins_dta_to_stata() -> None:
         "the prompt must explicitly steer .dta to Stata; without "
         "this the model retries R/Python in a loop on .dta files"
     )
-    # And the don't-loop-in-the-same-language note exists.
-    assert "switch to stata" in rendered.lower()
+    # The .dta-specific "don't reach for the other languages first"
+    # steer. Was previously phrased as "switch to stata"; the
+    # current prompt expresses the same idea against the .dta
+    # case directly.
+    assert "Don't reach for R/Python on a .dta" in rendered, (
+        "the prompt must tell the model NOT to default to R/Python "
+        "for a .dta file; without this it picks whichever language "
+        "it used last and loops on missing-package errors"
+    )
+    # And the generic don't-loop-in-the-same-language note: when a
+    # chosen language fails to import the package it needs, switch
+    # to the format's native language rather than working around
+    # the import.
+    assert "switch to the format-native language" in rendered
 
 
 def test_language_choice_guidance_pins_rds_to_r() -> None:
@@ -235,7 +247,13 @@ def test_partial_failure_semantics_documented(tmp_path: Path) -> None:
     rendered = build_system_prompt(tmp_path, "nora")
     assert "execution_failed_partial" in rendered
     assert "On partial failure" in rendered
-    assert "Do NOT re-run the helpers that already succeeded" in rendered
+    # The load-bearing line: partials in the response are real
+    # results, not retry candidates. Phrasing was previously
+    # "Do NOT re-run the helpers that already succeeded"; the
+    # current prompt expresses the same constraint as a positive
+    # framing ("treat partials as ordinary results") plus the
+    # imperative.
+    assert "Treat partials as ordinary results; don't re-run them" in rendered
 
 
 def test_runtime_environment_block_renders(tmp_path: Path) -> None:

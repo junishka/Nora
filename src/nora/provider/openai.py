@@ -98,14 +98,16 @@ def _resolve_api_key() -> str | None:
 # These three helpers are kept module-level (not session methods) so
 # the lockdown test can call them directly without spinning up a real
 # session — the test imports ``build_openai_tools`` and asserts the
-# returned list matches the canonical six tools, no others.
+# returned list matches the canonical Nora tool set exactly, with no
+# Responses-API built-ins mixed in.
 
 
 def build_openai_tools() -> list[dict[str, Any]]:
     """Build the OpenAI Responses-API tool list from the canonical
-    spec. ALWAYS returns exactly the six Nora tools — never any
-    Responses-API built-ins (``web_search``, ``code_interpreter``,
-    ``file_search``, …)."""
+    spec. Returns exactly the Nora tools defined in
+    ``nora.provider.tool_schemas.TOOL_SPECS`` — never any Responses-API
+    built-ins (``web_search``, ``code_interpreter``, ``file_search``,
+    …)."""
     return [spec.as_openai_tool() for spec in build_tool_specs()]
 
 

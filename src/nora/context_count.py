@@ -19,14 +19,16 @@ Accuracy tier (``exact`` field on the response):
 - Anthropic: no public local tokenizer matches server-side counting.
   When ``ANTHROPIC_API_KEY`` is set we'll route to
   ``messages/count_tokens`` (exact, costs an API call). Today: same
-  chars/3.5 approximation. The chip prefixes ``~`` whenever
-  ``exact=False`` so a researcher never confuses an estimate for
-  measured truth.
+  chars/3.5 approximation. The chip text itself stays clean — no
+  ``~`` prefix even when ``exact=False`` — because today every
+  render is approximate, so a permanent prefix conveys no signal.
+  The tooltip spells out that the value is approximate; once exact
+  tokenization lands the tooltip wording switches and the chip text
+  stays the same.
 """
 
 from __future__ import annotations
 
-import json
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
