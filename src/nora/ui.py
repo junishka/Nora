@@ -285,8 +285,24 @@ class NoraBridge:
                     break
         # If the active runner is using an unauthed provider, swap
         # it to the default — and persist so a reload survives.
+        # Skip the swap if the runner is mid-turn: ``swap_model``
+        # closes and reopens the underlying provider session, which
+        # would tear down a live stream. The unauthed turn will
+        # still surface an ``auth_failure`` naturally on the next
+        # event from the SDK; the next ``ui_ready`` (after the
+        # researcher dismisses the failure or reloads) will catch
+        # the swap when the runner is idle. ``delete_credential``
+        # already follows the same "leave busy runners alone" rule
+        # for its idle-runner close pass — without this guard,
+        # ``ui_ready`` would race ahead of that policy and replace
+        # the very session ``delete_credential`` deliberately
+        # spared.
         active = self._active_runner()
-        if active is not None and active.provider not in authed:
+        if (
+            active is not None
+            and active.provider not in authed
+            and not active.is_busy()
+        ):
             new_provider = self._default_provider
             new_model = self._default_model
             self._run_on_loop(active.swap_model(new_model, new_provider))
@@ -622,6 +638,14 @@ class NoraBridge:
             build_script_prefix=_build_script_attachment_prefix,
             turn_id=turn_id,
         )
+        # Register the id BEFORE scheduling so a Stop fired in the
+        # tiny window between this method returning and ``run_turn``
+        # actually starting on the worker loop still has something to
+        # cancel. Without this, ``interrupt_turn`` would see no
+        # current turn AND no pending turn and report "no turn in
+        # flight" while the runner went on to execute the supposedly-
+        # cancelled turn.
+        runner.register_pending_turn(turn_id)
         asyncio.run_coroutine_threadsafe(coro, self._loop)
         return turn_id
 
@@ -2537,11 +2561,26 @@ class NoraBridge:
 
         ceiling = self._context_ceiling_for_active_model()
 
+        # Override the JS-supplied attachment count with the runner's
+        # actual staging list, and compute the inlined content bytes
+        # that ``_build_script_attachment_prefix`` will emit on the
+        # next send. Without this the chip stayed flat when a
+        # researcher attached a 90 KB ``.do`` / ``.py`` file, even
+        # though those bytes will ride into the next request.
+        active = self._active_runner()
+        if active is not None:
+            attachments = active.pending_script_attachments
+            n_pending_attachments = len(attachments)
+            pending_attachment_chars = _sum_inline_attachment_chars(attachments)
+        else:
+            pending_attachment_chars = 0
+
         count = count_next_context(
             cwd=self.cwd,
             draft_text=draft_text,
             n_images=n_images,
             n_pending_attachments=n_pending_attachments,
+            pending_attachment_chars=pending_attachment_chars,
             system_prompt_chars=system_prompt_chars,
             tool_schema_chars=tool_schema_chars,
             ceiling=ceiling,
@@ -2855,6 +2894,39 @@ _INLINE_SCRIPT_MAX_BYTES = 64 * 1024
 # Generous enough to attach 5 typical analysis scripts; small enough
 # that a malicious / mistaken drop of 50 files can't OOM the model.
 _INLINE_SCRIPT_TOTAL_CAP = 256 * 1024
+
+
+def _sum_inline_attachment_chars(
+    attachments: list[dict[str, Any]],
+) -> int:
+    """Estimate of inlined char count for the next-turn prefix.
+
+    Mirrors the truncation logic in :func:`_build_script_attachment_prefix`
+    so the context chip's count tracks what the prefix actually emits
+    rather than just the number of attachments. Without this the chip
+    stayed flat when a researcher attached a 90 KB script.
+
+    Approximation deliberately chosen over re-rendering the full
+    prefix string: the chip is recounted on every keystroke that
+    triggers a recount, and we don't want to allocate tens of KB of
+    formatted text just to measure its length.
+    """
+    if not attachments:
+        return 0
+    used = 0
+    for att in attachments:
+        # ~120 bytes covers the ``\n### name (Lang)\n``` ... ``` \n``
+        # framing _build_script_attachment_prefix wraps each block
+        # in. The exact number doesn't matter — content dominates.
+        block_size = len(att.get("content", "") or "") + 120
+        if used + block_size > _INLINE_SCRIPT_TOTAL_CAP:
+            # Past this, _build_script_attachment_prefix emits an
+            # "omitted" line per remaining attachment instead of the
+            # content, so the chars stop climbing in proportion to
+            # file size. Stop counting once we hit the cap.
+            break
+        used += block_size
+    return used
 
 
 def _build_script_attachment_prefix(

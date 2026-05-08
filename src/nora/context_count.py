@@ -77,6 +77,7 @@ def count_next_context(
     draft_text: str = "",
     n_images: int = 0,
     n_pending_attachments: int = 0,
+    pending_attachment_chars: int = 0,
     system_prompt_chars: int = 0,
     tool_schema_chars: int = 0,
     ceiling: int = 1_000_000,
@@ -95,11 +96,17 @@ def count_next_context(
       (no in-flight draft).
     - ``n_images``: count of pending image attachments — counted via
       ``_IMAGE_TOKEN_ESTIMATE`` since chars-based math doesn't apply.
-    - ``n_pending_attachments``: pending script attachments. Their
-      bytes already live in the chat history if the previous turn
-      committed them; this kicker adds a small constant so the chip
-      moves immediately when a researcher attaches a script before
-      send.
+    - ``n_pending_attachments``: pending script attachment count. A
+      small per-attachment kicker covers the framing the bridge
+      wraps each one in (header + fence). Their *content* bytes
+      ride separately in ``pending_attachment_chars`` because the
+      chip needs to reflect a 90 KB ``.do`` file the moment the
+      researcher attaches it, not only after the next turn commits.
+    - ``pending_attachment_chars``: summed length of inlined script
+      content the next turn will prepend (post per-file truncation
+      and aggregate cap). Caller computes this against the runner's
+      staging list so the count matches what
+      ``_build_script_attachment_prefix`` will actually emit.
     - ``system_prompt_chars`` / ``tool_schema_chars``: caller passes
       lengths of the assembled system prompt and tool schemas (both
       provider-specific). Caller does this to avoid this module
@@ -119,12 +126,20 @@ def count_next_context(
             except OSError:
                 history_chars = 0
 
-    # Draft attachments aren't included in history yet; the kicker
-    # accounts for the framing the bridge will wrap them in (
-    # ``[Attached file: name]\n<bytes>\n``). Real bytes ride in once
-    # the turn commits and the next recount picks them up from the
-    # history file.
-    attachment_kicker_chars = n_pending_attachments * 200
+    # Draft attachments aren't in history yet. Two contributions:
+    #   - per-file kicker for the header / fence framing the bridge
+    #     wraps each attachment in, so the chip moves the moment a
+    #     file is attached even if its bytes are tiny;
+    #   - the actual inlined content bytes (post-truncation, post-
+    #     aggregate-cap) so a 90 KB ``.do`` file shifts the chip
+    #     proportionally instead of looking like a 200-char nudge.
+    # Real bytes also ride in once the turn commits and the next
+    # recount picks them up from the history file — at that point
+    # the runner's staging list is empty and these contributions
+    # drop out.
+    attachment_kicker_chars = (
+        n_pending_attachments * 200 + pending_attachment_chars
+    )
 
     total_chars = (
         system_prompt_chars

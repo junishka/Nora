@@ -149,6 +149,65 @@ def test_ui_ready_reconciles_provider(
     assert bridge._provider == "openai"
 
 
+def test_reconcile_skips_swap_when_active_runner_busy(
+    tmp_path: Path, fake_keyring: _FakeKeyring,
+) -> None:
+    """``_reconcile_active_provider_with_auth`` must NOT swap the
+    active runner mid-stream. ``swap_model`` closes and reopens the
+    provider session under the hood, which would tear down a live
+    turn — and this is exactly the case ``delete_credential``
+    deliberately spares (it leaves busy runners alone). Without this
+    guard, a credential delete + page reload would race ahead of
+    that policy and replace the very session ``delete_credential``
+    refused to touch.
+    """
+    # Set up: researcher has Anthropic configured, then OpenAI gets
+    # added, then Anthropic credential gets removed mid-turn.
+    fake_keyring.set_password("nora", "openai", "sk-openai-only")
+    bridge = NoraBridge(cwd=tmp_path)
+    # Pretend the active runner is on Anthropic and currently busy.
+    active = bridge._active_runner()
+    assert active is not None
+    active.provider = "anthropic"
+    active.model = "claude-sonnet-4-6[1m]"
+
+    class _BusyTask:
+        def done(self) -> bool: return False
+        def cancel(self) -> None: pass
+        def get_loop(self): return None
+
+    active._current_turn_task = _BusyTask()  # type: ignore[assignment]
+    active._current_turn_id = "t-busy"
+
+    swap_called = False
+    real_swap = active.swap_model
+
+    async def _spy(*args, **kwargs):
+        nonlocal swap_called
+        swap_called = True
+        return await real_swap(*args, **kwargs)
+
+    active.swap_model = _spy  # type: ignore[assignment]
+
+    # ui_ready triggers reconciliation.
+    bridge.ui_ready()
+
+    # Bridge defaults still updated (they don't touch the live
+    # session).
+    assert bridge._default_provider == "openai"
+    # But the in-flight runner is left alone.
+    assert active.provider == "anthropic"
+    assert swap_called is False, (
+        "swap_model must not be called on a busy runner — closing "
+        "the provider session mid-turn would tear down the live "
+        "stream that delete_credential deliberately spared."
+    )
+
+    # Cleanup before pytest tears down so close() doesn't trip.
+    active._current_turn_task = None
+    active._current_turn_id = None
+
+
 # ---------------------------------------------------------------------------
 # Anthropic credential delete stickiness
 # ---------------------------------------------------------------------------

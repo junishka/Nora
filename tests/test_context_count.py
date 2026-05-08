@@ -154,3 +154,75 @@ def test_bridge_count_next_context_no_session() -> None:
     res = bridge.count_next_context(request_id=5)
     assert res["ok"] is False
     assert res["request_id"] == 5
+
+
+def test_count_includes_pending_attachment_chars(tmp_path: Path) -> None:
+    """A 90 KB script staged for the next send must shift the chip
+    proportional to its bytes, not by a constant per-attachment
+    kicker. Pre-fix: the chip was nearly flat because
+    ``pending_attachment_chars`` wasn't a parameter and JS sent 0
+    for the count."""
+    base = count_next_context(
+        cwd=tmp_path, draft_text="", n_images=0,
+        n_pending_attachments=0, pending_attachment_chars=0,
+        system_prompt_chars=10_000, tool_schema_chars=20_000,
+    )
+    one_small = count_next_context(
+        cwd=tmp_path, draft_text="", n_images=0,
+        n_pending_attachments=1, pending_attachment_chars=200,
+        system_prompt_chars=10_000, tool_schema_chars=20_000,
+    )
+    one_big = count_next_context(
+        cwd=tmp_path, draft_text="", n_images=0,
+        n_pending_attachments=1, pending_attachment_chars=90_000,
+        system_prompt_chars=10_000, tool_schema_chars=20_000,
+    )
+    assert one_small.tokens > base.tokens
+    # The 90 KB attachment must move the chip dramatically more than
+    # a 200-byte one — proportional to bytes, not a flat kicker.
+    assert one_big.tokens - base.tokens > 10 * (
+        one_small.tokens - base.tokens
+    )
+
+
+def test_bridge_count_includes_runner_pending_scripts(tmp_path: Path) -> None:
+    """End-to-end: the bridge reads ``runner.pending_script_attachments``
+    when the JS side passes 0 for the count, so a script staged via
+    the file picker (which lives only on the runner) is reflected
+    in the chip the moment it's attached.
+
+    Pre-fix: ``count_next_context`` only saw the JS-supplied
+    ``n_pending_attachments`` (always 0 because
+    ``pendingComposerScriptCount`` returned 0), so a 90 KB ``.do``
+    file left the chip flat until the next turn committed.
+    """
+    from nora.ui import NoraBridge
+    bridge = NoraBridge(cwd=tmp_path)
+
+    # Baseline with no pending scripts.
+    base = bridge.count_next_context(
+        draft_text="", n_images=0, n_pending_attachments=0,
+        request_id=1,
+    )
+    assert base["ok"] is True
+
+    # Plant a 90 KB script directly on the runner's staging list, as
+    # the bridge's stage path would.
+    runner = bridge._active_runner()
+    assert runner is not None
+    runner.pending_script_attachments.append({
+        "name": "analysis.do",
+        "ext": ".do",
+        "content": "x" * 90_000,
+    })
+
+    bumped = bridge.count_next_context(
+        draft_text="", n_images=0, n_pending_attachments=0,
+        request_id=2,
+    )
+    assert bumped["ok"] is True
+    # Bytes ride into the count: ~90k chars / 3.5 ≈ 25k tokens.
+    assert bumped["tokens"] - base["tokens"] > 20_000, (
+        f"expected staged 90 KB script to shift the chip by ≥20k "
+        f"tokens, got {bumped['tokens'] - base['tokens']}"
+    )

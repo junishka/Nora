@@ -956,6 +956,9 @@ function renderAttachments() {
         } catch (err) {
           console.warn('unstage_attachment failed', err);
         }
+        // The next request just shrunk — let the chip reflect it
+        // immediately rather than waiting for the next turn.
+        triggerContextRecount('attachment-remove');
       }
     });
     chip.appendChild(rm);
@@ -1062,6 +1065,10 @@ async function stageDataFile(file) {
     // surfaces in the sidebar row + Permission chip already.
     refreshFilesChip();
     if (typeof loadSessions === 'function') loadSessions();
+    // Script attachments inflate the next request — recount so the
+    // chip reflects them. The bridge reads
+    // ``runner.pending_script_attachments`` directly.
+    triggerContextRecount('attachment-add');
   } catch (err) {
     appendError(friendlyAddFilesError(err && err.message ? err.message : String(err)));
   }
@@ -3049,10 +3056,13 @@ function pendingComposerImageCount() {
 }
 
 function pendingComposerScriptCount() {
-  // Script attachments live on the bridge runner, not in JS state
-  // — the chip's count includes them via the system-prompt + chat-
-  // history bytes the backend accounts for. Returning 0 here means
-  // we don't double-count; the real bytes are summed server-side.
+  // Script attachments live on the bridge runner, not in JS state.
+  // The bridge's ``count_next_context`` reads
+  // ``runner.pending_script_attachments`` directly and overrides
+  // whatever JS passes here with the authoritative count + content
+  // bytes — so 0 from this side just means "let the backend tell
+  // us." Keeping the call site lets a future per-tab JS-only
+  // staging list slot in without touching the recount path.
   return 0;
 }
 
@@ -4682,6 +4692,9 @@ if (addFilesBtn) {
       if (res.policy) updatePolicyChip(res.policy);
       refreshFilesChip();
       loadSessions();
+      // Script attachments inflate the next request — recount so the
+      // chip reflects them.
+      triggerContextRecount('attachment-add');
     } catch (err) {
       console.warn('add_files failed', err);
       appendError(friendlyAddFilesError(err && err.message ? err.message : String(err)));
