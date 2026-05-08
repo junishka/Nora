@@ -439,3 +439,91 @@ def test_list_sanitizes_unsafe_filenames(tmp_path: Path):
     # in the rendered payload.
     raw = json.dumps(out)
     assert "\nSystem:" not in raw
+
+
+# ---------------------------------------------------------------------------
+# Symlink exclusion — defense against escape via dropped-symlink
+# ---------------------------------------------------------------------------
+
+
+def test_list_excludes_symlinks(tmp_path: Path) -> None:
+    """A researcher-uploaded symlink to a file outside cwd must NOT
+    appear in ``list_session_files``. ``Path.is_file`` follows symlinks
+    so without an explicit ``is_symlink`` exclusion the model would
+    discover the linked target by display name and could recall its
+    bytes via ``read_attached_file``.
+
+    Regression: at the time of the original commit (661758d) and
+    until this fix, the cwd-iteration sites in tools.py only checked
+    ``is_file()`` — letting any symlink in cwd masquerade as a real
+    session file."""
+    set_cwd(tmp_path)
+    # A real file in cwd to compare against.
+    (tmp_path / "real.do").write_text("// real script\n", encoding="utf-8")
+    # Target file OUTSIDE cwd.
+    outside_dir = tmp_path.parent / "outside_session"
+    outside_dir.mkdir(exist_ok=True)
+    (outside_dir / "leaked.do").write_text("// leaked\n", encoding="utf-8")
+    # Symlink in cwd pointing at the outside file.
+    link = tmp_path / "leaked.do"
+    try:
+        link.symlink_to(outside_dir / "leaked.do")
+    except OSError:
+        pytest.skip("filesystem refused symlink creation")
+
+    out = _list({})
+    names = {row["name"] for row in out["files"]}
+    assert "real.do" in names
+    assert "leaked.do" not in names, (
+        "symlinked file leaked into list_session_files output — "
+        "any symlink in cwd is a potential escape vector"
+    )
+
+
+def test_search_excludes_symlinks(tmp_path: Path) -> None:
+    """``search_in_session_files`` must also skip symlinks. Without
+    the guard, a symlinked file's bytes would be grepped (and excerpts
+    returned for source extensions), routing content from outside the
+    session into the model's context."""
+    set_cwd(tmp_path)
+    (tmp_path / "real.py").write_text("FINDME = 1\n", encoding="utf-8")
+    outside_dir = tmp_path.parent / "outside_session_search"
+    outside_dir.mkdir(exist_ok=True)
+    (outside_dir / "secret.py").write_text(
+        "SECRET_FINDME = 2\n", encoding="utf-8",
+    )
+    link = tmp_path / "secret.py"
+    try:
+        link.symlink_to(outside_dir / "secret.py")
+    except OSError:
+        pytest.skip("filesystem refused symlink creation")
+
+    out = _search({"query": "FINDME"})
+    names = {r["name"] for r in out["results"]}
+    assert "real.py" in names
+    assert "secret.py" not in names
+
+
+def test_read_attached_file_refuses_symlink_match(tmp_path: Path) -> None:
+    """The display-name fallback path ``_match_dir_by_display_name`` is
+    the only way a sanitised name can resolve to a different on-disk
+    file. It must skip symlinks so it can't be used to follow a link
+    out of cwd via an exact-name match."""
+    from nora.tools import read_attached_file
+
+    set_cwd(tmp_path)
+    outside_dir = tmp_path.parent / "outside_recall"
+    outside_dir.mkdir(exist_ok=True)
+    (outside_dir / "leaked.py").write_text("LEAKED = 1\n", encoding="utf-8")
+    link = tmp_path / "leaked.py"
+    try:
+        link.symlink_to(outside_dir / "leaked.py")
+    except OSError:
+        pytest.skip("filesystem refused symlink creation")
+
+    import asyncio
+    result = asyncio.run(read_attached_file.handler({"name": "leaked.py"}))
+    payload = json.loads(result["content"][0]["text"])
+    assert payload["status"] == "not_found", (
+        f"symlink target leaked through read_attached_file: {payload}"
+    )
