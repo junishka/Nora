@@ -110,10 +110,12 @@ _JSON_TO_PY: dict[str, type] = {
 # Tool descriptions
 # ---------------------------------------------------------------------------
 #
-# Descriptions copied verbatim from the @tool decorations in
-# ``nora.tools`` so the model sees identical guidance regardless of
-# provider. If you edit one, edit the other (the consistency test will
-# fail loudly otherwise).
+# Single source of truth for the canonical description of each tool.
+# ``nora.tools`` registers each @tool with the SDK by reading its
+# description from here (via ``build_tool_specs()``), so editing a
+# string in this section flows through to both providers automatically.
+# The OpenAI side may override with a leaner variant via
+# ``openai_description`` further down.
 
 _GET_SCHEMA_DESC = (
     "Return the structural summary of a dataset. Variable names, types, "

@@ -121,59 +121,6 @@ let contextCountRequestId = 0;   // monotonic counter for stale-response rejecti
 let currentCwd = null;
 const busySessions = new Set();
 
-// ---- Two-meter context tracking -----------------------------------------
-//
-// The chip used to show ONLY ``lastOccupiedTokens`` — what the provider
-// reported was the prompt size after the last turn. That's a
-// measurement of what was sent, not a prediction of what the next
-// request will weigh, and the two diverge whenever the researcher
-// has typed/sent a message but turn_done hasn't landed yet (queued
-// messages, in-flight turn, etc.). The reviewer's framing was right:
-// keep showing the last reported number AND show a separate estimate
-// for what's about to be sent, so the researcher knows both "what
-// the provider thinks I have" and "what the next request will weigh
-// before I get the actual measurement back."
-//
-// ``pendingMessageTokensByCwd`` is a per-cwd FIFO of rough token
-// estimates (chars/4 plus a per-image allowance) for user messages
-// that have been submitted or queued but whose turn_done hasn't yet
-// acknowledged them. We push on submit, shift on turn_done. The chip
-// reads this as ``lastOccupiedTokens + sum(queue)`` to render the
-// "next request" estimate.
-const pendingMessageTokensByCwd = new Map();
-function pendingTokensFor(cwd) {
-  if (!cwd) return [];
-  if (!pendingMessageTokensByCwd.has(cwd)) {
-    pendingMessageTokensByCwd.set(cwd, []);
-  }
-  return pendingMessageTokensByCwd.get(cwd);
-}
-function estimateMessageTokens(text, imageCount) {
-  // chars/4 is the conventional ballpark for English; both Anthropic
-  // and OpenAI tokenizers fall close to it on prose. For images we
-  // use a fixed allowance roughly matching Anthropic's per-image
-  // base (~1.5k tokens at default detail) and OpenAI's high-detail
-  // tile cost (~1.1-1.6k). The chip's job is to be honest about
-  // approximation — the provider's actual count overwrites this on
-  // turn_done.
-  const textTokens = Math.ceil((text || '').length / 4);
-  const imageTokens = (imageCount || 0) * 1500;
-  return textTokens + imageTokens;
-}
-function pushPendingMessage(cwd, text, imageCount) {
-  if (!cwd) return;
-  // Pending message tokens are tracked locally for any caller that
-  // still wants the rough delta (none today — the chip stopped
-  // reading from this when the recount-on-trigger refactor landed).
-  // Kept as an empty-but-present FIFO so existing call sites don't
-  // break; remove once nothing reads it.
-  pendingTokensFor(cwd).push(estimateMessageTokens(text, imageCount));
-}
-function popPendingMessage(cwd) {
-  if (!cwd) return;
-  const q = pendingTokensFor(cwd);
-  if (q.length > 0) q.shift();
-}
 // Sessions whose in-flight turn the researcher just hit Stop on.
 // Cancellation is async — the bridge has to propagate it through the
 // asyncio task and the provider stream, which can leave tokens or
@@ -1681,10 +1628,6 @@ form.addEventListener('submit', async (e) => {
       attachments: messageAttachments,
       userEl,
     });
-    // Track this queued message in the next-request estimate so the
-    // chip's projected "~Nk" weight reflects what the conversation
-    // will weigh once this message fires.
-    pushPendingMessage(currentCwd, text, images.length);
     return;
   }
 
@@ -1694,11 +1637,6 @@ form.addEventListener('submit', async (e) => {
   // they carry the OLD id; new events flow because they carry the
   // NEW id. That's the whole point of the turn-identity rewrite.
   activeLiveTurn = { id: null, nodes: [userEl], hasVisibleReply: false };
-  // Track this immediate-fire message in the next-request estimate.
-  // Same reason as the queued path above — chip's projected "~Nk"
-  // weight should reflect what the next provider call will cost
-  // until turn_done lands the actual measurement.
-  pushPendingMessage(currentCwd, text, images.length);
   setSending(true);
   try {
     // If images are attached, use the richer send method. The
@@ -1986,11 +1924,7 @@ if (stopBtn) {
     // can see what they typed but didn't ship; silently removing
     // their text would be hostile UX.
     drainPendingFor(currentCwd);
-    // Also clear the next-request token estimate for this session
-    // — the in-flight message and any queued ones are no longer
-    // going to land, so their estimates shouldn't carry on the chip.
     if (currentCwd) {
-      pendingTokensFor(currentCwd).length = 0;
       triggerContextRecount('stop');
     }
     // Visible acknowledgement: the cancellation cascades through
@@ -2108,12 +2042,6 @@ window.nora_event = function (evt) {
       // its input_tokens already covers the cached prefix), so the
       // chip just renders that number. Older sessions persisted
       // before this field existed fall back to the legacy sum below.
-      // Pop one entry off the per-cwd pending-message queue — the
-      // turn that just completed corresponds to the OLDEST queued
-      // message. Done for both focused and background sessions so
-      // the chip's next-request estimate is accurate when the
-      // researcher switches focus to a different session mid-turn.
-      popPendingMessage(evtCwd);
       if (isFocused) {
         // Refresh the chip from the pre-flight counter — single
         // source of truth. The provider's ``post_turn_tokens`` is
@@ -2160,10 +2088,6 @@ window.nora_event = function (evt) {
         activeLiveTurn = null;
       }
       drainPendingFor(evtCwd);
-      // Clear the next-request token estimate too — drainPendingFor
-      // dropped all queued user messages, so their estimates would
-      // otherwise stick on the chip until the next send.
-      pendingTokensFor(evtCwd).length = 0;
       setSending(false, evtCwd);
       if (evtCwd === currentCwd) triggerContextRecount('turn_settled');
       break;
@@ -2182,9 +2106,6 @@ window.nora_event = function (evt) {
       // succeeding, so firing them blindly is worse than asking
       // them to retry.
       drainPendingFor(evtCwd);
-      // Same reasoning as auth_failure: drained queue → drained
-      // estimates so the chip stops carrying them as "next".
-      pendingTokensFor(evtCwd).length = 0;
       setSending(false, evtCwd);
       if (evtCwd === currentCwd) triggerContextRecount('turn_settled');
       break;
@@ -2408,16 +2329,9 @@ function append(kind, text, markdown, attachments, images) {
     copyBtn.className = 'message-action-btn message-copy-btn';
     copyBtn.title = 'Copy message to clipboard';
     copyBtn.setAttribute('aria-label', 'Copy message');
-    // Inline SVG so the icon doesn't depend on a font load. Two
-    // overlapping rounded rects — the universal "copy" glyph the
-    // researcher will recognise from every other chat client.
-    copyBtn.innerHTML =
-      '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" '
-      + 'stroke="currentColor" stroke-width="2" stroke-linecap="round" '
-      + 'stroke-linejoin="round" aria-hidden="true">'
-      + '<rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect>'
-      + '<path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path>'
-      + '</svg>';
+    // Inline SVG so the icon doesn't depend on a font load. Same
+    // copy glyph as the Files-panel action; see ``iconSvg``.
+    copyBtn.innerHTML = iconSvg('copy');
     copyBtn.addEventListener('click', (e) => {
       e.stopPropagation();
       copyMessageBubble(wrapper, copyBtn);
@@ -2440,13 +2354,7 @@ function append(kind, text, markdown, attachments, images) {
       editBtn.setAttribute('aria-label', 'Edit message');
       // Pencil glyph — same stroke style as the copy icon for
       // visual rhythm in the actions row.
-      editBtn.innerHTML =
-        '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" '
-        + 'stroke="currentColor" stroke-width="2" stroke-linecap="round" '
-        + 'stroke-linejoin="round" aria-hidden="true">'
-        + '<path d="M12 20h9"></path>'
-        + '<path d="M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4L16.5 3.5z"></path>'
-        + '</svg>';
+      editBtn.innerHTML = iconSvg('edit');
       editBtn.addEventListener('click', (e) => {
         e.stopPropagation();
         enterEditMode(wrapper);
@@ -3301,7 +3209,7 @@ function buildFilesRow(kind, f) {
   if (kind === 'graph' && f.data) {
     leftAction.title = 'Copy image to clipboard';
     leftAction.setAttribute('aria-label', 'Copy image');
-    leftAction.innerHTML = COPY_ICON_SVG;
+    leftAction.innerHTML = iconSvg('copy');
     leftAction.addEventListener('click', (ev) => {
       ev.stopPropagation();
       copyImageToClipboard(f.data, f.mime || 'image/png', f.name);
@@ -3310,7 +3218,7 @@ function buildFilesRow(kind, f) {
   } else if (kind === 'graph' && f.path) {
     leftAction.title = 'Open in default viewer';
     leftAction.setAttribute('aria-label', 'Open');
-    leftAction.innerHTML = OPEN_ICON_SVG;
+    leftAction.innerHTML = iconSvg('openExternal');
     leftAction.addEventListener('click', (ev) => {
       ev.stopPropagation();
       if (window.pywebview && window.pywebview.api &&
@@ -3322,7 +3230,7 @@ function buildFilesRow(kind, f) {
   } else if (kind === 'script' || kind === 'log') {
     leftAction.title = 'Copy file contents to clipboard';
     leftAction.setAttribute('aria-label', 'Copy contents');
-    leftAction.innerHTML = COPY_ICON_SVG;
+    leftAction.innerHTML = iconSvg('copy');
     leftAction.addEventListener('click', (ev) => {
       ev.stopPropagation();
       // Pass the full path (not just f.name): submit_script-written
@@ -3386,31 +3294,51 @@ function buildFilesRow(kind, f) {
 
 
 // Inline SVG icons. Small, monochrome — color is set via CSS so
-// the icon picks up the row's hover/focus colors.
-//
-// COPY_ICON_SVG is shared with the chat-bubble copy button so the
-// Files panel and the per-bubble action read as the same affordance:
-// two overlapping rounded rects (the universal "copy" glyph from
-// GitHub / Linear / Slack), 24×24 viewBox at 14×14 render. If you
-// change the path here, change it in the bubble copy button too
-// (``append()``'s copy SVG block) — they're meant to match
-// pixel-for-pixel so a researcher who learned one recognises the
-// other instantly.
-const COPY_ICON_SVG = (
-  '<svg viewBox="0 0 24 24" width="14" height="14" fill="none" ' +
-  'stroke="currentColor" stroke-width="2" stroke-linecap="round" ' +
-  'stroke-linejoin="round" aria-hidden="true">' +
-  '<rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect>' +
-  '<path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path>' +
-  '</svg>'
-);
+// the icon picks up the row's hover/focus colors. Single registry
+// so the same glyph reads identically wherever it appears: the
+// chat-bubble copy button and the Files-panel copy action are the
+// SAME copy icon, the bubble's transient post-copy checkmark is the
+// SAME check icon, etc. Add a new key here rather than inlining
+// another <svg> string at a call site.
+const ICON_SVG = {
+  copy: (
+    '<svg viewBox="0 0 24 24" width="14" height="14" fill="none" ' +
+    'stroke="currentColor" stroke-width="2" stroke-linecap="round" ' +
+    'stroke-linejoin="round" aria-hidden="true">' +
+    '<rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect>' +
+    '<path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path>' +
+    '</svg>'
+  ),
+  edit: (
+    '<svg viewBox="0 0 24 24" width="14" height="14" fill="none" ' +
+    'stroke="currentColor" stroke-width="2" stroke-linecap="round" ' +
+    'stroke-linejoin="round" aria-hidden="true">' +
+    '<path d="M12 20h9"></path>' +
+    '<path d="M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4L16.5 3.5z"></path>' +
+    '</svg>'
+  ),
+  // Heavier stroke (2.5 vs 2) so the transient post-copy checkmark
+  // reads as confirmation rather than just another monochrome stroke.
+  check: (
+    '<svg viewBox="0 0 24 24" width="14" height="14" fill="none" ' +
+    'stroke="currentColor" stroke-width="2.5" stroke-linecap="round" ' +
+    'stroke-linejoin="round" aria-hidden="true">' +
+    '<polyline points="20 6 9 17 4 12"></polyline>' +
+    '</svg>'
+  ),
+  // 16×16 viewBox for this one — the original "external link" glyph
+  // was authored at 16px and the path coordinates reflect that.
+  openExternal: (
+    '<svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true">' +
+    '<path fill="none" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round" ' +
+    'd="M9 2h5v5M14 2L7 9M3 4h3M3 4v9h9v-3"/>' +
+    '</svg>'
+  ),
+};
 
-const OPEN_ICON_SVG = (
-  '<svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true">' +
-  '<path fill="none" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round" ' +
-  'd="M9 2h5v5M14 2L7 9M3 4h3M3 4v9h9v-3"/>' +
-  '</svg>'
-);
+function iconSvg(name) {
+  return ICON_SVG[name] || '';
+}
 
 async function copyImageToClipboard(base64Data, mime, name) {
   /* Copy a thumbnail image to the system clipboard via the
@@ -3627,13 +3555,9 @@ async function runEditedMessage(wrapper) {
 
   // Render the new user bubble + busy state, mirroring the
   // composer's submit handler. ``activeLiveTurn`` carries the
-  // bubble nodes so disposable-turn cleanup recognises it; the
-  // ``pushPendingMessage`` call lets the context chip's projected
-  // weight reflect this turn until ``turn_done`` lands the
-  // authoritative count.
+  // bubble nodes so disposable-turn cleanup recognises it.
   const userEl = appendUser(newText, [], []);
   activeLiveTurn = { id: null, nodes: [userEl], hasVisibleReply: false };
-  pushPendingMessage(currentCwd, newText, 0);
   setSending(true);
 
   if (typeof window.pywebview.api.send_message === 'function') {
@@ -3708,12 +3632,7 @@ async function copyMessageBubble(wrapper, btnEl) {
   // for failures, where attention DOES need to leave the bubble.
   if (btnEl) {
     const original = btnEl.innerHTML;
-    btnEl.innerHTML =
-      '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" '
-      + 'stroke="currentColor" stroke-width="2.5" stroke-linecap="round" '
-      + 'stroke-linejoin="round" aria-hidden="true">'
-      + '<polyline points="20 6 9 17 4 12"></polyline>'
-      + '</svg>';
+    btnEl.innerHTML = iconSvg('check');
     btnEl.classList.add('copied');
     setTimeout(() => {
       btnEl.innerHTML = original;

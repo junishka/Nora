@@ -304,12 +304,15 @@ def test_tool_help_request_types_match_runtime_allowlist():
     trip on a phantom capability. The fix was to build the help
     text from SUPPORTED_REQUEST_TYPES; this test locks in the
     single-source-of-truth arrangement.
-    """
-    from nora import tools
 
-    # The rendered enumeration that the @tool decorator interpolated
-    # into the help string at import time.
-    rendered = tools._REQUEST_TYPE_LIST_STR
+    The canonical description now lives on the ToolSpec for
+    ``request_data`` in ``nora.provider.tool_schemas``; the @tool
+    registration in ``nora.tools`` reads from there. Asserting
+    against the spec covers both surfaces in one check.
+    """
+    from nora.provider.tool_schemas import tool_spec
+
+    rendered = tool_spec("request_data").description
 
     # Every supported type appears in the rendered string.
     for req_type in SUPPORTED_REQUEST_TYPES:

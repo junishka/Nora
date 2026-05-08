@@ -929,221 +929,70 @@ class NoraBridge:
         """Return every researcher-uploaded file in the active session
         cwd, grouped by kind, for the topbar Files panel.
 
-        ``policy.datasets`` carries data files only (the SDC layer
-        cares about schemas; scripts and graphs aren't part of that
-        story). The Files panel's job is broader: a researcher who
-        dropped ``regression.py``, ``ols.do``, and ``data.csv`` wants
-        to see all three at a glance — without this endpoint, only
-        the CSV showed up and the count stayed wrong.
-
-        Kinds:
-          - ``data``   — .csv / .tsv / .dta / .rds / .parquet / .jsonl
-          - ``script`` — .py / .do / .r / .rmd / .ipynb
-          - ``graph``  — .gph / .png / .jpg / .jpeg / .pdf
-          - ``log``    — .log / .smcl
-
-        Two locations are scanned (both non-recursively, so we don't
-        walk into deep subtrees):
-
-          1. The session cwd itself — researcher uploads, Stata's
-             ``graph export "fig.png"`` writes (the executor preamble
-             cd's there), and any direct ``ggsave`` / ``plt.savefig``
-             with a bare filename land here.
-          2. Each ``.nora/runs/<id>/_nora_plots/`` — the manifest-
-             allowlisted dir for runtime helpers
-             (``nora$plot_residuals`` / ``nora.plot_coefficients`` /
-             etc.). Listing these here lets the Files panel act as
-             a session-wide gallery of every plot the analysis
-             produced, regardless of which run wrote it.
-
-        Files are sorted by mtime descending (newest first) within
-        each kind so the most recent outputs sit at the top.
+        Filesystem walk + classification live in
+        :func:`nora.session_files.enumerate_session_files`; this
+        method orchestrates the call and adds Files-panel-only
+        thumbnail enrichment (base64 inline thumbs for image rows,
+        PDF/EPS rasterisation via ``plot_convert.png_for``).
         """
         if self.cwd is None:
             return {"ok": True, "files": []}
-        from nora.schema import DATA_EXTENSIONS
+        from nora.session_files import enumerate_session_files
 
-        # Mapping ext → (kind, sort priority). Priority orders the
-        # kinds in the rendered popup: data first (the analysis
-        # subjects), then scripts, then graphs, then logs.
-        kind_for_ext: dict[str, tuple[str, int]] = {}
-        for ext in DATA_EXTENSIONS:
-            kind_for_ext[ext] = ("data", 0)
-        for ext in (".py", ".do", ".r", ".rmd", ".ipynb"):
-            kind_for_ext[ext] = ("script", 1)
-        # Stata's native graph format + raster/vector image outputs.
-        # Researchers iterate on plots a lot; the Files panel is now
-        # the persistent gallery so a researcher can scroll back to
-        # every plot the analysis ever produced.
-        for ext in (".gph", ".png", ".jpg", ".jpeg", ".pdf", ".eps"):
-            kind_for_ext[ext] = ("graph", 2)
-        for ext in (".log", ".smcl"):
-            kind_for_ext[ext] = ("log", 3)
+        rows = enumerate_session_files(
+            self.cwd,
+            include_data=True,
+            include_run_scripts=True,
+        )
+        for row in rows:
+            self._enrich_files_panel_row(row)
+        return {"ok": True, "files": rows}
 
-        rows: list[dict[str, Any]] = []
-        seen_paths: set[Path] = set()
-        # Inline-thumbnail cap for image rows. Larger files still
-        # appear in the panel (with a placeholder + click-to-open),
-        # but their bytes don't ride through evaluate_js.
-        _IMAGE_THUMB_CAP = 3 * 1024 * 1024  # 3 MB — matches the chat-thumbnail cap so 1600px Stata PDFs / PNGs render at full res in the panel + lightbox
+    @staticmethod
+    def _enrich_files_panel_row(row: dict[str, Any]) -> None:
+        """Add inline thumbnail bytes (``data`` + ``mime``) to image
+        rows in the Files panel. PDF/EPS rows get a sips-rasterised
+        PNG sidecar shipped instead. 3 MB cap matches the chat-
+        thumbnail cap so 1600px Stata PDFs / PNGs render at full res
+        in the panel + lightbox; larger files still appear in the
+        panel (with a placeholder + click-to-open) but their bytes
+        don't ride through ``evaluate_js``.
+        """
+        import base64 as _base64
+
+        _IMAGE_THUMB_CAP = 3 * 1024 * 1024
         _IMAGE_THUMB_EXTS = {".png", ".jpg", ".jpeg"}
         _IMAGE_MIME = {
             ".png": "image/png",
             ".jpg": "image/jpeg",
             ".jpeg": "image/jpeg",
         }
-        import base64 as _base64
 
-        def _add(child: Path) -> None:
-            # Skip generated sidecars from the PDF→PNG conversion
-            # path so the Files panel doesn't list them alongside
-            # the originals.
-            if child.name.endswith(".nora.png"):
-                return
-            ext = child.suffix.lower()
-            kind_pri = kind_for_ext.get(ext)
-            if kind_pri is None:
-                return
-            kind, priority = kind_pri
+        ext = row.get("ext", "")
+        size = row.get("size", 0)
+        path = Path(row["path"])
+        if ext in _IMAGE_THUMB_EXTS and size <= _IMAGE_THUMB_CAP:
             try:
-                stat = child.stat()
-            except OSError:
-                return
-            try:
-                resolved = child.resolve()
-            except OSError:
-                return
-            if resolved in seen_paths:
-                return
-            seen_paths.add(resolved)
-            entry: dict[str, Any] = {
-                "name": child.name,
-                "kind": kind,
-                "priority": priority,
-                "size": stat.st_size,
-                "ext": ext,
-                "mtime": stat.st_mtime,
-                "path": str(child),
-            }
-            if ext in _IMAGE_THUMB_EXTS and stat.st_size <= _IMAGE_THUMB_CAP:
-                try:
-                    entry["data"] = _base64.b64encode(
-                        child.read_bytes()
-                    ).decode("ascii")
-                    entry["mime"] = _IMAGE_MIME.get(ext, "image/png")
-                except OSError:
-                    pass
-            elif ext in (".pdf", ".eps"):
-                # PDFs and EPS are graphs the researcher will want
-                # to preview too. Convert via sips to a sibling PNG
-                # (cached) and ship the rasterized bytes for the
-                # thumbnail tile. Clicking the tile still routes
-                # through the path field to open the original file
-                # in Preview.
-                from nora.plot_convert import png_for
-                sidecar = png_for(child)
-                if sidecar is not None:
-                    try:
-                        sidecar_size = sidecar.stat().st_size
-                    except OSError:
-                        sidecar_size = stat.st_size
-                    if sidecar_size <= _IMAGE_THUMB_CAP:
-                        try:
-                            entry["data"] = _base64.b64encode(
-                                sidecar.read_bytes()
-                            ).decode("ascii")
-                            entry["mime"] = "image/png"
-                        except OSError:
-                            pass
-            rows.append(entry)
-
-        try:
-            for child in self.cwd.iterdir():
-                if child.is_file() and not child.is_symlink():
-                    _add(child)
-        except OSError:
-            return {"ok": True, "files": []}
-
-        # Walk every run's _nora_plots/ subdir so helper-produced
-        # plots (which live outside the session-cwd top level) show
-        # up alongside session-cwd plots. Also surface each run's
-        # ``script.{do,R,py,ipynb}`` — those are the do-files /
-        # R-scripts Nora wrote when she called ``submit_script``,
-        # and researchers want to copy that finished script back
-        # out to take into Stata or RStudio themselves. The file
-        # exists on disk after every run; until this loop walked
-        # it, the Files panel only ever saw uploads, leaving Nora-
-        # written scripts inaccessible without leaving the chat.
-        # Display name: prefer the analytic label the model passed
-        # to ``submit_script`` ("reg_v12 2v common sample") so the
-        # researcher can identify which script is which without
-        # opening each one. Looked up via the run-dir-basename →
-        # label map built from ``results.db`` below. Falls back to
-        # ``script_<short_id>.do`` when the run produced no stored
-        # rows (e.g., the script crashed before any helper fired)
-        # or the model passed the default ``(unlabeled)``.
-        # Collisions get the short_id appended in parens. The actual
-        # file path on disk (``script.do`` etc.) is never renamed;
-        # only the surfaced ``name`` is rewritten.
-        # Cap: the 12 most recent submit_script runs, sorted by
-        # mtime desc. Without a cap, a long session (50+ runs)
-        # would bury uploaded scripts under generated ones; 12 is
-        # roughly "today's working set" and matches the typical
-        # number of result cards a researcher iterates on per
-        # session.
-        runs_root = self.cwd / ".nora" / "runs"
-        if runs_root.is_dir():
-            run_dirs: list[Path] = []
-            try:
-                for run_dir in runs_root.iterdir():
-                    plots_dir = run_dir / "_nora_plots"
-                    if plots_dir.is_dir():
-                        try:
-                            for plot in plots_dir.iterdir():
-                                if plot.is_file() and not plot.is_symlink():
-                                    _add(plot)
-                        except OSError:
-                            pass
-                    if run_dir.is_dir():
-                        run_dirs.append(run_dir)
+                row["data"] = _base64.b64encode(path.read_bytes()).decode("ascii")
+                row["mime"] = _IMAGE_MIME.get(ext, "image/png")
             except OSError:
                 pass
-
-            # Surface the script Nora wrote on each ``submit_script``
-            # — they live at ``<run_dir>/script.{do,R,py,ipynb}`` and
-            # the panel is the only path back to them once the chat
-            # history has scrolled away (or been rewound). The same
-            # enumeration drives the model-facing tools, so what the
-            # researcher sees here is exactly what the model can ask
-            # back for by name.
-            from nora.run_files import enumerate_run_dir_scripts
-            for entry in enumerate_run_dir_scripts(self.cwd):
-                ext = entry.path.suffix.lower()
-                kind_pri = kind_for_ext.get(ext) or ("script", 1)
-                kind, priority = kind_pri
+        elif ext in (".pdf", ".eps"):
+            from nora.plot_convert import png_for
+            sidecar = png_for(path)
+            if sidecar is not None:
                 try:
-                    resolved = entry.path.resolve()
+                    sidecar_size = sidecar.stat().st_size
                 except OSError:
-                    continue
-                if resolved in seen_paths:
-                    continue
-                seen_paths.add(resolved)
-                rows.append({
-                    "name": entry.display_name,
-                    "kind": kind,
-                    "priority": priority,
-                    "size": entry.size_bytes,
-                    "ext": ext,
-                    "mtime": entry.mtime,
-                    "path": str(entry.path),
-                })
-
-        # Newest-first within each kind so the most recent plots
-        # bubble to the top of the panel.
-        rows.sort(
-            key=lambda r: (r["priority"], -r.get("mtime", 0), r["name"].lower())
-        )
-        return {"ok": True, "files": rows}
+                    sidecar_size = size
+                if sidecar_size <= _IMAGE_THUMB_CAP:
+                    try:
+                        row["data"] = _base64.b64encode(
+                            sidecar.read_bytes()
+                        ).decode("ascii")
+                        row["mime"] = "image/png"
+                    except OSError:
+                        pass
 
     def delete_session_file(self, path: str) -> dict[str, Any]:
         """Delete a file inside the active session.
@@ -2918,14 +2767,10 @@ _MENTION_VISION_MAX_BYTES = 5 * 1024 * 1024
 def _classify_kind(ext: str) -> str:
     """Map a file extension to the same ``kind`` string
     :meth:`Bridge.list_session_files` uses, so the JS chip-renderer
-    only has one vocabulary to track."""
-    if ext in _INLINE_SCRIPT_EXTS or ext == ".ipynb":
-        return "script"
-    if ext in (".gph", ".png", ".jpg", ".jpeg", ".pdf", ".eps"):
-        return "graph"
-    if ext in (".log", ".smcl"):
-        return "log"
-    return "data"
+    only has one vocabulary to track. Unknown extensions fall through
+    to ``"data"`` so the chat-bubble renderer always has a kind."""
+    from nora.session_files import classify_ext
+    return classify_ext(ext, include_data=True, default="data")
 
 
 # Exact marker lines the executor writes between its bootstrap and

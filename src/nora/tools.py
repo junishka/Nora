@@ -1,16 +1,17 @@
-"""Nora — MCP tool surface (step 2 of the build ladder, mocked stage).
+"""Nora — MCP tool surface.
 
 This module defines the *exhaustive* interface through which the frontier
-model is allowed to reach the researcher's local machine. Six tools, no
-others. The Claude Agent SDK's built-in tools (Bash, Read, Write, Edit,
+model is allowed to reach the researcher's local machine. The canonical
+tool list lives in ``nora.provider.tool_schemas.TOOL_SPECS``; this module
+registers each spec with the Claude Agent SDK and supplies the handler
+bodies. The Claude Agent SDK's built-in tools (Bash, Read, Write, Edit,
 Glob, Grep, WebFetch, WebSearch, etc.) are disabled at the `app.py` layer
 via `disallowed_tools` + a `can_use_tool` catch-all.
 
-All tools return structured payloads. Earlier steps returned mocked values — the goal of
-step 2 is to define and enforce the interface, not to actually execute
-scripts or read data. Step 3 wires in real schema extraction; step 4 wires
-in the executor + sanitizer choke point; step 5 turns the pass-through
-sanitizer into a real allowlist with SDC rules.
+All tools return structured payloads (JSON-encoded). Raw stdout never
+crosses the boundary; the executor + sanitizer pipeline reduces script
+output to typed result entries with SDC rules applied before the model
+ever sees them.
 
 Invariants enforced here:
 - Values never cross the boundary. Mocked payloads never include simulated
@@ -29,11 +30,10 @@ import secrets
 from pathlib import Path
 from typing import Any
 
-from claude_agent_sdk import create_sdk_mcp_server, tool
+from claude_agent_sdk import create_sdk_mcp_server, tool as _sdk_tool
 
 from nora import data_request, executor, policy as policy_module, schema
 from nora.config import PathEscapeError, get_cwd, resolve_in_cwd
-from nora.data_request import SUPPORTED_REQUEST_TYPES
 from nora.policy import (
     depth_allowed,
     get_max_depth,
@@ -41,16 +41,29 @@ from nora.policy import (
     load_policy,
 )
 from nora import sanitizer
+from nora.provider.tool_schemas import build_tool_specs
 from nora.sanitizer import sanitize
 from nora.store import get_store
 
 
-# Build the request_type enumeration string from the canonical list in
-# data_request so the tool's help text cannot drift from the actual
-# implementation. Previously the help listed `numeric_range` and
-# `missingness_pattern` — neither supported by the runtime — so Claude
-# would call them and get "denied: request_type not in the allowlist".
-_REQUEST_TYPE_LIST_STR = ", ".join(f"'{t}'" for t in SUPPORTED_REQUEST_TYPES)
+# Single source of truth for tool name + description + arg shape lives
+# in ``nora.provider.tool_schemas``. The decorator below pulls every
+# field from there so the @tool registration cannot drift from the
+# canonical spec — and so the model sees identical guidance regardless
+# of provider. Cached at module load: ``build_tool_specs()`` resolves
+# ``request_data``'s description from
+# ``data_request.SUPPORTED_REQUEST_TYPES``, which is already imported
+# transitively above via ``from nora import data_request``.
+_TOOL_SPECS_BY_NAME = {spec.name: spec for spec in build_tool_specs()}
+
+
+def tool(name: str):
+    """Apply ``claude_agent_sdk.tool`` with description and arg-types
+    pulled from ``nora.provider.tool_schemas.TOOL_SPECS``. Editing a
+    tool's description means editing the spec; the @tool registration
+    follows. Drift is caught by ``test_tool_schema_consistency``."""
+    spec = _TOOL_SPECS_BY_NAME[name]
+    return _sdk_tool(name, spec.description, spec.as_sdk_args())
 
 
 def _effective_n(payload: dict[str, Any]) -> int | None:
@@ -555,32 +568,7 @@ def _as_mcp_text(payload: dict[str, Any]) -> dict[str, Any]:
 # Tool: get_schema
 # ---------------------------------------------------------------------------
 
-@tool(
-    "get_schema",
-    (
-        "Return the structural summary of a dataset. Variable names, types, "
-        "labels, value labels, observation count. Never returns individual "
-        "observation values. Use this before writing any analysis script so "
-        "you know what variables exist and their types.\n\n"
-        "Supported file types: .dta (Stata), .rds (R), .csv, .tsv, .parquet, "
-        ".jsonl / .ndjson.\n\n"
-        "Arguments:\n"
-        "  dataset: path to the dataset file, relative to the researcher's "
-        "working directory (or absolute path within it).\n"
-        "  depth: one of:\n"
-        "    - 'names_only': variable names only.\n"
-        "    - 'names_types': + type of each variable.\n"
-        "    - 'names_types_labels': + variable labels and value labels.\n"
-        "    - 'names_types_labels_summary': + NA counts and distinct counts "
-        "for categoricals.\n"
-        "  Default: 'names_types_labels_summary'. Each successful response "
-        "includes a 'policy_max_depth' field showing the ceiling the "
-        "researcher has set for this dataset. You cannot exceed it. "
-        "Requests above the ceiling are denied with the current ceiling "
-        "named in the reason."
-    ),
-    {"dataset": str, "depth": str},
-)
+@tool("get_schema")
 async def get_schema(args: dict[str, Any]) -> dict[str, Any]:
     """Step-3 implementation: real structural extraction, never values.
 
@@ -683,32 +671,7 @@ _SEARCH_SCHEMA_DEFAULT_LIMIT = 50
 _SEARCH_SCHEMA_HARD_CAP = 200
 
 
-@tool(
-    "search_schema",
-    (
-        "Find variables in a dataset whose name or label matches a "
-        "case-insensitive substring. Designed for wide datasets where "
-        "``get_schema`` would return hundreds of variables; "
-        "search_schema lets you ask 'which columns are salary-related' "
-        "without pulling the full schema into context.\n\n"
-        "Matches against variable ``name`` and (when policy allows) "
-        "``label``. Results are capped at ``limit`` (default 50, hard "
-        "max 200); the response includes ``total_matches`` so you "
-        "know whether to refine the query.\n\n"
-        "The search depth is the lower of (a) the dataset's policy "
-        "ceiling and (b) names_types_labels (no need to load summary "
-        "stats just to filter names). Returned variables carry the "
-        "same fields ``get_schema`` would return at that depth.\n\n"
-        "Arguments:\n"
-        "  dataset: path to the dataset, relative to cwd.\n"
-        "  query: case-insensitive substring to match against names "
-        "and labels. Empty string is rejected — list-everything is "
-        "what get_schema is for.\n"
-        "  limit: optional cap on matches returned (default 50, max "
-        "200). 0 or unset uses the default."
-    ),
-    {"dataset": str, "query": str, "limit": int},
-)
+@tool("search_schema")
 async def search_schema(args: dict[str, Any]) -> dict[str, Any]:
     """Filter a dataset's schema by a case-insensitive name/label query.
 
@@ -837,29 +800,7 @@ async def search_schema(args: dict[str, Any]) -> dict[str, Any]:
 # Tool: request_data
 # ---------------------------------------------------------------------------
 
-@tool(
-    "request_data",
-    (
-        "Ask the layer for a specific, bounded piece of information about "
-        "the data that is NOT in the default schema. The layer evaluates "
-        "the request against disclosure policy and returns either a "
-        "sanitized answer or a denial with a reason. Use this instead of "
-        "writing an exploratory probe script.\n\n"
-        "Arguments:\n"
-        "  dataset: identifier for the dataset.\n"
-        f"  request_type: one of {_REQUEST_TYPE_LIST_STR}.\n"
-        "  variable: name of the (first) variable the request is about.\n"
-        "  variable2: optional second variable, only used by "
-        "multi-variable types (correlation_pair). Single-variable "
-        "types ignore it."
-    ),
-    {
-        "dataset": str,
-        "request_type": str,
-        "variable": str,
-        "variable2": str,
-    },
-)
+@tool("request_data")
 async def request_data(args: dict[str, Any]) -> dict[str, Any]:
     """Step-5 implementation: real, SDC-gated bounded data queries.
 
@@ -1374,45 +1315,7 @@ def _attach_status_metadata(
         response["plots"] = plot_summary
 
 
-@tool(
-    "submit_script",
-    (
-        "Run an R, Stata, or Python analysis script against the researcher's "
-        "data. The script must emit structured results via the nora runtime "
-        "library (nora$result(...) / nora$from_* in R, nora_result_* in "
-        "Stata, nora.result(...) / nora.from_* in Python). Raw stdout/stderr "
-        "is shown to the researcher in their TUI but is not returned to you "
-        "; you receive only sanitized structured payloads.\n\n"
-        "A script can call helpers more than once; each call appends a "
-        "payload that comes back to you. The response carries a ``results`` "
-        "list (one entry per helper call, in emission order, each with its "
-        "own ``result_id``, ``label``, ``analysis_type``, and ``summary``) "
-        "plus a shared ``script_run_id`` so the group can be retrieved "
-        "together for audit. For parameterized batches (the same model "
-        "across N specifications, subgroups, outcomes, or sensitivity "
-        "perturbations), use ONE looping script over N separate scripts "
-        "to avoid repeated data preparation and a fragmented audit. If "
-        "the script aborts mid-loop, status becomes "
-        "``execution_failed_partial`` and the helpers that emitted "
-        "before the abort are returned in ``results`` alongside a "
-        "``debug_excerpt`` of the abort cause.\n\n"
-        "Arguments:\n"
-        "  language: 'R', 'Stata', or 'Python'.\n"
-        "  code: the full script source as a single string.\n"
-        "  label: short description of what the script is doing (e.g., "
-        "'OLS of outcome on predictors'). Used as the fallback row label "
-        "for any helper call that didn't pass its own label(\"...\").\n"
-        "  source_dataset: path (relative to cwd) of the dataset the "
-        "script reads. When set, Nora compares each analysis's "
-        "effective N to the dataset's row count and flags silent "
-        "filtering (NA-drops, subset conditions, listwise deletion) "
-        "in the transformations log. PASS THIS whenever the script "
-        "reads a known file. This is how researchers catch analyses "
-        "that quietly ran on a subset. Empty string is fine if the "
-        "script generates its own data or touches multiple files."
-    ),
-    {"language": str, "code": str, "label": str, "source_dataset": str},
-)
+@tool("submit_script")
 async def submit_script(args: dict[str, Any]) -> dict[str, Any]:
     """Run an R / Stata / Python script end-to-end: execute → sanitize → store.
 
@@ -1582,36 +1485,7 @@ _SCRIPT_FILE_LANGUAGES: dict[str, str] = {
 }
 
 
-@tool(
-    "submit_script_file",
-    (
-        "Run a script from a file the researcher attached, instead of "
-        "re-emitting the bytes through your tool input. Use this when "
-        "the researcher @-mentioned or uploaded a .do / .R / .Rmd / "
-        ".py file and wants it run as-is. For a 12 KB do-file, this "
-        "skips a 12 KB tool-input round-trip and the latency that "
-        "comes with it.\n\n"
-        "Same downstream behavior as submit_script (sanitizer, "
-        "row-count audit, store, multi-result, partial-success). The "
-        "response shape is identical.\n\n"
-        "Arguments:\n"
-        "  name: basename of the attached file (e.g., 'reg_v10.do'). "
-        "Must exist in the session cwd. Path components are stripped "
-        "(same posture as read_attached_file).\n"
-        "  language: 'R', 'Stata', or 'Python'. Optional — when "
-        "omitted, inferred from the file extension (.do→Stata, .r/"
-        ".rmd→R, .py→Python).\n"
-        "  label: short description (used as the fallback row label "
-        "for any helper that didn't pass its own label).\n"
-        "  source_dataset: same as submit_script."
-    ),
-    {
-        "name": str,
-        "language": str,
-        "label": str,
-        "source_dataset": str,
-    },
-)
+@tool("submit_script_file")
 async def submit_script_file(args: dict[str, Any]) -> dict[str, Any]:
     """Read a script from cwd by basename and forward to submit_script.
 
@@ -1742,33 +1616,7 @@ def _resolve_cross_session_cwd(session_path: str) -> Path | None:
     return target
 
 
-@tool(
-    "expand_result",
-    (
-        "Retrieve a stored sanitized payload by ID. Use this when you "
-        "need details of an earlier result (e.g., coefficients from a "
-        "prior regression) without carrying the whole payload in "
-        "context.\n\n"
-        "Arguments:\n"
-        "  result_id: the ID returned by a previous submit_script call.\n"
-        "  view: optional payload trim or render. ``\"\"`` (default) "
-        "or ``\"full\"`` returns the complete stored payload. "
-        "``\"coefficients\"`` is a regression-specific shorthand that "
-        "drops the variance-covariance matrix (``vcov``) and per-"
-        "predictor VIF table — useful when you only need the headline "
-        "coefficient pattern and not the collinearity diagnostics. "
-        "``\"markdown\"`` ALSO returns a ``markdown`` field with a "
-        "canonical pipe-table rendered from the sanitized payload — "
-        "drop it into your reply directly so the same payload renders "
-        "identically across recalls without re-deriving columns and "
-        "precision per-call. Other analysis types ignore the trim.\n"
-        "  session_path: optional path to ANOTHER session under "
-        f"~/.nora-sessions/ to expand a result from. Requires the "
-        f"{_CROSS_SESSION_ENV_VAR}=1 env var to be set; otherwise "
-        f"returns 'cross-session disabled'."
-    ),
-    {"result_id": str, "view": str, "session_path": str},
-)
+@tool("expand_result")
 async def expand_result(args: dict[str, Any]) -> dict[str, Any]:
     """Return the full stored sanitized payload for a given ID.
 
@@ -1885,52 +1733,7 @@ async def expand_result(args: dict[str, Any]) -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 
-@tool(
-    "compose_results",
-    (
-        "Compose a multi-result comparison table from a layout spec. "
-        "Use this AFTER ``submit_script`` returns N>=2 stored "
-        "regressions when the researcher would benefit from a "
-        "side-by-side comparison instead of N separate cards.\n\n"
-        "You emit the layout (which results to surface together, how "
-        "to label groups, which terms go in columns); the renderer "
-        "looks up cell values in the sanitized store by result_id. "
-        "You never type a coefficient. A result_id you got wrong, or "
-        "a term_id not in a payload's coefficients, renders as ``—`` "
-        "— grouping is fallible (you can re-emit a corrected spec) "
-        "but the numbers are infallible (they come from the store, "
-        "not your typing).\n\n"
-        "Spec shape (single ``spec`` argument, JSON object):\n"
-        "  {\n"
-        "    \"title\": \"Mechanism A: revenue effects\",   // optional\n"
-        "    \"columns\": [\n"
-        "      {\"id\": \"fp_y0\",  \"label\": \"year 0\"},\n"
-        "      {\"id\": \"fp_yp1\", \"label\": \"year +1\"}\n"
-        "    ],\n"
-        "    \"groups\": [\n"
-        "      {\n"
-        "        \"label\": \"H1: direct effect\",          // optional row header\n"
-        "        \"rows\": [\n"
-        "          {\"result_id\": \"M1\", \"label\": \"ln_rev_total\"},\n"
-        "          {\"result_id\": \"M2\", \"label\": \"ln_exp_total\"}\n"
-        "        ]\n"
-        "      }\n"
-        "    ]\n"
-        "  }\n\n"
-        "Cells render as ``estimate (SE) [p-value]``. Columns are "
-        "shared across all groups in one spec. If different groups "
-        "use different treatment terms (e.g., one panel uses "
-        "``fp_*``, another uses ``np_*``), call this tool once per "
-        "group rather than smashing them into one columns list — "
-        "non-matching cells will render as ``—``, which is honest "
-        "but not useful.\n\n"
-        "Returns ``markdown`` (the rendered table) and a "
-        "``missing_result_ids`` list flagging IDs you referenced "
-        "that aren't in the current session's store. Drop the "
-        "``markdown`` directly into your reply."
-    ),
-    {"spec": dict},
-)
+@tool("compose_results")
 async def compose_results(args: dict[str, Any]) -> dict[str, Any]:
     """Render a layout spec into a composite comparison table."""
     spec = args.get("spec")
@@ -2012,24 +1815,7 @@ _LIST_RESULTS_DEFAULT_LIMIT = 50
 _LIST_RESULTS_HARD_CAP = 500
 
 
-@tool(
-    "list_results",
-    (
-        "List stored sanitized results from this session as a table of "
-        "(id, label, analysis_type, created_at). Use to remind "
-        "yourself what analyses you've run without pulling full "
-        "payloads into context.\n\n"
-        "Newest-first ordering. Capped by ``limit`` (default 50, hard "
-        "max 500) so a long session doesn't ship hundreds of rows in "
-        "a single call. The response carries ``total`` (rows in the "
-        "store) and ``truncated`` (True iff total > rows shown) so "
-        "you know whether to refine.\n\n"
-        "Arguments:\n"
-        "  limit: optional cap on rows returned (default 50, max "
-        "500). 0 or unset uses the default."
-    ),
-    {"limit": int},
-)
+@tool("list_results")
 async def list_results(args: dict[str, Any]) -> dict[str, Any]:
     """Return the most recent stored results, capped at ``limit``.
 
@@ -2072,25 +1858,7 @@ async def list_results(args: dict[str, Any]) -> dict[str, Any]:
 # Tool: list_results_global
 # ---------------------------------------------------------------------------
 
-@tool(
-    "list_results_global",
-    (
-        "List stored sanitized results from EVERY Nora session under "
-        "~/.nora-sessions/. Use when the researcher refers to an analysis "
-        "from a different project/session and you need to find it. "
-        "Returns rows tagged with their session_path; pair with "
-        f"expand_result(result_id, session_path=...) to fetch the full "
-        f"payload.\n\n"
-        f"Requires the {_CROSS_SESSION_ENV_VAR}=1 env var to be set "
-        f"(default OFF — researchers may want explicit project "
-        f"separation regardless of payload safety). When disabled, "
-        f"returns 'cross-session disabled' with no results.\n\n"
-        f"Arguments:\n"
-        f"  query: optional case-insensitive substring filter on "
-        f"label / analysis_type. Omit to list everything."
-    ),
-    {"query": str},
-)
+@tool("list_results_global")
 async def list_results_global(args: dict[str, Any]) -> dict[str, Any]:
     """Walk ``~/.nora-sessions/*/.nora/results.db`` and return one
     row per stored result across all sessions, optionally filtered
@@ -2195,44 +1963,7 @@ def _render_tool_use(use: Any) -> dict[str, Any]:
     return out
 
 
-@tool(
-    "recall_conversation",
-    (
-        "Search this session's archived chat log for turns NOT already "
-        "in your context. The most recent ~20 turns are auto-loaded "
-        "when a session opens, so you already have short-term memory; "
-        "use this tool for DEEPER lookups into older history.\n\n"
-        "When to call this:\n"
-        "- The researcher references an analysis or exchange from "
-        "earlier in a long session that's no longer in your context "
-        "window (\"the regression we ran at the start\", \"what did "
-        "I ask yesterday about the gate variable\").\n"
-        "- You need the exact wording of something older. Quote it "
-        "back verbatim rather than paraphrasing.\n"
-        "- The auto-injected history starts with "
-        "\"N earlier turns omitted\" and the researcher's question "
-        "clearly points at those omitted turns.\n\n"
-        "Do NOT call this for content already visible to you in the "
-        "current conversation. Answer from context. The tool is a "
-        "disk read; use it when context genuinely can't answer the "
-        "question.\n\n"
-        "Arguments (all optional):\n"
-        "  query: case-insensitive substring matched against user + "
-        "assistant text and tool labels. Returns matching turns with "
-        "±2 neighboring turns for context, most-recent first.\n"
-        "  tail: last N turns regardless of query. Useful with a "
-        "large N to page further back than the auto-injected window.\n"
-        "  context: neighbor turns to include around each match "
-        "(default 2). Only applies when ``query`` is set.\n"
-        "  max_chars: soft cap on total text returned (default ~8000).\n\n"
-        "Returns {turn_count (total in archive), turns (list of "
-        "{index, user, assistant, tools: [{name,label,result_id?}], "
-        "result_ids, timestamp?})}. Thinking traces and raw tool-"
-        "result bodies are excluded. Use list_results / expand_result "
-        "for stored sanitized payloads."
-    ),
-    {"query": str, "tail": int, "context": int, "max_chars": int},
-)
+@tool("recall_conversation")
 async def recall_conversation(args: dict[str, Any]) -> dict[str, Any]:
     """Search or tail the persisted chat log for the active session.
 
@@ -2395,44 +2126,7 @@ _RECALL_SCRIPT_MAX_BYTES = 96 * 1024
 _RECALL_IMAGE_MAX_BYTES = 5 * 1024 * 1024
 
 
-@tool(
-    "read_attached_file",
-    (
-        "Re-read a file the researcher attached to this session, OR a "
-        "script you wrote on a prior ``submit_script`` call. Scripts "
-        "(.py / .do / .r / .rmd) and images (.png / .jpg / .jpeg / "
-        ".pdf / .eps). Use this when a file's content was in your "
-        "context earlier but has since scrolled out as the "
-        "conversation grew, or when a rewind cleared the chat history "
-        "and ``recall_conversation`` no longer surfaces it. The bytes "
-        "are still on disk; this tool fetches them again on demand. "
-        "For your own past scripts, pass the display name you see in "
-        "``list_session_files`` output (the labeled name like "
-        "``H1a Path A: op margin, FP-only.do``, or ``script_<short_id>"
-        ".do`` when no label was passed).\n\n"
-        "Behaviour:\n"
-        "  - Scripts: full text returned inline (capped at 96 KB; "
-        "longer files come back head+tail-truncated with an explicit "
-        "elision marker, so imports up top AND save / write calls at "
-        "the bottom are both visible). Use this to recall a "
-        "previously-attached do-file / .py before resubmitting or "
-        "proposing edits.\n"
-        "  - Images: returned as an MCP image content block so you can "
-        "see the plot. PDF / EPS are rasterised first.\n\n"
-        "Datasets (.csv / .dta / .parquet / .tsv / .jsonl / .ndjson / "
-        ".rds) are NOT retrievable through this tool. That boundary "
-        "is the SDC line. Use get_schema for column names / dtypes, "
-        "or write a script that reads the dataset.\n\n"
-        "Path safety: ``name`` is treated as a basename. Any directory "
-        "component is stripped before resolving against cwd. Paths "
-        "outside cwd are refused.\n\n"
-        "Arguments:\n"
-        "  name: basename of the file (e.g., 'reg_v9.do', "
-        "'residuals.png'). Must exist in the session cwd or one of "
-        "its plot subdirectories."
-    ),
-    {"name": str},
-)
+@tool("read_attached_file")
 async def read_attached_file(args: dict[str, Any]) -> dict[str, Any]:
     """Return the file's contents as inline text (scripts) or an MCP
     image content block (images). See the tool description above for
@@ -2660,60 +2354,18 @@ def _ext_to_language(ext: str) -> str:
 # Tool: list_session_files
 # ---------------------------------------------------------------------------
 
-# Extension → kind map. Datasets are intentionally NOT included: they're
-# already enumerated in the system prompt's cwd listing AND gated by the
-# SDC schema-depth policy. Listing them through this tool would create
-# a second discovery path that bypasses the policy story.
-_SESSION_FILE_KINDS: dict[str, str] = {
-    ".py": "script",
-    ".do": "script",
-    ".r": "script",
-    ".rmd": "script",
-    ".ipynb": "script",
-    ".log": "log",
-    ".smcl": "log",
-    ".png": "graph",
-    ".jpg": "graph",
-    ".jpeg": "graph",
-    ".pdf": "graph",
-    ".eps": "graph",
-    ".gph": "graph",
-}
-_SESSION_FILE_KIND_VALUES: frozenset[str] = frozenset({"script", "log", "graph"})
-
-
-@tool(
-    "list_session_files",
-    (
-        "List script, log, and graph files in the current session — "
-        "both researcher uploads in cwd top-level AND scripts you "
-        "wrote on prior ``submit_script`` calls (those live under "
-        "``<cwd>/.nora/runs/<id>/``). Datasets are NOT included — "
-        "those are already in your system-prompt context listing and "
-        "gated by the SDC schema-depth policy.\n\n"
-        "Use this when the researcher refers to a script or log "
-        "without naming it explicitly ('the do-file', 'that .py'), "
-        "when you need to recall a script you wrote earlier in this "
-        "session (especially after a rewind clears the chat history), "
-        "or to confirm a referenced filename actually exists.\n\n"
-        "Your past scripts surface under their analytic label (the "
-        "``label`` arg you passed to ``submit_script``), or under "
-        "``script_<short_id>.do`` when no label was passed. Pass the "
-        "same name back to ``read_attached_file`` to fetch contents.\n\n"
-        "Each entry carries name, kind (script / log / graph), size in "
-        "bytes, and last-modified mtime (ISO 8601 UTC). Newest first "
-        "within each kind.\n\n"
-        "Path safety: scan is non-recursive against cwd. Names are "
-        "basenames only.\n\n"
-        "Arguments:\n"
-        "  kinds: optional list of kinds to include — any subset of "
-        "['script', 'log', 'graph']. Empty / unset returns all three."
-    ),
-    {"kinds": list},
-)
+@tool("list_session_files")
 async def list_session_files(args: dict[str, Any]) -> dict[str, Any]:
-    """Enumerate non-data files in the session cwd, grouped by kind."""
+    """Enumerate non-data files in the session cwd, grouped by kind.
+
+    Datasets are intentionally NOT included: they're already
+    enumerated in the system prompt's cwd listing AND gated by the
+    SDC schema-depth policy. Listing them through this tool would
+    create a second discovery path that bypasses the policy story.
+    The shared taxonomy lives in :mod:`nora.session_files`.
+    """
     from datetime import datetime, timezone
+    from nora.session_files import NON_DATA_KINDS, classify_ext
     from nora.text_safety import safe_text
 
     raw_kinds = args.get("kinds") or []
@@ -2723,16 +2375,16 @@ async def list_session_files(args: dict[str, Any]) -> dict[str, Any]:
             "reason": "kinds must be a list of strings",
         })
     requested = {str(k).lower() for k in raw_kinds if isinstance(k, (str, int))}
-    if requested and not requested.issubset(_SESSION_FILE_KIND_VALUES):
-        bad = requested - _SESSION_FILE_KIND_VALUES
+    if requested and not requested.issubset(NON_DATA_KINDS):
+        bad = requested - NON_DATA_KINDS
         return _as_mcp_text({
             "status": "error",
             "reason": (
                 f"unknown kinds: {sorted(bad)!r}; "
-                f"valid: {sorted(_SESSION_FILE_KIND_VALUES)!r}"
+                f"valid: {sorted(NON_DATA_KINDS)!r}"
             ),
         })
-    keep_kinds = requested or _SESSION_FILE_KIND_VALUES
+    keep_kinds = requested or NON_DATA_KINDS
 
     cwd = get_cwd()
     if cwd is None or not cwd.is_dir():
@@ -2756,7 +2408,7 @@ async def list_session_files(args: dict[str, Any]) -> dict[str, Any]:
         except OSError:
             continue
         ext = child.suffix.lower()
-        kind = _SESSION_FILE_KINDS.get(ext)
+        kind = classify_ext(ext)
         if kind is None or kind not in keep_kinds:
             continue
         try:
@@ -2804,7 +2456,7 @@ async def list_session_files(args: dict[str, Any]) -> dict[str, Any]:
             seen_paths.add(name)
     rows.sort(key=lambda r: (r["kind"], -r["size_bytes"]))
     rows.sort(key=lambda r: r["mtime"], reverse=True)
-    counts = {k: 0 for k in _SESSION_FILE_KIND_VALUES}
+    counts = {k: 0 for k in NON_DATA_KINDS}
     for r in rows:
         counts[r["kind"]] += 1
     return _as_mcp_text({
@@ -2843,55 +2495,10 @@ _SEARCH_FILES_EXCERPT_EXTS: frozenset[str] = frozenset({
 })
 
 
-@tool(
-    "search_in_session_files",
-    (
-        "Search the contents of script and log files in the session "
-        "for a case-insensitive substring. Returns matching lines with "
-        "file + line-number context.\n\n"
-        "Use this when the researcher mentions a variable name, "
-        "regression label, or other identifier you don't recognize from "
-        "the conversation — find which script defined it before asking "
-        "for an upload. Pairs naturally with list_session_files: list to "
-        "see what's there, search to find which file contains the term "
-        "you care about.\n\n"
-        "Disclosure control: log files (.log, .smcl) and notebook files "
-        "(.ipynb) routinely contain raw command output — `list`, "
-        "`summarize, detail`, regression-by-group rows, notebook cell "
-        "outputs. Returning those lines verbatim would route raw "
-        "observations around the SDC sanitizer that owns the 'no raw "
-        "rows' boundary. Matches in those files therefore come back as "
-        "line numbers WITHOUT excerpt text (``{line: N}`` only), with "
-        "``excerpts: false`` on the file's result entry. Plain source "
-        "scripts (.py, .do, .r, .rmd) return excerpts as before — "
-        "their bytes are code, not computed output. If you need the "
-        "actual content of a log/notebook line, ask the researcher to "
-        "share the snippet directly.\n\n"
-        "Searches scripts and logs only by default; never searches "
-        "datasets (the SDC layer owns dataset content). Files larger "
-        "than 256 KB are skipped with a 'too large' marker. The skip "
-        "entry's ``reason`` field carries the right recovery path for "
-        "that file type: source scripts (.py / .do / .r / .rmd) say "
-        "'use read_attached_file'; logs / notebooks (.log / .smcl / "
-        ".ipynb) say 'ask the researcher for the snippet' — "
-        "read_attached_file refuses those by privacy contract, so a "
-        "blanket 'use read_attached_file' would be a guaranteed failed "
-        "follow-up.\n\n"
-        "Arguments:\n"
-        "  query: case-insensitive substring. Empty string is rejected.\n"
-        "  kinds: optional list — any subset of ['script', 'log']. "
-        "Default ['script', 'log']. 'graph' is never searchable.\n"
-        "  max_matches_per_file: optional cap on matches returned per "
-        "file (default 10, hard max 50)."
-    ),
-    {
-        "query": str,
-        "kinds": list,
-        "max_matches_per_file": int,
-    },
-)
+@tool("search_in_session_files")
 async def search_in_session_files(args: dict[str, Any]) -> dict[str, Any]:
     """Substring search across session script + log files."""
+    from nora.session_files import classify_ext
     from nora.text_safety import safe_text
 
     query = args.get("query", "")
@@ -2957,7 +2564,7 @@ async def search_in_session_files(args: dict[str, Any]) -> dict[str, Any]:
         except OSError:
             continue
         ext = child.suffix.lower()
-        kind = _SESSION_FILE_KINDS.get(ext)
+        kind = classify_ext(ext)
         if kind not in keep_kinds:
             continue
         try:

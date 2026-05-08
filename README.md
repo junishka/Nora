@@ -19,7 +19,7 @@ the long-form direction and open-question log,
 
 ## Status
 
-Alpha. Privacy invariants are implemented and tested (696 tests).
+Alpha. Privacy invariants are implemented and tested (775 tests).
 Two frontends ship. The terminal UI is `nora`. The pywebview web UI
 is `nora-ui` and is also what the `.app` launches. Bundled `.dmg`
 distribution to other people is blocked on Apple Developer Program
