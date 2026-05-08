@@ -129,6 +129,37 @@ def test_list_results_global_enabled_lists_other_sessions(
         assert r["session_name"]
 
 
+def test_list_results_global_caps_at_limit_and_reports_truncation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A user with many sessions × many results would otherwise ship
+    megabytes of metadata into the model context on a single call.
+    Same default and hard cap as ``list_results``; truncation is
+    surfaced via ``total`` and ``truncated``.
+    """
+    monkeypatch.setenv("NORA_ALLOW_CROSS_SESSION_RECALL", "1")
+    _patch_sessions_root(monkeypatch, tmp_path)
+
+    current = tmp_path / "20260101T000000Z_current"
+    other = tmp_path / "20260101T000000Z_other"
+    for d in (current, other):
+        d.mkdir()
+
+    # Insert more rows than the explicit ``limit`` we ask for.
+    for i in range(7):
+        _insert_fake_result(other, label=f"row {i:02d}")
+
+    with use_cwd(current):
+        res = asyncio.run(HANDLERS["list_results_global"]({"limit": 3}))
+    body = _mcp_text(res)
+    assert body["status"] == "ok"
+    assert body["total"] == 7
+    assert body["count"] == 3
+    assert body["limit"] == 3
+    assert body["truncated"] is True
+    assert len(body["results"]) == 3
+
+
 def test_list_results_global_query_filters_by_label(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:

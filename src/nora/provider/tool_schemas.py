@@ -322,9 +322,16 @@ _LIST_RESULTS_GLOBAL_DESC = (
     "(default OFF — researchers may want explicit project "
     "separation regardless of payload safety). When disabled, "
     "returns 'cross-session disabled' with no results.\n\n"
+    "Newest-first ordering. Capped by ``limit`` (default 50, hard "
+    "max 500) — same shape as ``list_results``. The response "
+    "carries ``total`` (rows across all sessions matching the "
+    "query) and ``truncated`` (True iff total > rows shown) so "
+    "you know whether to refine the query when the cap fires.\n\n"
     "Arguments:\n"
     "  query: optional case-insensitive substring filter on "
-    "label / analysis_type. Omit to list everything."
+    "label / analysis_type. Omit to list everything.\n"
+    "  limit: optional max number of rows to return; default 50, "
+    "hard max 500."
 )
 
 _LIST_RESULTS_DESC = (
@@ -652,6 +659,7 @@ def build_tool_specs() -> tuple[ToolSpec, ...]:
             _LIST_RESULTS_GLOBAL_DESC,
             properties={
                 "query": {"type": "string"},
+                "limit": {"type": "integer"},
             },
             required=(),
         ),

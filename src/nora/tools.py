@@ -1704,9 +1704,19 @@ async def submit_script_file(args: dict[str, Any]) -> dict[str, Any]:
     explicit_language = (args.get("language") or "").strip()
     language = explicit_language or inferred_language
     if explicit_language and explicit_language != inferred_language:
-        # The model overrode the extension-based inference. Honor it,
-        # but only if the override is one of the supported languages —
-        # otherwise the downstream submit_script would reject anyway.
+        # The model overrode the extension-based inference.
+        # Two ways this goes wrong:
+        #   1. Override isn't a language we support at all → reject
+        #      with the same shape the downstream submit_script would.
+        #   2. Override IS supported, but doesn't match the file
+        #      extension. Earlier behavior silently honored the
+        #      override, so a researcher who attached ``script.do``
+        #      and got ``language="Python"`` from the model would
+        #      hand a Stata-syntax script to the Python interpreter.
+        #      Reject loudly instead — the model can either drop
+        #      the override (and use the extension-inferred language)
+        #      or rename the file. Silent mis-routing is the worst
+        #      failure mode.
         if explicit_language not in {"R", "Stata", "Python"}:
             return _as_mcp_text({
                 "status": "error",
@@ -1715,6 +1725,16 @@ async def submit_script_file(args: dict[str, Any]) -> dict[str, Any]:
                     f"got {explicit_language!r}"
                 ),
             })
+        return _as_mcp_text({
+            "status": "error",
+            "reason": (
+                f"language override {explicit_language!r} conflicts "
+                f"with the file extension {ext!r} (which infers "
+                f"{inferred_language!r}). Drop the language argument "
+                f"to use the extension-inferred language, or rename "
+                f"the file to match the language you want to run."
+            ),
+        })
 
     try:
         code = target.read_text(encoding="utf-8")
@@ -1859,7 +1879,14 @@ async def expand_result(args: dict[str, Any]) -> dict[str, Any]:
     # rendered from the sanitized payload. Same source as the JSON
     # payload, but pre-formatted so the model can drop it into a
     # response without re-deriving columns / precision per-call (the
-    # source of inconsistent renders across recalls).
+    # source of inconsistent renders across recalls). When the
+    # markdown render succeeds we DROP the JSON ``payload`` from
+    # the response — shipping both is double-cost (kilobytes for a
+    # wide regression) and the model's only reason to call
+    # ``view="markdown"`` is when it wants the rendered table, not
+    # the raw arrays. If the payload type isn't one the renderer
+    # knows, ``markdown`` is omitted and ``payload`` falls back in
+    # so the call still has usable content.
     markdown: str | None = None
     if view == "markdown" and isinstance(payload, dict):
         from nora.result_render import render_table
@@ -1871,16 +1898,17 @@ async def expand_result(args: dict[str, Any]) -> dict[str, Any]:
         "label": row.label,
         "analysis_type": row.analysis_type,
         "language": row.language,
-        "payload": payload,
         "transformations": row.transformations,
         "created_at": row.created_at,
     }
+    if markdown is not None:
+        response["markdown"] = markdown
+    else:
+        response["payload"] = payload
     if view:
         response["view"] = view
     if view_dropped:
         response["view_dropped_fields"] = view_dropped
-    if markdown is not None:
-        response["markdown"] = markdown
     if raw_session_path:
         response["session_path"] = str(target_cwd)
     # Surface the run_dir so the TUI can re-render the raw R/Stata
@@ -2042,6 +2070,13 @@ async def list_results_global(args: dict[str, Any]) -> dict[str, Any]:
     payloads are pre-sanitized so the privacy boundary is preserved
     regardless of which session they came from; the gate exists for
     researcher-side project separation, not as a privacy property.
+
+    Capped at ``_LIST_RESULTS_HARD_CAP`` rows newest-first. A user
+    with hundreds of sessions × dozens of results per session would
+    otherwise ship megabytes of session metadata into the model
+    context on a single call. Same default and hard cap as
+    ``list_results`` for symmetry; the model treats the two tools
+    interchangeably aside from scope.
     """
     if not _cross_session_enabled():
         return _as_mcp_text({
@@ -2056,12 +2091,21 @@ async def list_results_global(args: dict[str, Any]) -> dict[str, Any]:
         })
     query = (args.get("query") or "").strip().lower()
 
+    requested_limit = args.get("limit", 0)
+    if not isinstance(requested_limit, int) or requested_limit <= 0:
+        limit = _LIST_RESULTS_DEFAULT_LIMIT
+    else:
+        limit = min(requested_limit, _LIST_RESULTS_HARD_CAP)
+
     from nora.ui import SESSIONS_ROOT
 
     if not SESSIONS_ROOT.exists():
         return _as_mcp_text({
             "status": "ok",
+            "total": 0,
             "count": 0,
+            "limit": limit,
+            "truncated": False,
             "results": [],
         })
 
@@ -2097,14 +2141,19 @@ async def list_results_global(args: dict[str, Any]) -> dict[str, Any]:
                 "analysis_type": atype,
                 "created_at": r.created_at,
             })
+    total = len(rows_out)
     # Newest-first so the model sees recent sessions before old ones.
     rows_out.sort(
         key=lambda r: r.get("created_at") or "", reverse=True,
     )
+    truncated_rows = rows_out[:limit]
     return _as_mcp_text({
         "status": "ok",
-        "count": len(rows_out),
-        "results": rows_out,
+        "total": total,
+        "count": len(truncated_rows),
+        "limit": limit,
+        "truncated": total > limit,
+        "results": truncated_rows,
         "query": query if query else None,
     })
 

@@ -37,6 +37,7 @@ import pytest
 from nora.env_detect import find_sandbox_exec
 from nora.executor import (
     RESULT_TOKEN_FIELD,
+    _format_bad_lines_summary,
     _generate_run_token,
     _parse_result_jsonl,
     _validate_and_strip_token,
@@ -171,6 +172,30 @@ def test_parse_jsonl_preserves_valid_lines_past_a_token_failure():
     assert len(payloads) == 2
     assert len(bad_lines) == 1
     assert "line 2" in bad_lines[0]
+
+
+def test_bad_lines_summary_surfaces_linenos_past_first_five():
+    """Eight corrupt lines: details for the first 5, then the line
+    numbers of the remaining 3. Plain ``…`` used to hide that
+    information, forcing the researcher to read the result file by
+    hand to find the rest of the failures."""
+    bad_lines = [f"line {i}: invalid json" for i in (3, 5, 7, 9, 11, 13, 17, 22)]
+    msg = _format_bad_lines_summary(bad_lines, payload_count=2)
+    assert "8 malformed result line(s) skipped (2 valid preserved)" in msg
+    # Each of the first 5 line numbers appears in detail form.
+    for ln in (3, 5, 7, 9, 11):
+        assert f"line {ln}: invalid json" in msg
+    # Each of the remaining 3 line numbers appears in the tail.
+    assert "and lines 13,17,22 also failed" in msg
+
+
+def test_bad_lines_summary_exact_five_omits_tail():
+    """Boundary: 5 entries fits in detail form, no tail needed."""
+    bad_lines = [f"line {i}: invalid json" for i in (1, 2, 3, 4, 5)]
+    msg = _format_bad_lines_summary(bad_lines, payload_count=0)
+    assert "5 malformed result line(s) skipped (0 valid preserved)" in msg
+    assert "…" not in msg
+    assert "also failed" not in msg
 
 
 def test_parse_jsonl_returns_no_bad_lines_for_clean_input():
