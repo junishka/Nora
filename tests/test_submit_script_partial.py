@@ -491,3 +491,59 @@ def test_status_is_failed_not_partial_when_emitted_payloads_all_rejected(
     # Diagnostic row is still persisted (the run dir must be
     # recoverable from the store even when only rejections came back).
     assert "result_id" in body, body
+
+
+@_skip_no_python
+def test_clean_exit_with_malformed_jsonl_line_stays_ok_with_warning(
+    tmp_path: Path,
+) -> None:
+    """A clean-exit run (exit_code 0) that produces valid payloads
+    AND one malformed JSONL line must surface as ``status="ok"``
+    with the bad-line summary in ``warnings``, not as
+    ``execution_failed_partial``.
+
+    Before the fix, ``run_script`` would set ``error`` on any bad
+    line, which flipped ``ok=False`` and demoted the envelope to
+    ``execution_failed_partial`` — reading to the model as "the
+    script aborted" even though the subprocess exited 0. The 24-
+    spec / one-glitched-helper case is the canonical failure here:
+    23 good results with one corrupt line should NOT make the model
+    apologise about an abort that didn't happen.
+    """
+    set_cwd(tmp_path)
+    reset_store_for_tests()
+
+    # Real helper produces one valid token-stamped line; the trailing
+    # write appends a non-JSON line directly to NORA_RESULT_PATH.
+    # Script exits 0 — there is no abort, only a bad line.
+    code = (
+        "import os\n"
+        "import nora\n"
+        "nora.from_summarize('a', n=50, mean=1.0, sd=0.1, missing_count=0)\n"
+        "open(os.environ['NORA_RESULT_PATH'], 'a').write("
+        "'{\"type\":\"linear_regression\",\"n\":100,bogus,}\\n')\n"
+    )
+    response = asyncio.run(submit_script.handler({
+        "language": "Python",
+        "code": code,
+        "label": "bad-line-but-clean-exit canary",
+        "source_dataset": "",
+    }))
+    body = _text_payload(response)
+
+    # Clean exit + at least one valid payload ⇒ envelope stays "ok".
+    assert body["status"] == "ok", body
+    assert body["exit_code"] == 0
+    assert len(body["results"]) == 1
+    assert body["results"][0]["status"] == "ok"
+
+    # Bad-line context surfaces in ``warnings`` so the model can see
+    # something went sideways without treating the whole run as failed.
+    assert "warnings" in body, body
+    assert any(
+        "malformed result line" in w.lower() for w in body["warnings"]
+    ), body["warnings"]
+    # No debug_excerpt / reason — those are reserved for actual
+    # execution failures.
+    assert "reason" not in body
+    assert "debug_excerpt" not in body

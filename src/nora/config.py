@@ -52,7 +52,7 @@ _cwd_var: ContextVar[Path | None] = ContextVar("nora_cwd", default=None)
 def set_cwd(path: Path) -> Path:
     """Set the process-wide default working directory.
 
-    Called from terminal startup (``app.py``) and tests. Web UI runners
+    Called from terminal startup (``ui.py``) and tests. Web UI runners
     bind their cwd via :func:`use_cwd` instead — see the module
     docstring for why.
     """

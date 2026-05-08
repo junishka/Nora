@@ -34,7 +34,7 @@ import shutil
 import subprocess
 import time
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from functools import lru_cache
 from importlib import resources
@@ -330,9 +330,19 @@ class ExecutionResult:
     """Outcome of running one script.
 
     - ``ok`` is ``True`` iff the subprocess exited 0 AND at least one
-      valid JSON payload was written to the result file. Any deviation
-      (timeout, non-zero exit, missing result, invalid JSON, token
-      mismatch) flips ``ok=False`` and fills ``error``.
+      valid JSON payload was written to the result file. Fatal
+      deviations (timeout, non-zero exit, missing result file, empty
+      result file, every line malformed) flip ``ok=False`` and fill
+      ``error``.
+    - ``warnings`` carries non-fatal advisories about the run — most
+      commonly malformed JSONL lines that were skipped while OTHER
+      lines parsed and validated cleanly. A run with 7 valid payloads
+      and 1 malformed line stays ``ok=True`` and the malformed-line
+      summary lands here, not in ``error``: the legitimate output
+      should reach the caller without being demoted to
+      "execution_failed". When NO payloads survive, the malformed-line
+      message is upgraded into ``error`` instead, since it is then the
+      only signal the caller has.
     - ``raw_stdout`` / ``raw_stderr`` are what the researcher sees in the
       TUI. Never routed to the sanitizer.
     - ``result_payloads`` is the list of parsed JSON payloads from the
@@ -355,6 +365,7 @@ class ExecutionResult:
     run_dir: Path
     script_path: Path | None
     duration_seconds: float
+    warnings: list[str] = field(default_factory=list)
 
 
 def run_script(
@@ -612,6 +623,7 @@ def run_script(
     # mode multi-result was meant to fix.
     payloads: list[dict] = []
     error: str | None = None
+    warnings: list[str] = []
     if not result_path.exists():
         error = (
             "script finished but did not emit a structured result — no file "
@@ -626,12 +638,33 @@ def run_script(
         else:
             payloads, bad_lines = _parse_result_jsonl(text, run_token)
             if bad_lines:
-                error = (
+                bad_msg = (
                     f"{len(bad_lines)} malformed result line(s) "
                     f"skipped ({len(payloads)} valid preserved): "
                     + "; ".join(bad_lines[:5])
                     + (" …" if len(bad_lines) > 5 else "")
                 )
+                # Two paths, two meanings:
+                #   - Some payloads survived alongside bad lines: the
+                #     bad lines are an advisory, not a failure. A
+                #     24-spec script with one runtime-library glitch
+                #     on spec #5 should stay ``ok=True`` and surface
+                #     the 23 good results — the prior "any bad line
+                #     ⇒ ok=False" behavior demoted these to
+                #     "execution_failed_partial", which reads to the
+                #     model as "the script aborted" even when the
+                #     subprocess exited 0.
+                #   - No payloads survived: the bad-line message IS
+                #     the only signal we have (this is the bypass-
+                #     attempt case — a forged JSON line that fails
+                #     the auth-token check produces zero survivors).
+                #     Keep it in ``error`` so the caller sees a
+                #     fatal-shaped response and the security signal
+                #     isn't buried under a non-blocking warning.
+                if payloads:
+                    warnings.append(bad_msg)
+                else:
+                    error = bad_msg
             if error is None and not payloads:
                 error = (
                     "script finished but emitted an empty result file. "
@@ -650,6 +683,7 @@ def run_script(
         error=error,
         run_dir=run_dir, script_path=script_path,
         duration_seconds=duration,
+        warnings=warnings,
     )
 
 

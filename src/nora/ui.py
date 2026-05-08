@@ -2612,9 +2612,13 @@ class NoraBridge:
         let an old draft's count overwrite a newer one.
 
         Returns ``{ok, tokens, exact, ceiling, request_id}``. Today
-        ``exact=False`` for both providers (chars/3.5 approximation);
-        the chip prefixes ``~`` whenever it sees ``exact=False`` so
-        the researcher never mistakes an estimate for a measurement.
+        ``exact=False`` for both providers (chars/3.5 approximation).
+        The chip text itself shows the bare number — no ``~`` prefix
+        — and the chip's hover tooltip carries the
+        approximate-vs-exact disclosure so the researcher never
+        mistakes an estimate for a measurement (see
+        ``web/app.js`` ``updateContextChip`` for the rendering
+        contract).
         """
         if self.cwd is None:
             return {

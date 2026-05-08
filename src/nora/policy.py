@@ -44,14 +44,13 @@ Design notes:
   ``names_only`` if Claude doesn't need the labels for the task at
   hand. Nora enforces "at most", not "exactly".
 
-- Interactive policy editing is wired up in both frontends:
-  the terminal ``/policy`` slash-command (see
-  ``app.py:_run_policy_wizard``) opens a dataset picker + depth
-  menu; the web UI exposes a compact "Policy" chip next to the
-  composer (see ``web/app.js:updatePolicyChip``) that unfurls a
-  per-dataset dropdown. The JSON file is still the single source
-  of truth — both UIs just read and write it — so a researcher
-  comfortable editing it directly can still do that.
+- Interactive policy editing is wired up in both frontends through
+  the same backend method (see ``ui.py:set_dataset_policy``); the
+  web UI exposes a compact "Policy" chip next to the composer (see
+  ``web/app.js:updatePolicyChip``) that unfurls a per-dataset
+  dropdown. The JSON file is still the single source of truth —
+  both UIs just read and write it — so a researcher comfortable
+  editing it directly can still do that.
 
 - Unknown or malformed entries fall back to the conservative
   default rather than raising. A broken policy file should not
