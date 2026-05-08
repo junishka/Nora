@@ -181,6 +181,20 @@ program define nora_result_regress
         local _x = strofreal(`=e(r2_a)', "%21.17e")
         file write `fh' `","adj_r_squared":`_x'"'
     }
+    * F-test from ``regress``. Stata's ``regress`` reports the
+    * F-test p-value in its display output (``Prob > F``) but does
+    * NOT populate ``e(p)`` for OLS (verified empirically against
+    * Stata 17/18). The chi2-gated branch further down therefore
+    * does not silently emit ``chi_squared_p_value`` from an OLS
+    * run — ``e(p)`` is empty, so the gate is satisfied either way.
+    * If a future Stata version starts populating ``e(p)`` for
+    * regress, the chi2 gate (``e(chi2)`` non-empty) keeps the
+    * fields disjoint: the value would be available as ``e(p)``
+    * but would not flow into ``chi_squared_p_value`` because
+    * regress doesn't set ``e(chi2)``. We don't capture it as
+    * ``f_p_value`` here because the value isn't in ``e()`` to
+    * read; researchers who need the F-test p-value can compute
+    * it from ``F``, ``df_m``, and ``df_r`` (via ``Ftail``).
     if "`e(F)'" != "" & !missing(`=e(F)') {
         local _x = strofreal(`=e(F)', "%21.17e")
         file write `fh' `","f_statistic":`_x'"'
@@ -221,17 +235,23 @@ program define nora_result_regress
         local _x = strofreal(`=e(ll)', "%21.17e")
         file write `fh' `","log_likelihood":`_x'"'
     }
+    * Chi-squared omnibus test (LR / Wald) — populated by logit /
+    * probit / Poisson / stcox via ``e(chi2)`` and its p-value
+    * via ``e(p)``. Gate ``chi_squared_p_value`` on ``e(chi2)``
+    * being populated, NOT on ``e(p)`` alone — Stata's ``regress``
+    * (OLS) ALSO populates ``e(p)`` with the F-test p-value, so a
+    * lone ``e(p)`` guard would emit ``chi_squared_p_value`` from
+    * an OLS run that has no chi-squared test, misleading the
+    * reader. The OLS path captures ``e(p)`` as ``f_p_value`` in
+    * the F-statistic block above; this one only fires when a
+    * chi2 test actually ran.
     if "`e(chi2)'" != "" & !missing(`=e(chi2)') {
         local _x = strofreal(`=e(chi2)', "%21.17e")
         file write `fh' `","chi_squared":`_x'"'
-    }
-    * For likelihood-ratio / Wald omnibus tests, e(p) is the chi2
-    * p-value. Guard separately: e(p) being populated means a chi2
-    * test ran; e(F) populated means an F test ran. They're mutually
-    * exclusive on every command we emit through.
-    if "`e(p)'" != "" & !missing(`=e(p)') {
-        local _x = strofreal(`=e(p)', "%21.17e")
-        file write `fh' `","chi_squared_p_value":`_x'"'
+        if "`e(p)'" != "" & !missing(`=e(p)') {
+            local _x = strofreal(`=e(p)', "%21.17e")
+            file write `fh' `","chi_squared_p_value":`_x'"'
+        }
     }
     if "`e(N_sub)'" != "" & !missing(`=e(N_sub)') {
         file write `fh' `","n_subjects":`=e(N_sub)'"'
