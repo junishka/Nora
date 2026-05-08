@@ -34,15 +34,25 @@
        can land on the data picker. -->
   <div id="auth" class="auth hidden">
     <div class="auth-card">
-      <picture class="landing-hero">
+      <div class="landing-hero">
         <!-- The wordmark's burgundy ink is too dark to read against
              the dark theme's plum background, so a recoloured PNG
              ships alongside it. ``data-theme`` (set by the topbar
-             toggle) swaps the visible variant; the ``prefers-color-scheme``
-             fallback covers researchers who never toggle. -->
+             toggle) swaps the visible variant via CSS ``display:
+             none``; the ``prefers-color-scheme`` fallback covers
+             researchers who never toggle.
+             Both <img> tags carry the same alt text so screen
+             readers always have a description regardless of which
+             theme is active — the previous markup gave the dark-
+             mode image alt="" and aria-hidden="true", silently
+             dropping the alt when dark mode was on. The wrapper
+             used to be <picture>, but <picture> requires <source>
+             children to do its job; the two-<img> + CSS pattern
+             here doesn't use that semantic, so a plain <div>
+             carries the layout class. -->
         <img class="landing-hero-img landing-hero-img--light" src="nora-wordmark.png" alt="Nora — No raw access" />
-        <img class="landing-hero-img landing-hero-img--dark" src="nora-wordmark-dark.png" alt="" aria-hidden="true" />
-      </picture>
+        <img class="landing-hero-img landing-hero-img--dark" src="nora-wordmark-dark.png" alt="Nora — No raw access" />
+      </div>
       <h1>Connect a model</h1>
       <p class="auth-lead">
         Nora drives a frontier model against your data. Pick at least
@@ -112,15 +122,25 @@
        The researcher drops files or clicks a button to pick them. -->
   <div id="landing" class="landing hidden">
     <div class="landing-card">
-      <picture class="landing-hero">
+      <div class="landing-hero">
         <!-- The wordmark's burgundy ink is too dark to read against
              the dark theme's plum background, so a recoloured PNG
              ships alongside it. ``data-theme`` (set by the topbar
-             toggle) swaps the visible variant; the ``prefers-color-scheme``
-             fallback covers researchers who never toggle. -->
+             toggle) swaps the visible variant via CSS ``display:
+             none``; the ``prefers-color-scheme`` fallback covers
+             researchers who never toggle.
+             Both <img> tags carry the same alt text so screen
+             readers always have a description regardless of which
+             theme is active — the previous markup gave the dark-
+             mode image alt="" and aria-hidden="true", silently
+             dropping the alt when dark mode was on. The wrapper
+             used to be <picture>, but <picture> requires <source>
+             children to do its job; the two-<img> + CSS pattern
+             here doesn't use that semantic, so a plain <div>
+             carries the layout class. -->
         <img class="landing-hero-img landing-hero-img--light" src="nora-wordmark.png" alt="Nora — No raw access" />
-        <img class="landing-hero-img landing-hero-img--dark" src="nora-wordmark-dark.png" alt="" aria-hidden="true" />
-      </picture>
+        <img class="landing-hero-img landing-hero-img--dark" src="nora-wordmark-dark.png" alt="Nora — No raw access" />
+      </div>
       <p class="landing-lead">
         Choose the data files you want Nora to help you analyze.
         They stay on this machine. Nora only sees schema and

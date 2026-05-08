@@ -15,11 +15,17 @@
 #   bash packaging/release.sh --app-only     # skip the .dmg + notarization
 #   bash packaging/release.sh --check-only   # run pre-flight, exit
 #   bash packaging/release.sh --allow-dirty  # skip the clean-tree check
+#   bash packaging/release.sh --yes          # auto-confirm prompts (CI use)
 #
 # Required env (drop these in ~/.zshrc to make them stick):
 #   NORA_SIGN_IDENTITY     e.g. "Developer ID Application: Your Name (TEAMID)"
 #   NORA_NOTARIZE_PROFILE  notarytool keychain-profile name from
 #                          `xcrun notarytool store-credentials`
+#
+# Optional env:
+#   NORA_RELEASE_YES=1     equivalent to --yes; auto-accepts the
+#                          off-main-branch and behind-origin prompts so
+#                          the script can run unattended (CI, cron).
 #
 # Why a wrapper at all:
 #   - build_app.sh + build_dmg.sh skip signing silently when the env
@@ -43,6 +49,13 @@ INSTALL=true
 CHECK_ONLY=false
 ALLOW_DIRTY=false
 APP_ONLY=false
+# Default --yes from the env so this script can run unattended (CI,
+# cron). Each interactive prompt below honours this flag instead of
+# blocking forever on a non-TTY ``read``.
+case "${NORA_RELEASE_YES:-}" in
+    1|true|yes|YES) ASSUME_YES=true ;;
+    *)              ASSUME_YES=false ;;
+esac
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -50,6 +63,7 @@ while [[ $# -gt 0 ]]; do
         --check-only)  CHECK_ONLY=true; shift ;;
         --allow-dirty) ALLOW_DIRTY=true; shift ;;
         --app-only)    APP_ONLY=true; shift ;;
+        --yes|-y)      ASSUME_YES=true; shift ;;
         -h|--help)
             sed -n '2,/^$/p' "$0" | sed 's/^# \{0,1\}//'
             exit 0
@@ -57,6 +71,26 @@ while [[ $# -gt 0 ]]; do
         *) echo "unknown flag: $1" >&2; exit 2 ;;
     esac
 done
+
+# Confirm prompts honour --yes / NORA_RELEASE_YES. When neither is set
+# AND stdin isn't a TTY, refuse instead of blocking forever — CI logs
+# would otherwise stall silently on a never-arriving newline.
+confirm() {
+    local prompt="$1"
+    if [[ "$ASSUME_YES" == "true" ]]; then
+        echo "    $prompt [y/N] y  (auto)"
+        return 0
+    fi
+    if [[ ! -t 0 ]]; then
+        echo "  ✗ $prompt — non-interactive shell. Re-run with --yes" >&2
+        echo "    or set NORA_RELEASE_YES=1 to bypass." >&2
+        return 1
+    fi
+    local ans=""
+    echo -n "    $prompt [y/N] "
+    read -r ans
+    [[ "$ans" =~ ^[Yy]$ ]]
+}
 
 # ── Pre-flight ────────────────────────────────────────────────────────
 
@@ -129,9 +163,7 @@ echo "  ✓ Working tree clean"
 BRANCH="$(/usr/bin/git rev-parse --abbrev-ref HEAD 2>/dev/null || echo unknown)"
 if [[ "$BRANCH" != "main" ]]; then
     echo "  ⚠ Building from '$BRANCH' (not main)."
-    echo -n "    Continue? [y/N] "
-    read -r ans
-    [[ "$ans" =~ ^[Yy]$ ]] || exit 1
+    confirm "Continue?" || exit 1
 fi
 echo "  ✓ Branch: $BRANCH"
 
@@ -140,14 +172,19 @@ echo "  ✓ Branch: $BRANCH"
 # bundle". Fetch is silent and non-merging, so this is informational —
 # we don't try to pull from inside the release pipeline because pull
 # failures (conflicts, network) belong upstream of the build.
+#
+# Surface fetch failures explicitly. The earlier ``2>/dev/null || true``
+# masked offline / auth issues, so a stale build with no network would
+# silently print "✓ Up to date" — exactly the case the freshness check
+# was meant to catch. Now we emit a clear warning and let the caller
+# decide whether to proceed.
 if /usr/bin/git rev-parse --abbrev-ref --symbolic-full-name @{u} >/dev/null 2>&1; then
     if /usr/bin/git fetch --quiet 2>/dev/null; then
         BEHIND="$(/usr/bin/git rev-list --count "HEAD..@{u}" 2>/dev/null || echo 0)"
         if [[ "$BEHIND" -gt 0 ]]; then
             echo "  ⚠ Local '$BRANCH' is $BEHIND commit(s) behind origin/$BRANCH."
-            echo -n "    Pull first to ship the latest, or continue anyway? [y/N] "
-            read -r ans
-            [[ "$ans" =~ ^[Yy]$ ]] || { echo "Run 'git pull' and re-run." >&2; exit 1; }
+            confirm "Pull first to ship the latest, or continue anyway?" \
+                || { echo "Run 'git pull' and re-run." >&2; exit 1; }
         else
             echo "  ✓ Up to date with origin/$BRANCH"
         fi
@@ -158,9 +195,8 @@ if /usr/bin/git rev-parse --abbrev-ref --symbolic-full-name @{u} >/dev/null 2>&1
         # whatever stale ref @{u} points to) is exactly the failure
         # mode the freshness check exists to prevent.
         echo "  ⚠ Could not fetch from origin (network/auth?) — local freshness unverified."
-        echo -n "    Continue without confirming freshness? [y/N] "
-        read -r ans
-        [[ "$ans" =~ ^[Yy]$ ]] || { echo "Restore network access and re-run." >&2; exit 1; }
+        confirm "Continue without confirming freshness?" \
+            || { echo "Restore network access and re-run." >&2; exit 1; }
     fi
 fi
 
@@ -244,14 +280,43 @@ if [[ "$INSTALL" == "true" ]]; then
     # If Nora is currently running, replacing the .app underneath it
     # would leave the running process in a weird state and the next
     # launch could load mismatched resources. Quit it cleanly first.
-    if pgrep -xq Nora; then
+    #
+    # Match by the actual executable name. Even though the .app's
+    # CFBundleExecutable is ``Nora``, the launcher script ``exec``s
+    # the bundled PyInstaller binary at ``Contents/Resources/nora/nora``
+    # — so the running process shows up as ``nora`` (lowercase) in
+    # ps / pgrep. The previous ``pgrep -xq Nora`` never matched, and
+    # the install path went straight to ``rm -rf /Applications/Nora.app``
+    # against a live process. Both names are checked here belt-and-
+    # suspenders so a future packaging change that drops the exec hand-
+    # off doesn't silently re-open the bug.
+    if pgrep -xq nora || pgrep -xq Nora; then
         echo "  Quitting running Nora.app first..."
         osascript -e 'tell application "Nora" to quit' 2>/dev/null \
-            || pkill -x Nora 2>/dev/null || true
-        sleep 1
+            || pkill -x nora 2>/dev/null \
+            || pkill -x Nora 2>/dev/null \
+            || true
+        # Loop briefly until the process actually exits — sleep 1 was
+        # a guess that fails under load (heavy GC inside an Anthropic
+        # SDK shutdown can take 2-3s on a busy laptop). Bail with a
+        # clear error if it never quits, rather than overwriting the
+        # bundle out from under it.
+        for _ in 1 2 3 4 5; do
+            if ! pgrep -xq nora && ! pgrep -xq Nora; then break; fi
+            sleep 1
+        done
+        if pgrep -xq nora || pgrep -xq Nora; then
+            echo "  ✗ Nora is still running. Quit it manually, then re-run." >&2
+            exit 1
+        fi
     fi
     rm -rf /Applications/Nora.app
-    cp -R "$APP" /Applications/Nora.app
+    # Use ``ditto`` instead of ``cp -R``: ditto preserves resource
+    # forks, ACLs, and especially extended attributes that the code
+    # signature relies on. ``cp -R`` on macOS strips some xattrs in
+    # certain configurations, breaking the signature in subtle ways
+    # that pass spctl but fail at first launch on a stricter machine.
+    /usr/bin/ditto "$APP" /Applications/Nora.app
     # Strip the quarantine attr in case the .app was tagged after a
     # download / move. macOS only assigns it when the file crosses an
     # internet trust boundary, so this is usually a no-op for local
