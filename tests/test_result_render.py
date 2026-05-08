@@ -257,6 +257,61 @@ def test_render_linear_regression_drops_p_value_column_when_payload_missing_it(
     assert "Std. Error" in md
 
 
+def test_render_escapes_pipe_in_data_origin_cell_keys() -> None:
+    """A coefficient key from the researcher's data may legitimately
+    contain ``|`` (categorical level "A | B" for "A or B"). Without
+    escaping, the pipe table grows an extra column and every
+    following row reads as garbage. Sanitised cell text must escape
+    delimiter characters at the renderer boundary."""
+    payload = {
+        "type": "linear_regression",
+        "n": 100,
+        "coefficients": {"A | B": 0.42, "x1": 0.13},
+        "standard_errors": {"A | B": 0.05, "x1": 0.04},
+        "p_values": {"A | B": 0.001, "x1": 0.06},
+        "response_variable": "y",
+        "predictor_variables": ["A | B", "x1"],
+    }
+    md = render_table(payload)
+    assert md is not None
+    # Each row must keep exactly the right number of cell delimiters
+    # (4 columns → 5 unescaped pipes per row when surrounded by
+    # ``|`` … ``|``). The escaped pipe inside the cell shows as
+    # ``\|`` and does NOT count as a column boundary.
+    body_rows = [
+        ln for ln in md.splitlines()
+        if ln.startswith("|") and "---" not in ln
+    ]
+    assert body_rows, md
+    for row in body_rows:
+        # Strip escaped pipes before counting unescaped delimiters.
+        unescaped = row.replace("\\|", "")
+        assert unescaped.count("|") == 5, (
+            f"row has wrong delimiter count after pipe escape:\n{row}"
+        )
+    # The escaped form is what reaches the markdown source.
+    assert "A \\| B" in md
+
+
+def test_render_escapes_backslash_in_data_origin_cell_keys() -> None:
+    """A literal backslash in a category label must round-trip through
+    the table without being interpreted as an escape character of
+    something else (e.g., another pipe)."""
+    payload = {
+        "type": "linear_regression",
+        "n": 50,
+        "coefficients": {"path\\A": 0.5},
+        "standard_errors": {"path\\A": 0.05},
+        "response_variable": "y",
+        "predictor_variables": ["path\\A"],
+    }
+    md = render_table(payload)
+    assert md is not None
+    # Backslash is doubled in the markdown source so it renders as a
+    # literal backslash in the visible output.
+    assert "path\\\\A" in md
+
+
 def test_render_t_test_two_sample() -> None:
     payload = {
         "type": "t_test",

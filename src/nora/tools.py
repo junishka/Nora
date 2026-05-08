@@ -2766,6 +2766,24 @@ async def search_in_session_files(args: dict[str, Any]) -> dict[str, Any]:
             "status": "error",
             "reason": f"could not list session cwd: {e}",
         })
+
+    # Build the search set: cwd top-level files first, then the
+    # Nora-written run-dir scripts when "script" is requested. The
+    # run-dir scripts live under ``<cwd>/.nora/runs/<id>/`` and don't
+    # appear in ``cwd.iterdir()``, but ``list_session_files`` and
+    # ``read_attached_file`` both surface them — search must too,
+    # otherwise the model can list a prior labeled spec, recall it,
+    # but not grep across recent runs to find which one set a given
+    # variable. That breaks the recovery path after a rewind.
+    #
+    # Each entry is ``(display_name, path, kind)``. Display names
+    # come from ``safe_text`` for top-level (matches the listing
+    # output) and from ``run_files`` for run-dir scripts (already
+    # cleaned by ``label_to_filename_stem``). Same-name de-dup
+    # prefers the top-level cwd entry (researcher's file) over the
+    # run-dir copy.
+    search_entries: list[tuple[str, Path, str]] = []
+    seen_names: set[str] = set()
     for child in sorted(children, key=lambda p: p.name):
         try:
             if not child.is_file():
@@ -2776,12 +2794,25 @@ async def search_in_session_files(args: dict[str, Any]) -> dict[str, Any]:
         kind = classify_ext(ext)
         if kind not in keep_kinds:
             continue
+        name = safe_text(child.name)
+        if not name or name in seen_names:
+            continue
+        seen_names.add(name)
+        search_entries.append((name, child, kind))
+    if "script" in keep_kinds:
+        from nora.run_files import enumerate_run_dir_scripts
+        for entry in enumerate_run_dir_scripts(cwd):
+            name = safe_text(entry.display_name)
+            if not name or name in seen_names:
+                continue
+            seen_names.add(name)
+            search_entries.append((name, entry.path, "script"))
+
+    for name, child, kind in search_entries:
+        ext = child.suffix.lower()
         try:
             st = child.stat()
         except OSError:
-            continue
-        name = safe_text(child.name)
-        if not name:
             continue
         if st.st_size > _SEARCH_FILES_FILE_BYTE_CAP:
             # Recovery hint depends on whether read_attached_file

@@ -127,15 +127,53 @@ def set_credential(provider: str, api_key: str) -> dict[str, object]:
 
 
 def delete_credential(provider: str) -> dict[str, object]:
-    """Remove the stored credential for ``provider``. Idempotent —
-    deleting a missing entry is success, not failure."""
+    """Remove the stored credential for ``provider``. Idempotent for
+    a genuinely-absent entry (delete-of-nothing succeeds), but
+    backend failures (locked Keychain, denied prompt, securityd
+    error) MUST surface as ``ok: False`` — silently swallowing them
+    leaves the secret in the OS store while the UI shows it as
+    forgotten, ready to reappear on the next launch.
+    """
     if _keyring is None:
         _CRED_CACHE[provider] = None
         return {"ok": True, "provider": provider}
+
+    # Pre-check via the cached read so we can distinguish "entry was
+    # already absent → idempotent OK" from "delete itself failed".
+    # ``keyring.delete_password`` wraps every backend error in
+    # ``PasswordDeleteError`` regardless of cause (item-not-found vs.
+    # backend locked vs. permission denied), so the exception type
+    # alone can't tell us which we hit. Reading first is portable and
+    # cheap (cached after first call).
+    try:
+        existing = get_credential(provider)
+    except Exception:  # noqa: BLE001 — get_credential is non-raising; defensive
+        existing = None
+
+    if existing is None:
+        # Either really absent, or a recent backend error left the
+        # backoff window active. In the backoff case we can't
+        # confidently claim success — but if the read errored
+        # transiently, ``_CRED_ERROR_AT`` was set by ``get_credential``.
+        # Surface that as a failure rather than a silent no-op so the
+        # UI doesn't report a deletion that didn't happen.
+        if provider in _CRED_ERROR_AT:
+            return {
+                "ok": False,
+                "reason": (
+                    "keyring backend is unavailable; could not confirm "
+                    "current credential state — try again once the "
+                    "system store is reachable"
+                ),
+            }
+        _CRED_CACHE[provider] = None
+        return {"ok": True, "provider": provider}
+
     try:
         _keyring.delete_password(KEYRING_SERVICE, provider)
-    except Exception:  # noqa: BLE001 — typically "no such entry"; idempotent OK
-        pass
+    except Exception as e:  # noqa: BLE001 — backend failure, not idempotent
+        _CRED_ERROR_AT[provider] = time.monotonic()
+        return {"ok": False, "reason": f"keyring delete failed: {e}"}
     _CRED_CACHE[provider] = None
     _CRED_ERROR_AT.pop(provider, None)
     return {"ok": True, "provider": provider}

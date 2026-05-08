@@ -324,6 +324,103 @@ def test_search_kinds_default_is_script_and_log(populated_session: Path):
 
 
 # ---------------------------------------------------------------------------
+# Run-dir script coverage in search — recovery path after rewind
+# ---------------------------------------------------------------------------
+
+
+def test_search_finds_term_in_run_dir_script(tmp_path: Path) -> None:
+    """``list_session_files`` advertises Nora-written run-dir scripts
+    and ``read_attached_file`` resolves them by display name. Search
+    must do the same — otherwise the model can list a prior labeled
+    spec and recall it but cannot grep across recent runs to find
+    which one set a given variable. That breaks the recovery path
+    after a rewind clears the chat history."""
+    set_cwd(tmp_path)
+    run_dir = tmp_path / ".nora" / "runs" / "20260507T120300Z_eeeeeeee"
+    run_dir.mkdir(parents=True)
+    (run_dir / "script.do").write_text(
+        "use \"panel.dta\", clear\nreg wage age educ TARGET_TERM\n",
+        encoding="utf-8",
+    )
+
+    from nora.store import get_store
+    get_store(tmp_path).insert(
+        label="H1a Path A",
+        analysis_type="linear_regression",
+        sanitized_payload={"type": "linear_regression"},
+        language="Stata",
+        script_code="reg wage age educ TARGET_TERM\n",
+        transformations=[],
+        raw_log_path=str(run_dir),
+        script_run_id="run-eeeeeeee",
+    )
+
+    out = _search({"query": "TARGET_TERM", "kinds": ["script"]})
+    assert out["status"] == "ok"
+    by_file = {r["name"]: r for r in out["results"]}
+    assert "H1a Path A.do" in by_file, list(by_file)
+    # Excerpts allowed for .do files (plain source).
+    matches = by_file["H1a Path A.do"]["matches"]
+    assert any("TARGET_TERM" in m["text"] for m in matches)
+
+
+def test_search_run_dir_scripts_dedup_against_cwd_collision(
+    tmp_path: Path,
+) -> None:
+    """If a top-level cwd file shares a name with a run-dir display
+    name (rare but possible — researcher copies a prior labeled
+    script up to cwd), the cwd entry wins so we don't search the
+    same logical file twice."""
+    set_cwd(tmp_path)
+    # Top-level: contains the marker.
+    (tmp_path / "shared.do").write_text("TOP_LEVEL_MARKER\n", encoding="utf-8")
+    # Run-dir with same display name, DIFFERENT contents.
+    run_dir = tmp_path / ".nora" / "runs" / "20260507T120400Z_ffffffff"
+    run_dir.mkdir(parents=True)
+    (run_dir / "script.do").write_text(
+        "RUN_DIR_MARKER\n", encoding="utf-8",
+    )
+    from nora.store import get_store
+    get_store(tmp_path).insert(
+        label="shared",
+        analysis_type="linear_regression",
+        sanitized_payload={"type": "linear_regression"},
+        language="Stata",
+        script_code="RUN_DIR_MARKER\n",
+        transformations=[],
+        raw_log_path=str(run_dir),
+        script_run_id="run-ffffffff",
+    )
+
+    out = _search({"query": "TOP_LEVEL_MARKER", "kinds": ["script"]})
+    by_file = {r["name"]: r for r in out["results"]}
+    assert "shared.do" in by_file
+    # The run-dir marker must NOT match — that would mean the run-dir
+    # entry was searched after the cwd entry, defeating the dedup.
+    out2 = _search({"query": "RUN_DIR_MARKER", "kinds": ["script"]})
+    assert not out2["results"], out2
+
+
+def test_search_skips_run_dir_scripts_when_kind_not_requested(
+    tmp_path: Path,
+) -> None:
+    """Searching only logs must not pull in run-dir scripts (they're
+    classified as ``script``)."""
+    set_cwd(tmp_path)
+    run_dir = tmp_path / ".nora" / "runs" / "20260507T120500Z_gggggggg"
+    run_dir.mkdir(parents=True)
+    (run_dir / "script.do").write_text(
+        "ONLY_IN_RUN_DIR_SCRIPT\n", encoding="utf-8",
+    )
+    (tmp_path / "out.log").write_text(
+        "DIFFERENT_LOG_TERM\n", encoding="utf-8",
+    )
+
+    out = _search({"query": "ONLY_IN_RUN_DIR_SCRIPT", "kinds": ["log"]})
+    assert out["results"] == []
+
+
+# ---------------------------------------------------------------------------
 # Filename safety
 # ---------------------------------------------------------------------------
 

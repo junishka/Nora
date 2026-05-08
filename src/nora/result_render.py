@@ -538,15 +538,49 @@ _HANDLERS: dict[str, Any] = {
 # ---------------------------------------------------------------------------
 
 
+def _escape_table_cell(s: str) -> str:
+    """Escape characters that would break a GitHub-flavored pipe table.
+
+    The renderer writes data-origin strings (variable names,
+    coefficient keys, category labels) into cells verbatim, and
+    ``safe_text`` / ``safe_key`` only neutralise control chars,
+    bidi tricks, and over-length — they leave ``|``, ``\\``, and
+    backticks alone because those are valid characters in research
+    identifiers. So a category labelled ``A | B`` (a legitimate
+    "A or B" ordinal) would otherwise emit an extra column and
+    derail every following row.
+
+    Escapes:
+      - ``\\`` → ``\\\\`` first (must precede pipe escape so the
+        backslash we add for ``|`` isn't itself escaped twice).
+      - ``|``  → ``\\|``  (the column delimiter).
+      - any residual ``\\n`` / ``\\r`` → space (defensive — text
+        sanitisers should have flattened these already, but fail
+        closed if a caller fed unsanitised text in).
+    """
+    return (
+        s.replace("\\", "\\\\")
+         .replace("|", "\\|")
+         .replace("\n", " ")
+         .replace("\r", " ")
+    )
+
+
 def _markdown_table(header: list[str], rows: list[list[str]]) -> str:
     """Render a GitHub-flavored pipe table.
 
     Pads cells to the column max so the source markdown stays
     readable when copy-pasted. Renderers that don't care about
     raw-source alignment (most chat clients) ignore the padding.
+
+    Cells are escaped via ``_escape_table_cell`` so a data-origin
+    label containing ``|`` doesn't break the table structure.
     """
-    widths = [len(h) for h in header]
-    for row in rows:
+    esc_header = [_escape_table_cell(h) for h in header]
+    esc_rows = [[_escape_table_cell(c) for c in row] for row in rows]
+
+    widths = [len(h) for h in esc_header]
+    for row in esc_rows:
         for i, cell in enumerate(row):
             if i < len(widths):
                 widths[i] = max(widths[i], len(cell))
@@ -556,8 +590,8 @@ def _markdown_table(header: list[str], rows: list[list[str]]) -> str:
         return "| " + " | ".join(padded) + " |"
 
     sep = "| " + " | ".join("-" * w for w in widths) + " |"
-    out = [_row(header), sep]
-    for row in rows:
+    out = [_row(esc_header), sep]
+    for row in esc_rows:
         out.append(_row(row))
     return "\n".join(out)
 
