@@ -9,15 +9,19 @@
 
 ## Two install paths
 
-Nora has two ways to run, and right now the **from-source path is the recommended one**. The `.app` / `.dmg` build works locally, but it's unsigned — Apple Developer Program signing is required before it can be distributed cleanly to other people, and that's not in place yet. If you're picking this up as a researcher, use the from-source path until that's fixed.
+Nora has two ways to run: a released `.dmg` you double-click (the recommended path for researchers) and a from-source clone (for development or local builds). The released `.dmg` is signed with a Developer ID Application certificate and notarized by Apple, so first-launch on a colleague's Mac doesn't trip Gatekeeper.
 
-## Path 1 — from source (recommended)
+## Path 1 — install the `.dmg` (recommended)
+
+Download the latest `Nora.dmg`, open it, and drag `Nora.app` to `/Applications`. Double-click to launch — the first run goes straight to the auth screen, no right-click-Open dance and no Terminal popup. R, Stata, and Python aren't bundled (Nora invokes them as subprocesses), so make sure you have at least one of them installed first.
+
+## Path 2 — from source
 
 ```bash
 git clone https://github.com/junishka/builder.git nora
 cd nora
 uv sync --group dev
-uv run pytest                       # expect ~283 passing
+uv run pytest                       # expect 758 passed, 17 skipped
 uv run nora-ui                   # web UI — landing screen for files / folder
 uv run nora-ui /path/to/data     # web UI — open straight into chat
 ```
@@ -26,11 +30,10 @@ The web UI opens a native window with a drop zone for `.csv` / `.dta` / `.rds` f
 
 There's also a terminal frontend — `uv run nora` — for power users who'd rather stay in the shell. Same backend, same privacy guarantees, same data; just no drag-drop and no fancy result panels.
 
-## Path 2 — from a `.app` build (local-only for now)
+## Building the `.dmg` yourself
 
-You can build a real macOS `.app` and `.dmg` locally and use them on your own machine. The .app launches the web UI directly; no Terminal popup, just the chat window. **What you can't do is hand the .dmg to a colleague — without an Apple Developer Program signature it triggers Gatekeeper and most users won't get past the warning. We're not paying the $99/yr for the cert until the project is closer to wider distribution.**
+You can rebuild the bundle locally if you want to ship a custom variant or test packaging changes. The same scripts produce the released artifact when run with the right env vars set.
 
-Local build:
 ```bash
 git clone https://github.com/junishka/builder.git nora
 cd nora
@@ -40,11 +43,13 @@ bash packaging/build_dmg.sh         # → dist/Nora.dmg  (~35 MB)
 open dist/Nora.app
 ```
 
-If you've moved `Nora.app` somewhere persistent (`/Applications/`), the first launch hits the same Gatekeeper dialog non-distributed apps do:
+A bare local build is unsigned — fine for testing on the same machine, but Gatekeeper will refuse it on someone else's. To produce a signed + notarized `.dmg`, set `NORA_SIGN_IDENTITY` (Developer ID Application certificate name) before `build_app.sh` and `NORA_NOTARIZE_PROFILE` (a `notarytool store-credentials` keychain profile) before `build_dmg.sh`. Both scripts skip those steps when the env vars are unset.
+
+If you've moved an unsigned `Nora.app` somewhere persistent (`/Applications/`), the first launch hits the standard Gatekeeper dialog:
 
 > *"Nora" cannot be opened because the developer cannot be verified.*
 
-Two workarounds:
+Two workarounds for the unsigned local-build case:
 - **Right-click → Open** in Finder. macOS shows a similar dialog but with an **Open** button. Click it. From then on, double-clicking works normally.
 - Or from Terminal: `xattr -cr /Applications/Nora.app` then double-click as usual.
 

@@ -4,7 +4,7 @@ Local research assistant for sensitive data. The data stays on the
 researcher's machine. The model behind Nora is Claude (Anthropic) or
 ChatGPT (OpenAI). The product the researcher talks to is Nora.
 
-The model reaches the researcher's files through an thirteen-tool MCP
+The model reaches the researcher's files through a thirteen-tool MCP
 interface. No Bash. No filesystem. No network. Scripts run under
 macOS `sandbox-exec` with network denied and a tight subpath
 allowlist for reads. Every result passes through a disclosure-control
@@ -21,10 +21,12 @@ the long-form direction and open-question log,
 
 Alpha. Privacy invariants are implemented and tested (775 tests).
 Two frontends ship. The terminal UI is `nora`. The pywebview web UI
-is `nora-ui` and is also what the `.app` launches. Bundled `.dmg`
-distribution to other people is blocked on Apple Developer Program
-signing. See [the handoff status table](docs/handoff.md#where-it-stands)
-for the layer-by-layer view.
+is `nora-ui` and is also what the `.app` launches. The released
+`.dmg` is signed with a Developer ID Application certificate and
+notarized by Apple, so a colleague double-clicking the bundle on
+their own Mac doesn't trip Gatekeeper. See
+[the handoff status table](docs/handoff.md#where-it-stands) for the
+layer-by-layer view.
 
 ## Platform
 
@@ -57,7 +59,7 @@ To build the `.dmg` yourself or run from source, see below.
 git clone https://github.com/junishka/builder.git nora
 cd nora
 uv sync --group dev
-uv run pytest                       # expect 696 passed
+uv run pytest                       # expect 758 passed, 17 skipped
 
 # Web UI (the recommended frontend; native WKWebView window)
 uv run nora-ui                      # landing: drop files or pick folder
@@ -77,10 +79,17 @@ becomes the sandbox root for the session.
 To rebuild the bundle:
 
 ```bash
-bash packaging/build_app.sh         # → dist/Nora.app   (~70 MB, unsigned)
+bash packaging/build_app.sh         # → dist/Nora.app   (~70 MB)
 bash packaging/build_dmg.sh         # → dist/Nora.dmg   (~35 MB)
 open dist/Nora.app                  # smoke test
 ```
+
+A bare local build is unsigned — fine for testing on the same
+machine. To produce a release-grade signed + notarized `.dmg`, set
+`NORA_SIGN_IDENTITY` (Developer ID Application certificate) before
+`build_app.sh` and `NORA_NOTARIZE_PROFILE` (notarytool keychain
+profile) before `build_dmg.sh`. The build scripts skip those steps
+when the env vars are unset.
 
 The `.app` bundles Python, the dependencies, and the runtime
 libraries. Researchers running it do not need Python, `uv`, or any
@@ -131,7 +140,7 @@ because Nora invokes them as subprocesses.
   - `provider/` for the Anthropic and OpenAI session adapters.
   - `chat_service.py` for the typed event stream both frontends
     consume.
-- `tests/` for 696 tests. `test_sanitizer.py` is the property-test
+- `tests/` for 775 tests. `test_sanitizer.py` is the property-test
   backbone. `test_executor_*` cover the sandbox profile.
   `test_concurrent_sessions.py` covers multi-runner isolation.
 - `docs/` for handoff, overview, direction, install, verification.
