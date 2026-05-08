@@ -209,10 +209,17 @@ def find_run_dir_script_by_name(
     Nora-written scripts living under ``<cwd>/.nora/runs/<id>/``.
     Walks the same enumeration the panel uses so the model can pass
     the same names it sees in ``list_session_files`` output.
+
+    The listing tool surfaces ``safe_text(display_name)``; for labels
+    longer than ~120 chars or carrying embedded whitespace, that's
+    not the same string as ``entry.display_name``. Match on both the
+    raw display name AND its sanitised form so the round-trip works
+    regardless of which side a researcher's label hit the cap on.
     """
     if not name:
         return None
+    from nora.text_safety import safe_text
     for entry in enumerate_run_dir_scripts(cwd, max_count=64):
-        if entry.display_name == name:
+        if entry.display_name == name or safe_text(entry.display_name) == name:
             return entry.path
     return None

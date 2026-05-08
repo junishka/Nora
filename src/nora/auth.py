@@ -18,6 +18,7 @@ this module — only API keys flow through here. ``detect_auth`` in
 
 from __future__ import annotations
 
+import time
 from typing import Iterable
 
 try:
@@ -45,7 +46,24 @@ KNOWN_PROVIDERS: tuple[str, ...] = ("anthropic", "openai")
 # Mutations (set/delete) write through to the cache so callers see a
 # coherent view immediately; otherwise the auth screen would show
 # stale "configured" badges right after a save until the next launch.
+#
+# Only successful reads land here. Backend errors (locked Keychain,
+# denied prompt, transient IPC failure) go through ``_CRED_ERROR_AT``
+# instead — caching ``None`` on error would conflate "definitely
+# missing" with "couldn't tell" and lock the app into a no-creds view
+# for the rest of the process even after the user grants access.
 _CRED_CACHE: dict[str, str | None] = {}
+
+# Monotonic timestamp of the last keyring exception per provider. While
+# a timestamp is within ``_ERROR_BACKOFF_SECONDS`` of now, ``get_credential``
+# returns ``None`` without re-hitting the backend. This preserves the
+# burst-suppression that the cache provides during a single auth-screen
+# render (4 redundant ``has_credential`` calls in microseconds → one
+# keyring hit, no prompt storm), while letting the read recover within
+# seconds once the underlying issue (locked keychain, denied prompt) is
+# resolved — instead of staying poisoned until process restart.
+_CRED_ERROR_AT: dict[str, float] = {}
+_ERROR_BACKOFF_SECONDS = 5.0
 
 
 def get_credential(provider: str) -> str | None:
@@ -61,11 +79,23 @@ def get_credential(provider: str) -> str | None:
     if _keyring is None:
         _CRED_CACHE[provider] = None
         return None
+    last_error = _CRED_ERROR_AT.get(provider)
+    if (
+        last_error is not None
+        and time.monotonic() - last_error < _ERROR_BACKOFF_SECONDS
+    ):
+        # Recent backend error — return None without re-hitting keyring
+        # to avoid prompt-storming the user during this render. Will
+        # retry once the backoff window elapses.
+        return None
     try:
         value = _keyring.get_password(KEYRING_SERVICE, provider)
-    except Exception:  # noqa: BLE001 — backend errors mean "no creds"
-        _CRED_CACHE[provider] = None
+    except Exception:  # noqa: BLE001 — backend errors mean "couldn't tell"
+        _CRED_ERROR_AT[provider] = time.monotonic()
         return None
+    # Successful read — clear any stale error backoff and cache the
+    # value (or true-miss ``None``) for the rest of the process.
+    _CRED_ERROR_AT.pop(provider, None)
     resolved = value if value else None
     _CRED_CACHE[provider] = resolved
     return resolved
@@ -89,8 +119,10 @@ def set_credential(provider: str, api_key: str) -> dict[str, object]:
     try:
         _keyring.set_password(KEYRING_SERVICE, provider, cleaned)
     except Exception as e:  # noqa: BLE001 — surface to caller
+        _CRED_ERROR_AT[provider] = time.monotonic()
         return {"ok": False, "reason": f"keyring write failed: {e}"}
     _CRED_CACHE[provider] = cleaned
+    _CRED_ERROR_AT.pop(provider, None)
     return {"ok": True, "provider": provider}
 
 
@@ -105,6 +137,7 @@ def delete_credential(provider: str) -> dict[str, object]:
     except Exception:  # noqa: BLE001 — typically "no such entry"; idempotent OK
         pass
     _CRED_CACHE[provider] = None
+    _CRED_ERROR_AT.pop(provider, None)
     return {"ok": True, "provider": provider}
 
 

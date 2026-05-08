@@ -155,6 +155,85 @@ def test_render_linear_regression_minimal() -> None:
     assert "R²" in md
 
 
+def test_render_linear_regression_caption_includes_pseudo_r_squared() -> None:
+    """Logit / probit / Poisson payloads carry ``pseudo_r_squared``
+    (McFadden) but no ``r_squared``. The caption must expose pseudo
+    R² rather than dropping the fit metric silently."""
+    payload = {
+        "type": "linear_regression",
+        "n": 800,
+        "coefficients": {"x1": 0.42, "(Intercept)": -0.5},
+        "standard_errors": {"x1": 0.05, "(Intercept)": 0.1},
+        "p_values": {"x1": 0.001, "(Intercept)": 0.001},
+        "pseudo_r_squared": 0.142,
+        "log_likelihood": -312.4,
+        "chi_squared": 88.7,
+        "chi_squared_p_value": 1e-18,
+        "response_variable": "y",
+        "predictor_variables": ["x1"],
+    }
+    md = render_table(payload)
+    assert md is not None
+    assert "pseudo R²" in md, md
+    assert "0.142" in md
+    assert "log-lik" in md
+    assert "χ²" in md
+    # Omnibus χ² renders alongside its p-value when present.
+    assert "<0.001" in md
+
+
+def test_render_linear_regression_caption_cox_subjects_and_concordance(
+) -> None:
+    """Cox PH payloads expose ``n_subjects`` / ``n_failures`` and
+    ``concordance``. The caption must surface those because for survival
+    models the OLS-style ``n = ...`` line alone is the wrong sample
+    metric — researchers read off "S subjects, E events". Records ``n``
+    is shown only when it diverges from subjects (split-episode data)."""
+    payload = {
+        "type": "linear_regression",
+        "n": 412,
+        "n_subjects": 324,
+        "n_failures": 178,
+        "coefficients": {"treatment": -0.31},
+        "standard_errors": {"treatment": 0.08},
+        "p_values": {"treatment": 0.0001},
+        "log_likelihood": -921.5,
+        "concordance": 0.74,
+        "response_variable": "_t",
+        "predictor_variables": ["treatment"],
+    }
+    md = render_table(payload)
+    assert md is not None
+    assert "subjects = 324" in md
+    assert "events = 178" in md
+    # Records leg appears because n != n_subjects (split episodes).
+    assert "records = 412" in md
+    assert "C = 0.74" in md
+    assert "log-lik" in md
+    # OLS R² line must NOT appear — payload didn't carry it.
+    assert "R² = " not in md or "pseudo R² = " in md
+
+
+def test_render_linear_regression_caption_ols_unchanged() -> None:
+    """The OLS caption must keep its original ``n · R² · κ(X)`` form so
+    existing renderings don't shift when the new optional metrics are
+    absent."""
+    payload = {
+        "type": "linear_regression",
+        "n": 1000,
+        "coefficients": {"x1": 0.5},
+        "standard_errors": {"x1": 0.05},
+        "r_squared": 0.27,
+        "condition_number": 18.4,
+        "response_variable": "y",
+        "predictor_variables": ["x1"],
+    }
+    md = render_table(payload)
+    assert md is not None
+    caption_line = md.split("\n\n")[-1]
+    assert caption_line == "n = 1,000 · R² = 0.27 · κ(X) = 18.4"
+
+
 def test_render_linear_regression_drops_p_value_column_when_payload_missing_it(
 ) -> None:
     """When the payload doesn't carry ``p_values`` (legacy script,

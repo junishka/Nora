@@ -242,16 +242,69 @@ def _render_linear_regression(p: dict[str, Any]) -> str | None:
         rows.append(row)
     table = _markdown_table(header, rows)
 
-    n = p.get("n")
-    r2 = p.get("r_squared")
     cap_parts: list[str] = []
-    if isinstance(n, int):
+
+    # Sample-size leg. For Cox PH / discrete-time survival, ``n`` is
+    # records (post-stset, can include split episodes per subject) and
+    # the researcher reads off "S subjects, E events" — so prefer the
+    # subjects/events pair when present, with records in parens. For
+    # everything else (OLS, logit, probit, Poisson, ...) show ``n``.
+    n = p.get("n")
+    n_subj = p.get("n_subjects")
+    n_fail = p.get("n_failures")
+    if isinstance(n_subj, int):
+        leg = f"subjects = {n_subj:,}"
+        if isinstance(n_fail, int):
+            leg += f" · events = {n_fail:,}"
+        if isinstance(n, int) and n != n_subj:
+            leg += f" (records = {n:,})"
+        cap_parts.append(leg)
+    elif isinstance(n, int):
         cap_parts.append(f"n = {n:,}")
+
+    # Fit metric. The sanitiser admits both R² (OLS) and pseudo R²
+    # (McFadden, for logit/probit/Poisson); a typical script sets one
+    # or the other. Showing both verbatim when both are present keeps
+    # the renderer dumb — we don't infer the model family from
+    # ``type`` alone, since the sanitiser canonicalises everything as
+    # ``linear_regression``.
+    r2 = p.get("r_squared")
     if isinstance(r2, (int, float)) and math.isfinite(float(r2)):
         cap_parts.append(f"R² = {_fmt_num(r2)}")
+    pseudo = p.get("pseudo_r_squared")
+    if isinstance(pseudo, (int, float)) and math.isfinite(float(pseudo)):
+        cap_parts.append(f"pseudo R² = {_fmt_num(pseudo)}")
+
+    # Survival-specific discrimination metric.
+    concordance = p.get("concordance")
+    if isinstance(concordance, (int, float)) and math.isfinite(
+        float(concordance),
+    ):
+        cap_parts.append(f"C = {_fmt_num(concordance)}")
+
+    # Likelihood-based diagnostics. Either the omnibus χ² (with
+    # p-value when present), or the log-likelihood. AIC/BIC are
+    # rendered when the model picker / cross-spec comparison cards
+    # need them — they aren't useful in the per-result caption alone
+    # and would crowd it.
+    chi2 = p.get("chi_squared")
+    chi2_p = p.get("chi_squared_p_value")
+    if isinstance(chi2, (int, float)) and math.isfinite(float(chi2)):
+        leg = f"χ² = {_fmt_num(chi2)}"
+        if isinstance(chi2_p, (int, float)) and math.isfinite(float(chi2_p)):
+            leg += f" (p = {_fmt_pvalue(chi2_p)})"
+        cap_parts.append(leg)
+    loglik = p.get("log_likelihood")
+    if isinstance(loglik, (int, float)) and math.isfinite(float(loglik)):
+        cap_parts.append(f"log-lik = {_fmt_num(loglik)}")
+
+    # OLS-specific design diagnostic. Tail position keeps the OLS
+    # caption identical to its previous form (n · R² · κ), modulo the
+    # new optional middle slots.
     cond = p.get("condition_number")
     if isinstance(cond, (int, float)) and math.isfinite(float(cond)):
         cap_parts.append(f"κ(X) = {_fmt_num(cond)}")
+
     caption = " · ".join(cap_parts)
     return f"{table}\n\n{caption}" if caption else table
 
