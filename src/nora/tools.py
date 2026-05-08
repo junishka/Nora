@@ -346,6 +346,64 @@ def _summarize(payload: dict[str, Any]) -> str:
         )
     return f"result of type {t!r}"
 
+# Per-analysis-type drop registry for the ``view="coefficients"``
+# trim. The same map is consulted by ``_compact_payload`` (inline
+# per-result trim on submit_script responses) and by
+# ``expand_result(view="coefficients")``, so a new diagnostic field
+# (e.g. a Wald-test side table on logit) only needs one entry here
+# to be hidden from the compact view across BOTH callers.
+#
+# Keys are ``payload["type"]`` strings as emitted by the runtime
+# helpers. Values are tuples of payload field names to drop. An
+# analysis_type absent from this map is "view-coefficients-clean"
+# already (no expensive diagnostics to trim) and the view is a
+# no-op — see ``_VIEW_COEFFICIENTS_NOOP`` below for the explicit
+# signal to the model.
+#
+# The previous code had ``("vcov", "vif")`` written twice in two
+# different locations; adding a third diagnostic to the runtime
+# (condition_number, partial_residuals, …) silently leaked into the
+# compact view because only one of the two copies got updated.
+_VIEW_COEFFICIENTS_DROP_FIELDS: dict[str, tuple[str, ...]] = {
+    "linear_regression": ("vcov", "vif"),
+}
+
+
+def _apply_view_coefficients_trim(
+    payload: dict[str, Any],
+) -> tuple[dict[str, Any], list[str], bool]:
+    """Apply the ``view="coefficients"`` drop registry to a payload.
+
+    Returns ``(trimmed_payload, dropped_fields, view_applied)``:
+
+    - ``trimmed_payload`` is a shallow copy with the registered
+      fields removed (or the original payload when no trim applies).
+    - ``dropped_fields`` lists the keys actually removed (always a
+      subset of the registry entry — fields that weren't present in
+      the payload aren't reported as dropped).
+    - ``view_applied`` is ``True`` when a registry entry matched the
+      payload's analysis type, regardless of whether anything was
+      actually removed. Callers use this to surface
+      ``view_ignored_for_type`` when a model passed
+      ``view="coefficients"`` against a payload type that doesn't
+      participate in the trim — without that signal the response's
+      ``view="coefficients"`` field would lie-by-omission about what
+      the trim did.
+    """
+    if not isinstance(payload, dict):
+        return payload, [], False
+    drop_fields = _VIEW_COEFFICIENTS_DROP_FIELDS.get(payload.get("type", ""))
+    if drop_fields is None:
+        return payload, [], False
+    trimmed = dict(payload)
+    dropped: list[str] = []
+    for key in drop_fields:
+        if key in trimmed:
+            trimmed.pop(key)
+            dropped.append(key)
+    return trimmed, dropped, True
+
+
 def _compact_payload(sanitized: dict[str, Any]) -> dict[str, Any]:
     """Inline-trimmed version of a sanitized payload for the per-result
     response entry. Same shape as ``expand_result(view="coefficients")``
@@ -374,9 +432,8 @@ def _compact_payload(sanitized: dict[str, Any]) -> dict[str, Any]:
     """
     if not isinstance(sanitized, dict):
         return {}
-    if sanitized.get("type") == "linear_regression":
-        return {k: v for k, v in sanitized.items() if k not in ("vcov", "vif")}
-    return dict(sanitized)
+    trimmed, _dropped, _applied = _apply_view_coefficients_trim(sanitized)
+    return trimmed if trimmed is not sanitized else dict(sanitized)
 
 
 # Two-stage inline budget for the assembled ``submit_script``
@@ -1456,6 +1513,40 @@ def _attach_status_metadata(
         response["plots"] = plot_summary
 
 
+def _with_zero_phase_metadata(
+    response: dict[str, Any],
+    *,
+    language: str = "",
+) -> dict[str, Any]:
+    """Stamp the envelope-shape monitoring fields onto an early-error
+    response so callers see the same shape regardless of whether the
+    submit_script call reached the executor or not.
+
+    Without this, monitoring code that introspects ``_phase_timings``
+    has to handle "field absent" alongside "field present with zero
+    values" — two shapes for "nothing happened in this phase."
+    Stamping zeros makes the shape always-present, with the values
+    making it obvious that no real work ran (every phase clocks at
+    0.000 seconds).
+
+    Caller doesn't need to remove existing keys: when the early
+    payload already populates one of these (e.g. a cancellation
+    path that captured a non-zero ``duration_seconds`` for the
+    process that did launch), we leave it. ``setdefault`` protects
+    that.
+    """
+    response.setdefault("duration_seconds", 0.0)
+    response.setdefault("_phase_timings", {
+        "executor_seconds": 0.0,
+        "row_count_audit_seconds": 0.0,
+        "sanitize_seconds": 0.0,
+        "store_seconds": 0.0,
+    })
+    if language:
+        response.setdefault("_language", language)
+    return response
+
+
 @tool("submit_script")
 async def submit_script(args: dict[str, Any]) -> dict[str, Any]:
     """Run an R / Stata / Python script end-to-end: execute → sanitize → store.
@@ -1495,18 +1586,18 @@ async def submit_script(args: dict[str, Any]) -> dict[str, Any]:
     source_dataset = args.get("source_dataset", "") or ""
 
     if language not in {"R", "Stata", "Python"}:
-        return _as_mcp_text({
+        return _as_mcp_text(_with_zero_phase_metadata({
             "status": "error",
             "reason": (
                 f"unsupported language: {language!r}. Nora runs R "
                 f"(via Rscript), Stata, and Python (3.x with pandas)."
             ),
-        })
+        }, language=language))
     if not code.strip():
-        return _as_mcp_text({
+        return _as_mcp_text(_with_zero_phase_metadata({
             "status": "error",
             "reason": "code argument is empty",
-        })
+        }, language=language))
 
     cwd = get_cwd()
 
@@ -1517,7 +1608,13 @@ async def submit_script(args: dict[str, Any]) -> dict[str, Any]:
         language, code, cwd,
     )
     if early_payload is not None:
-        return _as_mcp_text(early_payload)
+        # The cancellation path already populates ``early_payload``
+        # with status / reason / debug_excerpt; ensure it carries
+        # the same envelope-shape monitoring fields the happy path
+        # does so callers don't have to handle two response shapes.
+        return _as_mcp_text(_with_zero_phase_metadata(
+            early_payload, language=language,
+        ))
 
     # 2a. Persist the script-level label to the run dir so the Files
     # panel can name the SCRIPT after what the model called the whole
@@ -1646,16 +1743,16 @@ async def submit_script_file(args: dict[str, Any]) -> dict[str, Any]:
     """
     raw_name = args.get("name", "")
     if not raw_name or not isinstance(raw_name, str):
-        return _as_mcp_text({
+        return _as_mcp_text(_with_zero_phase_metadata({
             "status": "error",
             "reason": "name argument is required (basename of a script file)",
-        })
+        }))
     safe_name = Path(raw_name).name
     if not safe_name:
-        return _as_mcp_text({
+        return _as_mcp_text(_with_zero_phase_metadata({
             "status": "error",
             "reason": f"could not parse a basename from {raw_name!r}",
-        })
+        }))
 
     target: Path | None
     try:
@@ -1684,22 +1781,22 @@ async def submit_script_file(args: dict[str, Any]) -> dict[str, Any]:
             target = candidate
 
     if target is None:
-        return _as_mcp_text({
+        return _as_mcp_text(_with_zero_phase_metadata({
             "status": "not_found",
             "reason": f"no script named {safe_name!r} in this session",
-        })
+        }))
 
     ext = target.suffix.lower()
     inferred_language = _SCRIPT_FILE_LANGUAGES.get(ext)
     if inferred_language is None:
-        return _as_mcp_text({
+        return _as_mcp_text(_with_zero_phase_metadata({
             "status": "error",
             "reason": (
                 f"{safe_name!r} is not a recognised script file. "
                 f"Supported extensions: "
                 f"{sorted(_SCRIPT_FILE_LANGUAGES.keys())}"
             ),
-        })
+        }))
 
     explicit_language = (args.get("language") or "").strip()
     language = explicit_language or inferred_language
@@ -1718,14 +1815,14 @@ async def submit_script_file(args: dict[str, Any]) -> dict[str, Any]:
         #      or rename the file. Silent mis-routing is the worst
         #      failure mode.
         if explicit_language not in {"R", "Stata", "Python"}:
-            return _as_mcp_text({
+            return _as_mcp_text(_with_zero_phase_metadata({
                 "status": "error",
                 "reason": (
                     f"language must be one of R / Stata / Python; "
                     f"got {explicit_language!r}"
                 ),
-            })
-        return _as_mcp_text({
+            }, language=explicit_language))
+        return _as_mcp_text(_with_zero_phase_metadata({
             "status": "error",
             "reason": (
                 f"language override {explicit_language!r} conflicts "
@@ -1734,15 +1831,15 @@ async def submit_script_file(args: dict[str, Any]) -> dict[str, Any]:
                 f"to use the extension-inferred language, or rename "
                 f"the file to match the language you want to run."
             ),
-        })
+        }, language=explicit_language))
 
     try:
         code = target.read_text(encoding="utf-8")
     except OSError as e:
-        return _as_mcp_text({
+        return _as_mcp_text(_with_zero_phase_metadata({
             "status": "error",
             "reason": f"could not read {safe_name}: {e}",
-        })
+        }, language=language))
     except UnicodeDecodeError:
         # Fall back to replace-mode so a stray non-UTF-8 byte doesn't
         # block the run; the script is the researcher's, they can fix
@@ -1750,10 +1847,10 @@ async def submit_script_file(args: dict[str, Any]) -> dict[str, Any]:
         code = target.read_bytes().decode("utf-8", errors="replace")
 
     if not code.strip():
-        return _as_mcp_text({
+        return _as_mcp_text(_with_zero_phase_metadata({
             "status": "error",
             "reason": f"{safe_name!r} is empty",
-        })
+        }, language=language))
 
     return await submit_script.handler({
         "language": language,
@@ -1861,19 +1958,26 @@ async def expand_result(args: dict[str, Any]) -> dict[str, Any]:
         })
     payload = row.sanitized_payload
     view_dropped: list[str] = []
+    view_ignored_for_type = False
     if view == "coefficients" and isinstance(payload, dict):
-        # Trim the regression-collinearity diagnostics. ``vcov`` is the
-        # full variance-covariance matrix (NxN dict-of-dict, biggest
-        # field on a wide regression) and ``vif`` is the per-predictor
-        # VIF table. Coefficients, SEs, p-values, n, R², condition
-        # number, and degrees of freedom all stay; the model can
-        # re-fetch the trimmed fields with view="full" if needed.
-        if payload.get("type") == "linear_regression":
-            payload = dict(payload)
-            for key in ("vcov", "vif"):
-                if key in payload:
-                    payload.pop(key)
-                    view_dropped.append(key)
+        # Trim the regression-collinearity diagnostics through the
+        # shared ``_VIEW_COEFFICIENTS_DROP_FIELDS`` registry — the
+        # same map ``_compact_payload`` consults for the inline
+        # submit_script response, so adding a new diagnostic field
+        # to the runtime only needs one entry in the registry to be
+        # hidden from the compact view across both call sites.
+        #
+        # When the payload's analysis_type isn't in the registry,
+        # the view is a no-op for that type (a t-test or descriptive
+        # has no expensive diagnostics to trim). The previous code
+        # silently fell through, leaving the response's
+        # ``view="coefficients"`` field claiming a trim that didn't
+        # happen. We now flag that with ``view_ignored_for_type``
+        # so the model can either accept the full payload or
+        # request ``view="full"`` explicitly.
+        payload, view_dropped, applied = _apply_view_coefficients_trim(payload)
+        if not applied:
+            view_ignored_for_type = True
 
     # ``view="markdown"`` returns a canonical markdown pipe-table
     # rendered from the sanitized payload. Same source as the JSON
@@ -1909,6 +2013,8 @@ async def expand_result(args: dict[str, Any]) -> dict[str, Any]:
         response["view"] = view
     if view_dropped:
         response["view_dropped_fields"] = view_dropped
+    if view_ignored_for_type:
+        response["view_ignored_for_type"] = True
     if raw_session_path:
         response["session_path"] = str(target_cwd)
     # Surface the run_dir so the TUI can re-render the raw R/Stata
@@ -1931,7 +2037,20 @@ async def expand_result(args: dict[str, Any]) -> dict[str, Any]:
 
 @tool("compose_results")
 async def compose_results(args: dict[str, Any]) -> dict[str, Any]:
-    """Render a layout spec into a composite comparison table."""
+    """Render a layout spec into a composite comparison table.
+
+    Each row in ``spec.groups[*].rows`` may carry an optional
+    ``session_path`` to look the row's ``result_id`` up in another
+    session's store, mirroring the per-call ``session_path`` argument
+    on ``expand_result``. Cross-session lookups are gated by the
+    ``NORA_ALLOW_CROSS_SESSION_RECALL=1`` environment variable; when
+    the flag is off, any row that supplies a ``session_path`` outside
+    the current cwd is rejected and rendered as a missing-result em-
+    dash (``—``). The SDC posture is identical to expand_result —
+    payloads are pre-sanitized at write time, so cross-session reads
+    don't leak unsanitized data — the env gate exists because some
+    researchers want explicit project separation regardless.
+    """
     spec = args.get("spec")
     if not isinstance(spec, dict):
         return _as_mcp_text({
@@ -1940,12 +2059,12 @@ async def compose_results(args: dict[str, Any]) -> dict[str, Any]:
         })
 
     cwd = get_cwd()
-    store = get_store(cwd)
+    cross_enabled = _cross_session_enabled()
 
-    # Walk the spec and collect referenced result_ids; fetch each from
-    # the store. Missing IDs are flagged separately so the model can
-    # see exactly which references it got wrong.
-    referenced_ids: list[str] = []
+    # Walk the spec collecting (rid, session_path) pairs for lookup.
+    # Each row's session_path is optional — when absent we resolve to
+    # the current session.
+    referenced: list[tuple[str, str | None]] = []
     groups = spec.get("groups")
     if isinstance(groups, list):
         for group in groups:
@@ -1955,23 +2074,58 @@ async def compose_results(args: dict[str, Any]) -> dict[str, Any]:
             if not isinstance(rows, list):
                 continue
             for row in rows:
-                if isinstance(row, dict):
-                    rid = row.get("result_id")
-                    if isinstance(rid, str) and rid:
-                        referenced_ids.append(rid)
+                if not isinstance(row, dict):
+                    continue
+                rid = row.get("result_id")
+                if not isinstance(rid, str) or not rid:
+                    continue
+                sp = row.get("session_path")
+                referenced.append(
+                    (rid, sp if isinstance(sp, str) and sp else None)
+                )
 
+    # Resolve each (rid, session) once. Dedupe on the (session, rid)
+    # pair so an unsanitized session_path collision doesn't trigger
+    # multiple disk reads. If the same rid appears with both no
+    # session_path and a session_path pointing to a different session,
+    # we treat them as distinct lookups but the layout's payload dict
+    # is keyed by rid alone — which means a model that emits two
+    # rows with the same rid pointing at different sessions gets
+    # last-write-wins behavior. Surfaced via the
+    # ``rid_collisions_across_sessions`` hint when it actually fires.
     payloads_by_id: dict[str, dict[str, Any]] = {}
     missing: list[str] = []
-    seen: set[str] = set()
-    for rid in referenced_ids:
-        if rid in seen:
+    denied: list[str] = []
+    collisions: list[str] = []
+    seen: set[tuple[str, str]] = set()
+    for rid, sp in referenced:
+        if sp is None:
+            target_cwd: Path | None = cwd
+        elif not cross_enabled:
+            denied.append(rid)
             continue
-        seen.add(rid)
+        else:
+            target_cwd = _resolve_cross_session_cwd(sp)
+            if target_cwd is None:
+                denied.append(rid)
+                continue
+        key = (str(target_cwd), rid)
+        if key in seen:
+            continue
+        seen.add(key)
+        store = get_store(target_cwd)
         row_obj = store.get(rid)
         if row_obj is None:
             missing.append(rid)
             continue
         if isinstance(row_obj.sanitized_payload, dict):
+            if rid in payloads_by_id and payloads_by_id[rid] is not row_obj.sanitized_payload:
+                # Same rid resolved to different payloads from
+                # different sessions. The layout can only key cells
+                # by rid, so the second one would silently overwrite.
+                # Flag explicitly so the model can rename one of
+                # them and re-emit.
+                collisions.append(rid)
             payloads_by_id[rid] = row_obj.sanitized_payload
 
     from nora.result_render import compose_layout
@@ -1996,15 +2150,48 @@ async def compose_results(args: dict[str, Any]) -> dict[str, Any]:
         # renders as two distinct rows. Tying the count to the layout
         # the model will see keeps "rows_rendered" honest when callers
         # reconcile their spec against the response.
-        "rows_rendered": len(referenced_ids),
-        "result_ids_referenced": sorted(seen),
+        "rows_rendered": len(referenced),
+        "result_ids_referenced": sorted({rid for rid, _ in referenced}),
     }
     if missing:
-        response["missing_result_ids"] = sorted(missing)
+        response["missing_result_ids"] = sorted(set(missing))
         response["hint"] = (
-            f"{len(missing)} referenced result_id(s) not in this "
-            f"session's store; cells for those rows rendered as '—'. "
-            f"Use list_results to get the canonical IDs and re-emit."
+            f"{len(set(missing))} referenced result_id(s) not in "
+            f"the resolved store; cells for those rows rendered as "
+            f"'—'. Use list_results (or list_results_global for "
+            f"cross-session) to get the canonical IDs and re-emit."
+        )
+    if denied:
+        response["denied_result_ids"] = sorted(set(denied))
+        response.setdefault("hint", "")
+        gate_msg = (
+            f"{len(set(denied))} row(s) carried a session_path "
+            f"outside the current session"
+            + (
+                "; that session_path didn't resolve under "
+                "~/.nora-sessions/ so it was rejected."
+                if cross_enabled else
+                "; cross-session lookup is gated by "
+                "NORA_ALLOW_CROSS_SESSION_RECALL=1."
+            )
+        )
+        response["hint"] = (
+            f"{response['hint']}\n{gate_msg}".strip()
+            if response["hint"] else gate_msg
+        )
+    if collisions:
+        response["rid_collisions_across_sessions"] = sorted(set(collisions))
+        response.setdefault("hint", "")
+        coll_msg = (
+            f"{len(set(collisions))} result_id(s) collided across "
+            f"different sessions; the layout keys cells by result_id "
+            f"alone, so one payload silently overwrote another. Pick "
+            f"distinct labels in the spec or split into two compose "
+            f"calls."
+        )
+        response["hint"] = (
+            f"{response['hint']}\n{coll_msg}".strip()
+            if response["hint"] else coll_msg
         )
     return _as_mcp_text(response)
 

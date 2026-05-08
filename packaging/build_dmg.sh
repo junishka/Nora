@@ -134,6 +134,21 @@ if [[ -n "${NORA_NOTARIZE_PROFILE:-}" ]]; then
     # submissions in a workday rather than a workweek.
     POLL_INTERVAL="${NORA_NOTARIZE_POLL_INTERVAL:-30}"
     POLL_TIMEOUT="${NORA_NOTARIZE_POLL_TIMEOUT:-1800}"
+    # Validate the env-overridable knobs. ``POLL_INTERVAL=0`` would
+    # tight-loop forever: ``sleep 0`` returns immediately and
+    # ``SECONDS_WAITED + 0`` stays at 0, so the timeout check never
+    # trips and we hammer Apple's API until the user kills the
+    # build. A non-positive interval or non-integer value is almost
+    # always a typo in the caller's environment; refusing the build
+    # is friendlier than the alternative.
+    if ! [[ "$POLL_INTERVAL" =~ ^[1-9][0-9]*$ ]]; then
+        echo "NORA_NOTARIZE_POLL_INTERVAL must be a positive integer; got '${POLL_INTERVAL}'" >&2
+        exit 1
+    fi
+    if ! [[ "$POLL_TIMEOUT" =~ ^[1-9][0-9]*$ ]]; then
+        echo "NORA_NOTARIZE_POLL_TIMEOUT must be a positive integer; got '${POLL_TIMEOUT}'" >&2
+        exit 1
+    fi
     SECONDS_WAITED=0
     STATUS=""
     # Poll BEFORE the first sleep — Apple sometimes flips a tiny

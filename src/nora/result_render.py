@@ -167,6 +167,7 @@ def _compose_layout_inner(
             # Markdown pipe tables don't support row spans, so a
             # blank-cells header row is the conventional shape.
             rows.append([f"**{group_label.strip()}**", *([""] * len(col_ids))])
+        any_unresolved = False
         for row in group_rows:
             if not isinstance(row, dict):
                 return None
@@ -174,40 +175,115 @@ def _compose_layout_inner(
             if not isinstance(rid, str) or not rid:
                 return None
             rlabel = row.get("label", rid)
-            payload = payloads_by_id.get(rid) or {}
-            coefs = payload.get("coefficients") if isinstance(payload, dict) else None
-            ses = payload.get("standard_errors") if isinstance(payload, dict) else None
-            pvals = payload.get("p_values") if isinstance(payload, dict) else None
-            cells = [
-                _compose_cell(coefs, ses, pvals, col_id) for col_id in col_ids
-            ]
+            # Pass the raw lookup result (None when the result_id
+            # isn't in the store) so ``_compose_cell`` can distinguish
+            # "result missing" from "result present but term missing"
+            # — three failure modes get three distinct glyphs.
+            payload = payloads_by_id.get(rid)
+            cells = [_compose_cell(payload, col_id) for col_id in col_ids]
             rows.append([str(rlabel) if rlabel is not None else rid, *cells])
+            if payload is None or _has_unresolved_term(payload, col_ids):
+                any_unresolved = True
 
     table = _markdown_table(header, rows)
     title = spec.get("title")
+    parts: list[str] = []
     if isinstance(title, str) and title.strip():
-        return f"**{title.strip()}**\n\n{table}"
-    return table
+        parts.append(f"**{title.strip()}**")
+    parts.append(table)
+    # Legend: only emit when at least one cell rendered as something
+    # other than the data-bearing form. A clean composite has no need
+    # for the legend; a researcher who hits one of the three failure
+    # glyphs needs to know which means what. Keeping the legend
+    # conditional avoids polluting tidy outputs.
+    if any_unresolved:
+        parts.append(
+            "Legend: ``—`` result not found · "
+            "``·`` term in model but no estimate (often perfect "
+            "collinearity) · ``n/a`` term not part of this model."
+        )
+    return "\n\n".join(parts)
+
+
+# Intercept aliases each runtime emits. R's ``lm()`` reports
+# "(Intercept)"; statsmodels formula fits report "Intercept";
+# statsmodels ``add_constant(X)`` reports "const"; Stata reports
+# "_cons". The lowercase "intercept" form is a permissive fallback in
+# case a future runtime normalizes naming. Mirrors the set in
+# ``nora.sanitizer`` — kept duplicated here rather than imported
+# because result_render is on the cold render path and depending on
+# the sanitizer module from it would invert the natural import order.
+_INTERCEPT_ALIASES = frozenset({
+    "(Intercept)", "_cons", "intercept", "Intercept", "const",
+})
+
+
+def _has_unresolved_term(
+    payload: dict[str, Any], term_ids: list[str],
+) -> bool:
+    """Whether any ``term_id`` in ``term_ids`` will render as a
+    failure glyph (``·`` or ``n/a``) rather than a data cell. Used to
+    decide whether to emit the legend below the composite table.
+    """
+    coefs = payload.get("coefficients") if isinstance(payload, dict) else None
+    if not isinstance(coefs, dict):
+        return True
+    for tid in term_ids:
+        if coefs.get(tid) is None:
+            return True
+    return False
 
 
 def _compose_cell(
-    coefs: Any, ses: Any, pvals: Any, term_id: str,
+    payload: dict[str, Any] | None, term_id: str,
 ) -> str:
     """Render one ``estimate (SE) [p-value]`` cell.
 
-    Each component falls back to ``—`` independently. If all three
-    are absent (the result_id missed entirely, or the term isn't in
-    any of coefficients / SEs / p_values), collapse to a single
-    ``—`` rather than ``— (—) [—]`` which is just noise.
+    Three distinct failure glyphs let a researcher tell why a cell is
+    empty — the previous single ``—`` collapsed three meaningfully
+    different cases into one shape:
+
+    - ``—`` (em-dash): the result_id wasn't in the store at all. The
+      model invented or mistyped the id, or the result was deleted.
+    - ``·`` (middle dot): the term IS declared as a predictor for
+      this model (it's in ``predictor_variables``) but no coefficient
+      came back. In OLS this almost always means perfect collinearity
+      with another term — the estimator silently dropped it.
+    - ``n/a``: the term isn't part of this model at all (it lives in
+      a different column's model, or the model type structurally
+      doesn't produce that quantity).
+
+    The trichotomy only kicks in when the payload carries
+    ``predictor_variables`` — without it we can't tell case 2 from
+    case 3, so we fall back to ``—`` for the missing-term case
+    (matches the old behavior).
     """
+    if payload is None:
+        return "—"
+    if not isinstance(payload, dict):
+        return "—"
+    coefs = payload.get("coefficients")
+    ses = payload.get("standard_errors")
+    pvals = payload.get("p_values")
+    declared = payload.get("predictor_variables")
+
     e = coefs.get(term_id) if isinstance(coefs, dict) else None
     s = ses.get(term_id) if isinstance(ses, dict) else None
     p = pvals.get(term_id) if isinstance(pvals, dict) else None
+
     if e is None and s is None and p is None:
+        # No data on this term. Distinguish "in this model but dropped"
+        # from "not in this model" using ``predictor_variables``. If
+        # the payload didn't carry that list we can't tell, so we keep
+        # the conservative ``—``.
+        if isinstance(declared, list):
+            in_model = (term_id in declared) or (term_id in _INTERCEPT_ALIASES)
+            return "·" if in_model else "n/a"
         return "—"
-    e_str = (_fmt_num(e) if e is not None else "") or "—"
-    s_str = (_fmt_num(s) if s is not None else "") or "—"
-    p_str = (_fmt_pvalue(p) if p is not None else "") or "—"
+
+    e_str = (_fmt_num(e) if e is not None else "") or "·"
+    s_str = (_fmt_num(s) if s is not None else "") or "·"
+    p_str = (_fmt_pvalue(p) if p is not None else "") or "·"
     return f"{e_str} ({s_str}) [{p_str}]"
 
 

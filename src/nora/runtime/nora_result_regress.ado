@@ -281,6 +281,80 @@ program define nora_result_regress
         file write `fh' `","n_failures":`=e(N_fail)'"'
     }
 
+    * Collinearity diagnostics. R and Python emit ``vif`` and
+    * ``condition_number`` automatically; the Stata side used to
+    * skip them entirely on the rationale that ``estat vif`` is a
+    * display-only command (no clean r() vocabulary). That left
+    * Stata regression cards missing diagnostics R/Python users see,
+    * with no signal to the model that they're available — just
+    * silent absence.
+    *
+    * Both are now derived from e() directly, no estat parsing:
+    *
+    *   condition_number = sqrt(λ_max / λ_min) of e(V). Scaling by
+    *     σ² doesn't change eigenvalue ratios, so this equals the
+    *     Belsley-Kuh-Welsch condition index of X'X. Computed via
+    *     ``matrix symeigen`` (real eigenvalues for the symmetric
+    *     V); guarded against non-PD edge cases (the capture
+    *     swallows symeigen's failure on degenerate fits and we
+    *     simply omit the field).
+    *
+    *   vif (per non-intercept predictor) = SE²_j · TSS_j / σ²,
+    *     where TSS_j = Var(x_j) · (N_j - 1) under the regression
+    *     sample. Algebraically identical to ``estat vif`` but
+    *     reads off e() and the live data — no command output to
+    *     parse. Only meaningful for OLS, so gated on
+    *     ``e(cmd) == "regress"``; logit / probit / Poisson use
+    *     pseudo-R² and chi² omnibus stats instead.
+    tempname _evals _evecs
+    capture matrix symeigen `_evecs' `_evals' = `Vmat'
+    if !_rc {
+        local _ne = colsof(`_evals')
+        if `_ne' > 0 {
+            local _emax = `_evals'[1, 1]
+            local _emin = `_evals'[1, 1]
+            forvalues j = 2/`_ne' {
+                if !missing(`_evals'[1, `j']) {
+                    if `_evals'[1, `j'] > `_emax' local _emax = `_evals'[1, `j']
+                    if `_evals'[1, `j'] < `_emin' local _emin = `_evals'[1, `j']
+                }
+            }
+            if !missing(`_emin') & !missing(`_emax') & `_emin' > 0 {
+                local _cn = sqrt(`_emax' / `_emin')
+                local _x = strofreal(`_cn', "%21.17e")
+                file write `fh' `","condition_number":`_x'"'
+            }
+        }
+    }
+
+    if "`e(cmd)'" == "regress" & "`e(rmse)'" != "" & !missing(`=e(rmse)') & `=e(rmse)' > 0 {
+        local _rmse2 = `=e(rmse)'^2
+        * Build the field even if every predictor falls through to
+        * "skip"; the renderer is happy with an empty dict and
+        * shipping nothing here would suggest VIF wasn't computed
+        * at all on a regression where it's well-defined.
+        file write `fh' `","vif":{"'
+        local _vfirst = 1
+        forvalues i = 1/`k' {
+            local v : word `i' of `vnames'
+            if "`v'" == "_cons" continue
+            if missing(`Vmat'[`i', `i']) continue
+            quietly count if e(sample) & !missing(`v')
+            local _nj = r(N)
+            if `_nj' < 2 continue
+            quietly summarize `v' if e(sample)
+            local _varj = r(Var)
+            if missing(`_varj') | `_varj' == 0 continue
+            local _tssj = `_varj' * (`_nj' - 1)
+            local _vifj = `Vmat'[`i', `i'] * `_tssj' / `_rmse2'
+            if !`_vfirst' file write `fh' ","
+            local _x = strofreal(`_vifj', "%21.17e")
+            file write `fh' `""`v'":`_x'"'
+            local _vfirst = 0
+        }
+        file write `fh' "}"
+    }
+
     file write `fh' "}" _newline
     file close `fh'
 

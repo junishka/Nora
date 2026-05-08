@@ -134,7 +134,13 @@ class ContextCount:
     ``exact``: True when the count came from a provider-matching
        tokenizer (tiktoken for OpenAI, Anthropic's count_tokens for
        Claude); False for the chars/3.5 approximation. The chip
-       prefixes ``~`` when False.
+       text itself does NOT prefix ``~``; the approximate-vs-exact
+       distinction is surfaced in the tooltip instead (see
+       ``renderContextChip`` in ``app.js``). A leading ``~`` on
+       every render — when every render today is approximate —
+       conveys no information and reads as noise; the tooltip
+       carries the honesty caveat where the researcher can find
+       it.
     ``ceiling``: model context window in tokens — the chip's
        denominator. Sourced from the model registry, not derived
        here, so this struct stays decoupled from per-provider model
@@ -191,8 +197,11 @@ def count_next_context(
       risk.
 
     Returns ``ContextCount`` with ``exact=False`` until the
-    tiktoken / count_tokens paths land — caller should branch on
-    ``exact`` to decide whether to prefix the chip with ``~``.
+    tiktoken / count_tokens paths land. Callers branch on ``exact``
+    to choose the chip's tooltip wording (exact: ``"N tokens"``;
+    approximate: ``"N tokens · local estimate, expect a small gap
+    from the provider's billed count"``); the chip text itself
+    stays prefix-free.
     """
     history_chars = 0
     if cwd is not None:

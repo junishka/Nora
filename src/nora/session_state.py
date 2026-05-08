@@ -65,6 +65,33 @@ def _state_lock_for(cwd: Path) -> threading.Lock:
             _STATE_LOCKS[key] = lock
         return lock
 
+
+def evict_state_lock(cwd: Path) -> None:
+    """Drop the cached lock for ``cwd``.
+
+    Called by ``ui.delete_session`` after the session directory is
+    removed from disk. Without this, every session ever opened in
+    a long-running daemon leaves one ``threading.Lock`` + dict entry
+    behind in ``_STATE_LOCKS`` — small individually (~tens of bytes
+    each) but unbounded across a research day that opens and discards
+    many sessions.
+
+    Safe to call when no lock exists (no-op). Callers must not be
+    holding the lock; eviction during contention would let a future
+    ``_state_lock_for`` recreate a different lock that races against
+    the held one. In practice this is fine because ``delete_session``
+    only fires after the runner is closed, so no thread is mid-write
+    on this cwd's state file.
+    """
+    try:
+        key = cwd.resolve() if cwd.is_dir() else cwd
+    except OSError:
+        # Directory already gone (delete_session rmtree'd it before
+        # calling us); fall back to the unresolved path.
+        key = cwd
+    with _STATE_LOCKS_GUARD:
+        _STATE_LOCKS.pop(key, None)
+
 # Per-field caps for text we snapshot. These stay short because the
 # state file is meant to be glanceable, not a re-encoding of the full
 # transcript. Callers who need the full exchange use chat_history.
