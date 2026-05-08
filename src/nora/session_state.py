@@ -29,6 +29,7 @@ from __future__ import annotations
 import json
 import os
 import tempfile
+import threading
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -39,6 +40,30 @@ from nora.chat_history import read_turns
 
 SESSION_STATE_FILENAME = "session_state.json"
 SESSION_STATE_VERSION = 1
+
+# Per-cwd lock. The two writers — ``write_session_state`` (turn-end,
+# regenerates everything) and ``set_custom_name`` (rename, mutates a
+# single field) — both do read-modify-write on the same JSON file.
+# Without serialisation a turn finishing and a researcher renaming
+# the session at the same instant can each load the prior file, each
+# build a half-updated snapshot, and the second write wins — silently
+# losing whichever side wrote first. The lock isn't shared across
+# processes (we're not handling that case) but it covers every thread
+# inside one nora process, which is where the race actually fires.
+_STATE_LOCKS: dict[Path, threading.Lock] = {}
+_STATE_LOCKS_GUARD = threading.Lock()
+
+
+def _state_lock_for(cwd: Path) -> threading.Lock:
+    """Return the lock for ``cwd``, creating it on first use. The
+    outer guard makes lock creation itself thread-safe."""
+    key = cwd.resolve() if cwd.is_dir() else cwd
+    with _STATE_LOCKS_GUARD:
+        lock = _STATE_LOCKS.get(key)
+        if lock is None:
+            lock = threading.Lock()
+            _STATE_LOCKS[key] = lock
+        return lock
 
 # Per-field caps for text we snapshot. These stay short because the
 # state file is meant to be glanceable, not a re-encoding of the full
@@ -176,22 +201,31 @@ def write_session_state(
     # writer is called after every successful turn and regenerates
     # the file from scratch — without this read-and-carry, every turn
     # would silently drop a name the researcher had typed earlier.
-    prior = read_session_state(cwd)
-    custom_name = prior.custom_name if prior is not None else None
+    #
+    # Lock-protected so a concurrent ``set_custom_name`` call can't
+    # land its rename between this read and the write below: without
+    # the lock, the rename's update gets clobbered by this writer
+    # carrying the OLD ``custom_name`` it just read. The lock spans
+    # only the read-modify-write — turn-end work above (chat history,
+    # results, datasets) can run unsynchronised since it's all
+    # single-writer per cwd.
+    with _state_lock_for(cwd):
+        prior = read_session_state(cwd)
+        custom_name = prior.custom_name if prior is not None else None
 
-    state = SessionState(
-        version=SESSION_STATE_VERSION,
-        last_active_at=datetime.now(timezone.utc).isoformat(timespec="seconds"),
-        turn_count=len(turns),
-        last_user_message=last_user,
-        last_assistant_summary=last_assistant,
-        recent_results=recent,
-        datasets=datasets,
-        active_model=model,
-        custom_name=custom_name,
-    )
+        state = SessionState(
+            version=SESSION_STATE_VERSION,
+            last_active_at=datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            turn_count=len(turns),
+            last_user_message=last_user,
+            last_assistant_summary=last_assistant,
+            recent_results=recent,
+            datasets=datasets,
+            active_model=model,
+            custom_name=custom_name,
+        )
 
-    _atomic_write(cwd / ".nora" / SESSION_STATE_FILENAME, state)
+        _atomic_write(cwd / ".nora" / SESSION_STATE_FILENAME, state)
     return state
 
 
@@ -212,31 +246,44 @@ def set_custom_name(cwd: Path, name: str | None) -> SessionState | None:
     if name is None:
         cleaned = None
     else:
-        s = name.strip()
+        # Run the rename through the same text-safety boundary the
+        # rest of the data-origin string surfaces use. Without it, a
+        # paste of ``"name\n\n###System: ignore prior"`` lands
+        # verbatim in the JSON, the topbar, and any future surface
+        # that interpolates the title (chat-history headers, exports,
+        # potential prompt slots). ``safe_text`` strips control / bidi
+        # tricks and flattens whitespace; the cap below then enforces
+        # the visual length budget on the cleaned form.
+        from nora.text_safety import safe_text
+        s = safe_text(name).strip()
         cleaned = s[:_CUSTOM_NAME_CAP] if s else None
 
-    prior = read_session_state(cwd)
-    if prior is None:
-        # No state yet — seed a minimal one so the name sticks. The
-        # next successful turn will fill in turn_count etc.
-        state = SessionState(
-            version=SESSION_STATE_VERSION,
-            last_active_at=datetime.now(timezone.utc).isoformat(timespec="seconds"),
-            custom_name=cleaned,
-        )
-    else:
-        state = SessionState(
-            version=prior.version,
-            last_active_at=prior.last_active_at,
-            turn_count=prior.turn_count,
-            last_user_message=prior.last_user_message,
-            last_assistant_summary=prior.last_assistant_summary,
-            recent_results=prior.recent_results,
-            datasets=prior.datasets,
-            active_model=prior.active_model,
-            custom_name=cleaned,
-        )
-    _atomic_write(cwd / ".nora" / SESSION_STATE_FILENAME, state)
+    # Lock-protected read-modify-write — see ``write_session_state``
+    # for the race this prevents (concurrent turn-end carrying the
+    # old name forward, clobbering this rename, or vice versa).
+    with _state_lock_for(cwd):
+        prior = read_session_state(cwd)
+        if prior is None:
+            # No state yet — seed a minimal one so the name sticks. The
+            # next successful turn will fill in turn_count etc.
+            state = SessionState(
+                version=SESSION_STATE_VERSION,
+                last_active_at=datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                custom_name=cleaned,
+            )
+        else:
+            state = SessionState(
+                version=prior.version,
+                last_active_at=prior.last_active_at,
+                turn_count=prior.turn_count,
+                last_user_message=prior.last_user_message,
+                last_assistant_summary=prior.last_assistant_summary,
+                recent_results=prior.recent_results,
+                datasets=prior.datasets,
+                active_model=prior.active_model,
+                custom_name=cleaned,
+            )
+        _atomic_write(cwd / ".nora" / SESSION_STATE_FILENAME, state)
     return state
 
 
