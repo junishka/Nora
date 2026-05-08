@@ -936,23 +936,43 @@ class NoraBridge:
                 content_b64 = content_b64.split(",", 1)[1]
             safe_name = Path(name).name
             ext = Path(safe_name).suffix.lower()
-            # Data / script size gate. Images get their own 5 MB
-            # cap below — they're checked AFTER decode because the
-            # 5 MB threshold is small enough that pre-decode arithmetic
-            # adds no real saving. Data and script files are checked
-            # PRE-decode to avoid materializing multi-GB blobs that
-            # we'd reject anyway. The "+" button next to the composer
-            # uses the native picker and has no size limit.
-            if (
-                ext in _COPY_EXTS
-                and _b64_oversize(content_b64, _DRAG_DROP_MAX_BYTES)
-            ):
+            # Pre-decode size gate. Both data/script files (capped at
+            # _DRAG_DROP_MAX_BYTES, 512 MB) and images (capped at
+            # _IMAGE_MAX_BYTES, 5 MB) are checked BEFORE the
+            # ``base64.b64decode`` allocation. Without the image-side
+            # check, an oversize image flowed through to the decode
+            # call which materialised the full encoded + decoded
+            # bytes before rejection — a 100 MB image briefly held
+            # ~233 MB of transient heap. The savings is in skipping
+            # the allocation, not the arithmetic. The "+" button next
+            # to the composer uses the native picker and has no size
+            # limit.
+            if ext in _COPY_EXTS:
+                cap: int | None = _DRAG_DROP_MAX_BYTES
+                hint = "the + button next to the composer"
+            elif ext in _IMAGE_EXTS_MIMES:
+                cap = _IMAGE_MAX_BYTES
+                hint = ""  # images skipped silently below, not error-returned
+            else:
+                cap = None
+                hint = ""
+            if cap is not None and _b64_oversize(content_b64, cap):
                 approx_mb = (len(content_b64) * 3 // 4) // (1024 * 1024)
+                # Images skip via the per-file ``skipped`` list (the
+                # researcher dragged a folder of mixed sizes; the
+                # 50 MB screenshot shouldn't fail the whole drop).
+                # Data and script files error-return because they're
+                # the primary target of the drop and silently dropping
+                # one would hide the failure.
+                if ext in _IMAGE_EXTS_MIMES:
+                    skipped.append(
+                        f"{safe_name} (>{cap // (1024 * 1024)} MB)"
+                    )
+                    continue
                 return {
                     "ok": False,
                     "reason": _drag_drop_oversize_message(
-                        safe_name, approx_mb,
-                        "the + button next to the composer",
+                        safe_name, approx_mb, hint,
                     ),
                 }
             try:
@@ -982,9 +1002,6 @@ class NoraBridge:
                             safe_name, ext, blob,
                         )
             elif ext in _IMAGE_EXTS_MIMES:
-                if len(blob) > _IMAGE_MAX_BYTES:
-                    skipped.append(f"{safe_name} (>5 MB)")
-                    continue
                 # Save to cwd alongside vision staging — see the
                 # mirror code path in ``add_files`` for the
                 # rationale (researchers expect "I uploaded this"
@@ -995,8 +1012,14 @@ class NoraBridge:
                     img_dst.write_bytes(blob)
                 except OSError as e:
                     return {"ok": False, "reason": f"image save failed: {e}"}
+                # Reuse the original ``content_b64`` for the model-facing
+                # data field instead of re-encoding ``blob``. The image
+                # arrived as base64; round-tripping through decode +
+                # encode wastes ~10 MB of transient memory per 5 MB
+                # image for no semantic gain. ``content_b64`` is
+                # already stripped of any data-URL prefix above.
                 images.append({
-                    "data": base64.b64encode(blob).decode("ascii"),
+                    "data": content_b64,
                     "mime": _IMAGE_EXTS_MIMES[ext],
                     "name": img_dst.name,
                 })
@@ -1851,6 +1874,15 @@ class NoraBridge:
             shutil.rmtree(target)
         except OSError as e:
             return {"ok": False, "reason": f"delete failed: {e}"}
+        # Drop the cached state-file lock so a long-running daemon
+        # doesn't accumulate one ``threading.Lock`` entry per session
+        # ever opened. Eviction is safe here: the runner above is
+        # closed, no thread is mid-write on this cwd's state file.
+        try:
+            from nora.session_state import evict_state_lock
+            evict_state_lock(target)
+        except Exception:  # noqa: BLE001 — eviction isn't safety-critical
+            pass
         # If we just deleted the focused session, drop the bridge's
         # reference to it. The page is responsible for navigating to
         # the landing screen on ``was_active=True``; until it does,
