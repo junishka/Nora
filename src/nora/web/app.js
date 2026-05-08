@@ -1517,21 +1517,42 @@ function pendingFor(cwd) {
 async function fireQueuedMessage(cwd, item) {
   item.userEl.classList.remove('queued');
   activeLiveTurn = { id: null, nodes: [item.userEl], hasVisibleReply: false };
+  // Use the explicit-target send variants. The plain ``send_message``
+  // routes to the bridge's ``self.cwd`` (focused session); a queue
+  // can flush AFTER the user has switched sessions, so falling back
+  // to the focused cwd would persist / execute the queued message
+  // against the WRONG session. The ``_to_session`` variants route to
+  // the runner whose cwd matches ``cwd``, regardless of focus.
+  const api = window.pywebview.api;
+  const supportsTargeted = (
+    typeof api.send_message_to_session === 'function'
+    && typeof api.send_message_with_images_to_session === 'function'
+  );
   try {
     let turnId = null;
-    if (item.images.length > 0 && typeof window.pywebview.api.send_message_with_images === 'function') {
+    if (item.images.length > 0) {
       const payload = item.images.map((img) => ({ data: img.data, mime: img.mime }));
-      turnId = await window.pywebview.api.send_message_with_images(item.text, payload);
-    } else if (item.images.length > 0) {
-      const errEl = appendError('Restart Nora to send images.');
-      if (activeLiveTurn) {
-        activeLiveTurn.nodes.push(errEl);
-        queueDisposableTurn(activeLiveTurn.nodes);
+      if (supportsTargeted) {
+        turnId = await api.send_message_with_images_to_session(cwd, item.text, payload);
+      } else if (typeof api.send_message_with_images === 'function') {
+        // Older bridge: fall back to focused-cwd send. Cross-session
+        // mix-up risk remains until the new APIs ship; the explicit
+        // path above is the durable fix.
+        turnId = await api.send_message_with_images(item.text, payload);
+      } else {
+        const errEl = appendError('Restart Nora to send images.');
+        if (activeLiveTurn) {
+          activeLiveTurn.nodes.push(errEl);
+          queueDisposableTurn(activeLiveTurn.nodes);
+        }
+        activeLiveTurn = null;
+        setSending(false, cwd);
+        return;
       }
-      activeLiveTurn = null;
-      setSending(false, cwd);
+    } else if (supportsTargeted) {
+      turnId = await api.send_message_to_session(cwd, item.text);
     } else {
-      turnId = await window.pywebview.api.send_message(item.text);
+      turnId = await api.send_message(item.text);
     }
     if (activeLiveTurn) activeLiveTurn.id = turnId;
   } catch (err) {
