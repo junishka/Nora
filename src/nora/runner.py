@@ -75,11 +75,31 @@ _CANCELLED_TURN_ID_HISTORY = 256
 # are dropped (the researcher still sees them on disk). The manifest
 # kind is enforced against this allowlist — a future helper has to
 # land here AND in the runtime libraries to be visible to the model.
+#
+# Privacy line: ONLY plots that are pure functions of MODEL OUTPUT
+# (point estimates, CIs, predicted-response curves on a synthetic
+# grid, coefficient comparisons across specifications) cross to
+# Claude. Per-observation plots — residuals vs. fitted, Q-Q,
+# scale-location, leverage — are deliberately NOT on this list:
+# they expose individual residuals + fitted values, which together
+# are essentially the row-level data the JSON sanitizer refuses to
+# surface. An image side channel around SDC is still SDC bypass.
+# ``residuals.png`` still gets written to disk on every
+# ``nora.plot_residuals`` call so the researcher can inspect the
+# diagnostic; the model just doesn't see the image.
 _PLOT_KIND_ALLOWLIST: frozenset[str] = frozenset({
-    "residuals",
     "interaction",
     "coefficients",
     "marginal_effects",
+})
+# Kinds we explicitly know about but deliberately keep researcher-
+# only (see allowlist comment). Listed so ``_summarize_plot_helpers``
+# can surface the fact that the plot was MADE without attaching the
+# image — otherwise the model calls ``nora.plot_residuals(fitted)``
+# and sees no acknowledgement at all, which has been observed to
+# trigger retry loops.
+_PLOT_KIND_RESEARCHER_ONLY: frozenset[str] = frozenset({
+    "residuals",
 })
 _PLOT_MAX_BYTES = 2 * 1024 * 1024   # 2 MB / image
 _PLOT_MAX_PER_TURN = 8

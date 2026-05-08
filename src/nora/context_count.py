@@ -29,9 +29,83 @@ Accuracy tier (``exact`` field on the response):
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+
+
+# Fields the bridge enriches into ``tool_result`` records for UI
+# replay (raw stdout/stderr captures, base64 plot thumbnails, plot
+# diagnostic strings) but that NEVER ride into the next provider
+# request. Stripping them at counting time gives the chip a
+# realistic estimate of next-turn size — without this, plot- and
+# script-heavy sessions overcounted dramatically because a single
+# tool_result line could be 1-2 MB of base64 plot data the model
+# will never see.
+_HISTORY_UI_ONLY_FIELDS: frozenset[str] = frozenset({
+    "raw_stdout",
+    "raw_stderr",
+    "plots",
+    "plot_diagnostic",
+})
+
+
+def _model_facing_history_chars(history_path: Path) -> int:
+    """Sum the bytes of the persisted chat log MINUS UI-only fields.
+
+    The persisted ``chat_history.jsonl`` mixes model-facing record
+    bodies (``user_message`` text, ``assistant_text``, ``tool_call``
+    args, sanitized ``tool_result`` payloads) with UI-only
+    enrichments (full raw stdout/stderr captures, base64 plot
+    thumbnails). The model never sees the UI-only fields, but
+    ``stat()`` on the file counts them — the chip's denominator
+    pressure (raw bytes / chars-per-token) was therefore badly
+    inflated on plot-heavy or script-heavy sessions.
+
+    Streaming JSON parse, one line at a time. A 100-MB log is the
+    realistic upper bound (50+ tool calls each carrying ~1-2 MB of
+    plot bytes); on that size this scan takes ~1-2s. The chip's
+    triggers are infrequent enough that the cost is acceptable;
+    caching by file mtime is the obvious follow-up if it bites.
+    """
+    if not history_path.is_file():
+        return 0
+    total = 0
+    try:
+        with history_path.open("r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                except json.JSONDecodeError:
+                    # Unparseable lines shouldn't happen in normal
+                    # operation. Count their full length defensively
+                    # — better to over-report than under-report when
+                    # we genuinely don't know what they contain.
+                    total += len(line) + 1
+                    continue
+                if not isinstance(rec, dict):
+                    total += len(line) + 1
+                    continue
+                ui_only_present = any(
+                    k in rec for k in _HISTORY_UI_ONLY_FIELDS
+                )
+                if not ui_only_present:
+                    # Fast path: no enrichment to strip. Use the
+                    # original line length (saves a json.dumps).
+                    total += len(line) + 1
+                    continue
+                stripped = {
+                    k: v for k, v in rec.items()
+                    if k not in _HISTORY_UI_ONLY_FIELDS
+                }
+                total += len(json.dumps(stripped, ensure_ascii=False)) + 1
+    except OSError:
+        return 0
+    return total
 
 
 # Average bytes per token for English-leaning prose with code mixed
@@ -120,11 +194,12 @@ def count_next_context(
     history_chars = 0
     if cwd is not None:
         history_path = cwd / ".nora" / "chat_history.jsonl"
-        if history_path.is_file():
-            try:
-                history_chars = history_path.stat().st_size
-            except OSError:
-                history_chars = 0
+        # Project to model-facing fields only. The persisted log
+        # carries raw stdout/stderr captures and base64 plot
+        # thumbnails for UI replay; those never ride into the next
+        # provider request, so a stat() of the whole file would
+        # overcount badly on plot- or script-heavy sessions.
+        history_chars = _model_facing_history_chars(history_path)
 
     # Draft attachments aren't in history yet. Two contributions:
     #   - per-file kicker for the header / fence framing the bridge

@@ -84,7 +84,7 @@ def test_capture_reads_only_manifest_entries(tmp_path: Path) -> None:
     run_dir = _seed_run(
         tmp_path,
         manifest_lines=[
-            {"file": "residuals.png", "kind": "residuals", "label": "Residual diagnostics"},
+            {"file": "residuals.png", "kind": "coefficients", "label": "Residual diagnostics"},
         ],
         extra_files={
             # Researcher's raw-data plot — written via plt.savefig,
@@ -113,7 +113,7 @@ def test_capture_rejects_off_allowlist_kinds(tmp_path: Path) -> None:
     run_dir = _seed_run(
         tmp_path,
         manifest_lines=[
-            {"file": "residuals.png", "kind": "residuals", "label": "ok"},
+            {"file": "residuals.png", "kind": "coefficients", "label": "ok"},
             {"file": "raw_histogram.png", "kind": "raw_histogram",
              "label": "should not cross"},
             {"file": "scatter.png", "kind": "scatter_raw",
@@ -124,7 +124,7 @@ def test_capture_rejects_off_allowlist_kinds(tmp_path: Path) -> None:
     runner._capture_plots(run_dir)
 
     kinds = [p["kind"] for p in runner.pending_plot_images]
-    assert kinds == ["residuals"]
+    assert kinds == ["coefficients"]
     # And every kind that does cross is in the published allowlist.
     assert all(k in _PLOT_KIND_ALLOWLIST for k in kinds)
 
@@ -153,7 +153,7 @@ def test_capture_refuses_path_traversal(tmp_path: Path) -> None:
     live inside ``_nora_plots/``."""
     run_dir = _seed_run(
         tmp_path, manifest_lines=[
-            {"file": "residuals.png", "kind": "residuals", "label": "ok"},
+            {"file": "residuals.png", "kind": "coefficients", "label": "ok"},
         ],
     )
     # Drop a file the manifest entry would point at if traversal worked.
@@ -163,7 +163,7 @@ def test_capture_refuses_path_traversal(tmp_path: Path) -> None:
     plots = run_dir / "_nora_plots"
     with (plots / "manifest.jsonl").open("a", encoding="utf-8") as f:
         f.write(json.dumps({
-            "file": "../secret.png", "kind": "residuals",
+            "file": "../secret.png", "kind": "coefficients",
             "label": "evil",
         }) + "\n")
 
@@ -180,9 +180,9 @@ def test_capture_refuses_non_png(tmp_path: Path) -> None:
     model — and the executor uses PNG too."""
     run_dir = _seed_run(
         tmp_path, manifest_lines=[
-            {"file": "result.svg", "kind": "residuals", "label": "x"},
-            {"file": "report.pdf", "kind": "residuals", "label": "x"},
-            {"file": "data.json", "kind": "residuals", "label": "x"},
+            {"file": "result.svg", "kind": "coefficients", "label": "x"},
+            {"file": "report.pdf", "kind": "coefficients", "label": "x"},
+            {"file": "data.json", "kind": "coefficients", "label": "x"},
         ],
         extra_files={
             "result.svg": b"<svg/>",
@@ -204,8 +204,8 @@ def test_capture_drops_oversized_plots(tmp_path: Path) -> None:
     file stays for the researcher to view)."""
     run_dir = _seed_run(
         tmp_path, manifest_lines=[
-            {"file": "small.png", "kind": "residuals", "label": "ok"},
-            {"file": "huge.png", "kind": "residuals", "label": "too big"},
+            {"file": "small.png", "kind": "coefficients", "label": "ok"},
+            {"file": "huge.png", "kind": "coefficients", "label": "too big"},
         ],
     )
     # Overwrite huge.png with bytes above the cap.
@@ -222,7 +222,7 @@ def test_capture_caps_count_per_turn(tmp_path: Path) -> None:
     the most recent N are surfaced (manifest order)."""
     n_total = _PLOT_MAX_PER_TURN + 3
     entries = [
-        {"file": f"residual_{i}.png", "kind": "residuals", "label": f"r{i}"}
+        {"file": f"residual_{i}.png", "kind": "coefficients", "label": f"r{i}"}
         for i in range(n_total)
     ]
     run_dir = _seed_run(tmp_path, manifest_lines=entries)
@@ -268,7 +268,7 @@ def test_tool_result_with_run_dir_triggers_capture_and_next_turn_attaches(
     receives the plot in its images list."""
     run_dir = _seed_run(
         tmp_path, manifest_lines=[
-            {"file": "residuals.png", "kind": "residuals",
+            {"file": "residuals.png", "kind": "coefficients",
              "label": "Residual diagnostics"},
         ],
     )
@@ -329,7 +329,7 @@ def test_user_supplied_images_merge_with_pending_plots(tmp_path: Path) -> None:
     runner = _runner(tmp_path)
     runner.pending_plot_images = [{
         "data": "Zm9v", "mime": "image/png",
-        "name": "residuals.png", "kind": "residuals", "label": "x",
+        "name": "residuals.png", "kind": "coefficients", "label": "x",
     }]
 
     rec = _RecordingSession()
@@ -356,7 +356,7 @@ def test_cancel_during_send_restores_pending_plots(tmp_path: Path) -> None:
     runner = _runner(tmp_path)
     runner.pending_plot_images = [{
         "data": "Zm9v", "mime": "image/png",
-        "name": "residuals.png", "kind": "residuals", "label": "x",
+        "name": "residuals.png", "kind": "coefficients", "label": "x",
     }]
 
     class _CancelMidSend:

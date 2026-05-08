@@ -343,15 +343,15 @@ def test_capture_plots_sanitizes_label_via_safe_text(tmp_path: Path) -> None:
     run = tmp_path / "run"
     plots = run / "_nora_plots"
     plots.mkdir(parents=True)
-    (plots / "residuals.png").write_bytes(_png())
+    (plots / "coefficients.png").write_bytes(_png())
     # Hostile label: control chars (newline, tab, NUL), an
     # extra-long payload, and quote marks. ``safe_text`` should
     # collapse these into something boring (or empty).
     bad_label = "evil\nlabel\ttext\x00<script>" + ("X" * 500)
     (plots / "manifest.jsonl").write_text(
         _json.dumps({
-            "file": "residuals.png",
-            "kind": "residuals",
+            "file": "coefficients.png",
+            "kind": "coefficients",
             "label": bad_label,
         }) + "\n",
         encoding="utf-8",
@@ -384,11 +384,11 @@ def test_capture_plots_sanitizes_filename(tmp_path: Path) -> None:
     # File on disk has a clean name (the runtime helpers control
     # what they write); we just verify the staging dict's ``name``
     # field is run through safe_text rather than passed through raw.
-    (plots / "residuals.png").write_bytes(_png())
+    (plots / "coefficients.png").write_bytes(_png())
     (plots / "manifest.jsonl").write_text(
         _json.dumps({
-            "file": "residuals.png",
-            "kind": "residuals",
+            "file": "coefficients.png",
+            "kind": "coefficients",
             "label": "ok",
         }) + "\n",
         encoding="utf-8",
@@ -399,7 +399,7 @@ def test_capture_plots_sanitizes_filename(tmp_path: Path) -> None:
     runner._capture_plots(run)
     name = runner.pending_plot_images[0]["name"]
     # Clean name passes through unchanged.
-    assert name == "residuals.png"
+    assert name == "coefficients.png"
 
 
 # ---------------------------------------------------------------------------

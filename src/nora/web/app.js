@@ -3542,6 +3542,49 @@ async function runEditedMessage(wrapper) {
     return;
   }
 
+  // Edit-and-rerun on a message that originally carried attachments
+  // or images would silently drop them: the rewind path sends
+  // ``newText`` only, and the bridge has no way to reconstitute
+  // image bytes (they were never persisted, by design) or guarantee
+  // the named scripts still exist on disk. The resulting "rerun"
+  // is a different request than the original, while the original's
+  // attachment evidence has just been truncated out of history.
+  // Force the researcher to acknowledge the drop before proceeding;
+  // the alternative ("Cancel and resend a new message") gives them
+  // a clean way to redo it with fresh attachments.
+  const attachmentChips = wrapper.querySelectorAll(
+    '.message-attachment-chip',
+  );
+  const imageThumbs = wrapper.querySelectorAll('.message-image-thumb');
+  if (attachmentChips.length > 0 || imageThumbs.length > 0) {
+    const parts = [];
+    if (attachmentChips.length > 0) {
+      parts.push(
+        attachmentChips.length === 1
+          ? '1 attached file'
+          : attachmentChips.length + ' attached files',
+      );
+    }
+    if (imageThumbs.length > 0) {
+      parts.push(
+        imageThumbs.length === 1
+          ? '1 image'
+          : imageThumbs.length + ' images',
+      );
+    }
+    const msg = (
+      'This message originally included ' + parts.join(' and ') + '.\n\n'
+      + 'Editing and re-running will send the new text WITHOUT those '
+      + 'attachments — the rerun is therefore a different request than '
+      + 'the original. To keep the attachments, cancel here and resend '
+      + 'a new message instead.\n\n'
+      + 'Continue without attachments?'
+    );
+    if (!window.confirm(msg)) {
+      return;
+    }
+  }
+
   // Disable the editor's buttons so a double-click doesn't fire
   // the rewind twice. The composer / send button stays as-is —
   // the next user_message is what actually re-fires the turn, and
