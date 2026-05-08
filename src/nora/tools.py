@@ -52,10 +52,64 @@ from nora.text_safety import safe_text
 # the same data crossing through both surfaces is consistent.
 _PLOT_HELPER_LABEL_MAX_LEN = 120
 _PLOT_HELPER_NAME_MAX_LEN = 80
-# Helper-error prose can be longer than a label (a Stata `display`
-# error or matplotlib traceback summary), so a slightly more generous
-# cap keeps useful diagnostics intact while still bounding payloads.
-_PLOT_HELPER_MESSAGE_MAX_LEN = 400
+# Helper-error prose: tight cap. The previous 400-char value was a
+# leak surface — pandas / numpy exceptions can carry raw cell values
+# in their formatted message bodies, and a script can deliberately
+# raise with a row excerpt as the message. Bound here is short
+# enough that even a hostile message can't smuggle a meaningful
+# data slice through; the text-pattern allowlist below is what
+# actually decides whether to forward the message at all.
+_PLOT_HELPER_MESSAGE_MAX_LEN = 160
+
+# Allowlist of substrings that mark a helper-error message as
+# "diagnostically useful and safe to forward verbatim" — primarily
+# import / dependency errors that the model can act on by suggesting
+# ``pip install`` or telling the researcher to install a package.
+# The matcher is case-insensitive, substring-based, deliberately
+# narrow: anything outside this set is replaced with a redacted
+# placeholder so a user-script-authored exception body can't smuggle
+# raw cell values through the model-visible tool result.
+_PLOT_HELPER_MESSAGE_PATTERNS: tuple[str, ...] = (
+    "no module named",
+    "modulenotfounderror",
+    "matplotlib", "scipy", "statsmodels", "numpy", "pandas",
+    "haven", "ggplot2", "rmarkdown", "knitr",
+    # Stata helper diagnostics — file-not-found shapes that point at
+    # an env issue, not row data.
+    "command not found", "executable not found",
+    "no display", "could not import", "cannot import name",
+    # Generic shape-mismatch wording the helpers themselves emit
+    # (``_helper_failed("plot_residuals", "fitted object has no
+    # .resid; skipping")`` etc.). These come from Nora-authored
+    # strings, not from the researcher's code, but we still keep
+    # them here so they pass the allowlist.
+    "fitted object has no",
+    "params", "coef_table", "summary_frame",
+)
+
+
+def _safe_helper_error_message(raw: object) -> str:
+    """Forward only well-known import / dependency error patterns
+    verbatim; replace anything else with a redacted placeholder.
+
+    Helper exceptions are written by user-authored scripts, and
+    Python exception formatters (especially pandas / numpy) can
+    embed raw cell values in their message bodies. ``safe_text``
+    alone caps length and strips control characters but a 160-char
+    excerpt of cell values would still leak. The allowlist here is
+    the actual gate: the only messages forwarded verbatim are the
+    ones the model can usefully act on (import errors, helper-
+    emitted shape diagnostics).
+    """
+    if not isinstance(raw, str):
+        raw = str(raw) if raw is not None else ""
+    cleaned = safe_text(raw, max_len=_PLOT_HELPER_MESSAGE_MAX_LEN)
+    if not cleaned:
+        return ""
+    lower = cleaned.lower()
+    if any(p in lower for p in _PLOT_HELPER_MESSAGE_PATTERNS):
+        return cleaned
+    return "(error message redacted; full text in researcher's run log)"
 
 
 # Single source of truth for tool name + description + arg shape lives
@@ -523,47 +577,67 @@ def _summarize_plot_helpers(run_dir: Any) -> dict[str, Any] | None:
     # The runner's ``_capture_plots`` already runs the same data
     # through ``safe_text`` before storing pending plot images;
     # apply the same boundary here.
+    #
+    # Researcher-only kinds (e.g., residuals diagnostics) get a
+    # ``researcher_only: true`` marker so the model knows the plot
+    # was made on the disk side without seeing the image — the
+    # image side channel around SDC is closed in the runner's
+    # ``_PLOT_KIND_ALLOWLIST``; the surface here just keeps the
+    # signal so the model doesn't loop calling ``plot_residuals``.
+    from nora.runner import _PLOT_KIND_RESEARCHER_ONLY
     if manifest.is_file():
         for entry in _read_jsonl(manifest):
             raw_file = entry.get("file", "?")
             raw_kind = entry.get("kind", "?")
             raw_label = entry.get("label", "")
-            succeeded.append({
+            kind_str = (
+                raw_kind if isinstance(raw_kind, str) else str(raw_kind)
+            )
+            row: dict[str, Any] = {
                 "file": safe_text(
                     raw_file if isinstance(raw_file, str) else str(raw_file),
                     max_len=_PLOT_HELPER_NAME_MAX_LEN,
                 ) or "?",
                 "kind": safe_text(
-                    raw_kind if isinstance(raw_kind, str) else str(raw_kind),
-                    max_len=_PLOT_HELPER_NAME_MAX_LEN,
+                    kind_str, max_len=_PLOT_HELPER_NAME_MAX_LEN,
                 ) or "?",
                 "label": safe_text(
                     raw_label if isinstance(raw_label, str) else str(raw_label),
                     max_len=_PLOT_HELPER_LABEL_MAX_LEN,
                 ),
-            })
+            }
+            if kind_str in _PLOT_KIND_RESEARCHER_ONLY:
+                row["researcher_only"] = True
+            succeeded.append(row)
     if errors.is_file():
         for entry in _read_jsonl(errors):
             raw_helper = entry.get("helper", "?")
-            raw_message = entry.get("message", "")
             row: dict[str, Any] = {
                 "helper": safe_text(
                     raw_helper if isinstance(raw_helper, str)
                     else str(raw_helper),
                     max_len=_PLOT_HELPER_NAME_MAX_LEN,
                 ) or "?",
-                "message": safe_text(
-                    raw_message if isinstance(raw_message, str)
-                    else str(raw_message),
-                    max_len=_PLOT_HELPER_MESSAGE_MAX_LEN,
+                "message": _safe_helper_error_message(
+                    entry.get("message", ""),
                 ),
             }
-            raw_fix = entry.get("fix")
-            if raw_fix:
-                row["fix"] = safe_text(
-                    raw_fix if isinstance(raw_fix, str) else str(raw_fix),
-                    max_len=_PLOT_HELPER_MESSAGE_MAX_LEN,
-                )
+            # Surface ``fix`` only when we kept the message verbatim
+            # — i.e. the message matched the import/dependency
+            # allowlist. A redacted message has no actionable
+            # context, so a "fix" hint that came from the same
+            # exception body would be at best confusing and at
+            # worst smuggle an attacker-controlled instruction
+            # through a separate field.
+            if "redacted" not in row["message"]:
+                raw_fix = entry.get("fix")
+                if raw_fix:
+                    cleaned_fix = safe_text(
+                        raw_fix if isinstance(raw_fix, str) else str(raw_fix),
+                        max_len=_PLOT_HELPER_MESSAGE_MAX_LEN,
+                    )
+                    if cleaned_fix:
+                        row["fix"] = cleaned_fix
             failed.append(row)
 
     if not succeeded and not failed:
@@ -1574,14 +1648,33 @@ async def submit_script_file(args: dict[str, Any]) -> dict[str, Any]:
             "reason": f"could not parse a basename from {raw_name!r}",
         })
 
+    target: Path | None
     try:
         target = resolve_in_cwd(safe_name)
+        if not target.is_file():
+            target = None
     except (PathEscapeError, OSError):
-        return _as_mcp_text({
-            "status": "error",
-            "reason": f"path {raw_name!r} is outside the session cwd",
-        })
-    if not target.is_file():
+        target = None
+
+    # Run-dir scripts: ``list_session_files`` advertises Nora-written
+    # ``script.{do,R,py}`` files under label-derived display names
+    # (e.g. "Linear Regression Run.do"). Without this fallback, the
+    # purpose-built run-this-file tool would refuse them with
+    # ``not_found``, and the model had to round-trip the bytes
+    # through ``read_attached_file`` + ``submit_script`` — defeating
+    # the feature and failing on over-cap scripts. Mirrors the
+    # third fallback ``read_attached_file`` already does.
+    if target is None:
+        try:
+            from nora.run_files import find_run_dir_script_by_name
+            cwd = get_cwd()
+            candidate = find_run_dir_script_by_name(cwd, safe_name)
+        except Exception:  # noqa: BLE001
+            candidate = None
+        if candidate is not None and candidate.is_file():
+            target = candidate
+
+    if target is None:
         return _as_mcp_text({
             "status": "not_found",
             "reason": f"no script named {safe_name!r} in this session",
