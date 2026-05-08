@@ -213,3 +213,57 @@ def test_check_applies_to_magnitude_table(dataset_100):
     msg = _check_row_count(payload, "data.csv", 100)
     assert msg is not None
     assert "n=50" in msg
+
+
+# ---------------------------------------------------------------------------
+# row_count — header-row detection on .csv / .tsv
+# ---------------------------------------------------------------------------
+
+def test_row_count_csv_with_header(tmp_path: Path) -> None:
+    """A typical CSV with string column names: count is line count
+    minus 1 for the header. The pre-fix unconditional minus-1 also
+    handled this case correctly."""
+    from nora.schema import row_count
+
+    p = tmp_path / "with_header.csv"
+    p.write_text("col_a,col_b,col_c\n1,2,3\n4,5,6\n")
+    assert row_count(p) == 2
+
+
+def test_row_count_csv_without_header(tmp_path: Path) -> None:
+    """A headerless CSV (raw instrument dump, anonymous panel data,
+    log file renamed to .csv) — every line is data. The pre-fix
+    code subtracted 1 for a header that didn't exist, producing an
+    audit count off by one and false-flagging scripts that
+    correctly counted N rows."""
+    from nora.schema import row_count
+
+    p = tmp_path / "no_header.csv"
+    p.write_text("1,2,3\n4,5,6\n7,8,9\n")
+    assert row_count(p) == 3
+
+
+def test_row_count_tsv_with_header(tmp_path: Path) -> None:
+    from nora.schema import row_count
+
+    p = tmp_path / "panel.tsv"
+    p.write_text("id\tyear\tvalue\n1\t2020\t3.14\n2\t2021\t2.71\n")
+    assert row_count(p) == 2
+
+
+def test_row_count_empty_file(tmp_path: Path) -> None:
+    from nora.schema import row_count
+
+    p = tmp_path / "empty.csv"
+    p.write_text("")
+    assert row_count(p) == 0
+
+
+def test_row_count_header_only_file(tmp_path: Path) -> None:
+    """A file with only a header line — zero data rows. Distinguishes
+    from a single-data-row headerless file (which should report 1)."""
+    from nora.schema import row_count
+
+    p = tmp_path / "only_header.csv"
+    p.write_text("a,b,c\n")
+    assert row_count(p) == 0

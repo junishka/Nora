@@ -134,6 +134,45 @@ def load_data(dataset_path: Path) -> Any:
     )
 
 
+def _looks_like_header(first_line: bytes | None, sep: bytes) -> bool:
+    """Heuristic: does the first line of a delimited file look like a
+    header row (column names) or a data row?
+
+    True (header) when the line is non-empty AND at least one
+    delimiter-separated token can't be parsed as a number. The vast
+    majority of real-world CSVs/TSVs use string column names, so this
+    classifies the common case correctly. Edge cases:
+
+    - Empty or single-token line: treated as a header (common case is
+      a single-column file with a name like ``"id"``).
+    - Every token is numeric (e.g. raw sensor dump where the model's
+      first reading is ``"123,45.6,7"``): treated as data, no header
+      offset applied. The previous unconditional ``-1`` was wrong
+      here.
+    - Quoted strings: not de-quoted before the parse. A row like
+      ``"42","43"`` would be classified as header (non-numeric due
+      to the quotes); that matches typical usage where the first
+      row of such a file IS a header.
+
+    Used by ``row_count`` for the submit_script row-count audit. The
+    audit treats ``None`` and "best-effort numeric count" as the
+    same low-confidence signal, so a misclassification at the
+    heuristic boundary is harmless beyond the audit message wording.
+    """
+    if not first_line:
+        return True
+    tokens = first_line.split(sep)
+    for tok in tokens:
+        s = tok.strip().strip(b'"').strip(b"'").decode("utf-8", errors="replace")
+        if not s:
+            continue
+        try:
+            float(s)
+        except ValueError:
+            return True
+    return False
+
+
 def row_count(dataset_path: Path) -> int | None:
     """Return the row count for the dataset at ``dataset_path`` without
     materialising the values where the format allows it.
@@ -149,9 +188,17 @@ def row_count(dataset_path: Path) -> int | None:
       0.5s on a 3 GB file vs ~60s for a full load.
     - ``.parquet``: ``pyarrow.parquet.ParquetFile(...).metadata.num_rows``.
       Reads only the footer.
-    - ``.csv`` / ``.tsv``: byte-streamed line count minus 1 for the
-      header. Slower than metadata reads but still ~10x faster than a
-      full pandas parse on wide files.
+    - ``.csv`` / ``.tsv``: byte-streamed line count, minus 1 if the
+      first line looks like a header (any non-numeric token in the
+      first row). The previous unconditional ``-1`` was wrong for
+      headerless dumps (raw instrument files, anonymous panel data,
+      log files renamed to .csv) — it produced an audit count off
+      by one and the row-count check then false-flagged scripts
+      that correctly counted the headerless row. Heuristic-only;
+      a CSV whose header happens to be numeric (rare but possible
+      — column names like ``"123"``) still gets misclassified, but
+      the audit treats ``None`` and "off by 1" the same way (best-
+      effort flag, not a gate).
     - ``.jsonl`` / ``.ndjson``: byte-streamed line count.
     - ``.rds``: no light path available without spinning up R; falls
       back to ``load_data`` and counts.
@@ -172,13 +219,23 @@ def row_count(dataset_path: Path) -> int | None:
             import pyarrow.parquet as pq
             return int(pq.ParquetFile(str(dataset_path)).metadata.num_rows)
         if suffix == ".csv" or suffix == ".tsv":
-            # Line count minus 1 for the header row. Streamed read so
-            # we don't materialise the file in memory.
+            # Line count minus 1 ONLY when the first line looks like
+            # a header. Streamed read so we don't materialise the
+            # file in memory. The header heuristic peeks at the
+            # first line: if every comma/tab-separated token parses
+            # as a number, it's data; otherwise treat as a header.
+            sep = b"," if suffix == ".csv" else b"\t"
             n_lines = 0
+            first_line: bytes | None = None
             with open(dataset_path, "rb") as f:
-                for _ in f:
+                for line in f:
+                    if first_line is None:
+                        first_line = line.rstrip(b"\r\n")
                     n_lines += 1
-            return max(0, n_lines - 1)
+            if n_lines == 0:
+                return 0
+            has_header = _looks_like_header(first_line, sep)
+            return max(0, n_lines - 1 if has_header else n_lines)
         if suffix in (".jsonl", ".ndjson"):
             n_lines = 0
             with open(dataset_path, "rb") as f:

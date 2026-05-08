@@ -721,6 +721,105 @@ def test_compose_layout_returns_none_for_malformed_specs() -> None:
     ) is None
 
 
+def test_compose_layout_trichotomy_distinguishes_failure_modes() -> None:
+    """Three distinct failure glyphs let a researcher tell why a cell
+    is empty:
+
+    - ``—``: result_id wasn't found (model hallucinated, or deleted).
+    - ``·``: term IS in this model's predictors but no estimate came
+      back. In OLS this almost always means perfect collinearity.
+    - ``n/a``: term isn't part of this model at all (different model
+      family, or the spec asked for a column some models don't have).
+
+    Pinning all three requires a payload that DOES carry
+    ``predictor_variables``; without that list we can't tell case 2
+    from case 3 and the renderer falls back to ``—`` (covered by
+    ``test_compose_layout_missing_term_id_renders_em_dash``).
+    """
+    # M1 declares x1 + x2 but only x1 has an estimate (x2 was perfect-
+    # collinearity-dropped). M2 declares x3 only.
+    payloads = {
+        "M1": {
+            "type": "linear_regression",
+            "coefficients": {"x1": 0.5},
+            "standard_errors": {"x1": 0.05},
+            "predictor_variables": ["x1", "x2"],
+        },
+        "M2": {
+            "type": "linear_regression",
+            "coefficients": {"x3": 0.7},
+            "standard_errors": {"x3": 0.06},
+            "predictor_variables": ["x3"],
+        },
+    }
+    spec = {
+        "columns": [
+            {"id": "x1", "label": "x1"},
+            {"id": "x2", "label": "x2"},
+            {"id": "x3", "label": "x3"},
+        ],
+        "groups": [{"label": None, "rows": [
+            {"result_id": "M1", "label": "row1"},
+            {"result_id": "M2", "label": "row2"},
+            {"result_id": "M_BOGUS", "label": "row3"},
+        ]}],
+    }
+    md = compose_layout(spec, payloads)
+    assert md is not None
+
+    def _cells(line_substr: str) -> list[str]:
+        line = next(ln for ln in md.splitlines() if line_substr in ln)
+        return [c.strip() for c in line.split("|") if c.strip()]
+
+    row1 = _cells("row1")
+    # x1 has data; x2 is declared but no estimate (collinear);
+    # x3 isn't in M1's model at all.
+    assert row1[1].startswith("0.5"), f"x1 cell should have data: {row1[1]!r}"
+    assert row1[2] == "·", f"x2 should be middle dot (collinear): {row1[2]!r}"
+    assert row1[3] == "n/a", f"x3 should be n/a (not in model): {row1[3]!r}"
+
+    row2 = _cells("row2")
+    assert row2[1] == "n/a", f"x1 not in M2's model: {row2[1]!r}"
+    assert row2[2] == "n/a", f"x2 not in M2's model: {row2[2]!r}"
+    assert row2[3].startswith("0.7"), f"x3 cell should have data: {row2[3]!r}"
+
+    row3 = _cells("row3")
+    # Hallucinated row: every cell is em-dash regardless of predictors.
+    for cell in row3[1:]:
+        assert cell == "—", f"hallucinated row leaked: {cell!r}"
+
+    # Legend should appear because at least one cell rendered as a
+    # failure glyph.
+    assert "Legend:" in md
+    assert "result not found" in md
+    assert "perfect" in md  # collinearity description
+    assert "not part of this model" in md
+
+
+def test_compose_layout_no_legend_when_all_cells_resolve() -> None:
+    """When every cell resolves to a data value, the legend is
+    suppressed — its only purpose is to disambiguate failure glyphs
+    that didn't appear here. Keeps clean composites uncluttered."""
+    payloads = {
+        "M1": {
+            "type": "linear_regression",
+            "coefficients": {"x": 0.5},
+            "standard_errors": {"x": 0.05},
+            "p_values": {"x": 0.001},
+            "predictor_variables": ["x"],
+        },
+    }
+    spec = {
+        "columns": [{"id": "x", "label": "x"}],
+        "groups": [{"label": None, "rows": [
+            {"result_id": "M1", "label": "row1"},
+        ]}],
+    }
+    md = compose_layout(spec, payloads)
+    assert md is not None
+    assert "Legend:" not in md
+
+
 def test_compose_results_tool_renders_from_store(tmp_path: Path) -> None:
     """End-to-end: insert two regressions in the session store, call
     the ``compose_results`` tool with a spec referencing them, assert
@@ -836,6 +935,204 @@ def test_compose_results_tool_flags_missing_ids(tmp_path: Path) -> None:
         # rows still render as placeholder cells, so a 2-row spec with
         # one bogus id should report 2, not 1.
         assert body["rows_rendered"] == 2
+    finally:
+        reset_store_for_tests()
+
+
+def test_compose_results_tool_cross_session_lookup(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A row that carries ``session_path`` looks up its ``result_id``
+    in THAT session's store rather than the current cwd's. Mirrors
+    ``expand_result(session_path=...)`` and the symmetry the reviewer
+    flagged. Gated by ``NORA_ALLOW_CROSS_SESSION_RECALL=1`` for
+    parity with the rest of the cross-session surface."""
+    # Two sessions, both under a fake SESSIONS_ROOT.
+    sessions_root = tmp_path / ".nora-sessions"
+    sessions_root.mkdir()
+    sess_a = sessions_root / "20260101T000000Z_aaa"
+    sess_a.mkdir()
+    sess_b = sessions_root / "20260101T000001Z_bbb"
+    sess_b.mkdir()
+    monkeypatch.setattr("nora.ui.SESSIONS_ROOT", sessions_root)
+    monkeypatch.setenv("NORA_ALLOW_CROSS_SESSION_RECALL", "1")
+
+    reset_store_for_tests()
+    try:
+        # Result IDs are auto-generated (M1, M2, …) per store, so
+        # both fresh stores would assign M1 to their first insert and
+        # collide. Insert a placeholder in B first so its real
+        # regression lands as M2, distinct from A's M1.
+        store_b = get_store(sess_b)
+        store_b.insert(
+            label="placeholder", analysis_type="linear_regression",
+            sanitized_payload={"type": "linear_regression", "n": 1},
+            language="R", script_code="", transformations=[],
+        )
+        m_b = store_b.insert(
+            label="B", analysis_type="linear_regression",
+            sanitized_payload={
+                "type": "linear_regression", "n": 75,
+                "coefficients": {"x": 0.7},
+                "standard_errors": {"x": 0.07},
+                "response_variable": "y", "predictor_variables": ["x"],
+            },
+            language="R", script_code="", transformations=[],
+        )
+        store_a = get_store(sess_a)
+        m_a = store_a.insert(
+            label="A", analysis_type="linear_regression",
+            sanitized_payload={
+                "type": "linear_regression", "n": 50,
+                "coefficients": {"x": 0.5},
+                "standard_errors": {"x": 0.05},
+                "response_variable": "y", "predictor_variables": ["x"],
+            },
+            language="R", script_code="", transformations=[],
+        )
+        assert m_a.id != m_b.id  # otherwise the collision-detection
+        # would obscure the real lookup behaviour we're testing here
+
+        with use_cwd(sess_b):
+            res = asyncio.run(HANDLERS["compose_results"]({
+                "spec": {
+                    "columns": [{"id": "x", "label": "x"}],
+                    "groups": [{"rows": [
+                        {"result_id": m_b.id, "label": "in B"},
+                        {
+                            "result_id": m_a.id,
+                            "session_path": str(sess_a),
+                            "label": "in A",
+                        },
+                    ]}],
+                },
+            }))
+        body = _mcp_text(res)
+        assert body["status"] == "ok", body
+        # Both rows should have data cells (neither is missing or
+        # denied).
+        assert "missing_result_ids" not in body
+        assert "denied_result_ids" not in body
+        md = body["markdown"]
+        # B's coefficient (0.7) and A's coefficient (0.5) both
+        # appeared, proving the cross-session lookup actually
+        # resolved against sess_a.
+        assert "0.7" in md
+        assert "0.5" in md
+    finally:
+        reset_store_for_tests()
+
+
+def test_compose_results_tool_flags_cross_session_rid_collision(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When two rows reference the same ``result_id`` in different
+    sessions, the layout's payload dict is keyed by rid alone — one
+    payload silently overwrites the other. The tool flags this in
+    ``rid_collisions_across_sessions`` so the model can rename one
+    of them and re-emit instead of trusting a confused render."""
+    sessions_root = tmp_path / ".nora-sessions"
+    sessions_root.mkdir()
+    sess_a = sessions_root / "20260101T000000Z_aaa"
+    sess_a.mkdir()
+    sess_b = sessions_root / "20260101T000001Z_bbb"
+    sess_b.mkdir()
+    monkeypatch.setattr("nora.ui.SESSIONS_ROOT", sessions_root)
+    monkeypatch.setenv("NORA_ALLOW_CROSS_SESSION_RECALL", "1")
+
+    reset_store_for_tests()
+    try:
+        # Both stores assign M1 to their first insert; the rid
+        # collides on purpose.
+        m_a = get_store(sess_a).insert(
+            label="A", analysis_type="linear_regression",
+            sanitized_payload={
+                "type": "linear_regression", "n": 50,
+                "coefficients": {"x": 0.5},
+                "standard_errors": {"x": 0.05},
+                "response_variable": "y", "predictor_variables": ["x"],
+            },
+            language="R", script_code="", transformations=[],
+        )
+        m_b = get_store(sess_b).insert(
+            label="B", analysis_type="linear_regression",
+            sanitized_payload={
+                "type": "linear_regression", "n": 75,
+                "coefficients": {"x": 0.7},
+                "standard_errors": {"x": 0.07},
+                "response_variable": "y", "predictor_variables": ["x"],
+            },
+            language="R", script_code="", transformations=[],
+        )
+        assert m_a.id == m_b.id  # the collision case under test
+
+        with use_cwd(sess_b):
+            res = asyncio.run(HANDLERS["compose_results"]({
+                "spec": {
+                    "columns": [{"id": "x", "label": "x"}],
+                    "groups": [{"rows": [
+                        {"result_id": m_b.id, "label": "in B"},
+                        {
+                            "result_id": m_a.id,
+                            "session_path": str(sess_a),
+                            "label": "in A",
+                        },
+                    ]}],
+                },
+            }))
+        body = _mcp_text(res)
+        assert body["status"] == "ok"
+        assert m_a.id in body["rid_collisions_across_sessions"]
+        assert "distinct" in body["hint"] or "split" in body["hint"]
+    finally:
+        reset_store_for_tests()
+
+
+def test_compose_results_tool_denies_cross_session_when_gate_off(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Without the env gate, a row with ``session_path`` is rejected:
+    the row renders as missing (em-dash), and ``denied_result_ids``
+    flags it."""
+    sessions_root = tmp_path / ".nora-sessions"
+    sessions_root.mkdir()
+    sess_a = sessions_root / "20260101T000000Z_aaa"
+    sess_a.mkdir()
+    sess_b = sessions_root / "20260101T000001Z_bbb"
+    sess_b.mkdir()
+    monkeypatch.setattr("nora.ui.SESSIONS_ROOT", sessions_root)
+    monkeypatch.delenv("NORA_ALLOW_CROSS_SESSION_RECALL", raising=False)
+
+    reset_store_for_tests()
+    try:
+        store_a = get_store(sess_a)
+        m_a = store_a.insert(
+            label="A", analysis_type="linear_regression",
+            sanitized_payload={
+                "type": "linear_regression", "n": 50,
+                "coefficients": {"x": 0.5},
+                "standard_errors": {"x": 0.05},
+                "response_variable": "y", "predictor_variables": ["x"],
+            },
+            language="R", script_code="", transformations=[],
+        )
+        with use_cwd(sess_b):
+            res = asyncio.run(HANDLERS["compose_results"]({
+                "spec": {
+                    "columns": [{"id": "x", "label": "x"}],
+                    "groups": [{"rows": [
+                        {
+                            "result_id": m_a.id,
+                            "session_path": str(sess_a),
+                            "label": "in A",
+                        },
+                    ]}],
+                },
+            }))
+        body = _mcp_text(res)
+        assert body["status"] == "ok"
+        assert m_a.id in body.get("denied_result_ids", [])
+        assert "NORA_ALLOW_CROSS_SESSION_RECALL" in body.get("hint", "")
     finally:
         reset_store_for_tests()
 

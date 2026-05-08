@@ -529,17 +529,14 @@ class AnthropicSession:
                 # and which interpretation the 1M model uses.
                 if os.environ.get("NORA_DEBUG_USAGE") == "1":
                     import sys as _sys
+                    from nora.provider.usage_log import append_usage_line
                     line = (
                         f"[nora.usage] round usage={dict(usage)} "
                         f"computed prompt_total={prompt_total} "
                         f"(inp={inp}, cr={cr}, cc={cc}, out={outp})"
                     )
                     print(line, file=_sys.stderr, flush=True)
-                    try:
-                        with (self.cwd / ".nora-usage.log").open("a") as _f:
-                            _f.write(line + "\n")
-                    except Exception:  # noqa: BLE001 — diagnostic must never crash a turn
-                        pass
+                    append_usage_line(self.cwd, line)
                 last_input = inp
                 last_output = outp
                 last_cache_read = cr

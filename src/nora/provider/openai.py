@@ -130,18 +130,31 @@ def _verify_lockdown(tools: list[dict[str, Any]]) -> None:
     """Last-line guard: raise if anything in ``tools`` is a built-in
     type or otherwise off-allowlist. This is checked on every
     request, not just at startup, because a tool list that round-trips
-    through serialisation could in principle pick up extra entries."""
+    through serialisation could in principle pick up extra entries.
+
+    The non-function check has to enumerate ``FORBIDDEN_BUILTIN_TYPES``
+    explicitly before falling through to the generic non-function
+    error: every entry in that frozenset is itself a non-function
+    type, so a single ``ttype != "function"`` branch would fire on
+    them too — but with a generic message that hides which
+    forbidden built-in was attempted. Test cases that pin the
+    "forbidden built-in {name}" message would never see it.
+    """
     expected_names = {s.name for s in build_tool_specs()}
     for t in tools:
         ttype = t.get("type")
+        # Forbidden built-ins first, so the error names the specific
+        # built-in (web_search / code_interpreter / mcp / ...) rather
+        # than the generic "non-function entry" message that would
+        # otherwise cover the same input.
+        if ttype in FORBIDDEN_BUILTIN_TYPES:
+            raise RuntimeError(
+                f"Nora lockdown violation: forbidden built-in {ttype!r}"
+            )
         if ttype != "function":
             raise RuntimeError(
                 f"Nora lockdown violation: tools list contains "
                 f"non-function entry of type {ttype!r}"
-            )
-        if ttype in FORBIDDEN_BUILTIN_TYPES:
-            raise RuntimeError(
-                f"Nora lockdown violation: forbidden built-in {ttype!r}"
             )
         if t.get("name") not in expected_names:
             raise RuntimeError(
@@ -307,7 +320,24 @@ class OpenAISession:
 
         # Bound the tool-loop iterations so a runaway model can't pin
         # the loop forever. 16 is generous — most analyses use 1–4.
-        MAX_TOOL_ROUNDS = 16
+        # Env-overridable via ``NORA_OPENAI_MAX_TOOL_ROUNDS`` for
+        # researchers running parameterised batches that legitimately
+        # need >16 rounds (e.g. 24 specs each requiring a
+        # submit_script + a few expand_result rounds + a
+        # compose_results). Bounded to [1, 64]: lower than 1 makes no
+        # sense, higher than 64 is past the point where the user
+        # would rather see "stop and ask for guidance" than continue
+        # autonomously. Invalid env values fall back to the default
+        # rather than failing the turn — a typo in the env var
+        # shouldn't block a researcher mid-analysis.
+        try:
+            MAX_TOOL_ROUNDS = int(
+                os.environ.get("NORA_OPENAI_MAX_TOOL_ROUNDS", "16")
+            )
+            if not 1 <= MAX_TOOL_ROUNDS <= 64:
+                MAX_TOOL_ROUNDS = 16
+        except (TypeError, ValueError):
+            MAX_TOOL_ROUNDS = 16
         # We capture the LAST round's prompt size (not a cross-round
         # sum) because the Responses API reports ``input_tokens`` for
         # the FULL prompt at each round — cached prefix from
@@ -364,6 +394,70 @@ class OpenAISession:
                     if "auth" in lower or "api key" in lower or "401" in lower:
                         yield AuthFailure(reason=f"OpenAI auth failure: {msg}")
                         return
+                    # Context-window overrun: with ``truncation="disabled"``
+                    # the API returns a 400 whose message names the
+                    # token cap. Translate that to actionable guidance
+                    # — the generic "OpenAI request failed: …" would
+                    # otherwise leave the researcher staring at an
+                    # opaque error for the most-actionable failure in
+                    # the system. Match on tokens semantics rather
+                    # than HTTP status so SDK changes that surface
+                    # the same cause through a different exception
+                    # type still translate.
+                    if (
+                        "context_length_exceeded" in lower
+                        or "maximum context length" in lower
+                        or ("input" in lower and "tokens" in lower
+                            and ("limit" in lower or "exceed" in lower))
+                    ):
+                        yield TurnError(message=(
+                            "Conversation hit the model's context "
+                            "window. To continue: start a new "
+                            "session, or reduce earlier turns from "
+                            "this session by summarizing them via "
+                            "``recall_conversation`` and starting "
+                            "fresh from the summary. Underlying "
+                            f"error: {msg}"
+                        ))
+                        return
+                    # Response-id chain broken: the server retention
+                    # window for ``previous_response_id`` has elapsed,
+                    # or the response was deleted. Without the
+                    # full-replay path that used to back this up,
+                    # every subsequent turn would error with the same
+                    # opaque message. Surface what the researcher can
+                    # actually do — a chain reset is the only
+                    # in-product recovery.
+                    if (
+                        turn_response_id is not None
+                        and (
+                            "previous_response_id" in lower
+                            or "response not found" in lower
+                            or ("response" in lower and "404" in lower)
+                            or ("response" in lower and "expired" in lower)
+                        )
+                    ):
+                        # Reset and let the next turn rebuild the
+                        # chain from a fresh root. Drop ``self.``
+                        # _last_response_id so the next .send()
+                        # starts without ``previous_response_id``;
+                        # the conversation history isn't lost
+                        # (it's in chat_history.jsonl), it just
+                        # won't be cached on the server side
+                        # anymore.
+                        self._last_response_id = None
+                        yield TurnError(message=(
+                            "OpenAI's server-side response chain has "
+                            "expired (the previous response is no "
+                            "longer retrievable). The session's chat "
+                            "history is preserved on disk; the next "
+                            "turn will start a new chain from a "
+                            "fresh root, and the model will see this "
+                            "session's prior turns through "
+                            "``recall_conversation`` as needed. "
+                            f"Underlying error: {msg}"
+                        ))
+                        return
                     yield TurnError(message=f"OpenAI request failed: {msg}")
                     return
 
@@ -393,6 +487,7 @@ class OpenAISession:
                 # by the researcher regardless of launch method —
                 # pywebview swallows stderr on a double-clicked app).
                 if os.environ.get("NORA_DEBUG_USAGE") == "1" and usage is not None:
+                    from nora.provider.usage_log import append_usage_line
                     cached = (
                         getattr(getattr(usage, "input_tokens_details", None),
                                 "cached_tokens", 0) or 0
@@ -405,11 +500,7 @@ class OpenAISession:
                         f"(cached is a SUBSET of input_tokens, not additive)"
                     )
                     print(line, file=sys.stderr, flush=True)
-                    try:
-                        with (self.cwd / ".nora-usage.log").open("a") as _f:
-                            _f.write(line + "\n")
-                    except Exception:  # noqa: BLE001 — diagnostic must never crash a turn
-                        pass
+                    append_usage_line(self.cwd, line)
 
                 output = list(getattr(resp, "output", []) or [])
                 # Translate items + decide whether to keep looping.
@@ -660,7 +751,21 @@ def _parse_tool_args(s: str) -> tuple[dict[str, Any] | None, str | None]:
         # multi-MB malformed blob doesn't blow up the error-message
         # context. ``json.JSONDecodeError`` carries position info
         # that helps the model self-correct on the retry.
-        snippet = s[:120] + ("…" if len(s) > 120 else "")
+        #
+        # Strip non-printables BEFORE the 120-char cap so the
+        # truncation cap actually bounds output size. ``repr()``
+        # on bidi overrides or control chars expands each
+        # character to ``\\u202e`` / ``\\x07`` (4–6 chars), so a
+        # raw 120-char snippet of pathological input can render as
+        # 700+ chars after ``!r`` — defeating the cap whose entire
+        # job is bounding error-message size. Replacing
+        # non-printables with ``?`` before the slice keeps the cap
+        # honest and still lets the model see the rough shape of
+        # the JSON it tried to send.
+        cleaned = "".join(
+            c if (c.isprintable() or c in "\t ") else "?" for c in s
+        )
+        snippet = cleaned[:120] + ("…" if len(cleaned) > 120 else "")
         return None, (
             f"tool arguments were not valid JSON: {e}; received "
             f"{snippet!r}"
