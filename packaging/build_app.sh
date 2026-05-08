@@ -2,11 +2,9 @@
 #
 # Build Nora.app from the PyInstaller output.
 #
-# The bundled binary is the WEB UI (entry point:
-# src/nora/__main_ui__.py) — the pywebview shell. The terminal CLI
-# is intentionally NOT bundled in the .app; double-click should give
-# the chat window, not Terminal. The CLI stays available from source
-# via ``uv run nora``.
+# The bundled binary is the pywebview UI shell (entry point:
+# src/nora/__main__.py, which calls nora.ui:main). Double-click
+# opens the chat window directly with no Terminal popup.
 #
 # Pipeline:
 #   1. `uv run pyinstaller packaging/nora.spec --clean --noconfirm`

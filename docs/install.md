@@ -21,14 +21,12 @@ Download the latest `Nora.dmg`, open it, and drag `Nora.app` to `/Applications`.
 git clone https://github.com/junishka/builder.git nora
 cd nora
 uv sync --group dev
-uv run pytest                       # expect 758 passed, 17 skipped
-uv run nora-ui                   # web UI — landing screen for files / folder
-uv run nora-ui /path/to/data     # web UI — open straight into chat
+uv run pytest
+uv run nora                   # landing screen for files / folder
+uv run nora /path/to/data     # open straight into chat
 ```
 
-The web UI opens a native window with a drop zone for `.csv` / `.dta` / `.rds` files. Dropped files land in `~/.nora-sessions/<timestamp>_<id>/` — a per-session scratch dir that becomes the sandbox root. Cleanest way to share exactly the files you want to analyze without exposing a whole project folder.
-
-There's also a terminal frontend — `uv run nora` — for power users who'd rather stay in the shell. Same backend, same privacy guarantees, same data; just no drag-drop and no fancy result panels.
+`nora` opens a native window with a drop zone for `.csv` / `.dta` / `.rds` files. Dropped files land in `~/.nora-sessions/<timestamp>_<id>/` — a per-session scratch dir that becomes the sandbox root. Cleanest way to share exactly the files you want to analyze without exposing a whole project folder.
 
 ## Building the `.dmg` yourself
 
@@ -63,7 +61,7 @@ Once you're in the chat, you talk. Claude proposes; you steer. Scripts that Clau
 
 Claude sees only structural metadata about each dataset, never the rows. The default ceiling is **`names_types_labels_summary`** — variable names, types, value labels, and per-variable NA / distinct-value counts. That's the most informative tier that doesn't leak per-observation data.
 
-You change this via the **Permission chip** in the web UI's composer row (a dropdown per dataset), or `/policy` in the terminal UI. Both edit `<your-data-dir>/.nora/policy.json`, which you can also hand-edit:
+You change this via the **Permission chip** in the composer row (a dropdown per dataset). It edits `<your-data-dir>/.nora/policy.json`, which you can also hand-edit:
 
 ```json
 {
@@ -120,4 +118,4 @@ Most common cause: an import error in the bundled binary. The traceback in the l
 
 **No R or Stata installed warning.** Install R (or Stata) and relaunch. Schema and bounded data queries still work without them, but `submit_script` — the analysis path — won't.
 
-**Claude asks to see variable labels and gets denied.** That's the schema policy working as intended. If the labels aren't sensitive for this dataset, raise the ceiling via the Permission chip (web UI) or `/policy` (terminal UI).
+**Claude asks to see variable labels and gets denied.** That's the schema policy working as intended. If the labels aren't sensitive for this dataset, raise the ceiling via the Permission chip in the composer row.

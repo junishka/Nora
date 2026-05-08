@@ -15,14 +15,14 @@ The active cwd is sourced in two layers:
    simultaneously executing turns. ContextVar binding is asyncio-task
    local — sister tasks see their own bindings.
 2. **Process default** (``_cwd_default``) — the fallback used when no
-   per-task override is in scope. Set by :func:`set_cwd` from terminal
-   startup (``app.py``) and from tests. Web UI runners DO NOT update
-   this; they bind via ``use_cwd`` only, so a focus switch in the UI
-   doesn't trample tool execution in another session.
+   per-task override is in scope. Set by :func:`set_cwd` at startup
+   and from tests. Web UI runners DO NOT update this; they bind via
+   ``use_cwd`` only, so a focus switch in the UI doesn't trample tool
+   execution in another session.
 
 Anything that reads ``get_cwd()`` outside of a runner-bound context
-(e.g., terminal CLI, startup scripts, test fixtures) gets the default.
-Anything inside a runner-bound context gets the override.
+(e.g., startup, test fixtures) gets the default. Anything inside a
+runner-bound context gets the override.
 """
 
 from __future__ import annotations
@@ -37,10 +37,10 @@ class PathEscapeError(ValueError):
     """Raised when a tool input resolves to a path outside the working directory."""
 
 
-# Process-wide default. Used when no per-task ``use_cwd`` is in effect
-# (terminal UI, startup, tests). Web UI runners override this via the
-# ContextVar below; they do NOT mutate it, so concurrent runners don't
-# trample each other.
+# Process-wide default. Used when no per-task ``use_cwd`` is in
+# effect (startup, tests). Web UI runners override this via the
+# ContextVar below; they do NOT mutate it, so concurrent runners
+# don't trample each other.
 _cwd_default: Path = Path.cwd().resolve()
 
 # Per-asyncio-task override. ``ContextVar.set`` returns a Token that

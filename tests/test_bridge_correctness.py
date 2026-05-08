@@ -40,7 +40,7 @@ from nora.ui import NoraBridge
 # ---------------------------------------------------------------------------
 
 def test_ui_ready_with_cwd_returns_state_ready(tmp_path: Path) -> None:
-    """``nora-ui /path/to/session`` constructs the bridge with a cwd
+    """``nora /path/to/session`` constructs the bridge with a cwd
     set. The first ``ui_ready`` call must return ``state ==
     'ready'`` so the JS startup branch routes to chat instead of
     falling through to ``showLanding``."""

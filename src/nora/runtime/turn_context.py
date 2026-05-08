@@ -58,8 +58,7 @@ _runner_var: ContextVar[_TurnRegistry | None] = ContextVar(
 
 def current_turn_id() -> str | None:
     """Return the turn id bound to the current asyncio task, or
-    ``None`` outside a runner-managed turn (terminal UI, startup,
-    tests).
+    ``None`` outside a runner-managed turn (startup, tests).
     """
     return _turn_id_var.get()
 

@@ -85,8 +85,7 @@ keep streaming.
 | **delete_session_file** — Files-panel `×` deletes any file inside the session cwd, removes its PDF→PNG sidecar, drops matching pending-attachment chips | ✅ done |
 | **Image attachments** — saved to cwd, staged for vision, rendered above the user bubble, clickable lightbox; persistent chip under the user bubble matches accent styling so a script attachment reads as obviously as an image thumbnail | ✅ done |
 | **Cache-busted JS/CSS** — `_materialize_cache_busted_index` writes a per-launch `index.bust-<hash>.html` so WKWebView reloads frontend assets instead of serving stale cached versions on Python restart | ✅ done |
-| **Terminal UI** (`nora`) — Rich-based chat, `/policy` wizard | ✅ done |
-| **Web UI** (`nora-ui`) — pywebview shell, sessions sidebar, theme toggle, model picker grouped by provider with $ pricing links, drag-drop file/image upload, typewriter, Lottie cat loader, status line, per-message attachment chips, topbar visually integrated with chat surface | ✅ done |
+| **Frontend** (`nora`) — pywebview shell, sessions sidebar, theme toggle, model picker grouped by provider with $ pricing links, drag-drop file/image upload, typewriter, Lottie cat loader, status line, per-message attachment chips, topbar visually integrated with chat surface | ✅ done |
 | **Packaging** (`.app` + `.dmg`) — bundles the web UI; .app launches pywebview with no Terminal popup; launcher logging now resilient to unwritable log dirs | ✅ done & smoke-tested locally (unsigned) |
 | **Product-identity prompt rule** — model introduces itself as Nora, uses first person ("I noticed…" not "Nora flagged…") | ✅ done |
 | **Token-budget pass** — Anthropic 1h prompt-cache TTL via `ENABLE_PROMPT_CACHING_1H`; OpenAI uses `previous_response_id` so per-turn input is just the new content; tool-result JSON minified (~25-35% off every payload); warm-start prefix tightened (5k → 2.7k tokens on resume); `turn_done` events now persisted for cache-rate diagnostics; system-prompt content trim + STAGE NOTE deletion + em-dash dedupes | ✅ done |
@@ -179,16 +178,12 @@ rewrite, refusal on a non-existent cwd).
 ## Running it
 
 ```bash
-# Web UI — native WKWebView window. The recommended frontend.
-uv run nora-ui                           # landing: drop files or pick folder
-uv run nora-ui /path/to/data             # opens straight into chat
-
-# Terminal UI — same-shell chat. Power-user / shell-only path.
-uv run nora                              # opens landing prompt
-uv run nora /path/to/data                # opens straight into chat
+# Frontend — native WKWebView window via pywebview.
+uv run nora                           # landing: drop files or pick folder
+uv run nora /path/to/data             # opens straight into chat
 
 # Tests
-uv run pytest -q                         # expect 758 passing, 17 skipped
+uv run pytest -q
 
 # Build the .app + .dmg locally. Bundles the web UI.
 # A bare local build is unsigned (fine for same-machine testing).
@@ -278,9 +273,7 @@ keyed by cwd) — each runner owns its own ProviderSession plus
 its own asyncio lock and turn task, so two researchers' worth
 of in-flight chats can run concurrently without trampling each
 other. Switching provider for a given runner closes and reopens
-that runner's session; OTHER runners are untouched. The terminal
-UI is Anthropic-only for now (the multi-provider auth screen is
-web-specific).
+that runner's session; OTHER runners are untouched.
 
 - `provider/base.py` — `ProviderSession` Protocol + Event types
   (canonical home; `chat_service.py` re-exports for back-compat).
@@ -367,7 +360,7 @@ and can react instead of guessing "thumbnail should be visible".
 
 ### Session model
 
-`nora-ui` without an argv opens a landing screen; dropped /
+`nora` without an argv opens a landing screen; dropped /
 picked files land in `~/.nora-sessions/<ts>_<id>/` which becomes
 the cwd. That dir is spaces-free (Stata-safe), outside cloud-sync
 roots, persistent across restarts. Reopening a session restores
@@ -463,12 +456,11 @@ them by surprise.
 | `src/nora/runtime/nora.R` + `nora.py` + `nora_result_*.ado` + `nora_plot_*.ado` + `_nora_export_plot.ado` + `nora_safe_export.ado` | Runtime emitters: result helpers (`from_lm`, `from_t_test`, …) and plot helpers (`plot_residuals`, `plot_interaction`, `plot_coefficients`, `plot_estimate_comparison`). Stata fallback chain in `_nora_export_plot`; Stata ad-hoc safe wrapper in `nora_safe_export` |
 | `src/nora/schema.py` | Schema extractors for all six supported file formats |
 | `src/nora/ui.py` | Web UI bridge: runners dict, focus-only `switch_session`, plot collection + diagnostic, Files panel endpoints, cache-busted index.html, `delete_session_file` |
-| `src/nora/app.py` | Terminal entry point, chat loop, rendering |
 | `src/nora/chat_service.py` | Back-compat re-export shim for the Event types |
 | `src/nora/chat_history.py` | Turn-grouped reader; warm-start prefix renderer |
 | `src/nora/session_state.py` | Atomic writer / reader for `.nora/session_state.json` (carries `active_model` for per-session memory) |
 | `src/nora/web/{index.html,app.js,markdown.js,style.css}` | Web frontend; `app.js` holds the per-session focus state + Files-panel rendering |
-| `src/nora/__main_ui__.py` | Bundle entry — calls `nora.ui:main`. The .app launches this, NOT the terminal CLI |
+| `src/nora/__main__.py` | Package entry — calls `nora.ui:main`. The .app and `python -m nora` both end up here |
 | `docs/direction.md` | Long-form architectural doc; open questions |
 | `docs/overview.md` | Plain-language description for researchers |
 | `docs/install.md` | Researcher-facing install flow |
@@ -501,7 +493,7 @@ them by surprise.
   would need `bubblewrap`/`nsjail`, Windows is on nobody's path.
 - **Schema policy is a ceiling, not a fixed value.** The model
   can request any depth ≤ ceiling. Researchers edit via the
-  Permission chip (web) or `/policy` slash-command (terminal).
+  Permission chip in the composer row.
 - **Data files in `Permission`, scripts/graphs/logs in `Files`.**
   Two surfaces, no duplication: data files have schema-depth
   policy attached, scripts/graphs/logs don't. Listing data in
@@ -540,9 +532,9 @@ them by surprise.
 - **Per-task cwd via ContextVar, not process-global.** Tool
   handlers MUST resolve cwd through `nora.config.get_cwd()`,
   which reads the per-task ContextVar. The process-global default
-  exists only for the terminal CLI / startup. Any new code that
-  reaches around the ContextVar (e.g., reads a stashed cwd
-  from somewhere else) breaks concurrent-runner isolation.
+  exists only for startup before any session is active. Any new
+  code that reaches around the ContextVar (e.g., reads a stashed
+  cwd from somewhere else) breaks concurrent-runner isolation.
 - **Don't carry forward script attachments on cancel/error.** An
   earlier version restored `pending_script_attachments` on the
   bridge after a failed turn, but the JS chip cleared at send

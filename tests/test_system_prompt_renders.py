@@ -347,9 +347,10 @@ def test_openai_prompt_drops_mcp_prefix_intro(tmp_path: Path) -> None:
 
 
 def test_provider_default_is_anthropic_for_back_compat(tmp_path: Path) -> None:
-    """Older call sites (and the terminal CLI which is Anthropic-only)
-    omit the ``provider=`` arg. Default behavior must match the
-    pre-split rendering so nothing silently regresses."""
+    """Older call sites that omit the ``provider=`` arg should still
+    render the Anthropic prompt, since that's the historical default.
+    Default behavior must match the pre-split rendering so nothing
+    silently regresses."""
     default = build_system_prompt(tmp_path, "nora")
     explicit = build_system_prompt(tmp_path, "nora", provider="anthropic")
     assert default == explicit

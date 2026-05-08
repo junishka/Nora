@@ -1,18 +1,15 @@
-"""Nora — web UI entry point.
+"""Nora — UI entry point.
 
 Opens a native WKWebView window (via pywebview) hosting a local HTML
-chat interface, and bridges it to the same backend plumbing the
-terminal UI uses: a ``ProviderSession`` (Anthropic today, OpenAI also
-supported) + the 6 MCP tools + sanitizer + policy + sandboxed
-executor.
+chat interface, and bridges it to the rest of the stack: a
+``ProviderSession`` (Anthropic or OpenAI) + the MCP tool surface +
+sanitizer + policy + sandboxed executor.
 
 Launched via:
 
-    uv run python -m nora.ui [cwd]
+    uv run python -m nora [cwd]
 
-or the ``nora-ui`` console script. Terminal UI (``nora``) is
-unchanged and still works. The two share everything except
-rendering.
+or the ``nora`` console script.
 
 Session model (new in this commit):
 
@@ -191,7 +188,7 @@ class NoraBridge:
             self._loop.run_forever()
 
         self._loop_thread = threading.Thread(
-            target=_run, name="nora-ui-loop", daemon=True
+            target=_run, name="nora-event-loop", daemon=True
         )
         self._loop_thread.start()
 
@@ -251,7 +248,7 @@ class NoraBridge:
         # decide whether to land on chat or the file picker. The
         # ready_payload carries ``type: 'ready'`` (an event-shape
         # holdover) but not ``state`` — without this explicit add,
-        # ``nora-ui <cwd>`` and the auth-Continue path both fall
+        # ``nora <cwd>`` and the auth-Continue path both fall
         # through to ``showLanding`` even though the bridge knows
         # the session is ready to chat.
         return {"state": "ready", **self._ready_payload(), "auth": status}
@@ -2083,7 +2080,7 @@ class NoraBridge:
     ) -> None:
         """Emit a one-line diagnostic to stderr for every tool_result
         dispatch that included plot collection. Visible in the
-        terminal where the researcher ran ``uv run nora-ui`` so we
+        terminal where the researcher ran ``uv run nora`` so we
         can debug "I don't see thumbnails" claims without screen-
         sharing — the line tells us run_dir, session_cwd, and which
         plot files (if any) the collector found."""
@@ -2588,7 +2585,7 @@ class NoraBridge:
         if self.cwd is None:
             from nora.policy import DEFAULT_MAX_DEPTH
             return {"default_max_depth": DEFAULT_MAX_DEPTH, "datasets": []}
-        from nora.app import _scan_datasets
+        from nora.system_prompt import scan_datasets as _scan_datasets
         policy = load_policy(self.cwd)
         return {
             "default_max_depth": policy.default_max_depth,
@@ -3481,10 +3478,10 @@ def _resolve_cwd(raw: str | None) -> Path | None:
     try:
         path = path.resolve()
     except OSError as e:
-        print(f"nora-ui: {e}", file=sys.stderr)
+        print(f"nora: {e}", file=sys.stderr)
         sys.exit(2)
     if not path.is_dir():
-        msg = [f"nora-ui: not a directory: {path}"]
+        msg = [f"nora: not a directory: {path}"]
         if raw.startswith("~/Users/"):
             suggested = raw.replace("~/Users/", "/Users/", 1)
             msg.append(
@@ -3516,11 +3513,11 @@ def _resolve_cwd(raw: str | None) -> Path | None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        prog="nora-ui",
+        prog="nora",
         description=(
-            "Nora — web UI. Same backend as `nora` (terminal), "
-            "different frontend. Launch without a path to drop/choose "
-            "files from the UI."
+            "Nora — local research assistant. Launch without a path "
+            "to drop/choose files from the landing screen, or pass a "
+            "directory to open straight into chat."
         ),
     )
     parser.add_argument(
@@ -3542,19 +3539,20 @@ def main() -> None:
     env = detect_environment()
     if env.sandbox_exec is None:
         print(
-            "nora-ui: warning — sandbox-exec unavailable; "
+            "nora: warning — sandbox-exec unavailable; "
             "submit_script will refuse to run.",
             file=sys.stderr,
         )
 
-    import webview  # lazy import so `nora` (terminal) doesn't
-                    # require pywebview at import time
+    import webview  # lazy so module import doesn't pay pywebview's
+                    # startup cost when something else (e.g. a test)
+                    # imports nora.ui without launching the window.
 
     web_dir = Path(__file__).parent / "web"
     index_path = web_dir / "index.html"
     if not index_path.is_file():
         print(
-            f"nora-ui: missing web assets at {index_path}",
+            f"nora: missing web assets at {index_path}",
             file=sys.stderr,
         )
         sys.exit(2)
