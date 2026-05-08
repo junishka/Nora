@@ -5,8 +5,9 @@ model is allowed to reach the researcher's local machine. The canonical
 tool list lives in ``nora.provider.tool_schemas.TOOL_SPECS``; this module
 registers each spec with the Claude Agent SDK and supplies the handler
 bodies. The Claude Agent SDK's built-in tools (Bash, Read, Write, Edit,
-Glob, Grep, WebFetch, WebSearch, etc.) are disabled at the `app.py` layer
-via `disallowed_tools` + a `can_use_tool` catch-all.
+Glob, Grep, WebFetch, WebSearch, etc.) are disabled at the
+provider layer (``provider/anthropic.py``) via ``disallowed_tools``
++ a ``can_use_tool`` catch-all.
 
 All tools return structured payloads (JSON-encoded). Raw stdout never
 crosses the boundary; the executor + sanitizer pipeline reduces script
@@ -1328,6 +1329,14 @@ def _build_response_envelope(
         response["_inline_payload_omitted"] = True
     if inline_markdown_omitted:
         response["_inline_markdown_omitted"] = True
+    # Non-fatal advisories from the executor (currently: malformed
+    # JSONL lines that were skipped while other lines parsed cleanly).
+    # Surfacing these on a status="ok" response lets the model see "the
+    # run succeeded, but spec #5's helper emitted a bogus line" without
+    # demoting the whole run to execution_failed_partial.
+    exec_warnings = getattr(exec_result, "warnings", None) or []
+    if exec_warnings:
+        response["warnings"] = list(exec_warnings)
     return response
 
 
@@ -1953,7 +1962,13 @@ async def compose_results(args: dict[str, Any]) -> dict[str, Any]:
     response: dict[str, Any] = {
         "status": "ok",
         "markdown": markdown,
-        "rows_rendered": len(payloads_by_id),
+        # Count actual rendered data rows, not resolved-payload uniques:
+        # a missing result_id still produces a row in the layout (cells
+        # render as ``—``), and the same id appearing in two groups
+        # renders as two distinct rows. Tying the count to the layout
+        # the model will see keeps "rows_rendered" honest when callers
+        # reconcile their spec against the response.
+        "rows_rendered": len(referenced_ids),
         "result_ids_referenced": sorted(seen),
     }
     if missing:
@@ -2936,15 +2951,13 @@ def friendly_tool_names(prefixed: bool = True) -> tuple[str, ...]:
     """Return tool names for human-facing messages (denial hints, etc.).
 
     Derived from ``ALLOWED_TOOL_NAMES`` so any new tool added to the
-    registry shows up automatically in recovery hints. Prior versions
-    hardcoded a comma-separated list in two places (the catch-all
-    permission deny in ``provider/anthropic.py`` and the terminal
-    catch-all in ``app.py``). Both drifted — the Anthropic copy got
-    stuck at six names while the registry grew to thirteen, and the
-    terminal copy stalled at ten. Drift is bad here because the
-    denial message is exactly the recovery path the model needs to
-    discover new tools like ``list_session_files`` and
-    ``search_in_session_files``.
+    registry shows up automatically in recovery hints. Hard-coded
+    copies of this list previously drifted — the catch-all permission
+    deny in ``provider/anthropic.py`` got stuck at six names while
+    the registry grew to thirteen — and the denial message is exactly
+    the recovery path the model needs to discover new tools like
+    ``list_session_files`` and ``search_in_session_files``, so any
+    drift is user-visible.
 
     ``prefixed=True`` keeps the ``mcp__<server>__`` prefix that Claude
     actually sees in its tool list. ``prefixed=False`` strips it for

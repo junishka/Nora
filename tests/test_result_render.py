@@ -823,6 +823,10 @@ def test_compose_results_tool_flags_missing_ids(tmp_path: Path) -> None:
         md = body["markdown"]
         assert "made up" in md and "—" in md
         assert "0.5" in md
+        # rows_rendered counts data rows in the layout — missing-id
+        # rows still render as placeholder cells, so a 2-row spec with
+        # one bogus id should report 2, not 1.
+        assert body["rows_rendered"] == 2
     finally:
         reset_store_for_tests()
 
