@@ -122,15 +122,10 @@ keep streaming.
 | **Loading-label rotation expansion + sidebar shortcut guard** — added 18 data-themed gerunds (`crunching`, `wrangling`, `polishing`, …) and 3 noun-phrase jokes (`herding outliers`, `minding the gaps`, `reticulating splines`). Sidebar arrow/Backspace shortcut handler now bails out when focus is inside an `<input>` / `<textarea>` / `[contenteditable]` so typing in the rename input doesn't fire the row's delete confirm | ✅ done |
 | **Real-researcher pilot** | ⏳ self-pilot in progress |
 | **Cross-query composition / release ledger** | ⏭ named, future-deployment scope |
-| **Apple Developer Program signing + notarization for distributable .dmg** | ⏭ blocked on $99/yr cert |
+| **Apple Developer Program signing + notarization for distributable .dmg** | ✅ done — release `.dmg` is signed (Developer ID Application) and notarized; first-launch on a colleague's Mac doesn't trip Gatekeeper |
 | **Stata batch wrapper around `_cons` "omitted" edge case** | ⏭ named, low-priority |
 
-**696 tests passing** (two pre-existing failures unrelated to
-this branch in `test_system_prompt_renders.py`:
-`test_language_choice_guidance_pins_dta_to_stata` and
-`test_partial_failure_semantics_documented` — both expect string
-fragments that earlier prompt-tightening passes removed; confirmed
-pre-branch by stashing the working tree).
+**758 tests passing**, 17 skipped (sandbox-exec / pandas-dependent).
 Coverage spans SDK lockdown (Anthropic) +
 OpenAI lockdown, schema for all six file formats, executor SBPL
 profile, Python executor end-to-end, helper-through-sanitizer
@@ -193,12 +188,13 @@ uv run nora                              # opens landing prompt
 uv run nora /path/to/data                # opens straight into chat
 
 # Tests
-uv run pytest -q                         # expect 696 passing (2 pre-existing failures unrelated to this branch)
+uv run pytest -q                         # expect 758 passing, 17 skipped
 
 # Build the .app + .dmg locally. Bundles the web UI.
-# Distribution to other people is blocked on Apple Developer Program
-# signing — the unsigned .dmg trips Gatekeeper for anyone who
-# didn't build it themselves.
+# A bare local build is unsigned (fine for same-machine testing).
+# Set NORA_SIGN_IDENTITY before build_app.sh and NORA_NOTARIZE_PROFILE
+# before build_dmg.sh to produce a release-grade signed + notarized
+# .dmg; the scripts skip those steps when the env vars are unset.
 bash packaging/build_app.sh              # → dist/Nora.app (~70 MB)
 bash packaging/build_dmg.sh              # → dist/Nora.dmg (~35 MB)
 open dist/Nora.app                       # smoke test the build
