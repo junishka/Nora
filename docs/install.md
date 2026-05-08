@@ -22,11 +22,11 @@ git clone https://github.com/junishka/builder.git nora
 cd nora
 uv sync --group dev
 uv run pytest
-uv run nora-ui                   # landing screen for files / folder
-uv run nora-ui /path/to/data     # open straight into chat
+uv run nora                   # landing screen for files / folder
+uv run nora /path/to/data     # open straight into chat
 ```
 
-`nora-ui` opens a native window with a drop zone for `.csv` / `.dta` / `.rds` files. Dropped files land in `~/.nora-sessions/<timestamp>_<id>/` — a per-session scratch dir that becomes the sandbox root. Cleanest way to share exactly the files you want to analyze without exposing a whole project folder.
+`nora` opens a native window with a drop zone for `.csv` / `.dta` / `.rds` files. Dropped files land in `~/.nora-sessions/<timestamp>_<id>/` — a per-session scratch dir that becomes the sandbox root. Cleanest way to share exactly the files you want to analyze without exposing a whole project folder.
 
 ## Building the `.dmg` yourself
 

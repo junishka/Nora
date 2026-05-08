@@ -85,7 +85,7 @@ keep streaming.
 | **delete_session_file** — Files-panel `×` deletes any file inside the session cwd, removes its PDF→PNG sidecar, drops matching pending-attachment chips | ✅ done |
 | **Image attachments** — saved to cwd, staged for vision, rendered above the user bubble, clickable lightbox; persistent chip under the user bubble matches accent styling so a script attachment reads as obviously as an image thumbnail | ✅ done |
 | **Cache-busted JS/CSS** — `_materialize_cache_busted_index` writes a per-launch `index.bust-<hash>.html` so WKWebView reloads frontend assets instead of serving stale cached versions on Python restart | ✅ done |
-| **Frontend** (`nora-ui`) — pywebview shell, sessions sidebar, theme toggle, model picker grouped by provider with $ pricing links, drag-drop file/image upload, typewriter, Lottie cat loader, status line, per-message attachment chips, topbar visually integrated with chat surface | ✅ done |
+| **Frontend** (`nora`) — pywebview shell, sessions sidebar, theme toggle, model picker grouped by provider with $ pricing links, drag-drop file/image upload, typewriter, Lottie cat loader, status line, per-message attachment chips, topbar visually integrated with chat surface | ✅ done |
 | **Packaging** (`.app` + `.dmg`) — bundles the web UI; .app launches pywebview with no Terminal popup; launcher logging now resilient to unwritable log dirs | ✅ done & smoke-tested locally (unsigned) |
 | **Product-identity prompt rule** — model introduces itself as Nora, uses first person ("I noticed…" not "Nora flagged…") | ✅ done |
 | **Token-budget pass** — Anthropic 1h prompt-cache TTL via `ENABLE_PROMPT_CACHING_1H`; OpenAI uses `previous_response_id` so per-turn input is just the new content; tool-result JSON minified (~25-35% off every payload); warm-start prefix tightened (5k → 2.7k tokens on resume); `turn_done` events now persisted for cache-rate diagnostics; system-prompt content trim + STAGE NOTE deletion + em-dash dedupes | ✅ done |
@@ -179,8 +179,8 @@ rewrite, refusal on a non-existent cwd).
 
 ```bash
 # Frontend — native WKWebView window via pywebview.
-uv run nora-ui                           # landing: drop files or pick folder
-uv run nora-ui /path/to/data             # opens straight into chat
+uv run nora                           # landing: drop files or pick folder
+uv run nora /path/to/data             # opens straight into chat
 
 # Tests
 uv run pytest -q
@@ -360,7 +360,7 @@ and can react instead of guessing "thumbnail should be visible".
 
 ### Session model
 
-`nora-ui` without an argv opens a landing screen; dropped /
+`nora` without an argv opens a landing screen; dropped /
 picked files land in `~/.nora-sessions/<ts>_<id>/` which becomes
 the cwd. That dir is spaces-free (Stata-safe), outside cloud-sync
 roots, persistent across restarts. Reopening a session restores

@@ -42,11 +42,10 @@ from PyInstaller.utils.hooks import collect_submodules
 # so we resolve relative to the spec's directory.
 REPO_ROOT = Path(SPECPATH).parent  # type: ignore[name-defined]  # SPECPATH from PyInstaller
 
-# Web UI entry. The shim re-exports ``nora.ui.main`` so
-# ``uv run nora-ui`` (console-script) and ``python -m nora`` (package
-# entry) both end up at the same place; PyInstaller targets the file
-# rather than a console-script so it doesn't need entry-point metadata
-# at build time.
+# UI entry. The shim re-exports ``nora.ui.main`` so ``uv run nora``
+# (console-script) and ``python -m nora`` (package entry) both end up
+# at the same place; PyInstaller targets the file rather than a
+# console-script so it doesn't need entry-point metadata at build time.
 ENTRY = str(REPO_ROOT / "src" / "nora" / "__main__.py")
 
 # Runtime libraries (R + Stata) are loaded via `importlib.resources`
@@ -66,11 +65,11 @@ RUNTIME_DATAS = [
 ]
 
 # Web UI assets (HTML + JS + CSS + the bundled Lottie player + the
-# cat-loading animation JSON). The web shell (`nora-ui`) loads
-# these from ``Path(__file__).parent / "web"`` at runtime — see
-# ui.py near `webview.create_window`. PyInstaller's static import
-# scan can't see static asset files; without an explicit datas
-# entry the bundle ships without the UI.
+# cat-loading animation JSON). The UI shell loads these from
+# ``Path(__file__).parent / "web"`` at runtime — see ui.py near
+# `webview.create_window`. PyInstaller's static import scan can't see
+# static asset files; without an explicit datas entry the bundle
+# ships without the UI.
 #
 # Globbed dynamically so anything dropped into web/ (a future asset,
 # a different Lottie animation, etc.) gets bundled without spec

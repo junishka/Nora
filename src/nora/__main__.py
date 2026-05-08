@@ -1,6 +1,6 @@
 """Package entry point: ``python -m nora`` brings up the pywebview window.
 
-The .app launcher and the ``nora-ui`` console-script (declared in
+The .app launcher and the ``nora`` console-script (declared in
 pyproject.toml) both ultimately call ``nora.ui.main``; this module
 exists so ``python -m nora`` from a source checkout takes the same
 path without going through the script shim.

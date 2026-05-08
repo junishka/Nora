@@ -20,7 +20,7 @@ the long-form direction and open-question log,
 ## Status
 
 Beta. Privacy invariants are implemented and tested. The frontend is
-the pywebview-based `nora-ui`, which is also what the `.app`
+the pywebview-based `nora`, which is also what the `.app`
 launches. The released `.dmg` is signed with a Developer ID
 Application certificate and notarized by Apple, so a colleague
 double-clicking the bundle on their own Mac doesn't trip Gatekeeper.
@@ -60,11 +60,11 @@ cd nora
 uv sync --group dev
 uv run pytest
 
-uv run nora-ui                      # landing: drop files or pick folder
-uv run nora-ui /path/to/data        # straight into chat
+uv run nora                      # landing: drop files or pick folder
+uv run nora /path/to/data        # straight into chat
 ```
 
-With no path, `nora-ui` opens a landing screen. Drop `.csv`, `.tsv`,
+With no path, `nora` opens a landing screen. Drop `.csv`, `.tsv`,
 `.dta`, `.rds`, `.parquet`, `.jsonl`, or `.ndjson` files onto the
 drop zone. Or click **Choose files…** or **Choose folder…**. Dropped
 files land in `~/.nora-sessions/<timestamp>_<id>/`. That directory

@@ -35,9 +35,9 @@ dependencies = [
     # researchers would otherwise get the first time they upload a
     # ``.parquet`` file. Also enables ``.feather`` if we add it later.
     "pyarrow>=15",
-    # Web UI shell (`nora-ui` entry point). pywebview wraps a native
-    # WKWebView window on macOS — no Chromium bundled, ~25 MB added to
-    # the .app rather than ~120 MB for Electron.
+    # UI shell (`nora` entry point). pywebview wraps a native WKWebView
+    # window on macOS — no Chromium bundled, ~25 MB added to the .app
+    # rather than ~120 MB for Electron.
     "pywebview>=5.0",
     # Multi-provider auth: ``keyring`` brokers credentials through the
     # OS-native secret store (macOS Keychain). API keys never touch
@@ -53,7 +53,7 @@ dependencies = [
 ]
 
 [project.scripts]
-nora-ui = "nora.ui:main"
+nora = "nora.ui:main"
 
 [dependency-groups]
 dev = [
