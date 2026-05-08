@@ -374,18 +374,24 @@ class NoraBridge:
         into a fresh session dir. Multiple files are supported —
         they all land in the same session.
 
-        Size capped per-file at 2 GB. The real constraint is peak
-        memory while transferring through the bridge: a file of N
-        bytes needs roughly 3N during upload (JS ArrayBuffer + JS
-        base64 string + Python-side decode), so 2 GB is already
-        ~6 GB of peak heap. Larger datasets should use the file
-        picker (`choose_files`) which copies directly from disk
-        with no memory overhead.
+        Size capped per-file at ``_DRAG_DROP_MAX_BYTES`` (512 MB).
+        The constraint is peak memory while transferring through
+        the bridge: a file of N bytes needs roughly 3–4N during
+        upload (JS ArrayBuffer + JS base64 string + Python-side
+        decode), so 512 MB peaks around 2 GB — comfortable on any
+        modern Mac. Larger datasets should use the file picker
+        (:meth:`choose_files`), which copies directly from disk
+        with no memory overhead and no size limit.
+
+        The cap is enforced on the base64 string length BEFORE
+        ``b64decode`` runs so a forged or malicious oversize blob
+        doesn't allocate multiple GB of decoded bytes just to be
+        rejected. The JS side gates on ``file.size`` first; this is
+        defense-in-depth for clients that bypass the JS check.
         """
         if not files:
             return {"ok": False, "reason": "no files"}
         import base64
-        max_bytes = 2 * 1024 * 1024 * 1024
         decoded: list[tuple[str, bytes]] = []
         for item in files:
             name = item.get("name", "")
@@ -395,19 +401,27 @@ class NoraBridge:
             # Strip any data URL prefix JS may have added.
             if "," in content_b64:
                 content_b64 = content_b64.split(",", 1)[1]
+            # Pre-decode size gate. base64 expands 4:3, so a 512 MB
+            # binary file is ~683 MB encoded; ``_b64_oversize`` does
+            # the comparison without materializing the decoded blob.
+            if _b64_oversize(content_b64, _DRAG_DROP_MAX_BYTES):
+                approx_mb = (len(content_b64) * 3 // 4) // (1024 * 1024)
+                return {
+                    "ok": False,
+                    "reason": _drag_drop_oversize_message(
+                        name, approx_mb, "Choose Files…",
+                    ),
+                }
             try:
                 blob = base64.b64decode(content_b64, validate=False)
             except Exception:  # noqa: BLE001
                 return {"ok": False, "reason": f"could not decode {name!r}"}
-            if len(blob) > max_bytes:
+            if len(blob) > _DRAG_DROP_MAX_BYTES:
                 mb = len(blob) // (1024 * 1024)
                 return {
                     "ok": False,
-                    "reason": (
-                        f"{name!r} is {mb} MB — above the 2 GB "
-                        f"drag-drop cap. Use Choose Files… instead; "
-                        f"it copies straight from disk with no "
-                        f"memory overhead, so there's no size limit."
+                    "reason": _drag_drop_oversize_message(
+                        name, mb, "Choose Files…",
                     ),
                 }
             decoded.append((Path(name).name, blob))
@@ -920,12 +934,31 @@ class NoraBridge:
                 continue
             if "," in content_b64:
                 content_b64 = content_b64.split(",", 1)[1]
+            safe_name = Path(name).name
+            ext = Path(safe_name).suffix.lower()
+            # Data / script size gate. Images get their own 5 MB
+            # cap below — they're checked AFTER decode because the
+            # 5 MB threshold is small enough that pre-decode arithmetic
+            # adds no real saving. Data and script files are checked
+            # PRE-decode to avoid materializing multi-GB blobs that
+            # we'd reject anyway. The "+" button next to the composer
+            # uses the native picker and has no size limit.
+            if (
+                ext in _COPY_EXTS
+                and _b64_oversize(content_b64, _DRAG_DROP_MAX_BYTES)
+            ):
+                approx_mb = (len(content_b64) * 3 // 4) // (1024 * 1024)
+                return {
+                    "ok": False,
+                    "reason": _drag_drop_oversize_message(
+                        safe_name, approx_mb,
+                        "the + button next to the composer",
+                    ),
+                }
             try:
                 blob = base64.b64decode(content_b64, validate=False)
             except Exception:  # noqa: BLE001
                 return {"ok": False, "reason": f"could not decode {name!r}"}
-            safe_name = Path(name).name
-            ext = Path(safe_name).suffix.lower()
             if ext in _COPY_EXTS:
                 dst = self.cwd / safe_name
                 if dst.exists():
@@ -2908,6 +2941,61 @@ _MENTION_VISION_EXTS: frozenset[str] = frozenset(_MENTION_VISION_MIMES)
 # researcher's intent ("look at this plot") is better served by
 # pointing them at a smaller export.
 _MENTION_VISION_MAX_BYTES = 5 * 1024 * 1024
+
+
+# Per-file cap on JS drag-drop / paste uploads (data and script files,
+# not images — those have their own 5 MB cap upstream). The chain is
+# FileReader → base64 string → pywebview bridge → ``b64decode``, with
+# peak memory roughly 3–4× the file size while the encoded string and
+# decoded bytes both live on the heap. 512 MB peaks around 2 GB total,
+# which is comfortable on any modern Mac without swap pressure.
+#
+# Files larger than this should use the native picker
+# (:meth:`Bridge.choose_files` / :meth:`Bridge.add_files`), which uses
+# ``shutil.copy2`` and has no size limit. The frontend gates on
+# ``file.size`` before calling FileReader; this constant is the
+# backend's matching defense-in-depth check, in case a client bypasses
+# the JS gate or sends a forged base64 string from a non-browser path.
+_DRAG_DROP_MAX_BYTES = 512 * 1024 * 1024
+
+
+def _b64_oversize(content_b64: str, max_decoded_bytes: int) -> bool:
+    """Return True iff a base64 string would decode to more than
+    ``max_decoded_bytes``. Cheap arithmetic — no decoding.
+
+    base64 encodes every 3 input bytes as 4 output chars with up to
+    2 trailing ``=`` pad chars; each pad char represents zero bytes.
+    Decoded length is ``len(b64) * 3 // 4`` minus the padding count.
+    Subtracting pad makes the boundary exact at the byte — a 1 MB
+    file encoded into a ~1.33 MB string compares as exactly 1 MB,
+    not 1 MB + 2 bytes. Saves materializing a multi-GB decoded blob
+    just to measure it.
+    """
+    n = len(content_b64)
+    if n == 0:
+        return 0 > max_decoded_bytes
+    pad = 0
+    if content_b64[-1] == "=":
+        pad += 1
+        if n >= 2 and content_b64[-2] == "=":
+            pad += 1
+    return (n * 3 // 4 - pad) > max_decoded_bytes
+
+
+def _drag_drop_oversize_message(
+    name: str, mb: int, picker_label: str,
+) -> str:
+    """Format the rejection message for drag-drop oversize. The JS
+    side has its own copy of the same wording — keep them aligned so
+    a researcher who hits one path sees a recognizable error if they
+    later hit the other."""
+    return (
+        f"{name!r} is {mb} MB — drag-drop is capped at "
+        f"{_DRAG_DROP_MAX_BYTES // (1024 * 1024)} MB because the "
+        f"file is read fully into memory (peak ~3–4× the file size). "
+        f"Use {picker_label} instead — it copies directly from disk "
+        f"with no memory overhead and no size limit."
+    )
 
 
 def _classify_kind(ext: str) -> str:

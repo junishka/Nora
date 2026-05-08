@@ -291,3 +291,120 @@ def test_native_add_files_path_mirrors_added_files_into_composer_chips() -> None
            / "src" / "nora" / "web" / "app.js").read_text(encoding="utf-8")
     assert "function addStagedDataNotices(names)" in src
     assert "const addedNotices = addStagedDataNotices(added);" in src
+
+
+# ---------------------------------------------------------------------------
+# Drag-drop size gate
+# ---------------------------------------------------------------------------
+
+
+def test_b64_oversize_helper_arithmetic() -> None:
+    """``_b64_oversize`` must compare decoded byte length against the
+    cap WITHOUT materializing the decoded blob. Pure arithmetic on
+    the encoded-string length: ``len * 3 // 4`` is the upper bound on
+    decoded bytes (we ignore padding for a one-byte conservatism)."""
+    from nora.ui import _b64_oversize
+
+    # 1 MB cap, exactly 1 MB encoded (~1.33 MB) → decodes to ~1 MB → not over.
+    one_mb = 1024 * 1024
+    encoded_for_1mb = base64.b64encode(b"x" * one_mb).decode("ascii")
+    assert _b64_oversize(encoded_for_1mb, one_mb) is False
+
+    # 1 MB cap, 2 MB encoded → decodes to ~1.5 MB → over.
+    encoded_for_2mb = base64.b64encode(b"x" * (2 * one_mb)).decode("ascii")
+    assert _b64_oversize(encoded_for_2mb, one_mb) is True
+
+    # Empty string never trips the gate.
+    assert _b64_oversize("", one_mb) is False
+
+
+def test_upload_files_rejects_oversize_pre_decode(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Drag-drop files larger than the cap must be rejected BEFORE
+    ``base64.b64decode`` runs — otherwise a 5 GB forged base64 string
+    would allocate ~5 GB just to be told "too large." The cap is
+    monkeypatched to 1 KB so the test doesn't need a multi-MB string.
+    """
+    import nora.ui as ui_mod
+    monkeypatch.setattr(ui_mod, "_DRAG_DROP_MAX_BYTES", 1024)
+
+    bridge = _make_bridge(tmp_path)
+    # 4 KB raw → ~5.4 KB encoded → 5400 * 3 // 4 ≈ 4050 > 1024 → reject.
+    payload = [{
+        "name": "big.csv",
+        "content": base64.b64encode(b"x" * 4096).decode("ascii"),
+    }]
+    res = bridge.add_files_from_blobs(payload)
+    assert res["ok"] is False
+    assert "drag-drop is capped" in res["reason"]
+    assert "the + button" in res["reason"]
+    # Nothing was written to disk and nothing was staged.
+    assert list(bridge.cwd.iterdir()) == []
+    assert bridge._pending_script_attachments == []
+
+
+def test_upload_files_session_path_rejects_oversize(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The landing-page drop path (``upload_files``, fresh session)
+    enforces the same cap as the composer drop path. Distinct from
+    ``add_files_from_blobs`` because it stages a NEW session rather
+    than copying into an existing cwd, so the rejection wording
+    points at "Choose Files…" instead of the "+" button."""
+    import nora.ui as ui_mod
+    monkeypatch.setattr(ui_mod, "_DRAG_DROP_MAX_BYTES", 1024)
+
+    bridge = NoraBridge()  # no cwd — landing-page state.
+    payload = [{
+        "name": "big.csv",
+        "content": base64.b64encode(b"x" * 4096).decode("ascii"),
+    }]
+    res = bridge.upload_files(payload)
+    assert res["ok"] is False
+    assert "drag-drop is capped" in res["reason"]
+    assert "Choose Files" in res["reason"]
+
+
+def test_upload_files_under_cap_still_works(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Pin the happy path: small files still flow through
+    ``add_files_from_blobs`` after the gate is in place. Without
+    this, a typo in the gate could silently reject everything."""
+    import nora.ui as ui_mod
+    # Cap stays at 512 MB — well above our test payload.
+    bridge = _make_bridge(tmp_path)
+    payload = [{
+        "name": "small.csv",
+        "content": base64.b64encode(b"a,b\n1,2\n").decode("ascii"),
+    }]
+    res = bridge.add_files_from_blobs(payload)
+    assert res["ok"] is True
+    assert "small.csv" in res["added"]
+    assert (bridge.cwd / "small.csv").read_text() == "a,b\n1,2\n"
+
+
+def test_js_drop_handler_gates_on_file_size() -> None:
+    """The JS drag-drop handlers must check ``file.size`` BEFORE
+    calling FileReader. Without this, a researcher who drops a
+    multi-GB file sees the app freeze before the Python side returns
+    "too large." We grep for the gate rather than spinning up a
+    headless browser — the contract is "the constant is referenced
+    from both drop sites and the helper formats the rejection."
+    """
+    src = (Path(__file__).resolve().parent.parent
+           / "src" / "nora" / "web" / "app.js").read_text(encoding="utf-8")
+    assert "const MAX_DRAG_DROP_BYTES = " in src
+    assert "function formatDragDropOversizeReason(" in src
+    # Both drop paths must reference the cap.
+    landing_drop = src.split("landingEl.addEventListener('drop'", 1)[1]
+    landing_drop = landing_drop.split("function readFileAsBase64", 1)[0]
+    assert "MAX_DRAG_DROP_BYTES" in landing_drop, (
+        "landing-page drop handler missing size gate"
+    )
+    composer_drop = src.split("async function stageDataFile(", 1)[1]
+    composer_drop = composer_drop.split("\n}\n", 1)[0]
+    assert "MAX_DRAG_DROP_BYTES" in composer_drop, (
+        "composer drop handler missing size gate"
+    )
