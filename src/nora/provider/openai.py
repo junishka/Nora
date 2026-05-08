@@ -673,21 +673,105 @@ def _parse_tool_args(s: str) -> tuple[dict[str, Any] | None, str | None]:
     return out, None
 
 
+def _payload_has_image_block(payload: Any) -> bool:
+    """Whether an MCP-shaped tool result carries an inline image block.
+
+    ``read_attached_file`` returns ``{"type": "image", "data": ...}``
+    alongside a text descriptor when the user recalls a PNG / PDF /
+    EPS. The Anthropic dispatcher forwards both blocks; the OpenAI
+    Responses API's ``function_call_output`` only takes a single
+    string, so the image bytes can't ride with the tool result. We
+    detect the image-block case so the descriptor we DO send tells
+    the model definitively that pixel data was dropped on this path.
+    """
+    if not isinstance(payload, dict):
+        return False
+    content = payload.get("content")
+    if not isinstance(content, list):
+        return False
+    for block in content:
+        if isinstance(block, dict) and block.get("type") == "image":
+            return True
+    return False
+
+
 def _mcp_payload_to_text(payload: Any) -> str:
     """Nora handlers return MCP-shaped payloads:
     ``{"content": [{"type": "text", "text": "..."}]}``. Extract the
-    JSON-text body for the OpenAI tool output."""
+    JSON-text body for the OpenAI tool output.
+
+    For payloads that carry an image content block alongside a text
+    descriptor (``read_attached_file`` for PNG / PDF recall), rewrite
+    the text descriptor so the model knows the pixels were dropped on
+    this provider — without that, the descriptor's hedged "if your
+    provider doesn't support images" hint is the only signal, and the
+    model may still try to reason about the (absent) bytes. The
+    Anthropic path is unaffected — its content list survives intact
+    on its own dispatcher.
+    """
     if isinstance(payload, dict):
         content = payload.get("content")
         if isinstance(content, list):
+            text_block = None
             for block in content:
-                if isinstance(block, dict) and block.get("type") == "text":
-                    return str(block.get("text", ""))
+                if (
+                    isinstance(block, dict)
+                    and block.get("type") == "text"
+                ):
+                    text_block = block
+                    break
+            if text_block is not None:
+                if _payload_has_image_block(payload):
+                    return _rewrite_for_dropped_image(
+                        str(text_block.get("text", "")),
+                    )
+                return str(text_block.get("text", ""))
         # Already-flat dict: serialise.
         return json.dumps(payload)
     if isinstance(payload, str):
         return payload
     return json.dumps(payload)
+
+
+def _rewrite_for_dropped_image(descriptor_text: str) -> str:
+    """Replace ``read_attached_file``'s hedged image descriptor with an
+    OpenAI-specific reason telling the model the pixels weren't sent.
+
+    The original descriptor (see ``read_attached_file`` in
+    ``tools.py``) reads "If your provider doesn't support image tool
+    results, ask the researcher to re-@mention the file …". On this
+    provider it definitely doesn't, so we promote that conditional
+    note to the primary status and keep the file metadata so the
+    model can name the file precisely in its follow-up message to the
+    researcher.
+
+    Falls back to the original text if the descriptor isn't the JSON
+    shape we expect — never raises.
+    """
+    try:
+        meta = json.loads(descriptor_text)
+    except (ValueError, TypeError):
+        return descriptor_text
+    if not isinstance(meta, dict):
+        return descriptor_text
+    name = meta.get("name") or "the file"
+    rewritten = {
+        "status": "image_not_supported_on_provider",
+        "name": meta.get("name"),
+        "kind": meta.get("kind"),
+        "ext": meta.get("ext"),
+        "mime": meta.get("mime"),
+        "size": meta.get("size"),
+        "reason": (
+            "Image tool results aren't supported on this provider. "
+            f"Ask the researcher to re-@mention {name!r} in their "
+            "next message — that routes the bytes through the user-"
+            "message vision channel, which the model can see."
+        ),
+    }
+    # Drop None fields so the response stays tight.
+    rewritten = {k: v for k, v in rewritten.items() if v is not None}
+    return json.dumps(rewritten, separators=(",", ":"), ensure_ascii=False)
 
 
 def _extract_hints(text: str) -> tuple[str | None, str | None]:

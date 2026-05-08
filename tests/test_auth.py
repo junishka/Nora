@@ -219,3 +219,71 @@ def test_set_credential_clears_error_backoff(
     res = auth.set_credential("openai", "sk-new")
     assert res["ok"] is True
     assert "openai" not in auth._CRED_ERROR_AT
+
+
+def test_delete_credential_backend_failure_returns_error(
+    monkeypatch: pytest.MonkeyPatch, fake_keyring: _FakeKeyring,
+) -> None:
+    """A keyring backend that raises during delete (locked Keychain,
+    denied prompt, securityd error) must surface ``ok: False``.
+    Reporting success would lie to the UI: the secret is still in the
+    OS store, the user thinks it's gone, and it reappears on next
+    launch.
+
+    Regression: previously every delete exception was swallowed and
+    delete_credential returned ``{"ok": True}``.
+    """
+    fake_keyring.store[(auth.KEYRING_SERVICE, "openai")] = "sk-real"
+
+    def _raise_on_delete(*_a: Any, **_kw: Any) -> None:
+        raise RuntimeError("keychain locked")
+
+    monkeypatch.setattr(fake_keyring, "delete_password", _raise_on_delete)
+
+    res = auth.delete_credential("openai")
+    assert res["ok"] is False
+    assert "delete failed" in res["reason"]
+    # Cache must NOT be poisoned with None — that would hide the
+    # still-present credential from the auth screen.
+    assert auth._CRED_CACHE.get("openai") == "sk-real"
+
+
+def test_delete_credential_missing_entry_is_idempotent(
+    monkeypatch: pytest.MonkeyPatch, fake_keyring: _FakeKeyring,
+) -> None:
+    """Deleting a credential that isn't there should still report
+    success — and must not even attempt a backend delete (so no
+    spurious ACL prompt for a no-op)."""
+    delete_calls = {"n": 0}
+    real_delete = fake_keyring.delete_password
+
+    def _counting(*a: Any, **kw: Any) -> None:
+        delete_calls["n"] += 1
+        return real_delete(*a, **kw)
+
+    monkeypatch.setattr(fake_keyring, "delete_password", _counting)
+
+    res = auth.delete_credential("openai")
+    assert res["ok"] is True
+    # Pre-check via get_password saw None; no delete attempted.
+    assert delete_calls["n"] == 0
+
+
+def test_delete_credential_during_backoff_returns_error(
+    monkeypatch: pytest.MonkeyPatch, fake_keyring: _FakeKeyring,
+) -> None:
+    """If a recent read error is still inside the backoff window, we
+    can't confidently claim deletion — surface the unreachable backend
+    rather than silently no-op'ing the user's request."""
+
+    def _raise(*_a: Any, **_kw: Any) -> None:
+        raise RuntimeError("backend locked")
+
+    monkeypatch.setattr(fake_keyring, "get_password", _raise)
+    # Trigger the error path on a read so the backoff is set.
+    auth.get_credential("openai")
+    assert "openai" in auth._CRED_ERROR_AT
+
+    res = auth.delete_credential("openai")
+    assert res["ok"] is False
+    assert "unavailable" in res["reason"]

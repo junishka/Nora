@@ -23,6 +23,7 @@ from nora.provider.openai import (
     FORBIDDEN_BUILTIN_TYPES,
     OpenAISession,
     build_openai_tools,
+    _mcp_payload_to_text,
     _verify_lockdown,
 )
 from nora.provider.tool_schemas import build_tool_specs
@@ -88,6 +89,79 @@ def test_lockdown_verifier_rejects_unknown_function_name():
     }]
     with pytest.raises(RuntimeError, match="lockdown"):
         _verify_lockdown(bad)
+
+
+# ---------------------------------------------------------------------------
+# Image-bearing tool results — pixels can't ride function_call_output
+# ---------------------------------------------------------------------------
+
+
+def test_text_only_payload_passes_through_unchanged():
+    """A normal tool result with only a text content block is
+    forwarded verbatim — no rewrite, no provider-specific noise."""
+    payload = {
+        "content": [
+            {"type": "text", "text": '{"status":"ok","result_id":"M1"}'},
+        ]
+    }
+    assert _mcp_payload_to_text(payload) == (
+        '{"status":"ok","result_id":"M1"}'
+    )
+
+
+def test_image_payload_descriptor_is_rewritten_for_openai():
+    """``read_attached_file`` returns a hedged "if your provider
+    doesn't support images" descriptor alongside an image block. On
+    OpenAI the image bytes can't ride the function_call_output, so
+    the descriptor must be rewritten to tell the model definitively
+    that the image was dropped — and to point at the recovery path
+    (re-@mention, which uses the user-message vision channel)."""
+    descriptor = json.dumps({
+        "status": "ok",
+        "name": "residuals.png",
+        "kind": "image",
+        "ext": ".png",
+        "mime": "image/png",
+        "size": 12345,
+        "note": (
+            "The image is attached as an inline content block. "
+            "If your provider doesn't support image tool results, "
+            "ask the researcher to re-@mention the file in their "
+            "next message."
+        ),
+    })
+    payload = {
+        "content": [
+            {"type": "image", "data": "BASE64...", "mimeType": "image/png"},
+            {"type": "text", "text": descriptor},
+        ]
+    }
+    rewritten = _mcp_payload_to_text(payload)
+    parsed = json.loads(rewritten)
+    assert parsed["status"] == "image_not_supported_on_provider"
+    assert parsed["name"] == "residuals.png"
+    # The model is told what to ask the researcher to do, definitively.
+    assert "re-@mention" in parsed["reason"]
+    assert "residuals.png" in parsed["reason"]
+    # The hedged "If your provider doesn't support" wording must NOT
+    # leak through — that conditional was the whole problem.
+    assert "If your provider" not in rewritten
+
+
+def test_malformed_descriptor_falls_back_to_original_text():
+    """If the descriptor isn't the JSON shape we expect (e.g. an
+    older tool, a hand-written test fixture, an MCP server we don't
+    own), the rewrite path must NOT raise — fall back to the
+    original text. The rewrite is best-effort polish, not a load-
+    bearing parse."""
+    payload = {
+        "content": [
+            {"type": "image", "data": "BASE64...", "mimeType": "image/png"},
+            {"type": "text", "text": "not json"},
+        ]
+    }
+    out = _mcp_payload_to_text(payload)
+    assert out == "not json"
 
 
 # ---------------------------------------------------------------------------

@@ -652,17 +652,30 @@ class SessionRunner:
                 new_datasets = current_datasets - self.known_datasets
                 carried_dataset_diff: frozenset[str] = frozenset()
                 if new_datasets:
-                    added_lines = "\n".join(
-                        f"  - {n}" for n in sorted(new_datasets)
-                    )
-                    dataset_notice = (
-                        "[The researcher added new datasets to the "
-                        "working directory mid-session. These weren't in "
-                        "the original prompt's listing but are reachable "
-                        "via get_schema / submit_script:\n"
-                        f"{added_lines}\n]\n\n"
-                    )
-                    prompt = dataset_notice + prompt
+                    # Sanitize each filename before interpolation. The
+                    # startup ``dataset_listing`` already does this; the
+                    # mid-turn diff path is the same threat surface (a
+                    # researcher dropping a file named with embedded
+                    # newlines / fake "###System:" markers / bidi
+                    # overrides into cwd would otherwise reformat the
+                    # next turn's prompt). Any name that sanitises to
+                    # empty is dropped.
+                    safe_added = [
+                        s for s in (safe_text(n) for n in sorted(new_datasets))
+                        if s
+                    ]
+                    if safe_added:
+                        added_lines = "\n".join(
+                            f"  - {n}" for n in safe_added
+                        )
+                        dataset_notice = (
+                            "[The researcher added new datasets to the "
+                            "working directory mid-session. These weren't in "
+                            "the original prompt's listing but are reachable "
+                            "via get_schema / submit_script:\n"
+                            f"{added_lines}\n]\n\n"
+                        )
+                        prompt = dataset_notice + prompt
                     carried_dataset_diff = new_datasets
                 self.known_datasets = current_datasets
 
@@ -673,16 +686,27 @@ class SessionRunner:
                 # generic ambient context.
                 carried_mentioned_files: list[str] = []
                 if self.pending_mentioned_files:
-                    mentioned_lines = "\n".join(
-                        f"  - {n}" for n in self.pending_mentioned_files
-                    )
-                    mention_notice = (
-                        "[The researcher referenced these existing "
-                        "session files in their message. Read or use "
-                        "them as appropriate (no re-upload needed):\n"
-                        f"{mentioned_lines}\n]\n\n"
-                    )
-                    prompt = mention_notice + prompt
+                    # Same boundary check as the dataset diff above —
+                    # @-mentioned filenames cross from the researcher's
+                    # filesystem into the model's prompt and would
+                    # otherwise let a hostile filename break out of the
+                    # bracketed notice.
+                    safe_mentions = [
+                        s for s in (
+                            safe_text(n) for n in self.pending_mentioned_files
+                        ) if s
+                    ]
+                    if safe_mentions:
+                        mentioned_lines = "\n".join(
+                            f"  - {n}" for n in safe_mentions
+                        )
+                        mention_notice = (
+                            "[The researcher referenced these existing "
+                            "session files in their message. Read or use "
+                            "them as appropriate (no re-upload needed):\n"
+                            f"{mentioned_lines}\n]\n\n"
+                        )
+                        prompt = mention_notice + prompt
                     carried_mentioned_files = list(
                         self.pending_mentioned_files
                     )
