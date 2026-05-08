@@ -557,10 +557,6 @@ function showChat(payload) {
   input.focus();
 }
 
-// Set while we're replaying a persisted chat log so appendAssistant
-// skips the typewriter animation — past messages should appear all
-// at once, not trickle in for several seconds per bubble.
-let replayMode = false;
 // Turns that yielded no visible reply artifacts. Keep them around
 // just long enough for the researcher to notice the failure, then
 // sweep them the next time a new message is sent so the transcript
@@ -606,11 +602,9 @@ async function replayHistory() {
     messagesEl.innerHTML = '';
     setWelcomeOnlyMode(false);
     if (events.length === 0) return;
-    replayMode = true;
     try {
       events.forEach((evt) => replayEvent(evt));
     } finally {
-      replayMode = false;
       if (replayTailTurn && !replayTailTurn.hasVisibleReply) {
         queueDisposableTurn(replayTailTurn.nodes);
       }
@@ -2158,98 +2152,7 @@ function appendUser(text, attachments, images) {
 }
 
 function appendAssistant(text) {
-  // Render markdown immediately for both replay and live paths. The
-  // earlier typewriter animation cushioned wall-of-text shock but
-  // showed RAW markdown during typing — tables as ``|---|---|``,
-  // code blocks as escaped text, bold as literal asterisks — and
-  // delayed the rendered version by up to ~37 s on long replies.
-  // For Nora's audience (dense regression tables, stata/python
-  // code, multi-section answers) the cost compounded: the researcher
-  // couldn't read the structure that mattered most until the swap.
-  // Going without typing animation; revisit if it turns out the
-  // chat metaphor needed it.
-  //
-  // The runTypewriter / finalizeActiveTypewriter scaffolding still
-  // lives below in case we re-enable a (skippable) version of this.
   return append('assistant', text || '', /*markdown=*/ true);
-}
-
-// The typewriter currently animating, if any. Tracked globally so
-// any other UI event (new assistant block, tool_call, tool_result,
-// turn_done) can force it to finish immediately — we never want a
-// visual animation to outlive the event that follows it.
-let activeTypewriter = null;
-
-function finalizeActiveTypewriter() {
-  if (activeTypewriter) activeTypewriter.finalize();
-}
-
-function runTypewriter(bodyEl, fullText, onComplete) {
-  const len = fullText.length;
-  if (len === 0) {
-    onComplete();
-    return;
-  }
-  // Tiered constant pace. Base rate is ~22 ms per char (~45 chars/sec),
-  // a thoughtful typing rhythm rather than a stream. To keep long
-  // messages from trapping the reader, the rate steps up at two length
-  // thresholds: 2× past 500 chars, 3× past 2000. It never goes faster
-  // than 3× — past 2000 chars the animation just takes longer, the way
-  // a constant-pace typewriter naturally would.
-  //
-  // Earlier code clamped total animation time to ~4 s, which made
-  // ``charsPerMs = len/4000`` grow linearly with length (a 5000-char
-  // turn typed at ~1250 cps, indistinguishable from an instant dump).
-  // The tiered approach gives the same "doesn't make me wait forever"
-  // behavior on truly long turns without erasing the typing rhythm
-  // entirely the moment a message crosses some arbitrary length.
-  //
-  // Any follow-up UI event (next assistant block, tool call, thinking,
-  // user input) calls ``finalizeActiveTypewriter()`` and collapses the
-  // animation immediately — see its call sites.
-  const speedFactor = len < 500 ? 1 : len < 2000 ? 2 : 3;
-  const MS_PER_CHAR = 22 / speedFactor;
-  let typed = 0;
-  // Fractional accumulator. Per-frame ``Math.ceil`` (the earlier
-  // approach) forced at least 1 char every animation frame, which at
-  // 60 fps clamps the floor to ~60 cps — the documented 45 cps target
-  // was unreachable. Accumulating fractional progress lets us advance
-  // 0 chars on some frames so the visible rate matches MS_PER_CHAR.
-  let accumulator = 0;
-  let lastTime = performance.now();
-  let rafId = 0;
-  let finalized = false;
-
-  const tw = {
-    finalize() {
-      if (finalized) return;
-      finalized = true;
-      cancelAnimationFrame(rafId);
-      if (activeTypewriter === tw) activeTypewriter = null;
-      onComplete();
-    },
-  };
-  activeTypewriter = tw;
-
-  function frame(now) {
-    if (finalized) return;
-    const dt = now - lastTime;
-    lastTime = now;
-    accumulator += dt / MS_PER_CHAR;
-    const advance = Math.floor(accumulator);
-    if (advance > 0) {
-      typed = Math.min(len, typed + advance);
-      accumulator -= advance;
-      bodyEl.textContent = fullText.slice(0, typed);
-      scrollToBottom();
-    }
-    if (typed < len) {
-      rafId = requestAnimationFrame(frame);
-    } else {
-      tw.finalize();
-    }
-  }
-  rafId = requestAnimationFrame(frame);
 }
 
 function appendThinking(text) {
@@ -2258,7 +2161,6 @@ function appendThinking(text) {
    * dominating the transcript. Starts collapsed; clicking the
    * header expands. Mirrors the submit_script card shape so the
    * interaction model is consistent. */
-  finalizeActiveTypewriter();
   setWelcomeOnlyMode(false);
   const card = document.createElement('div');
   card.className = 'thinking-card collapsed';
@@ -2296,11 +2198,7 @@ function appendError(text) {
 }
 
 function append(kind, text, markdown, attachments, images) {
-  // User / system / error messages appear instantly. Make sure any
-  // typewriter from the previous turn lands first, so a fresh user
-  // bubble doesn't appear above a still-animating assistant bubble.
   setWelcomeOnlyMode(false);
-  finalizeActiveTypewriter();
   const wrapper = document.createElement('div');
   wrapper.className = 'message ' + kind;
   // Stash the original (pre-render) text on the wrapper so the
@@ -2469,7 +2367,6 @@ function appendToolCall(evt) {
   // ``list_results`` etc. happen silently — they're plumbing, not
   // results the researcher reads. Claude summarizes whatever
   // matters from them in the chat text that follows.
-  finalizeActiveTypewriter();
   setWelcomeOnlyMode(false);
   const shortName = shortenToolName(evt.name);
   const isSubmitScript = shortName === 'submit_script';
@@ -2902,8 +2799,7 @@ function scrollToBottom() {
 
 // "Scroll to latest" floating button. Anchored above the composer
 // in the markup; visibility tracks whether the transcript is near
-// its bottom. The threshold accommodates the natural overshoot of
-// in-flight typewriter renders without flashing the button.
+// its bottom.
 const scrollToBottomBtn = document.getElementById('scroll-to-bottom');
 const SCROLL_TO_BOTTOM_THRESHOLD = 100;
 
