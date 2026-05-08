@@ -306,6 +306,54 @@ def test_summarize_tool_call_expand_result_with_view():
     ) == "M5 (view=markdown)"
 
 
+def test_summarize_tool_call_compose_results_dimensions():
+    """compose_results' summary should surface the layout shape so a
+    recall reads as ``[compose_results] 3 cols × 6 rows`` rather than
+    a bare tag — earlier code dropped these tools onto the ``return ''``
+    fallback and lost all argument context for the warm-start prefix.
+    """
+    spec = {
+        "columns": [
+            {"id": "M1", "label": "OLS"},
+            {"id": "M2", "label": "FE"},
+            {"id": "M3", "label": "Robust"},
+        ],
+        "groups": [
+            {
+                "label": "Direct",
+                "rows": [
+                    {"result_id": "R1", "label": "treat"},
+                    {"result_id": "R2", "label": "x"},
+                ],
+            },
+            {
+                "rows": [
+                    {"result_id": "R3", "label": "z"},
+                ],
+            },
+        ],
+    }
+    assert summarize_tool_call(
+        "compose_results", {"spec": spec},
+    ) == "3 cols × 3 rows"
+
+
+def test_summarize_tool_call_list_session_files_kinds():
+    assert summarize_tool_call(
+        "list_session_files", {"kinds": ["data", "graph"]},
+    ) == "data,graph"
+    assert summarize_tool_call("list_session_files", {}) == ""
+
+
+def test_summarize_tool_call_search_in_session_files():
+    assert summarize_tool_call(
+        "search_in_session_files", {"query": "regress", "kinds": ["script"]},
+    ) == "'regress' (script)"
+    assert summarize_tool_call(
+        "search_in_session_files", {"query": "regress"},
+    ) == "'regress'"
+
+
 def test_summarize_tool_call_unknown_returns_empty():
     assert summarize_tool_call("unknown_tool", {"foo": "bar"}) == ""
 

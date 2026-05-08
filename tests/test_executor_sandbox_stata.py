@@ -138,6 +138,48 @@ nora_result_regress, label("stata-cwd-read")
 
 
 # ---------------------------------------------------------------------------
+# Estimator-family coverage — non-OLS p-values via Wald z-fallback
+# ---------------------------------------------------------------------------
+
+@requires_sandbox_apply
+@requires_stata
+def test_stata_logit_emits_wald_p_values(tmp_path: Path):
+    """Logit doesn't populate ``e(df_r)`` (z-tests, not t-tests).
+
+    The helper used to gate ``p_values`` emission on ``e(df_r)``
+    being set, which silently dropped the entire dict for every
+    non-OLS estimator. The renderer then dropped the p-value
+    column, making logit/probit/Poisson/Cox cards look like the
+    estimator doesn't define p-values when the Wald z-test is in
+    fact well-defined and is what Stata's own display uses.
+
+    Asserts the helper now falls back to the asymptotic Wald
+    z-test (``2 * normal(-|b/se|)``) when df_r is empty, so the
+    payload carries one finite p-value per coefficient.
+    """
+    code = '''
+sysuse auto, clear
+logit foreign mpg weight
+nora_result_regress, label("stata-logit-wald")
+'''
+    r = run_script("Stata", code, tmp_path)
+    assert r.ok, f"Stata logit failed: error={r.error}\nstdout tail={r.raw_stdout[-500:]}"
+    payload = r.result_payloads[0]
+    pvals = payload.get("p_values")
+    assert isinstance(pvals, dict), (
+        "non-OLS estimator must still emit p_values via the Wald "
+        f"z-fallback; got {type(pvals).__name__}"
+    )
+    assert set(pvals) == {"mpg", "weight", "_cons"}
+    for term, p in pvals.items():
+        assert isinstance(p, float) and 0.0 <= p <= 1.0, f"{term}={p!r}"
+    # Sanity: logit always populates e(chi2) — keeps the omnibus
+    # caption populated alongside the per-coefficient p-values.
+    assert "chi_squared" in payload
+    assert "chi_squared_p_value" in payload
+
+
+# ---------------------------------------------------------------------------
 # Security invariants — sandbox blocks what matters
 # ---------------------------------------------------------------------------
 

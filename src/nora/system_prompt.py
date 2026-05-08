@@ -41,7 +41,7 @@ clauses. Plain prose. No em or en dashes; use periods, semicolons, \
 commas, parentheses, or colons.\
 \n\n\
 The data never leaves this machine. You reach the researcher's data \
-ONLY through the thirteen tools below. No other tools exist in this \
+ONLY through the {tool_count} tools below. No other tools exist in this \
 environment.
 
 Working directory: {cwd}
@@ -486,11 +486,13 @@ its full payload, so re-fitting a model the researcher already \
 ran wastes time and risks a numerically-different rerun. Optional \
 `view`: omit (or `"full"`) for the complete payload; \
 `"coefficients"` drops `vcov`/`vif` for regressions when only the \
-headline pattern matters; `"markdown"` ALSO returns a canonical \
-pre-rendered pipe-table in the response's `markdown` field — drop \
-it into your reply directly so the same payload renders \
-identically across recalls without re-deriving columns and \
-precision per-call. Optional `session_path` looks up in another \
+headline pattern matters; `"markdown"` returns a canonical \
+pre-rendered pipe-table in the response's `markdown` field \
+INSTEAD of the JSON payload — drop the markdown into your reply \
+directly so the same payload renders identically across recalls \
+without re-deriving columns and precision per-call. Reach for \
+`view="markdown"` when you want the table; `view="full"` when \
+you need the raw arrays (vcov, residuals, vif). Optional `session_path` looks up in another \
 session under `~/.nora-sessions/`; requires the \
 `NORA_ALLOW_CROSS_SESSION_RECALL=1` env var (default off).
 
@@ -517,13 +519,14 @@ researcher refers to earlier work without naming an id ("the size \
 split", "the H1 panel"); skim the labels and `expand_result` the \
 match.
 
-9. `list_results_global(query?)`. List results across EVERY Nora \
-session. Use when the researcher refers to an analysis from a \
-different project/session and you need to find it. Returns rows \
-tagged with `session_path`; feed that into `expand_result` to fetch. \
-Disabled by default; requires `NORA_ALLOW_CROSS_SESSION_RECALL=1`. \
-Stored payloads are pre-sanitized — the gate exists for project \
-separation, not privacy.
+9. `list_results_global(query?, limit?)`. List results across \
+EVERY Nora session. Use when the researcher refers to an analysis \
+from a different project/session and you need to find it. Returns \
+newest-first rows tagged with `session_path`; feed that into \
+`expand_result` to fetch. Capped at `limit` (default 50, hard max \
+500) — same shape as `list_results`. Disabled by default; \
+requires `NORA_ALLOW_CROSS_SESSION_RECALL=1`. Stored payloads are \
+pre-sanitized — the gate exists for project separation, not privacy.
 
 10. `recall_conversation(query?, tail?, max_chars?)`. Search older \
 archived turns. The most recent ~20 turns auto-load on session \
@@ -698,7 +701,7 @@ methodological (novel method, old relationship) or substantive \
 Tool use notes:
 
 - You don't have Bash, Read, Write, Edit, Glob, Grep, or any other \
-general tool. Only the thirteen above. If you think you need one, the \
+general tool. Only the {tool_count} above. If you think you need one, the \
 right move is a custom tool call or asking the researcher.
 - Keep scripts small and focused. One question per script is usually \
 right.
@@ -941,11 +944,21 @@ def build_system_prompt(
     to ``"anthropic"`` for back-compat with any call site that
     pre-dates the split.
     """
+    # Source-of-truth tool count. Hardcoding "thirteen" twice in the
+    # template was a DRY trap: each new tool that landed in
+    # ``ALLOWED_TOOL_NAMES`` would have left the prose claiming the
+    # wrong count until someone noticed. Importing here (not at
+    # module top) keeps the system_prompt → tools dependency
+    # one-directional: tools.py builds its registry, then any
+    # caller can ask for the rendered prompt.
+    from nora.tools import ALLOWED_TOOL_NAMES
+
     rendered = SYSTEM_PROMPT_TEMPLATE.format(
         cwd=cwd,
         SERVER_NAME=server_name,
         datasets_list=dataset_listing(cwd),
         runtime_environment=runtime_environment_listing(),
+        tool_count=len(ALLOWED_TOOL_NAMES),
     )
     if provider == "openai":
         # The template bakes in the Anthropic-style intro because the

@@ -133,12 +133,25 @@ program define nora_result_regress
     }
     file write `fh' "}"
 
-    * p_values (named dict, two-sided t-test against e(df_r)). Skipped
-    * when the estimator didn't populate e(df_r) — the renderer drops
-    * the p-value column when the dict is absent. Dropped/collinear
-    * terms have SE=0, which makes b/se missing; emit JSON `null` for
-    * those rather than Stata's "." (not valid JSON).
-    if "`e(df_r)'" != "" {
+    * p_values (named dict). Two cases by estimator family:
+    *   OLS (regress): e(df_r) is populated → two-sided t-test
+    *     against that df_r.
+    *   GLMs / survival (logit, probit, poisson, stcox, ...):
+    *     e(df_r) is empty → fall back to the asymptotic Wald
+    *     z-test, p = 2 * (1 - normal(|b/se|)). Stata's display
+    *     output for these estimators uses the same z-test, so the
+    *     emitted values match what the researcher sees printed.
+    * Without the z-fallback, every non-OLS regression silently
+    * shipped with no per-coefficient p-values and the renderer
+    * dropped the p-value column entirely — making logit / probit /
+    * Poisson / Cox cards look like "estimator doesn't compute
+    * p-values" when in fact the Wald test is well-defined.
+    * Dropped/collinear terms have SE=0, which makes b/se missing;
+    * emit JSON `null` for those rather than Stata's "." (not valid
+    * JSON). When neither b nor V is meaningfully populated (a
+    * non-regression e()), the dict is omitted entirely.
+    if `k' > 0 {
+        local _has_dfr = ("`e(df_r)'" != "" & !missing(`=e(df_r)'))
         tempname _se _b _t _p
         scalar `_se' = .
         scalar `_b' = .
@@ -156,7 +169,15 @@ program define nora_result_regress
             }
             else {
                 scalar `_t' = abs(`_b' / `_se')
-                scalar `_p' = 2 * ttail(`=e(df_r)', `_t')
+                if `_has_dfr' {
+                    scalar `_p' = 2 * ttail(`=e(df_r)', `_t')
+                }
+                else {
+                    * 2 * normal(-|t|) is numerically stable for
+                    * large |t|; (1 - normal(|t|)) loses precision
+                    * once |t| > 8 or so and rounds to 0.
+                    scalar `_p' = 2 * normal(-`_t')
+                }
                 local _pstr = strofreal(`_p', "%21.17e")
                 file write `fh' `""`v'":`_pstr'"'
             }

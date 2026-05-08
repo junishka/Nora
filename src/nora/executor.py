@@ -257,6 +257,39 @@ def _validate_and_strip_token(
     return cleaned, None
 
 
+def _format_bad_lines_summary(bad_lines: list[str], payload_count: int) -> str:
+    """Render the malformed-lines advisory.
+
+    Shows full detail for the first 5 entries and surfaces the line
+    numbers (only) for any that follow, so a 12-corrupt-line debug
+    session reads as ``lines 6,7,8,9,10,11,12 also failed`` rather
+    than an opaque ``…``. The line-number tail is bounded by the
+    bad-line count, not by an arbitrary cap — the message is
+    diagnostic, the researcher reads it once and moves on.
+    """
+    head = "; ".join(bad_lines[:5])
+    tail_msg = ""
+    if len(bad_lines) > 5:
+        extra_linenos: list[str] = []
+        for entry in bad_lines[5:]:
+            # Each entry starts "line N: ..."; pull N back out so
+            # the tail stays compact. Defensive: if a future
+            # caller adds a non-prefixed entry, the line-number
+            # extraction skips it and we fall back to the count.
+            if entry.startswith("line "):
+                extra_linenos.append(
+                    entry.split(":", 1)[0].removeprefix("line ").strip()
+                )
+        if extra_linenos:
+            tail_msg = f" … and lines {','.join(extra_linenos)} also failed"
+        else:
+            tail_msg = f" … and {len(bad_lines) - 5} more"
+    return (
+        f"{len(bad_lines)} malformed result line(s) skipped "
+        f"({payload_count} valid preserved): " + head + tail_msg
+    )
+
+
 def _parse_result_jsonl(
     text: str, run_token: str
 ) -> tuple[list[dict[str, Any]], list[str]]:
@@ -638,12 +671,7 @@ def run_script(
         else:
             payloads, bad_lines = _parse_result_jsonl(text, run_token)
             if bad_lines:
-                bad_msg = (
-                    f"{len(bad_lines)} malformed result line(s) "
-                    f"skipped ({len(payloads)} valid preserved): "
-                    + "; ".join(bad_lines[:5])
-                    + (" …" if len(bad_lines) > 5 else "")
-                )
+                bad_msg = _format_bad_lines_summary(bad_lines, len(payloads))
                 # Two paths, two meanings:
                 #   - Some payloads survived alongside bad lines: the
                 #     bad lines are an advisory, not a failure. A

@@ -30,6 +30,7 @@ from nora.system_prompt import (
 
 _INTENDED_PLACEHOLDERS = frozenset({
     "cwd", "datasets_list", "SERVER_NAME", "runtime_environment",
+    "tool_count",
 })
 
 
@@ -65,6 +66,23 @@ def test_no_unintended_format_placeholders() -> None:
         f"unescaped brace placeholders in system prompt: {sorted(unexpected)}. "
         f"Use ``{{{{...}}}}`` for a literal ``{{...}}`` in example code."
     )
+
+
+def test_tool_count_matches_allowed_tool_names(tmp_path: Path) -> None:
+    """The prompt's two ``"the {N} tools below/above"`` lines must
+    reflect the actual tool registry. Hardcoding "thirteen" twice
+    drifted in the past — adding ``compose_results`` /
+    ``list_session_files`` / ``search_in_session_files`` left the
+    prose claiming the wrong count for a window. Now the count is
+    derived from ``ALLOWED_TOOL_NAMES`` at render time and this
+    test pins the link so the two can't desync.
+    """
+    from nora.tools import ALLOWED_TOOL_NAMES
+
+    rendered = build_system_prompt(tmp_path, "nora")
+    n = len(ALLOWED_TOOL_NAMES)
+    assert f"the {n} tools below" in rendered
+    assert f"Only the {n} above" in rendered
 
 
 def test_render_substitutes_each_placeholder(tmp_path: Path) -> None:

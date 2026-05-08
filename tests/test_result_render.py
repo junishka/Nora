@@ -481,9 +481,13 @@ def test_expand_result_markdown_view_returns_canonical_table(
         assert "Term" in md and "Estimate" in md
         assert "x1" in md and "x2" in md
         assert "n = 200" in md
-        # Payload still ships in full (the markdown view ADDS
-        # the rendered field; doesn't replace the JSON).
-        assert body["payload"]["coefficients"] == {"x1": 0.4, "x2": -0.1}
+        # When markdown renders successfully, the JSON ``payload``
+        # is dropped from the response — shipping both is real
+        # cost duplication (kilobytes for a wide regression) and
+        # the model's only reason to ask for ``view="markdown"`` is
+        # the rendered table, not the raw arrays. ``view="full"``
+        # remains the way to get the JSON back.
+        assert "payload" not in body
     finally:
         reset_store_for_tests()
 
@@ -514,6 +518,11 @@ def test_expand_result_markdown_view_unknown_payload_omits_field(
         body = _mcp_text(res)
         assert body["status"] == "ok"
         assert "markdown" not in body
+        # Renderer didn't know this payload type, so the JSON
+        # falls back in. Without this the model would get an empty
+        # response on a markdown view of an unrecognised payload —
+        # worse than just returning the raw fields.
+        assert body["payload"] == {"type": "totally_unknown", "value": 42}
     finally:
         reset_store_for_tests()
 

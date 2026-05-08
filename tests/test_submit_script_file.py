@@ -88,6 +88,26 @@ def test_missing_file_returns_not_found(tmp_path: Path) -> None:
     assert body["status"] == "not_found"
 
 
+def test_language_override_conflicts_with_extension_rejected(
+    tmp_path: Path,
+) -> None:
+    """A model that hands a ``.do`` file with ``language="Python"``
+    used to silently win the override and route the Stata-syntax
+    script to the Python interpreter — undefined behaviour, often
+    surfacing as an opaque syntax error from cpython on Stata
+    locals/globals. Reject loudly instead so the model can either
+    drop the override or rename the file.
+    """
+    set_cwd(tmp_path)
+    (tmp_path / "regression.do").write_text("regress y x\n", encoding="utf-8")
+    body = _call({"name": "regression.do", "language": "Python"})
+    assert body["status"] == "error"
+    reason = body.get("reason") or ""
+    assert "conflicts with the file extension" in reason
+    assert ".do" in reason
+    assert "Stata" in reason
+
+
 def test_language_inference_from_extension(tmp_path: Path) -> None:
     """When ``language`` is omitted, the extension drives the choice.
     Verified at the rejection path (no Python installed in CI's R-only

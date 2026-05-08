@@ -246,6 +246,42 @@ def summarize_tool_call(short_name: str, input_args: dict[str, Any]) -> str:
         if tail:
             bits.append(f"tail={tail}")
         return ", ".join(bits)
+    if short_name == "compose_results":
+        # Layout-spec composer — surface the dimensions so the recall
+        # snippet conveys "this turn built a 3-column × 4-row table"
+        # rather than just "[compose_results]".
+        spec = input_args.get("spec")
+        cols = spec.get("columns") if isinstance(spec, dict) else None
+        groups = spec.get("groups") if isinstance(spec, dict) else None
+        ncols = len(cols) if isinstance(cols, list) else 0
+        nrows = 0
+        if isinstance(groups, list):
+            for g in groups:
+                gr = g.get("rows") if isinstance(g, dict) else None
+                if isinstance(gr, list):
+                    nrows += len(gr)
+        if ncols or nrows:
+            return f"{ncols} cols × {nrows} rows"
+        return ""
+    if short_name == "list_session_files":
+        # No required args; surface the optional ``kinds`` filter
+        # when set so a recall like ``list_session_files [data]``
+        # reads sensibly.
+        kinds = input_args.get("kinds")
+        if isinstance(kinds, list) and kinds:
+            return ",".join(str(k) for k in kinds)
+        return ""
+    if short_name == "search_in_session_files":
+        q = input_args.get("query") or ""
+        kinds = input_args.get("kinds")
+        kinds_part = ""
+        if isinstance(kinds, list) and kinds:
+            kinds_part = ",".join(str(k) for k in kinds)
+        if q and kinds_part:
+            return f"{q!r} ({kinds_part})"
+        if q:
+            return f"{q!r}"
+        return kinds_part
     return ""
 
 
