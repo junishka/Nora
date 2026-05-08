@@ -135,6 +135,24 @@ if [[ "$BRANCH" != "main" ]]; then
 fi
 echo "  ✓ Branch: $BRANCH"
 
+# Freshness check: warn if local is behind the remote tracking branch.
+# Common failure mode is "forgot to pull, built and shipped a stale
+# bundle". Fetch is silent and non-merging, so this is informational —
+# we don't try to pull from inside the release pipeline because pull
+# failures (conflicts, network) belong upstream of the build.
+if /usr/bin/git rev-parse --abbrev-ref --symbolic-full-name @{u} >/dev/null 2>&1; then
+    /usr/bin/git fetch --quiet 2>/dev/null || true
+    BEHIND="$(/usr/bin/git rev-list --count "HEAD..@{u}" 2>/dev/null || echo 0)"
+    if [[ "$BEHIND" -gt 0 ]]; then
+        echo "  ⚠ Local '$BRANCH' is $BEHIND commit(s) behind origin/$BRANCH."
+        echo -n "    Pull first to ship the latest, or continue anyway? [y/N] "
+        read -r ans
+        [[ "$ans" =~ ^[Yy]$ ]] || { echo "Run 'git pull' and re-run." >&2; exit 1; }
+    else
+        echo "  ✓ Up to date with origin/$BRANCH"
+    fi
+fi
+
 if [[ "$CHECK_ONLY" == "true" ]]; then
     echo
     echo "Pre-flight passed. (--check-only: skipping build.)"
