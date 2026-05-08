@@ -569,7 +569,7 @@ class NoraBridge:
         the same id so the JS event filter can drop late events from
         a turn the researcher cancels later.
         """
-        return self._send_to_active(text, images=None)
+        return self._send_to_active(text, images=None, target_cwd=None)
 
     def send_message_with_images(
         self, text: str, images: list[dict[str, Any]]
@@ -580,14 +580,52 @@ class NoraBridge:
         ``None`` on early failure. ``images[i] = {"data": <base64>,
         "mime": ...}``.
         """
-        return self._send_to_active(text, images=images)
+        return self._send_to_active(text, images=images, target_cwd=None)
+
+    def send_message_to_session(
+        self, session_cwd: str, text: str,
+    ) -> str | None:
+        """Schedule a turn on the runner whose cwd matches ``session_cwd``.
+
+        Used by the JS-side queue-flush path: when a background
+        turn finishes on session A, its queued follow-up has to fire
+        AGAINST A even if the user has since switched the focus to
+        session B. Without this explicit-target variant, the queued
+        send routed through ``send_message`` would land on whatever
+        ``self.cwd`` happened to be at flush time — a cross-session
+        execution mix-up where A's pending message ran in B's
+        working directory.
+        """
+        return self._send_to_active(
+            text, images=None, target_cwd=session_cwd,
+        )
+
+    def send_message_with_images_to_session(
+        self, session_cwd: str, text: str, images: list[dict[str, Any]],
+    ) -> str | None:
+        """Image-bearing twin of :meth:`send_message_to_session`.
+
+        Same routing rule: the turn fires on the runner registered
+        under ``session_cwd``, regardless of which session is
+        currently focused.
+        """
+        return self._send_to_active(
+            text, images=images, target_cwd=session_cwd,
+        )
 
     def _send_to_active(
         self,
         text: str,
         images: list[dict[str, Any]] | None,
+        target_cwd: str | None,
     ) -> str | None:
-        """Find the active session's runner and start a turn on it.
+        """Schedule a turn on a runner.
+
+        ``target_cwd`` selects the runner explicitly (used by the
+        queue-flush path so a background-finished turn fires its
+        follow-up against the right session, not whichever happens
+        to be focused). When ``None``, the active runner is used —
+        the normal interactive-send path.
 
         Each runner has its own send-lock, so kicking off a turn on
         runner A while runner B is still streaming does NOT block —
@@ -608,20 +646,53 @@ class NoraBridge:
             self._dispatch_event({
                 "type": "turn_error",
                 "message": "worker loop not running",
-                "session_cwd": str(self.cwd) if self.cwd else None,
-            })
-            return None
-        if self.cwd is None:
-            self._dispatch_event({
-                "type": "turn_error",
-                "message": (
-                    "no working directory set — choose files or a "
-                    "folder first"
+                "session_cwd": (
+                    target_cwd if target_cwd is not None
+                    else (str(self.cwd) if self.cwd else None)
                 ),
-                "session_cwd": None,
             })
             return None
-        runner = self._ensure_runner_for_cwd(self.cwd)
+        # Resolve which runner this send goes to. Explicit target
+        # wins; without one, fall back to the focused cwd.
+        if target_cwd is not None:
+            try:
+                resolved = Path(target_cwd).resolve()
+            except (OSError, RuntimeError):
+                self._dispatch_event({
+                    "type": "turn_error",
+                    "message": f"invalid target cwd: {target_cwd!r}",
+                    "session_cwd": target_cwd,
+                })
+                return None
+            # Match against the runners dict — its keys are resolved
+            # paths. A targeted send must hit a runner that already
+            # exists; lazily creating one for an arbitrary caller-
+            # supplied path would let a stale queue resurrect a
+            # session the researcher has since deleted.
+            runner_key = str(resolved)
+            runner = self._runners.get(runner_key)
+            if runner is None:
+                self._dispatch_event({
+                    "type": "turn_error",
+                    "message": (
+                        "queued message dropped — its session is no "
+                        "longer open"
+                    ),
+                    "session_cwd": runner_key,
+                })
+                return None
+        else:
+            if self.cwd is None:
+                self._dispatch_event({
+                    "type": "turn_error",
+                    "message": (
+                        "no working directory set — choose files or a "
+                        "folder first"
+                    ),
+                    "session_cwd": None,
+                })
+                return None
+            runner = self._ensure_runner_for_cwd(self.cwd)
         self._record_user_message(runner, text, image_count=len(images or []))
         # 16 hex chars = 64 bits of entropy. Vastly more than enough
         # for a per-session non-collision guarantee, short enough to
@@ -1264,6 +1335,26 @@ class NoraBridge:
                             break
                 except OSError:
                     pass
+        if target is None:
+            # Run-dir scripts: ``list_session_files`` surfaces the
+            # ``script.{do,R,py}`` file at the root of each run dir
+            # under a label-derived display name (e.g.
+            # "Linear Regression Run.do"). The mention dropdown
+            # offers those rows but their display names don't match
+            # any on-disk basename in cwd or _nora_plots — that's
+            # what made selecting a run-dir script fail with
+            # "not found" even though it appears in the list. Resolve
+            # the display name back through the same enumeration
+            # the panel uses so the advertised recovery path
+            # actually works.
+            from nora.run_files import find_run_dir_script_by_name
+            run_script = find_run_dir_script_by_name(self.cwd, safe_name)
+            if (
+                run_script is not None
+                and _is_within(run_script, cwd_resolved)
+                and run_script.is_file()
+            ):
+                target = run_script
         if target is None:
             return {"ok": False, "reason": f"not found: {safe_name}"}
         runner = self._active_runner()
@@ -2564,11 +2655,26 @@ class NoraBridge:
         # next send. Without this the chip stayed flat when a
         # researcher attached a 90 KB ``.do`` / ``.py`` file, even
         # though those bytes will ride into the next request.
+        #
+        # Same posture for pending vision images: ``run_turn``
+        # auto-merges the runner's ``pending_plot_images`` (up to
+        # eight result plots from the previous script) and
+        # ``pending_mentioned_images`` (researcher @-mentions) into
+        # the next provider request. JS only sees its OWN composer-
+        # staged image count, so without adding the runner-side
+        # totals here the chip would recount as if no images were
+        # pending right after a script emitted plots — even though
+        # the next send would silently attach them.
         active = self._active_runner()
         if active is not None:
             attachments = active.pending_script_attachments
             n_pending_attachments = len(attachments)
             pending_attachment_chars = _sum_inline_attachment_chars(attachments)
+            n_images = (
+                n_images
+                + len(active.pending_plot_images)
+                + len(active.pending_mentioned_images)
+            )
         else:
             pending_attachment_chars = 0
 
@@ -2944,6 +3050,7 @@ def _build_script_attachment_prefix(
     """
     if not attachments:
         return ""
+    from nora.text_safety import safe_text
     parts: list[str] = [
         "[Files the researcher attached to this message — reference "
         "them as needed; the originals are saved alongside the data "
@@ -2956,12 +3063,33 @@ def _build_script_attachment_prefix(
         lang_label, fence_lang = _SCRIPT_LANGUAGE_HINTS.get(
             att.get("ext", ""), ("plaintext", "")
         )
-        rel_path = name
-        if cwd is not None:
+        # Sanitize the display name before interpolating it into a
+        # markdown heading. Filenames on macOS / Linux can contain
+        # newlines, bidi/control characters, and markdown syntax;
+        # without this, a hostile filename can break out of the
+        # intended ``### name (Lang)`` line and inject prompt
+        # instructions that ride above the researcher's message.
+        # ``safe_text`` flattens whitespace (so newlines become
+        # spaces), strips bidi/zero-width chars, and caps length —
+        # matching the boundary every other data-origin string
+        # crossing to Claude already respects. The on-disk basename
+        # in ``att["name"]`` is preserved unchanged for any actual
+        # file lookups; this sanitization is purely for the prompt
+        # rendering surface.
+        display_name = safe_text(
+            name if isinstance(name, str) else str(name),
+            max_len=120,
+        ) or "(attached file)"
+        rel_path = display_name
+        if cwd is not None and isinstance(name, str):
             try:
-                rel_path = str((cwd / name).relative_to(cwd))
+                # Resolve the on-disk relative path off the REAL
+                # basename, then sanitize the result. Falls back to
+                # the sanitized display name on error.
+                resolved = str((cwd / name).relative_to(cwd))
+                rel_path = safe_text(resolved, max_len=120) or display_name
             except (ValueError, OSError):
-                rel_path = name
+                rel_path = display_name
         header = f"\n### {rel_path} ({lang_label})\n"
         block = (
             f"{header}```{fence_lang}\n"

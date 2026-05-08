@@ -470,6 +470,91 @@ def test_cancel_turn_does_not_cancel_running_task_when_pending_targeted(
 
 
 # ---------------------------------------------------------------------------
+# send_message_to_session — explicit-target send for the queue-flush path
+# ---------------------------------------------------------------------------
+
+def test_send_message_to_session_routes_to_target_not_focus(tmp_path: Path):
+    """``fireQueuedMessage`` calls the targeted variant after a
+    background turn finishes. If session A queued a follow-up and
+    the user has since switched the focus to session B, the queued
+    send MUST land on A's runner, not B's. Pre-fix: the bridge had
+    no targeted variant; ``send_message`` always routed to
+    ``self.cwd`` (the focused session), so A's queued message would
+    persist and execute against B's working directory.
+    """
+    a = (tmp_path / "session-a").resolve()
+    b = (tmp_path / "session-b").resolve()
+    a.mkdir()
+    b.mkdir()
+
+    bridge = NoraBridge(cwd=a)
+    bridge.start_loop()
+    try:
+        # Lazy-create both runners so the targeted send has someone
+        # to route to.
+        runner_a = bridge._ensure_runner_for_cwd(a)
+        runner_b = bridge._ensure_runner_for_cwd(b)
+        assert runner_a is not runner_b
+        # Simulate the user switching focus to B without going through
+        # ``switch_session`` (which enforces SESSIONS_ROOT containment
+        # — irrelevant to what this test pins).
+        bridge.cwd = b
+        assert bridge.cwd == b
+
+        # Patch run_turn on both runners to a no-op coroutine that
+        # records which runner got the call. We don't want the test
+        # to actually open a provider session.
+        called_on: list[str] = []
+
+        async def _spy_a(*args, **kwargs):
+            called_on.append("a")
+
+        async def _spy_b(*args, **kwargs):
+            called_on.append("b")
+
+        runner_a.run_turn = _spy_a  # type: ignore[assignment]
+        runner_b.run_turn = _spy_b  # type: ignore[assignment]
+
+        turn_id = bridge.send_message_to_session(str(a), "hi from A's queue")
+        assert turn_id is not None, (
+            "targeted send should schedule even when focus is on B"
+        )
+        # Give the worker loop a beat to dispatch.
+        import time
+        time.sleep(0.05)
+        assert called_on == ["a"], (
+            f"queued message must run on session A, got {called_on}"
+        )
+    finally:
+        bridge.stop_loop()
+
+
+def test_send_message_to_session_rejects_unknown_cwd(tmp_path: Path):
+    """A targeted send must NOT lazy-create runners for arbitrary
+    caller-supplied paths — that would let a stale queue resurrect
+    a session the researcher has since deleted. Unknown targets
+    should produce a turn_error event and return None instead.
+    """
+    bridge = NoraBridge(cwd=tmp_path)
+    bridge.start_loop()
+    try:
+        events: list[dict] = []
+        bridge._dispatch_event = events.append  # type: ignore[assignment]
+
+        result = bridge.send_message_to_session(
+            str(tmp_path / "does-not-exist"), "hi",
+        )
+        assert result is None
+        assert any(
+            e.get("type") == "turn_error"
+            and "no longer open" in (e.get("message") or "")
+            for e in events
+        ), f"expected turn_error event, got {events}"
+    finally:
+        bridge.stop_loop()
+
+
+# ---------------------------------------------------------------------------
 # delete_session on the currently-active session
 # ---------------------------------------------------------------------------
 

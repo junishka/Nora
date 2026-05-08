@@ -44,6 +44,18 @@ from nora import sanitizer
 from nora.provider.tool_schemas import build_tool_specs
 from nora.sanitizer import sanitize
 from nora.store import get_store
+from nora.text_safety import safe_text
+
+
+# Caps for plot-helper manifest fields. Match the runner's
+# ``_PLOT_LABEL_MAX_LEN`` / ``_PLOT_NAME_MAX_LEN`` so the chars cap on
+# the same data crossing through both surfaces is consistent.
+_PLOT_HELPER_LABEL_MAX_LEN = 120
+_PLOT_HELPER_NAME_MAX_LEN = 80
+# Helper-error prose can be longer than a label (a Stata `display`
+# error or matplotlib traceback summary), so a slightly more generous
+# cap keeps useful diagnostics intact while still bounding payloads.
+_PLOT_HELPER_MESSAGE_MAX_LEN = 400
 
 
 # Single source of truth for tool name + description + arg shape lives
@@ -502,21 +514,56 @@ def _summarize_plot_helpers(run_dir: Any) -> dict[str, Any] | None:
                 out.append(entry)
         return out
 
+    # Every string in these JSONL files originates from a user-
+    # authored script (the helper libraries write whatever the
+    # researcher's code passes them). Without sanitization these go
+    # straight into the model-visible tool result, so a script could
+    # compute a label or filename from raw data values and inject
+    # prompt instructions that bypass the analysis-payload sanitizer.
+    # The runner's ``_capture_plots`` already runs the same data
+    # through ``safe_text`` before storing pending plot images;
+    # apply the same boundary here.
     if manifest.is_file():
         for entry in _read_jsonl(manifest):
+            raw_file = entry.get("file", "?")
+            raw_kind = entry.get("kind", "?")
+            raw_label = entry.get("label", "")
             succeeded.append({
-                "file": str(entry.get("file", "?")),
-                "kind": str(entry.get("kind", "?")),
-                "label": str(entry.get("label", "")),
+                "file": safe_text(
+                    raw_file if isinstance(raw_file, str) else str(raw_file),
+                    max_len=_PLOT_HELPER_NAME_MAX_LEN,
+                ) or "?",
+                "kind": safe_text(
+                    raw_kind if isinstance(raw_kind, str) else str(raw_kind),
+                    max_len=_PLOT_HELPER_NAME_MAX_LEN,
+                ) or "?",
+                "label": safe_text(
+                    raw_label if isinstance(raw_label, str) else str(raw_label),
+                    max_len=_PLOT_HELPER_LABEL_MAX_LEN,
+                ),
             })
     if errors.is_file():
         for entry in _read_jsonl(errors):
+            raw_helper = entry.get("helper", "?")
+            raw_message = entry.get("message", "")
             row: dict[str, Any] = {
-                "helper": str(entry.get("helper", "?")),
-                "message": str(entry.get("message", "")),
+                "helper": safe_text(
+                    raw_helper if isinstance(raw_helper, str)
+                    else str(raw_helper),
+                    max_len=_PLOT_HELPER_NAME_MAX_LEN,
+                ) or "?",
+                "message": safe_text(
+                    raw_message if isinstance(raw_message, str)
+                    else str(raw_message),
+                    max_len=_PLOT_HELPER_MESSAGE_MAX_LEN,
+                ),
             }
-            if entry.get("fix"):
-                row["fix"] = str(entry["fix"])
+            raw_fix = entry.get("fix")
+            if raw_fix:
+                row["fix"] = safe_text(
+                    raw_fix if isinstance(raw_fix, str) else str(raw_fix),
+                    max_len=_PLOT_HELPER_MESSAGE_MAX_LEN,
+                )
             failed.append(row)
 
     if not succeeded and not failed:
