@@ -77,23 +77,43 @@ class _FlakyKeyring:
 def test_get_credential_does_not_cache_transient_failures(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A keyring backend error must NOT be cached as 'no creds' for
-    the rest of the process. Pre-fix, the second call returned the
-    cached None even though the backend had recovered, so the auth
-    screen kept claiming the credential was gone until restart."""
+    """A keyring backend error must NOT be cached as 'no creds' in
+    ``_CRED_CACHE``. Pre-fix, the second call returned the cached
+    None even though the backend had recovered, so the auth screen
+    kept claiming the credential was gone until restart.
+
+    The current implementation records the error timestamp in
+    ``_CRED_ERROR_AT`` instead and uses a short backoff to suppress
+    re-querying within a single render — that's prompt-storm
+    prevention without poisoning the cache. The recovery property
+    is what this test pins: once we step past the backoff window,
+    the next call sees the recovered value.
+    """
     from nora import auth
 
     auth._CRED_CACHE.clear()
+    auth._CRED_ERROR_AT.clear()
     flaky = _FlakyKeyring(eventual_value="sk-ant-recovered")
     monkeypatch.setattr(auth, "_keyring", flaky)
 
     # First call: backend raises → returns None, but the failure
-    # must NOT be cached.
+    # must NOT be recorded as a missing credential in _CRED_CACHE
+    # (would survive any backoff and lock the UI for the process
+    # lifetime).
     first = auth.get_credential("anthropic")
     assert first is None
     assert "anthropic" not in auth._CRED_CACHE, (
-        "transient errors must not poison the cache"
+        "transient errors must not poison the credential cache"
     )
+    # The error IS recorded in the backoff dict so a burst of
+    # follow-up calls within the same render returns None without
+    # re-prompting the user.
+    assert "anthropic" in auth._CRED_ERROR_AT
+
+    # Step past the backoff window (the implementation uses a small
+    # number of seconds; clear the dict to simulate elapsed time
+    # without wall-clock waiting in the test).
+    auth._CRED_ERROR_AT.clear()
 
     # Second call: backend has recovered, value comes through.
     second = auth.get_credential("anthropic")
