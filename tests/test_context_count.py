@@ -98,7 +98,7 @@ def test_count_threads_request_id_unchanged(tmp_path: Path) -> None:
     transformation here would let an old response masquerade as
     fresh."""
     c = count_next_context(
-        cwd=tmp_path, request_id=12345,
+        cwd=tmp_path, ceiling=1_000_000, request_id=12345,
     )
     assert c.request_id == 12345
     assert to_payload(c)["request_id"] == 12345
@@ -163,17 +163,17 @@ def test_count_includes_pending_attachment_chars(tmp_path: Path) -> None:
     ``pending_attachment_chars`` wasn't a parameter and JS sent 0
     for the count."""
     base = count_next_context(
-        cwd=tmp_path, draft_text="", n_images=0,
+        cwd=tmp_path, ceiling=1_000_000, draft_text="", n_images=0,
         n_pending_attachments=0, pending_attachment_chars=0,
         system_prompt_chars=10_000, tool_schema_chars=20_000,
     )
     one_small = count_next_context(
-        cwd=tmp_path, draft_text="", n_images=0,
+        cwd=tmp_path, ceiling=1_000_000, draft_text="", n_images=0,
         n_pending_attachments=1, pending_attachment_chars=200,
         system_prompt_chars=10_000, tool_schema_chars=20_000,
     )
     one_big = count_next_context(
-        cwd=tmp_path, draft_text="", n_images=0,
+        cwd=tmp_path, ceiling=1_000_000, draft_text="", n_images=0,
         n_pending_attachments=1, pending_attachment_chars=90_000,
         system_prompt_chars=10_000, tool_schema_chars=20_000,
     )

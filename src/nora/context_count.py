@@ -108,12 +108,15 @@ def _model_facing_history_chars(history_path: Path) -> int:
     return total
 
 
-# Average bytes per token for English-leaning prose with code mixed
-# in. 3.5 sits between Claude's empirical 3.6-3.8 (per Anthropic's
-# own published rule of thumb) and the chars/4 figure the OpenAI
-# docs cite, biased slightly toward over-estimation so we don't
-# under-report headroom. Replaced by exact tokenization once the
-# tiktoken / count_tokens paths land.
+# Average characters per token for English-leaning prose with code
+# mixed in. 3.5 sits BELOW Claude's empirical 3.6-3.8 (per Anthropic's
+# published rule of thumb) and the chars/4 figure the OpenAI docs
+# cite. The smaller divisor over-estimates tokens — and an over-
+# estimate of tokens is a CONSERVATIVE chip reading: the chip looks
+# fuller than reality, so the researcher gets warned about a packed
+# context BEFORE they hit the wall, rather than discovering a
+# "context too long" error mid-turn. Replaced by exact tokenization
+# once the tiktoken / count_tokens paths land.
 _CHARS_PER_TOKEN_FALLBACK = 3.5
 
 # Each image submitted as a vision content block costs roughly this
@@ -148,13 +151,13 @@ class ContextCount:
 def count_next_context(
     cwd: Path | None,
     *,
+    ceiling: int,
     draft_text: str = "",
     n_images: int = 0,
     n_pending_attachments: int = 0,
     pending_attachment_chars: int = 0,
     system_prompt_chars: int = 0,
     tool_schema_chars: int = 0,
-    ceiling: int = 1_000_000,
     request_id: int = 0,
 ) -> ContextCount:
     """Count the size of the next request the bridge would assemble.
