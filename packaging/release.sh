@@ -75,6 +75,14 @@ done
 # Confirm prompts honour --yes / NORA_RELEASE_YES. When neither is set
 # AND stdin isn't a TTY, refuse instead of blocking forever — CI logs
 # would otherwise stall silently on a never-arriving newline.
+# Both regexes match either the single-letter form (y / Y / n / N) or
+# the full word (yes / YES / Yes, no / NO / No). Empty input falls
+# through to whichever default the helper enforces. Explicit "no"
+# typed at a default-yes prompt should mean no, not "garbage → default
+# → yes" which is what an over-strict ^[Nn]$ would do.
+_RE_YES='^[Yy]([Ee][Ss])?$'
+_RE_NO='^[Nn]([Oo])?$'
+
 confirm() {
     local prompt="$1"
     if [[ "$ASSUME_YES" == "true" ]]; then
@@ -89,7 +97,27 @@ confirm() {
     local ans=""
     echo -n "    $prompt [y/N] "
     read -r ans
-    [[ "$ans" =~ ^[Yy]$ ]]
+    [[ "$ans" =~ $_RE_YES ]]
+}
+
+# Default-yes counterpart of ``confirm``. Use for prompts where the
+# obvious / expected answer is yes (e.g. "pull now?") so the user can
+# accept by just hitting Enter. Non-TTY runs silently accept — CI's
+# explicit choice is to not interact, and a default-yes prompt's whole
+# point is that yes is the safe path.
+confirm_yes() {
+    local prompt="$1"
+    if [[ "$ASSUME_YES" == "true" ]]; then
+        echo "    $prompt [Y/n] y  (auto)"
+        return 0
+    fi
+    if [[ ! -t 0 ]]; then
+        return 0
+    fi
+    local ans=""
+    echo -n "    $prompt [Y/n] "
+    read -r ans
+    [[ ! "$ans" =~ $_RE_NO ]]
 }
 
 # ── Pre-flight ────────────────────────────────────────────────────────
@@ -183,8 +211,24 @@ if /usr/bin/git rev-parse --abbrev-ref --symbolic-full-name @{u} >/dev/null 2>&1
         BEHIND="$(/usr/bin/git rev-list --count "HEAD..@{u}" 2>/dev/null || echo 0)"
         if [[ "$BEHIND" -gt 0 ]]; then
             echo "  ⚠ Local '$BRANCH' is $BEHIND commit(s) behind origin/$BRANCH."
-            confirm "Pull first to ship the latest, or continue anyway?" \
-                || { echo "Run 'git pull' and re-run." >&2; exit 1; }
+            # Single-purpose prompt with the obvious default. The
+            # earlier two-actions-in-one wording ("Pull first, or
+            # continue anyway?") forced the user to puzzle out which
+            # answer meant which action, then dumped the work back on
+            # them as a manual ``git pull`` re-run. Now: just ask, just
+            # do it.
+            if confirm_yes "Pull now?"; then
+                if /usr/bin/git pull --ff-only --quiet; then
+                    NEW_HEAD="$(/usr/bin/git log -1 --format='%h %s' HEAD)"
+                    echo "  ✓ Pulled — now at $NEW_HEAD"
+                else
+                    echo "  ✗ Pull failed (divergence or unmerged paths)." >&2
+                    echo "    Resolve manually with 'git pull' and re-run." >&2
+                    exit 1
+                fi
+            else
+                echo "  ⚠ Continuing with stale source."
+            fi
         else
             echo "  ✓ Up to date with origin/$BRANCH"
         fi
