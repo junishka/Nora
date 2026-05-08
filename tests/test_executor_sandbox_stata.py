@@ -86,6 +86,28 @@ nora_result_regress, label("stata-happy-path")
     for term, p in pvals.items():
         assert isinstance(p, float) and 0.0 <= p <= 1.0, f"{term}={p!r}"
 
+    # No category-error fields: ``regress`` does not run a
+    # chi-squared test, so neither ``chi_squared`` nor
+    # ``chi_squared_p_value`` may appear in an OLS payload. The
+    # helper gates these on ``e(chi2)`` being populated, which
+    # ``regress`` leaves empty. (Stata's ``regress`` also does not
+    # populate ``e(p)`` for OLS — the F-test p-value lives in the
+    # display output as ``Prob > F`` but is not stored in ``e()``,
+    # which is why this test does not assert ``f_p_value``.)
+    assert "f_statistic" in payload, (
+        "regress emits e(F); the helper must surface it as f_statistic"
+    )
+    assert "chi_squared" not in payload, (
+        "regress does not run a chi-squared test; e(chi2) is empty, "
+        "so no chi_squared field should appear"
+    )
+    assert "chi_squared_p_value" not in payload, (
+        "regress does not run a chi-squared test; chi_squared_p_value "
+        "must NOT leak into an OLS payload — even if a future Stata "
+        "version starts populating e(p) for regress, the e(chi2) gate "
+        "keeps the fields disjoint"
+    )
+
 
 @requires_sandbox_apply
 @requires_stata

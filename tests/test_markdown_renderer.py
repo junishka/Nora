@@ -147,6 +147,25 @@ def test_bold_still_renders() -> None:
     assert "<strong>both</strong>" in out
 
 
+def test_bold_italic_triple_asterisk_renders_nested() -> None:
+    """CommonMark's ``***x***`` produces nested ``<strong><em>x</em></strong>``.
+    The earlier renderer's ``\\*\\*((?:[^*]|\\*(?!\\*))+?)\\*\\*`` bold
+    rule consumed the outer ``**`` but happily kept the inner ``*``
+    via the ``\\*(?!\\*)`` clause, leaving one literal ``*`` visible
+    on each side. Pin the fix so a regression here is loud — Claude
+    occasionally emits ``***x***`` for emphasis-within-emphasis and
+    those characters MUST not leak into rendered output."""
+    out = _render("This is ***bold-italic*** text.")
+    assert "<strong><em>bold-italic</em></strong>" in out, out
+    # No literal asterisk should leak through into rendered output.
+    # (Strip <strong>/<em> markers first since they don't contain *.)
+    visible = out.replace("<strong>", "").replace("</strong>", "")
+    visible = visible.replace("<em>", "").replace("</em>", "")
+    assert "*" not in visible, (
+        f"literal asterisk leaked to rendered output: {out!r}"
+    )
+
+
 def test_bold_inside_otherwise_normal_text() -> None:
     """Regression for the field screenshot: ``**both**`` rendered
     bold even though earlier failures had also italicised the

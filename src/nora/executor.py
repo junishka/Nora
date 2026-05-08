@@ -69,7 +69,17 @@ _PYTHON_HARD_REQUIRED: frozenset[str] = frozenset({"pandas", "numpy"})
 # where 5 min isn't enough (large simulations, bootstraps with many
 # replications) or where you want a tighter cap (CI smoke tests).
 # Bad values fall back to the default rather than crashing the
-# bridge — a malformed env var should never strand the user.
+# bridge — a malformed env var should never strand the user — but
+# emit a warning so a typo (``5min``, ``300s``) isn't silent. Cap
+# at 24 hours: a value of e.g. ``2147483647`` would be accepted by
+# the prior parser, letting a runaway script hang the runner for
+# years; the upper bound prevents that without limiting any
+# realistic research workload (a 24h script is already in
+# "should be a batch job" territory, not "interactive analysis").
+_TIMEOUT_FLOOR_SECONDS = 1
+_TIMEOUT_CEILING_SECONDS = 24 * 60 * 60  # 24 hours
+
+
 def _resolve_default_timeout() -> int:
     raw = os.environ.get("NORA_SCRIPT_TIMEOUT_SECONDS", "").strip()
     if not raw:
@@ -77,9 +87,27 @@ def _resolve_default_timeout() -> int:
     try:
         v = int(raw)
     except ValueError:
+        import logging
+        logging.getLogger("nora.executor").warning(
+            "NORA_SCRIPT_TIMEOUT_SECONDS=%r is not an integer; "
+            "falling back to default 300s", raw,
+        )
         return 300
-    if v <= 0:
+    if v < _TIMEOUT_FLOOR_SECONDS:
+        import logging
+        logging.getLogger("nora.executor").warning(
+            "NORA_SCRIPT_TIMEOUT_SECONDS=%d is below floor %ds; "
+            "falling back to default 300s", v, _TIMEOUT_FLOOR_SECONDS,
+        )
         return 300
+    if v > _TIMEOUT_CEILING_SECONDS:
+        import logging
+        logging.getLogger("nora.executor").warning(
+            "NORA_SCRIPT_TIMEOUT_SECONDS=%d exceeds ceiling %ds (24h); "
+            "clamping. A runaway script shouldn't hang the runner for "
+            "longer than that.", v, _TIMEOUT_CEILING_SECONDS,
+        )
+        return _TIMEOUT_CEILING_SECONDS
     return v
 
 
