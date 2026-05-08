@@ -80,19 +80,37 @@ def test_get_credential_does_not_cache_transient_failures(
     """A keyring backend error must NOT be cached as 'no creds' for
     the rest of the process. Pre-fix, the second call returned the
     cached None even though the backend had recovered, so the auth
-    screen kept claiming the credential was gone until restart."""
+    screen kept claiming the credential was gone until restart.
+
+    The recovery path is gated by ``_ERROR_BACKOFF_SECONDS`` (5s by
+    default — prevents prompt-storm during a single auth-screen
+    render where 4+ ``has_credential`` calls fire in microseconds).
+    Within that window the second call still returns ``None`` to
+    suppress re-prompts; once the window elapses the next call hits
+    the backend and recovers. This test rewinds the recorded error
+    timestamp to simulate "enough time has passed" so the recovery
+    path is exercised deterministically."""
+    import time
     from nora import auth
 
     auth._CRED_CACHE.clear()
+    auth._CRED_ERROR_AT.clear()
     flaky = _FlakyKeyring(eventual_value="sk-ant-recovered")
     monkeypatch.setattr(auth, "_keyring", flaky)
 
     # First call: backend raises → returns None, but the failure
-    # must NOT be cached.
+    # must NOT be cached as a definitive "no creds".
     first = auth.get_credential("anthropic")
     assert first is None
     assert "anthropic" not in auth._CRED_CACHE, (
         "transient errors must not poison the cache"
+    )
+
+    # Rewind the error timestamp so the backoff window is past — the
+    # next call will retry the backend instead of returning the
+    # within-window suppressed ``None``.
+    auth._CRED_ERROR_AT["anthropic"] = (
+        time.monotonic() - auth._ERROR_BACKOFF_SECONDS - 1
     )
 
     # Second call: backend has recovered, value comes through.

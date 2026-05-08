@@ -2370,7 +2370,13 @@ def _match_dir_by_display_name(directory: Path, displayed: str) -> Path | None:
         return None
     for child in children:
         try:
-            if not child.is_file():
+            # ``is_file`` follows symlinks; ``is_symlink`` doesn't. A
+            # researcher-uploaded symlink to ``/etc/passwd`` or a
+            # neighbouring session's directory would otherwise let the
+            # model recall its target via display name. ``read_attached_file``
+            # is the only path that can return file BYTES to the model;
+            # excluding symlinks at every match site is the chokepoint.
+            if not child.is_file() or child.is_symlink():
                 continue
         except OSError:
             continue
@@ -2676,7 +2682,12 @@ async def list_session_files(args: dict[str, Any]) -> dict[str, Any]:
         })
     for child in children:
         try:
-            if not child.is_file():
+            # Skip symlinks: ``is_file`` follows them, so a symlink to
+            # ``/etc/passwd`` or another session's run dir would
+            # otherwise be listed and (via ``read_attached_file``)
+            # readable. The shared session_files helper already does
+            # this; the inline tool path missed it.
+            if not child.is_file() or child.is_symlink():
                 continue
         except OSError:
             continue
@@ -2727,7 +2738,14 @@ async def list_session_files(args: dict[str, Any]) -> dict[str, Any]:
                 ).isoformat(timespec="seconds"),
             })
             seen_paths.add(name)
-    rows.sort(key=lambda r: (r["kind"], -r["size_bytes"]))
+    # Flat mtime-desc — newest first, what the model expects to see.
+    # The previous code did two ``rows.sort()`` calls (first by
+    # ``(kind, -size_bytes)``, then by ``mtime`` desc); Python's
+    # stable sort meant the second call's key was the only effective
+    # one, so the first sort was dead weight. Single sort makes the
+    # contract explicit. Ties on the mtime ISO string fall back to
+    # whatever order the tuple comparator gave us (rare in practice
+    # — sub-second filesystem timestamps).
     rows.sort(key=lambda r: r["mtime"], reverse=True)
     counts = {k: 0 for k in NON_DATA_KINDS}
     for r in rows:
@@ -2850,7 +2868,11 @@ async def search_in_session_files(args: dict[str, Any]) -> dict[str, Any]:
     seen_names: set[str] = set()
     for child in sorted(children, key=lambda p: p.name):
         try:
-            if not child.is_file():
+            # Skip symlinks (see list_session_files for the same guard
+            # rationale): a symlink in cwd would otherwise let
+            # search_in_session_files read its target's bytes,
+            # bypassing the SDC line for the file's actual location.
+            if not child.is_file() or child.is_symlink():
                 continue
         except OSError:
             continue
