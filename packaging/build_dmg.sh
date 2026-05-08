@@ -108,21 +108,71 @@ if [[ -n "${NORA_NOTARIZE_PROFILE:-}" ]]; then
         exit 1
     fi
 
-    echo "==> Submitting to Apple notary service (this may take 2-15 minutes)"
-    # --wait blocks until Apple returns a status. On rejection, fetch the
-    # detailed log so the user doesn't have to chase the submission ID.
-    if ! xcrun notarytool submit "$DMG_OUT" \
-            --keychain-profile "$NORA_NOTARIZE_PROFILE" \
-            --wait; then
-        echo
-        echo "Notarization failed. Fetching the most recent submission log:" >&2
-        LATEST_ID="$(xcrun notarytool history \
-                        --keychain-profile "$NORA_NOTARIZE_PROFILE" 2>/dev/null \
-                    | awk '/id:/{print $2; exit}')"
-        if [[ -n "$LATEST_ID" ]]; then
-            xcrun notarytool log "$LATEST_ID" \
-                --keychain-profile "$NORA_NOTARIZE_PROFILE" >&2 || true
-        fi
+    echo "==> Submitting to Apple notary service"
+    # We poll explicitly instead of using ``--wait``. ``--wait`` is a
+    # tight in-process loop with no timeout; when Apple's notary queue
+    # stalls (it does, occasionally — outage, accumulated backpressure,
+    # something on their side), the loop hangs the build for hours
+    # without ever giving up. A previous release of this DMG sat in
+    # --wait for 26 hours before someone noticed. Manual polling lets
+    # us bail with a recovery hint that lets the user resume from the
+    # staple step once Apple eventually finishes.
+    SUBMIT_OUT="$(xcrun notarytool submit "$DMG_OUT" \
+                    --keychain-profile "$NORA_NOTARIZE_PROFILE")"
+    echo "$SUBMIT_OUT"
+    SUBMISSION_ID="$(echo "$SUBMIT_OUT" \
+                     | awk -F': ' '/^[[:space:]]*id:/{print $2; exit}')"
+    if [[ -z "$SUBMISSION_ID" ]]; then
+        echo "Could not parse submission id from notarytool output." >&2
+        exit 1
+    fi
+
+    # Poll up to 30 minutes. Apple's median is ~5min; this absorbs
+    # routine backlogs while still surfacing genuinely-stuck submissions
+    # in a workday rather than a workweek.
+    POLL_INTERVAL=30
+    POLL_TIMEOUT=1800
+    SECONDS_WAITED=0
+    STATUS=""
+    while [[ "$SECONDS_WAITED" -lt "$POLL_TIMEOUT" ]]; do
+        sleep "$POLL_INTERVAL"
+        SECONDS_WAITED=$((SECONDS_WAITED + POLL_INTERVAL))
+        STATUS="$(xcrun notarytool info "$SUBMISSION_ID" \
+                    --keychain-profile "$NORA_NOTARIZE_PROFILE" 2>/dev/null \
+                  | awk -F': ' '/^[[:space:]]*status:/{print $2; exit}')"
+        echo "    [${SECONDS_WAITED}s] status: ${STATUS:-unknown}"
+        case "$STATUS" in
+            Accepted) break ;;
+            Invalid)
+                echo >&2
+                echo "Notarization rejected. Submission log:" >&2
+                xcrun notarytool log "$SUBMISSION_ID" \
+                    --keychain-profile "$NORA_NOTARIZE_PROFILE" >&2 || true
+                exit 1
+                ;;
+        esac
+    done
+
+    if [[ "$STATUS" != "Accepted" ]]; then
+        # Apple is still chewing on it. The artifact and the
+        # submission id are both salvageable — the user just runs the
+        # staple step manually once `notarytool info` flips to Accepted.
+        cat >&2 <<EOF
+
+Notarization still pending after ${POLL_TIMEOUT}s. This is recoverable;
+we just stopped watching. Apple's queue may be backlogged
+(check https://developer.apple.com/system-status/).
+
+Submission id: $SUBMISSION_ID
+
+To finish the release once Apple flips it to Accepted, run:
+
+    xcrun notarytool info $SUBMISSION_ID --keychain-profile $NORA_NOTARIZE_PROFILE
+    # ...wait until status: Accepted, then:
+    xcrun stapler staple "$DMG_OUT"
+    xcrun stapler validate "$DMG_OUT"
+
+EOF
         exit 1
     fi
 
