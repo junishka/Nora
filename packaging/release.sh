@@ -141,15 +141,26 @@ echo "  ✓ Branch: $BRANCH"
 # we don't try to pull from inside the release pipeline because pull
 # failures (conflicts, network) belong upstream of the build.
 if /usr/bin/git rev-parse --abbrev-ref --symbolic-full-name @{u} >/dev/null 2>&1; then
-    /usr/bin/git fetch --quiet 2>/dev/null || true
-    BEHIND="$(/usr/bin/git rev-list --count "HEAD..@{u}" 2>/dev/null || echo 0)"
-    if [[ "$BEHIND" -gt 0 ]]; then
-        echo "  ⚠ Local '$BRANCH' is $BEHIND commit(s) behind origin/$BRANCH."
-        echo -n "    Pull first to ship the latest, or continue anyway? [y/N] "
-        read -r ans
-        [[ "$ans" =~ ^[Yy]$ ]] || { echo "Run 'git pull' and re-run." >&2; exit 1; }
+    if /usr/bin/git fetch --quiet 2>/dev/null; then
+        BEHIND="$(/usr/bin/git rev-list --count "HEAD..@{u}" 2>/dev/null || echo 0)"
+        if [[ "$BEHIND" -gt 0 ]]; then
+            echo "  ⚠ Local '$BRANCH' is $BEHIND commit(s) behind origin/$BRANCH."
+            echo -n "    Pull first to ship the latest, or continue anyway? [y/N] "
+            read -r ans
+            [[ "$ans" =~ ^[Yy]$ ]] || { echo "Run 'git pull' and re-run." >&2; exit 1; }
+        else
+            echo "  ✓ Up to date with origin/$BRANCH"
+        fi
     else
-        echo "  ✓ Up to date with origin/$BRANCH"
+        # Network or auth failure means we can't tell whether the local
+        # tree is current. Without an explicit confirmation that's
+        # acceptable, fail closed — the alternative (silently shipping
+        # whatever stale ref @{u} points to) is exactly the failure
+        # mode the freshness check exists to prevent.
+        echo "  ⚠ Could not fetch from origin (network/auth?) — local freshness unverified."
+        echo -n "    Continue without confirming freshness? [y/N] "
+        read -r ans
+        [[ "$ans" =~ ^[Yy]$ ]] || { echo "Restore network access and re-run." >&2; exit 1; }
     fi
 fi
 
@@ -191,18 +202,37 @@ ASSESS="$( /usr/sbin/spctl --assess --verbose=2 --type execute "$APP" 2>&1 || tr
 if echo "$ASSESS" | grep -qE "accepted"; then
     echo "  ✓ spctl assess: $(echo "$ASSESS" | tr '\n' ' ' | sed 's/  */ /g')"
 else
-    echo "  ⚠ spctl assess did not accept the .app:" >&2
+    # Gatekeeper would block this on a fresh Mac. Shipping anyway
+    # defeats the wrapper's release-gating contract — the whole reason
+    # to run release.sh instead of build_app.sh + build_dmg.sh directly
+    # is so a rejected artifact never reaches the install / "Done" path.
+    echo "  ✗ spctl assess REJECTED the .app — Gatekeeper would block this:" >&2
     echo "    $ASSESS" >&2
+    echo
+    echo "  Common causes:" >&2
+    echo "    • Signature didn't apply (NORA_SIGN_IDENTITY unset on the" >&2
+    echo "      build_app.sh run)" >&2
+    echo "    • Notarization hasn't completed for the bundled .app" >&2
+    echo "    • The signing identity has expired or been revoked" >&2
+    exit 1
 fi
 
 if [[ "$APP_ONLY" == "false" ]] && [[ -f "$DMG" ]]; then
     if xcrun stapler validate "$DMG" >/dev/null 2>&1; then
         echo "  ✓ DMG notarization stapled"
     else
-        echo "  ⚠ DMG is not stapled. Notarization may still be in progress on" >&2
-        echo "    Apple's side. Once 'xcrun notarytool history' shows the latest" >&2
-        echo "    submission as Accepted, finish with:" >&2
-        echo "      xcrun stapler staple \"$DMG\"" >&2
+        # build_dmg.sh staples after notarytool returns Accepted, so a
+        # missing staple here means either the notarize step never ran
+        # (env unset) or it timed out / errored. Either way the .dmg
+        # isn't ready for distribution — fail rather than print Done.
+        echo "  ✗ DMG is NOT stapled — first launch on a fresh Mac will hit Gatekeeper." >&2
+        echo
+        echo "  Recovery if Apple is just slow:" >&2
+        echo "    xcrun notarytool history --keychain-profile \"\$NORA_NOTARIZE_PROFILE\"" >&2
+        echo "    # …wait for status: Accepted, then:" >&2
+        echo "    xcrun stapler staple \"$DMG\"" >&2
+        echo "    xcrun stapler validate \"$DMG\"" >&2
+        exit 1
     fi
 fi
 
