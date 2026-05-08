@@ -91,6 +91,16 @@ def get_credential(provider: str) -> str | None:
     try:
         value = _keyring.get_password(KEYRING_SERVICE, provider)
     except Exception:  # noqa: BLE001 — backend errors mean "couldn't tell"
+        # Record the error timestamp instead of caching ``None``.
+        # Caching ``None`` on a transient backend hiccup conflated
+        # "definitely missing" with "couldn't tell" — the auth
+        # screen reported the credential gone, the researcher saved
+        # a new key, and the UI still showed the provider as unauthed
+        # until restart. ``_CRED_ERROR_AT`` + ``_ERROR_BACKOFF_SECONDS``
+        # gives us both: prompt-storm suppression within a single
+        # render (multiple ``has_credential`` calls in microseconds
+        # → one keyring hit), AND automatic recovery once the backoff
+        # window elapses (no restart needed).
         _CRED_ERROR_AT[provider] = time.monotonic()
         return None
     # Successful read — clear any stale error backoff and cache the

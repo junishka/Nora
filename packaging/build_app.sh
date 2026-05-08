@@ -63,8 +63,12 @@ cp "$REPO_ROOT/packaging/launcher.sh" "$APP_BUNDLE/Contents/MacOS/Nora"
 chmod +x "$APP_BUNDLE/Contents/MacOS/Nora"
 
 # PyInstaller bundle — lives under Resources/nora/.
-# `cp -R` preserves the _internal/ layout PyInstaller generates.
-cp -R "$PYINSTALLER_OUT/." "$APP_BUNDLE/Contents/Resources/nora/"
+# Use ``ditto`` so extended attributes (most importantly the ones a
+# subsequent ``codesign`` will rely on) survive the copy. ``cp -R``
+# can drop xattrs in certain configurations; the breakage is
+# silent — spctl still accepts the bundle but the signature is
+# corrupt enough to fail at launch on a stricter machine.
+/usr/bin/ditto "$PYINSTALLER_OUT/" "$APP_BUNDLE/Contents/Resources/nora/"
 
 # App icon — `Nora.icns` lives at the bundle's Resources root and is
 # referenced by CFBundleIconFile in Info.plist below. Finder, Dock,

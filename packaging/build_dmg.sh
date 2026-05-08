@@ -127,30 +127,76 @@ if [[ -n "${NORA_NOTARIZE_PROFILE:-}" ]]; then
         exit 1
     fi
 
-    # Poll up to 30 minutes. Apple's median is ~5min; this absorbs
-    # routine backlogs while still surfacing genuinely-stuck submissions
-    # in a workday rather than a workweek.
-    POLL_INTERVAL=30
-    POLL_TIMEOUT=1800
+    # Poll up to 30 minutes (default; both intervals env-overridable
+    # so CI can shorten on fast notarization paths and lengthen on
+    # known-slow days). Apple's median is ~5min; the default absorbs
+    # routine backlogs while still surfacing genuinely-stuck
+    # submissions in a workday rather than a workweek.
+    POLL_INTERVAL="${NORA_NOTARIZE_POLL_INTERVAL:-30}"
+    POLL_TIMEOUT="${NORA_NOTARIZE_POLL_TIMEOUT:-1800}"
     SECONDS_WAITED=0
     STATUS=""
-    while [[ "$SECONDS_WAITED" -lt "$POLL_TIMEOUT" ]]; do
-        sleep "$POLL_INTERVAL"
-        SECONDS_WAITED=$((SECONDS_WAITED + POLL_INTERVAL))
-        STATUS="$(xcrun notarytool info "$SUBMISSION_ID" \
-                    --keychain-profile "$NORA_NOTARIZE_PROFILE" 2>/dev/null \
-                  | awk -F': ' '/^[[:space:]]*status:/{print $2; exit}')"
+    # Poll BEFORE the first sleep — Apple sometimes flips a tiny
+    # submission to Accepted within seconds, and a leading 30s wait
+    # was a guaranteed floor on every release. Layout is "check,
+    # then sleep, then check again" so a fast accept exits in <1s,
+    # a typical accept exits at the first natural-cadence interval,
+    # and slow ones still cap at POLL_TIMEOUT.
+    while true; do
+        # ``--output-format json`` gives a stable shape regardless
+        # of Apple's free-form column layout. The previous awk
+        # ``status:`` parser was one Apple cosmetic change away from
+        # silently returning empty status forever (which would loop
+        # the script until POLL_TIMEOUT). The python one-liner is
+        # vendored here so the script keeps its single-bash-file
+        # contract — bringing in jq would add a dependency that
+        # release machines may not have.
+        STATUS_JSON="$(xcrun notarytool info "$SUBMISSION_ID" \
+                        --keychain-profile "$NORA_NOTARIZE_PROFILE" \
+                        --output-format json 2>/dev/null || true)"
+        STATUS="$(printf '%s' "$STATUS_JSON" \
+                  | /usr/bin/python3 -c 'import json,sys
+try:
+  print(json.loads(sys.stdin.read()).get("status", ""))
+except Exception:
+  pass' 2>/dev/null)"
         echo "    [${SECONDS_WAITED}s] status: ${STATUS:-unknown}"
         case "$STATUS" in
-            Accepted) break ;;
-            Invalid)
+            Accepted)
+                break
+                ;;
+            Invalid|Rejected)
+                # ``Invalid`` is Apple's documented terminal-failure
+                # status. ``Rejected`` is included defensively in case
+                # Apple introduces a synonym; treating it as failure
+                # is correct either way.
                 echo >&2
-                echo "Notarization rejected. Submission log:" >&2
+                echo "Notarization rejected (status=$STATUS). Submission log:" >&2
                 xcrun notarytool log "$SUBMISSION_ID" \
                     --keychain-profile "$NORA_NOTARIZE_PROFILE" >&2 || true
                 exit 1
                 ;;
+            "In Progress"|"")
+                # Still working / transient query failure. Loop.
+                ;;
+            *)
+                # Unknown terminal status — treat as failure rather
+                # than spinning until POLL_TIMEOUT. Apple may add new
+                # statuses; we'd rather fail loudly than silently
+                # consume a 30-min timeout.
+                echo >&2
+                echo "Notarization returned unexpected status: $STATUS" >&2
+                echo "Submission id: $SUBMISSION_ID" >&2
+                echo "Inspect with:" >&2
+                echo "  xcrun notarytool info $SUBMISSION_ID --keychain-profile $NORA_NOTARIZE_PROFILE" >&2
+                exit 1
+                ;;
         esac
+        if [[ "$SECONDS_WAITED" -ge "$POLL_TIMEOUT" ]]; then
+            break
+        fi
+        sleep "$POLL_INTERVAL"
+        SECONDS_WAITED=$((SECONDS_WAITED + POLL_INTERVAL))
     done
 
     if [[ "$STATUS" != "Accepted" ]]; then
