@@ -9,6 +9,7 @@ Credential Manager available. The fake mirrors the methods Nora's
 
 from __future__ import annotations
 
+import time
 from typing import Any
 
 import pytest
@@ -41,8 +42,10 @@ class _FakeKeyring:
 def _clear_cred_cache() -> None:
     """The auth module caches credential reads across the process to
     avoid redundant Keychain prompts. Tests need a fresh cache each
-    case or fakes from the previous test bleed through."""
+    case or fakes from the previous test bleed through. The error
+    backoff dict mirrors the cache and must be cleared too."""
     auth._CRED_CACHE.clear()
+    auth._CRED_ERROR_AT.clear()
 
 
 @pytest.fixture
@@ -154,3 +157,65 @@ def test_keyring_read_error_returns_none(
 
     monkeypatch.setattr(fake_keyring, "get_password", _raise)
     assert auth.get_credential("openai") is None
+
+
+def test_keyring_error_does_not_poison_cache_permanently(
+    monkeypatch: pytest.MonkeyPatch, fake_keyring: _FakeKeyring,
+) -> None:
+    """A transient backend failure (locked Keychain, denied prompt,
+    securityd hiccup) must not lock the process into a no-creds view.
+    Once the backoff window elapses and the backend recovers, the
+    next read picks up the real credential — without restarting the
+    app.
+
+    Regression: previously ``get_credential`` cached ``None`` on any
+    keyring exception, so a single denied prompt made every later
+    call return ``None`` even after the user granted access via
+    Keychain Access.
+    """
+    # Pre-populate the fake's store as if a credential was set
+    # before the process even started.
+    fake_keyring.store[(auth.KEYRING_SERVICE, "openai")] = "sk-real"
+
+    calls = {"n": 0}
+    real_get = fake_keyring.get_password
+
+    def _flaky(service: str, username: str) -> str | None:
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise RuntimeError("backend locked")
+        return real_get(service, username)
+
+    monkeypatch.setattr(fake_keyring, "get_password", _flaky)
+
+    # First call — backend errors → returns None.
+    assert auth.get_credential("openai") is None
+
+    # Within the backoff window, repeated calls do NOT re-hit keyring
+    # (so the user isn't prompt-stormed during a single render burst).
+    # Burst suppression: 5 calls produce 1 backend hit total.
+    for _ in range(5):
+        assert auth.get_credential("openai") is None
+    assert calls["n"] == 1
+
+    # Simulate enough time passing for the backoff to expire by
+    # rewinding the recorded error timestamp. The next call retries
+    # the backend and recovers.
+    auth._CRED_ERROR_AT["openai"] = (
+        time.monotonic() - auth._ERROR_BACKOFF_SECONDS - 1
+    )
+    assert auth.get_credential("openai") == "sk-real"
+    assert calls["n"] == 2
+
+
+def test_set_credential_clears_error_backoff(
+    monkeypatch: pytest.MonkeyPatch, fake_keyring: _FakeKeyring,
+) -> None:
+    """Once the user successfully writes a credential, the error
+    backoff for that provider is cleared — a successful write proves
+    the backend is reachable, so future reads must not be artificially
+    delayed by a stale error timestamp."""
+    auth._CRED_ERROR_AT["openai"] = time.monotonic()
+    res = auth.set_credential("openai", "sk-new")
+    assert res["ok"] is True
+    assert "openai" not in auth._CRED_ERROR_AT
