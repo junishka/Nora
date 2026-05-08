@@ -1,12 +1,10 @@
 # -*- mode: python ; coding: utf-8 -*-
 """PyInstaller spec — builds the self-contained Nora binary.
 
-The bundle entry is ``__main_ui__.py`` (the web shell), NOT
-``__main__.py`` (the terminal CLI). The .app the build script
-assembles around this bundle launches the pywebview-based UI
-directly — researchers double-click Nora.app and get the
-chat window with no Terminal popup. The terminal CLI stays
-available from source via ``uv run nora``.
+The bundle entry is ``__main__.py`` — a thin shim that calls
+``nora.ui.main`` to bring up the pywebview-based UI directly.
+Researchers double-click Nora.app and get the chat window with no
+Terminal popup.
 
 Produces ``dist/nora/`` with the ``nora`` executable plus every
 dependency (Python runtime, pandas, pyreadstat, claude-agent-sdk,
@@ -44,12 +42,12 @@ from PyInstaller.utils.hooks import collect_submodules
 # so we resolve relative to the spec's directory.
 REPO_ROOT = Path(SPECPATH).parent  # type: ignore[name-defined]  # SPECPATH from PyInstaller
 
-# Web UI entry. The terminal CLI's __main__.py is intentionally NOT
-# the bundle entry — see the module docstring for the why. Keeping
-# both Python entry-point modules in src/nora/ means
-# ``uv run nora`` (CLI) and ``uv run nora-ui`` (web) both
-# still work from source unchanged.
-ENTRY = str(REPO_ROOT / "src" / "nora" / "__main_ui__.py")
+# Web UI entry. The shim re-exports ``nora.ui.main`` so
+# ``uv run nora-ui`` (console-script) and ``python -m nora`` (package
+# entry) both end up at the same place; PyInstaller targets the file
+# rather than a console-script so it doesn't need entry-point metadata
+# at build time.
+ENTRY = str(REPO_ROOT / "src" / "nora" / "__main__.py")
 
 # Runtime libraries (R + Stata) are loaded via `importlib.resources`
 # inside `executor._stage_runtime`. PyInstaller preserves the package

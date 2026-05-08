@@ -205,22 +205,13 @@ Never at any depth: raw values, min, max, median, individual
 observations. Those belong to `request_data` (with its own SDC
 rules) and `submit_script` (sanitized via the result pipeline).
 
-Interactive editing now exists in both frontends:
-
-- **Terminal:** `/policy` slash-command (handled in `app.py`)
-  opens a dataset picker + depth menu; changes persist immediately
-  to `.nora/policy.json`. Startup banner still lists each
-  dataset with its ceiling and `explicit` vs `default` source.
-- **Web UI:** compact "Policy" chip beside the Send button; click
-  unfurls a popup with per-dataset dropdowns. Changes write
-  through the same bridge method (`set_dataset_policy`) as the
-  terminal path.
-
-The JSON file remains the single source of truth; both UIs just
-read and write it, so a researcher who prefers hand-editing can
-keep doing that. Unknown depths / malformed entries silently
-fall back to the conservative default — a broken policy never
-locks anyone out.
+Interactive editing lives in the composer's compact "Policy" chip:
+click unfurls a popup with per-dataset dropdowns, changes write
+through the `set_dataset_policy` bridge method to
+`.nora/policy.json`. The JSON file remains the single source of
+truth, so a researcher who prefers hand-editing can keep doing that.
+Unknown depths / malformed entries silently fall back to the
+conservative default — a broken policy never locks anyone out.
 
 Also covered: ceiling annotation on successful responses (so
 Claude learns the limit without probing), per-dataset
@@ -276,17 +267,15 @@ current friction bites:
   pipe tables (added after researcher feedback that coefficient
   tables rendered as raw pipes). No CDN dependency — keeps
   "nothing phones home" intact.
-- **Inline raw R/Stata output panel in the web UI.** *Done.*
-  `tool_result` events carry the first 32 KB of `stdout.log` and
-  `stderr.log`; the result panel renders them above the collapsed
-  sanitized JSON, mirroring the terminal split. Action buttons
-  ("Open output", "Open in Stata/R", "Show folder") let the
+- **Inline raw R/Stata output panel.** *Done.* `tool_result` events
+  carry the first 32 KB of `stdout.log` and `stderr.log`; the result
+  panel renders them above the collapsed sanitized JSON. Action
+  buttons ("Open output", "Open in Stata/R", "Show folder") let the
   researcher launch the native app on the staged script with one
   click.
 - **Policy editing in the UI.** *Done.* Compact "Policy" chip in
-  the composer footer unfurls a per-dataset dropdown popup. Shares
-  the same `set_dataset_policy` bridge method as the terminal's
-  `/policy` wizard.
+  the composer footer unfurls a per-dataset dropdown popup,
+  writing through `set_dataset_policy` to `.nora/policy.json`.
 - **Dataset picker sidebar / session list.** *Done.* Left rail in
   the web UI lists every session under `~/.nora-sessions/` with
   timestamp + dataset label + on-disk size; click switches into
@@ -300,9 +289,9 @@ current friction bites:
   auto-derived dataset/timestamp label.
 - **Bundling web assets into the PyInstaller `.app`.** *Done.*
   The spec lists `src/nora/web/` (HTML / JS / CSS / Lottie / vendored
-  player) as data files; the .app's bundle entry is
-  `__main_ui__.py` which calls `nora.ui:main`, so a double-click
-  opens the pywebview chat window directly with no Terminal popup.
+  player) as data files; the .app's bundle entry is `__main__.py`
+  which calls `nora.ui:main`, so a double-click opens the pywebview
+  chat window directly with no Terminal popup.
   Logs go to `~/Library/Logs/Nora/nora-YYYY-MM-DD.log` for
   debugging when it fails to start. The .dmg pipeline produces a
   working bundle locally; what's still missing is the Apple

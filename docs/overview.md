@@ -20,11 +20,11 @@ analysis while the actual values stay on the researcher's machine.
 
 ## How it works
 
-The researcher either drags the data files into Nora's window
-(web UI: `nora-ui`) or points Nora at a directory (terminal
-UI: `nora`). Supported formats are `.csv`, `.dta` (Stata), and
-`.rds` (R). A chat starts with Claude through Nora; Claude is
-then restricted — no filesystem access, no shell, no network tools.
+The researcher drags the data files into Nora's window or points
+Nora at a directory on launch. Supported formats are `.csv`, `.dta`
+(Stata), and `.rds` (R). A chat starts with Claude through Nora;
+Claude is then restricted — no filesystem access, no shell, no
+network tools.
 
 Instead, Claude reaches the researcher's machine through ten
 narrow operations:
@@ -194,8 +194,7 @@ What's done since this overview was first written:
   confidence-interval length constraint, structural size caps on
   every dict / list payload field.
 - ✅ Researcher consent UI: per-dataset Permission chip in the
-  web UI; `/policy` slash-command in the terminal UI. Both edit
-  the same `.nora/policy.json`.
+  composer row, editing `.nora/policy.json`.
 - ✅ Packaging: `.app` is built and launches the web UI directly
   (no Terminal popup). Build pipeline produces a `.dmg` too. Both
   work locally.

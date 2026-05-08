@@ -19,14 +19,13 @@ the long-form direction and open-question log,
 
 ## Status
 
-Alpha. Privacy invariants are implemented and tested (775 tests).
-Two frontends ship. The terminal UI is `nora`. The pywebview web UI
-is `nora-ui` and is also what the `.app` launches. The released
-`.dmg` is signed with a Developer ID Application certificate and
-notarized by Apple, so a colleague double-clicking the bundle on
-their own Mac doesn't trip Gatekeeper. See
-[the handoff status table](docs/handoff.md#where-it-stands) for the
-layer-by-layer view.
+Beta. Privacy invariants are implemented and tested. The frontend is
+the pywebview-based `nora-ui`, which is also what the `.app`
+launches. The released `.dmg` is signed with a Developer ID
+Application certificate and notarized by Apple, so a colleague
+double-clicking the bundle on their own Mac doesn't trip Gatekeeper.
+See [the handoff status table](docs/handoff.md#where-it-stands) for
+the layer-by-layer view.
 
 ## Platform
 
@@ -59,15 +58,10 @@ To build the `.dmg` yourself or run from source, see below.
 git clone https://github.com/junishka/builder.git nora
 cd nora
 uv sync --group dev
-uv run pytest                       # expect 758 passed, 17 skipped
+uv run pytest
 
-# Web UI (the recommended frontend; native WKWebView window)
 uv run nora-ui                      # landing: drop files or pick folder
 uv run nora-ui /path/to/data        # straight into chat
-
-# Terminal UI (power-user, shell-only)
-uv run nora                         # landing prompt
-uv run nora /path/to/data           # straight into chat
 ```
 
 With no path, `nora-ui` opens a landing screen. Drop `.csv`, `.tsv`,
@@ -122,7 +116,7 @@ because Nora invokes them as subprocesses.
 ## Layout
 
 - `src/nora/`
-  - `app.py` and `__main__.py` for the terminal entry point.
+  - `__main__.py` — entry-point shim that calls `nora.ui.main`.
   - `ui.py` and `web/` for the pywebview shell and the HTML, CSS,
     JS frontend.
   - `tools.py` for the thirteen MCP tools the model sees.
@@ -138,8 +132,8 @@ because Nora invokes them as subprocesses.
   - `runtime/` for the R library, the Python library, and the ten
     Stata `.ado` helpers scripts call.
   - `provider/` for the Anthropic and OpenAI session adapters.
-  - `chat_service.py` for the typed event stream both frontends
-    consume.
+  - `chat_service.py` for the typed event stream the frontend
+    consumes.
 - `tests/` for 775 tests. `test_sanitizer.py` is the property-test
   backbone. `test_executor_*` cover the sandbox profile.
   `test_concurrent_sessions.py` covers multi-runner isolation.

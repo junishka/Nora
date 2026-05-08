@@ -1,18 +1,15 @@
-"""Nora — web UI entry point.
+"""Nora — UI entry point.
 
 Opens a native WKWebView window (via pywebview) hosting a local HTML
-chat interface, and bridges it to the same backend plumbing the
-terminal UI uses: a ``ProviderSession`` (Anthropic today, OpenAI also
-supported) + the 6 MCP tools + sanitizer + policy + sandboxed
-executor.
+chat interface, and bridges it to the rest of the stack: a
+``ProviderSession`` (Anthropic or OpenAI) + the MCP tool surface +
+sanitizer + policy + sandboxed executor.
 
 Launched via:
 
-    uv run python -m nora.ui [cwd]
+    uv run python -m nora [cwd]
 
-or the ``nora-ui`` console script. Terminal UI (``nora``) is
-unchanged and still works. The two share everything except
-rendering.
+or the ``nora-ui`` console script.
 
 Session model (new in this commit):
 
@@ -2588,7 +2585,7 @@ class NoraBridge:
         if self.cwd is None:
             from nora.policy import DEFAULT_MAX_DEPTH
             return {"default_max_depth": DEFAULT_MAX_DEPTH, "datasets": []}
-        from nora.app import _scan_datasets
+        from nora.system_prompt import scan_datasets as _scan_datasets
         policy = load_policy(self.cwd)
         return {
             "default_max_depth": policy.default_max_depth,
@@ -3518,9 +3515,9 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         prog="nora-ui",
         description=(
-            "Nora — web UI. Same backend as `nora` (terminal), "
-            "different frontend. Launch without a path to drop/choose "
-            "files from the UI."
+            "Nora — local research assistant. Launch without a path "
+            "to drop/choose files from the landing screen, or pass a "
+            "directory to open straight into chat."
         ),
     )
     parser.add_argument(
@@ -3547,8 +3544,9 @@ def main() -> None:
             file=sys.stderr,
         )
 
-    import webview  # lazy import so `nora` (terminal) doesn't
-                    # require pywebview at import time
+    import webview  # lazy so module import doesn't pay pywebview's
+                    # startup cost when something else (e.g. a test)
+                    # imports nora.ui without launching the window.
 
     web_dir = Path(__file__).parent / "web"
     index_path = web_dir / "index.html"

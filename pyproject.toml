@@ -4,8 +4,8 @@ version = "0.0.1"
 description = "Local privacy layer letting Claude drive statistical analysis on a researcher's own machine (macOS-only at this stage)"
 requires-python = ">=3.10"
 classifiers = [
-    "Development Status :: 3 - Alpha",
-    "Environment :: Console",
+    "Development Status :: 4 - Beta",
+    "Environment :: MacOS X",
     "Intended Audience :: Science/Research",
     "License :: Other/Proprietary License",
     # Platform scope: `submit_script` relies on macOS `sandbox-exec` for
@@ -22,7 +22,6 @@ classifiers = [
 ]
 dependencies = [
     "claude-agent-sdk>=0.1.61",
-    "rich>=13.0",
     # Schema extractors (step 3).
     # pyreadstat: .dta (Stata) with variable labels, value labels, types.
     # pyreadr: .rds / .rda / .RData (R) — pure-Python port, no R needed.
@@ -38,9 +37,7 @@ dependencies = [
     "pyarrow>=15",
     # Web UI shell (`nora-ui` entry point). pywebview wraps a native
     # WKWebView window on macOS — no Chromium bundled, ~25 MB added to
-    # the .app rather than ~120 MB for Electron. Terminal UI (`nora`)
-    # keeps working without it; pywebview is imported lazily by the UI
-    # entry point.
+    # the .app rather than ~120 MB for Electron.
     "pywebview>=5.0",
     # Multi-provider auth: ``keyring`` brokers credentials through the
     # OS-native secret store (macOS Keychain). API keys never touch
@@ -56,7 +53,6 @@ dependencies = [
 ]
 
 [project.scripts]
-nora = "nora.app:main"
 nora-ui = "nora.ui:main"
 
 [dependency-groups]

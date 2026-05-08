@@ -782,10 +782,10 @@ just the first paragraph.
 # Dataset listing helpers
 # ---------------------------------------------------------------------------
 #
-# These were originally in ``app.py`` (when the terminal entry point was
-# the only consumer of the system prompt). They moved here so both
-# providers can render the same listing without dragging in app.py's
-# CLI scaffolding (Rich console, slash-commands, banner code).
+# These render the dataset list that goes into the system prompt for
+# both providers. Kept here (next to the rest of the prompt
+# rendering) rather than in a UI module so a future second consumer
+# doesn't have to reach into the frontend for them.
 
 
 def scan_datasets(cwd: Path) -> list[Path]:

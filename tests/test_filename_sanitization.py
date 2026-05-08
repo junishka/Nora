@@ -18,7 +18,7 @@ import pandas as pd
 import pytest
 from pathlib import Path
 
-from nora.app import _dataset_listing
+from nora.system_prompt import dataset_listing as _dataset_listing
 from nora.schema import extract
 
 
