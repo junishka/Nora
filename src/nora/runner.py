@@ -147,6 +147,21 @@ class SessionRunner:
         # grow the set without limit.
         self._current_turn_id: str | None = None
         self._cancelled_turn_ids: "OrderedDict[str, None]" = OrderedDict()
+        # Turn ids whose ``run_turn`` coroutine has been scheduled on
+        # the worker loop but hasn't claimed ``_send_lock`` yet — i.e.
+        # ``send_message`` returned an id to the JS side, but the
+        # coroutine is still queued behind the previous turn (or
+        # behind the worker loop's normal scheduling latency). Stop
+        # fired in this gap used to find ``_current_turn_id is None``
+        # and report "no turn in flight" while the runner went on to
+        # execute the turn anyway; tracking pending ids here lets
+        # ``cancel_turn`` mark the right id cancelled even before the
+        # coroutine starts, and ``run_turn`` notices the flag on entry
+        # and bails before opening a session or hitting the API.
+        # Protected by ``_turn_lock`` (same lock that guards the
+        # cancellation set, so the pending → cancelled transition is
+        # atomic with respect to ``register_turn_process`` etc.).
+        self._pending_turn_ids: list[str] = []
         # Per-turn subprocess registry. Keyed on turn id; each entry
         # holds the Popen handles ``submit_script`` spawned during
         # the turn. ``cancel_turn`` walks this under the lock and
@@ -223,9 +238,21 @@ class SessionRunner:
     # -------- session lifecycle --------
 
     def is_busy(self) -> bool:
-        """True iff a turn is currently in flight on this runner."""
+        """True iff a turn is currently in flight on this runner.
+
+        Includes pending turns — ones whose ``run_turn`` coroutine
+        was scheduled on the worker loop but hasn't claimed
+        ``_send_lock`` yet. The bridge's ``interrupt_turn`` keys off
+        this; without the pending check, a Stop fired in the tiny
+        window between ``send_message`` returning a turn id and
+        ``run_turn`` actually starting would report "no turn in
+        flight" while the runner went ahead and executed the turn.
+        """
         t = self._current_turn_task
-        return t is not None and not t.done()
+        if t is not None and not t.done():
+            return True
+        with self._turn_lock:
+            return bool(self._pending_turn_ids)
 
     async def ensure_session(self) -> ProviderSession:
         """Open the underlying provider session if it isn't already.
@@ -480,6 +507,42 @@ class SessionRunner:
         if kill_now:
             _kill_proc_quietly(proc)
 
+    def register_pending_turn(self, turn_id: str) -> None:
+        """Record a turn id whose ``run_turn`` coroutine was just
+        scheduled but hasn't started executing yet.
+
+        Called by the bridge synchronously, immediately before
+        ``asyncio.run_coroutine_threadsafe``. Closes the gap where
+        ``send_message`` had already returned the id to JS but the
+        coroutine had not yet claimed ``_send_lock`` and set
+        ``_current_turn_id``. Without this, a Stop fired in that
+        window would find no turn in flight and the runner would go
+        on to execute the cancelled turn anyway.
+        """
+        with self._turn_lock:
+            self._pending_turn_ids.append(turn_id)
+
+    def _consume_pending_turn(self, turn_id: str) -> bool:
+        """Atomically transition ``turn_id`` from pending → running,
+        returning True if the turn was already cancelled while pending
+        (caller should bail before doing any work).
+
+        Run as the very first thing inside ``run_turn`` after
+        acquiring ``_send_lock``: removes ``turn_id`` from the pending
+        list so a later ``cancel_turn(None)`` won't double-target it,
+        and reports whether ``cancel_turn`` already marked it
+        cancelled before the coroutine got the lock.
+        """
+        with self._turn_lock:
+            try:
+                self._pending_turn_ids.remove(turn_id)
+            except ValueError:
+                # Already drained (e.g., bridge shutdown bypassed the
+                # normal path). Treat as if cancellation may have
+                # raced; the in_cancelled check below still decides.
+                pass
+            return turn_id in self._cancelled_turn_ids
+
     def cancel_turn(self, turn_id: str | None = None) -> str | None:
         """Mark ``turn_id`` cancelled, kill its registered subprocesses,
         and request asyncio cancellation of the in-flight task.
@@ -488,11 +551,25 @@ class SessionRunner:
         in flight). The bridge surfaces the returned id to the JS
         event filter so late events stamped with it get dropped.
 
-        ``turn_id=None`` cancels whichever turn is currently running.
+        ``turn_id=None`` resolves to the running turn's id, falling
+        back to the most-recently-scheduled pending turn — so a Stop
+        fired in the gap between ``send_message`` returning and
+        ``run_turn`` claiming the lock still cancels the right turn.
         Pass an explicit id only when cancelling cross-thread (e.g.,
         from a deferred handler that captured the id earlier).
         """
-        target = turn_id if turn_id is not None else self._current_turn_id
+        target = turn_id
+        if target is None:
+            target = self._current_turn_id
+        if target is None:
+            # No running turn — fall back to the latest pending id so
+            # a Stop fired before ``run_turn`` claims the lock still
+            # marks the right id cancelled. The pending → cancelled
+            # transition under ``_turn_lock`` is what ``run_turn``
+            # checks on entry to bail early.
+            with self._turn_lock:
+                if self._pending_turn_ids:
+                    target = self._pending_turn_ids[-1]
         if target is None:
             return None
 
@@ -500,25 +577,31 @@ class SessionRunner:
         # flag is set, any concurrent ``register_turn_process`` call
         # for the same id will see the flag and self-kill instead of
         # appending; so popping here gives us every proc we need to
-        # touch.
+        # touch. Also evict from the pending list (no-op if not
+        # present) so a later cancel_turn(None) doesn't re-resolve to
+        # this same id.
         with self._turn_lock:
             self._cancelled_turn_ids[target] = None
             # Bounded LRU eviction: keep at most _CANCELLED_TURN_ID_HISTORY.
             while len(self._cancelled_turn_ids) > _CANCELLED_TURN_ID_HISTORY:
                 self._cancelled_turn_ids.popitem(last=False)
             procs = self._turn_processes.pop(target, [])
+            try:
+                self._pending_turn_ids.remove(target)
+            except ValueError:
+                pass
 
         # Kill outside the lock so a stuck ``proc.kill`` / ``wait``
         # can't block another thread's ``register_turn_process``.
         for proc in procs:
             _kill_proc_quietly(proc)
 
-        # Cancel the asyncio task last. The asyncio cancellation
-        # unblocks the runner's ``await session.send(...)`` so it
-        # exits the event loop and runs its ``except CancelledError``
-        # cleanup. By the time it gets there, the subprocess kills
-        # above have already landed — so the cancel branch doesn't
-        # have to reproduce the kill logic the prior code carried.
+        # Cancel the asyncio task last — but ONLY if it's the running
+        # turn we're targeting. Cancelling a still-pending id must
+        # not tear down the previous turn's task; the pending turn
+        # has no task yet, and ``run_turn`` will see the cancelled
+        # flag when it eventually wakes up and bail without doing
+        # any LLM work.
         #
         # ``cancel_turn`` is called from the bridge thread (not the
         # worker loop thread), so ``Task.cancel`` has to be scheduled
@@ -526,7 +609,11 @@ class SessionRunner:
         # the loop off the task itself avoids a parameter every call
         # site would otherwise have to thread through.
         t = self._current_turn_task
-        if t is not None and not t.done():
+        if (
+            t is not None
+            and not t.done()
+            and self._current_turn_id == target
+        ):
             try:
                 loop = t.get_loop()
                 loop.call_soon_threadsafe(t.cancel)
@@ -597,6 +684,16 @@ class SessionRunner:
 
         with use_cwd(cwd), use_turn_context(turn_id, self):
             async with self._send_lock:
+                # Pending → running transition. If Stop fired in the
+                # gap between ``send_message`` returning the id and
+                # this coroutine winning the lock, ``cancel_turn``
+                # already added our id to ``_cancelled_turn_ids``;
+                # bail before opening a session or hitting the API.
+                # The dispatcher would drop our events anyway, but
+                # we still don't want to spend an LLM call on output
+                # the researcher won't see.
+                if self._consume_pending_turn(turn_id):
+                    return
                 # Claim the in-flight pointer only after winning the
                 # send lock. Earlier this happened at function entry,
                 # outside the lock — which meant a second

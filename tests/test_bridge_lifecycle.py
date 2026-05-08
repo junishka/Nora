@@ -354,6 +354,121 @@ def test_interrupt_turn_no_running_turn(tmp_path: Path):
     assert "no turn in flight" in result["reason"]
 
 
+def test_interrupt_pending_turn_marks_cancelled_before_run(tmp_path: Path):
+    """The fast-Stop race: if the researcher hits Stop in the gap
+    between ``send_message`` returning and ``run_turn`` actually
+    starting on the worker loop, the runner must mark the pending id
+    cancelled so the eventual ``run_turn`` call bails before opening
+    a session or hitting the API.
+
+    Pre-fix: ``interrupt_turn`` saw ``is_busy() is False`` (no
+    current task yet) and returned "no turn in flight" while the
+    queued coroutine went on to execute the cancelled turn.
+    """
+    bridge = NoraBridge(cwd=tmp_path)
+    bridge.start_loop()
+    try:
+        runner = bridge._active_runner()
+        assert runner is not None
+
+        # Simulate what ``_send_to_active`` does synchronously: register
+        # the pending id BEFORE the coroutine has been picked up by the
+        # worker loop.
+        runner.register_pending_turn("t-pending")
+
+        # Bridge sees a turn in flight via the pending list.
+        assert runner.is_busy() is True
+
+        res = bridge.interrupt_turn()
+        assert res["ok"] is True
+        assert res["turn_id"] == "t-pending"
+        # The id is now in ``_cancelled_turn_ids``; ``run_turn`` checks
+        # this on entry and bails before doing any LLM work.
+        assert runner.is_turn_cancelled("t-pending") is True
+        # Pending list drained so a second Stop doesn't re-cancel the
+        # same id.
+        assert "t-pending" not in runner._pending_turn_ids
+    finally:
+        bridge.stop_loop()
+
+
+def test_cancel_turn_does_not_cancel_running_task_when_pending_targeted(
+    tmp_path: Path,
+):
+    """A pending turn cancellation must NOT cancel the already-
+    running turn's asyncio task. Without the equality check in
+    ``cancel_turn``, falling back to the latest pending id would
+    still call ``task.cancel`` on whatever task happened to be in
+    ``_current_turn_task`` — the previous, still-running turn.
+    """
+    bridge = NoraBridge(cwd=tmp_path)
+    bridge.start_loop()
+    try:
+        runner = bridge._active_runner()
+        assert runner is not None
+
+        running_cancelled = False
+
+        class _FakeTask:
+            def done(self) -> bool: return False
+            def cancel(self) -> None:
+                nonlocal running_cancelled
+                running_cancelled = True
+            def get_loop(self):
+                return bridge._loop
+
+        # Plant a fake "currently running" task A and pend a separate
+        # turn B.
+        runner._current_turn_task = _FakeTask()  # type: ignore[assignment]
+        runner._current_turn_id = "t-running"
+        runner.register_pending_turn("t-pending")
+
+        # Cancel without an explicit id. Resolution order is:
+        # _current_turn_id → 't-running'. (cancel_turn falls back to
+        # pending only when nothing is current.) The running task
+        # SHOULD get cancelled in this case.
+        result = runner.cancel_turn()
+        assert result == "t-running"
+        # Cancellation hops via ``call_soon_threadsafe``; let it land.
+        import time
+        time.sleep(0.05)
+        assert running_cancelled is True
+
+        # Now the pending one: explicit id, no current task left.
+        running_cancelled = False
+        runner._current_turn_task = None
+        runner._current_turn_id = None
+        # Re-register since cancel_turn drained it.
+        runner.register_pending_turn("t-pending")
+        # Plant ANOTHER running task to make sure it ISN'T cancelled
+        # when we target the pending id.
+        other_cancelled = False
+
+        class _OtherTask:
+            def done(self) -> bool: return False
+            def cancel(self) -> None:
+                nonlocal other_cancelled
+                other_cancelled = True
+            def get_loop(self):
+                return bridge._loop
+
+        runner._current_turn_task = _OtherTask()  # type: ignore[assignment]
+        runner._current_turn_id = "t-other-running"
+
+        result = runner.cancel_turn("t-pending")
+        assert result == "t-pending"
+        time.sleep(0.05)
+        # The other task is NOT cancelled because its id doesn't
+        # match the cancellation target.
+        assert other_cancelled is False
+    finally:
+        # Clear before stop_loop awaits runner.close().
+        for r in bridge._runners.values():
+            r._current_turn_task = None
+            r._current_turn_id = None
+        bridge.stop_loop()
+
+
 # ---------------------------------------------------------------------------
 # delete_session on the currently-active session
 # ---------------------------------------------------------------------------
