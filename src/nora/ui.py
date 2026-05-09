@@ -569,21 +569,38 @@ class NoraBridge:
             return {"ok": False, "reason": "empty dataset name"}
 
         current = load_policy(self.cwd)
+        existing = current.datasets.get(name)
         # When the researcher selects the same depth as the app-wide
-        # default, drop any explicit entry for this dataset rather
-        # than saving "explicit at the default value." Result: the
-        # dataset's `explicit` flag goes back to False, matching the
-        # researcher's mental model that "I chose the default" is the
-        # same state as "I never changed it." Without this, a round
-        # trip (change away, change back) left the entry stuck at
-        # `explicit=True`.
+        # default, drop the explicit ``max_depth`` entry rather than
+        # saving "explicit at the default value." But preserve any
+        # ``non_disclosive_variables`` opt-ins the researcher made
+        # earlier — those are an independent dimension of the policy
+        # (per-variable min/max disclosure consent) and have no
+        # relationship with the schema-depth ceiling. Without this
+        # carry-over, a researcher who had opted ``year_of_birth`` and
+        # ``education_years`` into safe min/max disclosure would lose
+        # both opt-ins simply by clicking the schema-depth chip back
+        # to the default tier — surprising, silent data-policy regression.
         updated_datasets = dict(current.datasets)
+        preserved_ndv = existing.non_disclosive_variables if existing else ()
         if depth == current.default_max_depth:
-            updated_datasets.pop(name, None)
+            if preserved_ndv:
+                # Keep the opt-in list alive even though the depth is
+                # back at the default. The entry stays "explicit" in
+                # the sense that the researcher has expressed an
+                # opinion — just on a different axis.
+                updated_datasets[name] = DatasetPolicy(
+                    max_depth=depth,
+                    set_at=datetime.now(timezone.utc).isoformat(),
+                    non_disclosive_variables=preserved_ndv,
+                )
+            else:
+                updated_datasets.pop(name, None)
         else:
             updated_datasets[name] = DatasetPolicy(
                 max_depth=depth,
                 set_at=datetime.now(timezone.utc).isoformat(),
+                non_disclosive_variables=preserved_ndv,
             )
         updated = NoraPolicy(
             version=current.version,
@@ -811,7 +828,7 @@ class NoraBridge:
         # the older fire-without-token path stays valid.
         if frozen_token:
             runner.restore_frozen_pending(frozen_token)
-        self._record_user_message(runner, text, image_count=len(images or []))
+        self._record_user_message(runner, text, images=images)
         # 16 hex chars = 64 bits of entropy. Vastly more than enough
         # for a per-session non-collision guarantee, short enough to
         # log + paste comfortably when debugging cancellation issues.
@@ -2527,7 +2544,7 @@ class NoraBridge:
         runner: SessionRunner,
         text: str,
         *,
-        image_count: int = 0,
+        images: list[dict[str, Any]] | None = None,
     ) -> None:
         """Persist the user-side record for a newly queued turn.
 
@@ -2541,6 +2558,16 @@ class NoraBridge:
         Before appending, drops any trailing orphaned ``user_message``
         from a previous failed / unsent turn so retries replace
         rather than accumulate stale "no-reply" bubbles.
+
+        Image attachments are persisted as ``{data, mime}`` blobs
+        inline (per-image cap below), the same shape ``tool_result``
+        uses for plot thumbnails. Without this, a reload or session
+        switch replays an image-only prompt as bare text and the
+        researcher / model-visible transcript loses the evidence
+        that was actually sent. The blobs are flagged as UI-only in
+        :mod:`nora.context_count` so they don't inflate the chip's
+        denominator. ``image_count`` is still emitted alongside for
+        legacy histories that pre-date this persistence.
         """
         self._drop_trailing_orphan_user_message(runner.cwd)
         attached_names = [
@@ -2553,8 +2580,26 @@ class NoraBridge:
         }
         if attached_names:
             record["attachments"] = attached_names
-        if image_count > 0:
-            record["image_count"] = image_count
+        if images:
+            record["image_count"] = len(images)
+            persisted_images: list[dict[str, str]] = []
+            for img in images:
+                data = img.get("data") if isinstance(img, dict) else None
+                mime = img.get("mime") if isinstance(img, dict) else None
+                if not isinstance(data, str) or not isinstance(mime, str):
+                    continue
+                # Same per-image ceiling as the Files-panel thumbnail
+                # cap (see ``_enrich_files_panel_row``): 3 MB decoded,
+                # which covers ~4 MB of base64. Anything above this
+                # rides the live turn but isn't persisted — the
+                # transcript shows the count without the bytes, which
+                # is the same fallback the placeholder branch in the
+                # plot-render path uses.
+                if _b64_oversize(data, 3 * 1024 * 1024):
+                    continue
+                persisted_images.append({"data": data, "mime": mime})
+            if persisted_images:
+                record["images"] = persisted_images
         self._persist_event(record)
 
     def _drop_trailing_orphan_user_message(self, cwd: Path) -> None:
@@ -2775,6 +2820,26 @@ class NoraBridge:
             except Exception:  # noqa: BLE001 — close errors aren't fatal here
                 pass
         runner.needs_context_prefix = True
+
+        # 7. Regenerate the durable snapshot. The chat history was
+        # truncated and several results were hidden, but
+        # ``session_state.json`` still describes the discarded
+        # branch — its ``last_user_message`` /
+        # ``last_assistant_summary`` were pulled from a turn that no
+        # longer exists, and ``recent_results`` lists rows we just
+        # marked hidden. The next turn's natural rewrite will
+        # eventually fix this, but the sidebar / session picker
+        # reads the snapshot on every reload and session switch, so
+        # without an immediate refresh a researcher who reloads
+        # right after rewinding still sees the old branch in the
+        # sidebar — breaks the "rewind takes effect now" promise.
+        # Failures here are advisory; the rewind itself already
+        # committed.
+        try:
+            from nora.session_state import write_session_state
+            write_session_state(self.cwd, model=runner.model)
+        except Exception:  # noqa: BLE001 — snapshot is advisory
+            pass
 
         return {
             "ok": True,

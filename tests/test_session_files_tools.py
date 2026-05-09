@@ -452,17 +452,24 @@ def test_search_finds_term_in_run_dir_script(tmp_path: Path) -> None:
     assert any("TARGET_TERM" in m["text"] for m in matches)
 
 
-def test_search_run_dir_scripts_dedup_against_cwd_collision(
+def test_search_run_dir_scripts_disambiguates_against_cwd_collision(
     tmp_path: Path,
 ) -> None:
-    """If a top-level cwd file shares a name with a run-dir display
+    """If a top-level cwd file shares a label with a run-dir display
     name (rare but possible — researcher copies a prior labeled
-    script up to cwd), the cwd entry wins so we don't search the
-    same logical file twice."""
+    script up to cwd), both files surface in the search under
+    distinct names. The run-dir entry gets a ``(short_id)`` suffix
+    so the model can address each independently.
+
+    Pre-fix, the run-dir entry was silently dropped here AND in
+    ``list_session_files``: a top-level file with the same name
+    shadowed the script, so a researcher who renamed an upload to
+    match a prior label could lose access to the run-dir script
+    without warning."""
     set_cwd(tmp_path)
     # Top-level: contains the marker.
     (tmp_path / "shared.do").write_text("TOP_LEVEL_MARKER\n", encoding="utf-8")
-    # Run-dir with same display name, DIFFERENT contents.
+    # Run-dir with same labeled display name, DIFFERENT contents.
     run_dir = tmp_path / ".nora" / "runs" / "20260507T120400Z_ffffffff"
     run_dir.mkdir(parents=True)
     (run_dir / "script.do").write_text(
@@ -480,13 +487,17 @@ def test_search_run_dir_scripts_dedup_against_cwd_collision(
         script_run_id="run-ffffffff",
     )
 
+    # Top-level file is searched under its plain name.
     out = _search({"query": "TOP_LEVEL_MARKER", "kinds": ["script"]})
     by_file = {r["name"]: r for r in out["results"]}
     assert "shared.do" in by_file
-    # The run-dir marker must NOT match — that would mean the run-dir
-    # entry was searched after the cwd entry, defeating the dedup.
+
+    # Run-dir file is also searchable, under a disambiguated name.
     out2 = _search({"query": "RUN_DIR_MARKER", "kinds": ["script"]})
-    assert not out2["results"], out2
+    assert out2["results"], out2
+    run_dir_hit = out2["results"][0]
+    assert run_dir_hit["name"] != "shared.do"
+    assert "ffffffff" in run_dir_hit["name"]
 
 
 def test_search_skips_run_dir_scripts_when_kind_not_requested(

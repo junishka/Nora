@@ -134,9 +134,38 @@ class RunDirScript:
     size_bytes: int
 
 
+def cwd_top_level_display_names(cwd: Path) -> frozenset[str]:
+    """Return the ``safe_text``-projected basenames of cwd top-level files.
+
+    These are the names ``read_attached_file`` resolves first; a
+    run-dir script that produces the same display name would be
+    shadowed (the top-level file wins on lookup, and the listing
+    used to silently drop the run-dir script entirely). Used by
+    ``enumerate_run_dir_scripts`` and ``find_run_dir_script_by_name``
+    to disambiguate run-script names against this set so each row in
+    the model-facing listing has a unique, resolvable handle.
+    """
+    from nora.text_safety import safe_text
+    out: set[str] = set()
+    try:
+        for child in cwd.iterdir():
+            try:
+                if not child.is_file() or child.is_symlink():
+                    continue
+            except OSError:
+                continue
+            cleaned = safe_text(child.name)
+            if cleaned:
+                out.add(cleaned)
+    except OSError:
+        pass
+    return frozenset(out)
+
+
 def enumerate_run_dir_scripts(
     cwd: Path, *, max_count: int = 12,
     visible_run_dirs: set[str] | None = None,
+    reserved_names: frozenset[str] | None = None,
 ) -> list[RunDirScript]:
     """Return the ``max_count`` most recently-modified run-dir scripts.
 
@@ -155,12 +184,23 @@ def enumerate_run_dir_scripts(
     model can still discover scripts from a discarded conversation
     branch. ``None`` (the default) leaves every run dir visible
     (researcher-only Files panel).
+
+    ``reserved_names``: when supplied, any run-script whose display
+    name (after ``safe_text``) collides with a name in the set has
+    the short_id appended to disambiguate. The intended set is the
+    cwd top-level filenames — ``read_attached_file`` resolves those
+    first, so without this disambiguation a top-level file shadows
+    the run-dir script in lookup AND the listing used to drop the
+    run-dir row entirely (deduped against top-level names). Pass
+    ``cwd_top_level_display_names(cwd)`` from any model-facing call
+    site to keep the listing and the lookup consistent.
     """
     runs_root = cwd / ".nora" / "runs"
     if not runs_root.is_dir():
         return []
 
     labels = _labels_by_run_basename(cwd)
+    from nora.text_safety import safe_text
 
     candidates: list[tuple[float, Path, str, str, int]] = []
     try:
@@ -196,9 +236,21 @@ def enumerate_run_dir_scripts(
     for _, _path, display, _sid, _sz in top:
         name_counts[display] = name_counts.get(display, 0) + 1
 
+    reserved = reserved_names or frozenset()
+
     out: list[RunDirScript] = []
     for mtime, path, display, short_id, size in top:
-        if name_counts.get(display, 0) > 1:
+        # Two reasons to disambiguate: another run-dir script in this
+        # batch produced the same display name (existing behavior), or
+        # a cwd top-level file already owns the name (new — without
+        # this, ``list_session_files`` dropped the run-script row and
+        # ``read_attached_file`` resolved to the top-level file
+        # silently, hiding prior runs from the model).
+        collides_with_sibling = name_counts.get(display, 0) > 1
+        collides_with_top_level = (
+            display in reserved or safe_text(display) in reserved
+        )
+        if collides_with_sibling or collides_with_top_level:
             ext = path.suffix.lower()
             stem = display[: -len(ext)] if ext else display
             display = f"{stem} ({short_id}){ext}"
@@ -216,6 +268,7 @@ def find_run_dir_script_by_name(
     cwd: Path, name: str,
     *,
     visible_run_dirs: set[str] | None = None,
+    reserved_names: frozenset[str] | None = None,
 ) -> Path | None:
     """Resolve a Files-panel display name back to its on-disk path.
 
@@ -236,12 +289,23 @@ def find_run_dir_script_by_name(
     ``read_attached_file`` MUST pass the visible set so a rewound
     script can't be re-fetched by the name the model still
     remembers from the discarded chat branch.
+
+    ``reserved_names``: must match the value passed to
+    ``enumerate_run_dir_scripts`` at listing time. The disambiguation
+    suffix this enumeration applies depends on the reserved set, so
+    if the model saw "foo (ab12cd34).do" in the listing, the lookup
+    has to enumerate with the same reserved set to reproduce that
+    name. Defaults to the cwd top-level names when not supplied —
+    the same default any model-facing path should use.
     """
     if not name:
         return None
     from nora.text_safety import safe_text
+    if reserved_names is None:
+        reserved_names = cwd_top_level_display_names(cwd)
     for entry in enumerate_run_dir_scripts(
         cwd, max_count=64, visible_run_dirs=visible_run_dirs,
+        reserved_names=reserved_names,
     ):
         if entry.display_name == name or safe_text(entry.display_name) == name:
             return entry.path

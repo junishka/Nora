@@ -52,9 +52,15 @@ Design notes:
   both UIs just read and write it — so a researcher comfortable
   editing it directly can still do that.
 
-- Unknown or malformed entries fall back to the conservative
-  default rather than raising. A broken policy file should not
-  prevent the researcher from using Nora — the default is safe.
+- A malformed policy file (truncated JSON, wrong shape, future
+  schema version) fails closed: the in-memory policy returned has
+  ``default_max_depth = "names_only"`` so schema access is denied
+  until the file is repaired. A broken consent file is not a
+  fresh-session signal — it's most often a partial write or editor
+  mishap, and silently reverting to the rich default would expose
+  metadata the researcher had previously restricted. Per-entry
+  malformations clamp to the strictest tier on the same reasoning.
+  Loading never raises.
 """
 
 from __future__ import annotations
@@ -78,6 +84,18 @@ VALID_DEPTHS: tuple[str, ...] = (
 # variables with almost no metadata). Researchers can still dial it
 # down per dataset via the Permission chip.
 DEFAULT_MAX_DEPTH = "names_types_labels_summary"
+
+# Fail-closed depth used when the policy file exists but is broken
+# (truncated JSON, wrong shape, future schema version, malformed
+# entry). The premise: a researcher who wrote a policy.json had
+# opinions about their data, and the most likely reason their file
+# is unreadable is a partial write or an editor mishap — NOT a fresh
+# session. Defaulting to the richest tier in that state would silently
+# expose metadata they had previously restricted. Falling back to the
+# strictest tier instead means schema queries get denied until the
+# file is repaired, which is the right loudness for "your consent
+# policy is unreadable."
+FAIL_CLOSED_MAX_DEPTH = "names_only"
 
 # Map depth → rank so we can compare "is requested at most the ceiling".
 _DEPTH_RANK: dict[str, int] = {d: i for i, d in enumerate(VALID_DEPTHS)}
@@ -129,13 +147,40 @@ def policy_path(cwd: Path) -> Path:
     return cwd / POLICY_FILE
 
 
-def load_policy(cwd: Path) -> NoraPolicy:
-    """Load the policy for ``cwd``, or return a conservative default.
+def _fail_closed_policy() -> NoraPolicy:
+    """Return the policy used when ``policy.json`` exists but is unreadable.
 
-    Never raises. Malformed files (JSON errors, wrong shape, unknown
-    depths) fall back to the default — a broken policy should not
-    lock the researcher out of using Nora, and the fallback is
-    safe.
+    Set ``default_max_depth`` to the strictest tier so a researcher
+    who tightened their consent policy doesn't see it silently revert
+    to the richest tier just because the JSON file got a stray
+    character. Schema requests for unrestricted datasets will be
+    denied until the file is repaired — the correct loudness for "we
+    can't read your policy file."
+    """
+    return NoraPolicy(default_max_depth=FAIL_CLOSED_MAX_DEPTH)
+
+
+def load_policy(cwd: Path) -> NoraPolicy:
+    """Load the policy for ``cwd``.
+
+    Never raises. Behavior in three regimes:
+
+    - File absent: return the permissive in-memory default
+      (``DEFAULT_MAX_DEPTH``). A fresh session has no expressed
+      researcher opinion to honor, so the rich-by-default tier is
+      correct — they can dial it down per-dataset later.
+
+    - File present but unparseable / wrong shape / future version:
+      fail closed. Return ``_fail_closed_policy()`` so schema access
+      defaults to ``names_only`` until the file is repaired. The
+      previous behavior fell back to the rich default here, which
+      meant a partial write could silently expose metadata that the
+      researcher had explicitly restricted.
+
+    - File present and parseable: honor the document. Per-entry
+      malformations (unknown ``max_depth``, missing fields) clamp the
+      offending entry to the strictest tier rather than to the rich
+      default, on the same fail-closed reasoning.
     """
     p = policy_path(cwd)
     if not p.is_file():
@@ -143,17 +188,20 @@ def load_policy(cwd: Path) -> NoraPolicy:
     try:
         data = json.loads(p.read_text(encoding="utf-8"))
     except (json.JSONDecodeError, OSError):
-        return NoraPolicy()
+        return _fail_closed_policy()
     if not isinstance(data, dict):
-        return NoraPolicy()
+        return _fail_closed_policy()
     if data.get("version") != 1:
         # Future versions should have a migration path, but until one
-        # exists, bail to default rather than misinterpret.
-        return NoraPolicy()
+        # exists, fail closed rather than misinterpret. A version-skewed
+        # file wasn't written for this code path; treating its absent
+        # entries as "no opinion" would silently re-open access the
+        # newer version may have tightened.
+        return _fail_closed_policy()
 
     default_max = data.get("default_max_depth", DEFAULT_MAX_DEPTH)
     if default_max not in VALID_DEPTHS:
-        default_max = DEFAULT_MAX_DEPTH
+        default_max = FAIL_CLOSED_MAX_DEPTH
 
     datasets: dict[str, DatasetPolicy] = {}
     raw = data.get("datasets")
@@ -161,9 +209,14 @@ def load_policy(cwd: Path) -> NoraPolicy:
         for name, entry in raw.items():
             if not isinstance(name, str) or not isinstance(entry, dict):
                 continue
-            max_depth = entry.get("max_depth", DEFAULT_MAX_DEPTH)
+            max_depth = entry.get("max_depth", FAIL_CLOSED_MAX_DEPTH)
             if max_depth not in VALID_DEPTHS:
-                max_depth = DEFAULT_MAX_DEPTH
+                # The entry exists — researcher had an opinion — but
+                # the depth string is unrecognised. Clamp to the
+                # strictest tier rather than letting the file-wide
+                # default take over (which could be more permissive
+                # than what the researcher intended).
+                max_depth = FAIL_CLOSED_MAX_DEPTH
             set_at = entry.get("set_at", "")
             if not isinstance(set_at, str):
                 set_at = ""

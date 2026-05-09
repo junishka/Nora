@@ -693,32 +693,77 @@ def _sanitize_linear_regression(
     # AND column key must reference a declared predictor (or
     # intercept alias); alien keys are dropped with the same defense
     # used on coefficients above.
+    #
+    # Sanitize each row/col key through ``safe_key`` BEFORE validation.
+    # ``allowed_coefficient_keys`` was derived from already-sanitized
+    # coefficient names (``out["predictor_variables"]`` was passed
+    # through ``safe_key`` in ``_collect_allowed``). The raw vcov
+    # keys haven't been sanitized yet, so any coefficient name that
+    # changes under ``safe_key`` (length > 40, embedded control
+    # chars, newlines) would compare unequal to its sanitized
+    # counterpart and the entire row/col would be dropped as
+    # "undeclared" — losing the matrix while keeping the coefficient
+    # / SE entries intact (those went through the dict_numeric
+    # branch in ``_collect_allowed``, which sanitizes keys). Apply
+    # ``safe_key`` here so the comparison is apples-to-apples, and
+    # detect post-sanitization collisions (two raw keys that map to
+    # the same cleaned form) explicitly so a sanitized matrix
+    # doesn't silently overwrite cells.
     raw_vcov = raw.get("vcov")
     if isinstance(raw_vcov, dict):
         sanitized_vcov: dict[str, dict[str, float]] = {}
         dropped_vcov: list[str] = []
+        collisions: list[str] = []
         for row_key, row_value in raw_vcov.items():
-            if row_key not in allowed_coefficient_keys:
-                dropped_vcov.append(f"row {row_key!r}")
+            if not isinstance(row_key, str):
+                dropped_vcov.append(f"row {row_key!r} (non-string key)")
+                continue
+            safe_row = safe_key(row_key)
+            if safe_row not in allowed_coefficient_keys:
+                dropped_vcov.append(f"row {safe_row!r}")
                 continue
             if not isinstance(row_value, dict):
-                dropped_vcov.append(f"row {row_key!r} (non-dict)")
+                dropped_vcov.append(f"row {safe_row!r} (non-dict)")
                 continue
             sanitized_row: dict[str, float] = {}
             for col_key, val in row_value.items():
-                if col_key not in allowed_coefficient_keys:
-                    dropped_vcov.append(f"{row_key}.{col_key}")
+                if not isinstance(col_key, str):
+                    dropped_vcov.append(
+                        f"{safe_row}.{col_key!r} (non-string key)"
+                    )
+                    continue
+                safe_col = safe_key(col_key)
+                if safe_col not in allowed_coefficient_keys:
+                    dropped_vcov.append(f"{safe_row}.{safe_col}")
                     continue
                 if not _is_finite_number(val):
                     continue
-                sanitized_row[col_key] = float(val)
+                if safe_col in sanitized_row:
+                    # Two raw column keys cleaned to the same name.
+                    # Don't silently overwrite the earlier value;
+                    # log the collision and skip the duplicate so
+                    # the matrix degrades safely (the model sees the
+                    # transformation log entry and can decide
+                    # whether to re-fit with disambiguated names).
+                    collisions.append(f"{safe_row}.{safe_col}")
+                    continue
+                sanitized_row[safe_col] = float(val)
             if sanitized_row:
-                sanitized_vcov[row_key] = sanitized_row
+                if safe_row in sanitized_vcov:
+                    collisions.append(f"row {safe_row}")
+                    continue
+                sanitized_vcov[safe_row] = sanitized_row
         if dropped_vcov:
             transformations.append(
                 f"dropped {len(dropped_vcov)} undeclared key(s) from "
                 f"'vcov': {sorted(dropped_vcov)[:5]}"
                 + (" …" if len(dropped_vcov) > 5 else "")
+            )
+        if collisions:
+            transformations.append(
+                f"dropped {len(collisions)} 'vcov' cell(s) whose "
+                f"sanitized keys collided: {sorted(collisions)[:5]}"
+                + (" …" if len(collisions) > 5 else "")
             )
         if sanitized_vcov:
             out["vcov"] = sanitized_vcov

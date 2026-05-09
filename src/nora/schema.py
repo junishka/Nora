@@ -25,6 +25,14 @@ Depths (graded from conservative → permissive):
   names_types_labels
   names_types_labels_summary     (+ NA count, distinct count for categoricals)
 
+The ``na_count`` field at the summary depth is subject to primary
+cell suppression (see ``_suppress_rare_count``): a count below the
+threshold on the rarer side is replaced with a ``<N`` marker, same
+shape as :func:`nora.sdc.suppression_marker`. Without this, a
+column with exactly one missing value would re-identify that
+observation through ``get_schema`` before the stricter
+``request_data`` / result-sanitizer paths ever ran.
+
 Not included, ever, at any depth:
 - Actual observation values
 - Min / max / mean / quantiles on numerics (these are individual values)
@@ -79,6 +87,45 @@ _TYPE_STRING = "string"
 _TYPE_BOOLEAN = "boolean"
 _TYPE_DATETIME = "datetime"
 _TYPE_UNKNOWN = "unknown"
+
+
+# Primary cell-suppression threshold for schema summary metadata. The
+# value here mirrors :class:`nora.sanitizer.SDCConfig.cell_suppression_threshold`
+# (10) but is kept inline so this module doesn't take a runtime
+# dependency on the regression sanitizer. Schema summary publishes
+# ``na_count`` per variable at the richest depth tier; without
+# suppression a column with exactly one missing value (or one present
+# value, in a mostly-empty column) would re-identify that observation
+# directly — the same disclosive concern that primary cell
+# suppression solves for frequency tables. ``request_data`` /
+# regression-result paths apply their own SDC, but ``get_schema`` is
+# the first surface the model can call against a dataset and runs
+# before either of those, so the suppression has to live here too.
+_SCHEMA_SUMMARY_THRESHOLD = 10
+
+
+def _suppress_rare_count(value: int, n: int, threshold: int) -> int | str:
+    """Return ``value`` unchanged when it sits comfortably above the
+    threshold on both sides; otherwise return the suppression marker.
+
+    "Both sides" is the symmetric edge case: a column with
+    ``na_count == 1`` identifies the one missing observation; a
+    column with ``n - na_count == 1`` identifies the one present
+    observation. Either is a re-identification channel, so suppress
+    when the rarer side falls below ``threshold``. ``value == 0`` and
+    ``value == n`` are both safe (no rare subgroup) and pass
+    through.
+    """
+    if value < 0 or n < 0 or threshold <= 0:
+        return value
+    rarer = min(value, n - value) if n >= value else value
+    if rarer == 0:
+        return value
+    if rarer < threshold:
+        # ``<10``-style marker, same shape as
+        # :func:`nora.sdc.suppression_marker`.
+        return f"<{threshold}"
+    return value
 
 
 def load_data(dataset_path: Path) -> Any:
@@ -378,7 +425,11 @@ def _extract_stata(path: Path, depth: str) -> dict[str, Any]:
         # but report the SANITIZED name to Claude.
         if wants_summary and df is not None and name in df.columns:
             series = df[name]
-            var["na_count"] = int(series.isna().sum())
+            n_obs = int(len(series))
+            raw_na = int(series.isna().sum())
+            var["na_count"] = _suppress_rare_count(
+                raw_na, n_obs, _SCHEMA_SUMMARY_THRESHOLD,
+            )
             if var.get("type") == _TYPE_CATEGORICAL:
                 var["distinct_count"] = int(series.nunique(dropna=True))
 
@@ -546,7 +597,11 @@ def _extract_from_pandas(
         # future formats (SPSS etc.) carry labels, we'll add them here.
         if depth == "names_types_labels_summary":
             series = df[name]
-            var["na_count"] = int(series.isna().sum())
+            n_obs = int(len(series))
+            raw_na = int(series.isna().sum())
+            var["na_count"] = _suppress_rare_count(
+                raw_na, n_obs, _SCHEMA_SUMMARY_THRESHOLD,
+            )
             if var.get("type") == _TYPE_CATEGORICAL:
                 var["distinct_count"] = int(series.nunique(dropna=True))
         variables.append(var)
