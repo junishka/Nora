@@ -236,7 +236,12 @@ def test_sanitized_variable_resolves_back_to_raw(tmp_path: Path):
     pass that sanitized name back to request_data and have it resolve
     — otherwise every long-named column is unqueryable."""
     long_raw = "extremely_verbose_column_name_that_exceeds_the_safe_key_cap_x"
-    df = pd.DataFrame({long_raw: np.arange(20)})
+    # ``numeric_bounds`` denies anything below 30 non-missing rows
+    # (tail-percentile bounds at small N would interpolate close to
+    # the actual min/max and identify the tail individuals). The
+    # fixture must clear that floor — the test is about the
+    # sanitized-name resolver, not the percentile floor.
+    df = pd.DataFrame({long_raw: np.arange(40)})
     p = tmp_path / "longname.csv"
     df.to_csv(p, index=False)
 
@@ -247,6 +252,44 @@ def test_sanitized_variable_resolves_back_to_raw(tmp_path: Path):
     # Direct lookup with the sanitized name resolves to the raw column.
     r = handle(p, "numeric_bounds", sanitized)
     assert r.status == "granted", r.reason
+
+
+def test_raw_match_does_not_bypass_sanitized_collision_check(tmp_path: Path):
+    """Two raw column names that sanitize to the same safe_key — but
+    where ONE of them happens to equal the sanitized form — must
+    still trip the collision denial. A prior fast-path returned the
+    raw match immediately when ``requested in df.columns``, which
+    silently picked the wrong column when ``"A B"`` and ``"A\\nB"``
+    coexisted (both sanitize to ``"A B"``). The model only saw the
+    sanitized name, so the fast-path's "I found the raw column" was
+    not a license to skip the ambiguity check."""
+    raw_clean = "A B"
+    raw_with_newline = "A\nB"
+    from nora.text_safety import safe_key
+    # Prerequisite: both raw names sanitize to the same safe_key, AND
+    # one of them already equals that safe_key. This is the exact
+    # shape the prior fast path mishandled.
+    assert safe_key(raw_clean) == safe_key(raw_with_newline) == raw_clean
+
+    df = pd.DataFrame({
+        raw_clean: np.arange(40),
+        raw_with_newline: np.arange(40, 80),
+    })
+    # Write via DataFrame.to_csv would mangle the newline column name;
+    # we test the resolver directly so the column-name bytes survive.
+    # Read path: load_data returns the DataFrame; the resolver only
+    # consumes ``df.columns`` so we can pass any path that load_data
+    # round-trips. Use a parquet to preserve the raw bytes — but
+    # since the test is about the resolver, exercise it directly.
+    from nora.data_request import _resolve_variable, RequestResult
+
+    result = _resolve_variable(df, raw_clean)
+    assert isinstance(result, RequestResult)
+    assert result.status == "denied"
+    assert (
+        "collide" in (result.reason or "").lower()
+        or "colliding" in (result.reason or "").lower()
+    )
 
 
 def test_sanitized_collision_returns_structured_denial(tmp_path: Path):

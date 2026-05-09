@@ -577,7 +577,16 @@ def run_script(
         # Allow the interpreter to read its own stdlib + site-packages
         # — critical for venv / pyenv / conda Pythons that live
         # outside the system trees the default sandbox already covers.
-        extra_read_paths = env.python.extra_read_paths  # type: ignore[union-attr]
+        # Plus the Nora-managed package dir, where ``install_packages``
+        # writes pip ``--target`` payloads — without this read grant,
+        # script imports of Nora-installed packages would deny at the
+        # sandbox layer even though the import path entry resolves.
+        from nora.package_installer import nora_python_pkg_dir
+        pkg_dir = nora_python_pkg_dir(env.python.binary)  # type: ignore[union-attr]
+        extra_read_paths = (
+            *env.python.extra_read_paths,  # type: ignore[union-attr]
+            str(pkg_dir),
+        )
 
     # sandbox_exec presence is enforced above as a precondition.
     profile_path = _write_sandbox_profile(
@@ -871,22 +880,38 @@ def _write_script(run_dir: Path, language: Language, code: str) -> Path:
         path.write_text(code, encoding="utf-8")
         return path
     if language == "Python":
-        # Two-line preamble puts the staged ``nora.py`` on
-        # ``sys.path`` so the researcher's ``import nora`` resolves
-        # cleanly. We use a preamble (rather than PYTHONPATH) because
-        # the interpreter is invoked with ``-I`` (isolated mode),
-        # which ignores all PYTHON* env vars by design — keeps a
-        # researcher's stray ``PYTHONSTARTUP`` from running before
-        # their script. Same shape as the Stata adopath preamble:
-        # explicit, visible in the scratch dir, easy to audit.
+        # Two-line preamble puts the staged ``nora.py`` AND the Nora
+        # Python package install dir on ``sys.path``. We use a
+        # preamble (rather than PYTHONPATH) because the interpreter
+        # is invoked with ``-I`` (isolated mode), which ignores all
+        # PYTHON* env vars by design — keeps a researcher's stray
+        # ``PYTHONSTARTUP`` from running before their script. Same
+        # shape as the Stata adopath preamble: explicit, visible in
+        # the scratch dir, easy to audit.
+        #
+        # The Nora pkg dir entry is critical for the
+        # ``install_packages`` → ``submit_script`` path. ``--user``
+        # writes get filtered by ``-I`` and the sandbox; ``--target
+        # <nora_python_pkg_dir>`` is the path both surfaces share.
+        # See ``package_installer.nora_python_pkg_dir``.
+        from nora.package_installer import nora_python_pkg_dir
+        from nora.env_detect import find_python
         lib_dir = run_dir / "lib"
-        preamble = (
-            "import sys as _nora_sys\n"
-            f"_nora_sys.path.insert(0, {str(lib_dir)!r})\n"
-            "del _nora_sys\n"
-            "# ----- Nora preamble above; researcher code below -----\n"
-            "\n"
+        py_tool = find_python()
+        preamble_lines = [
+            "import sys as _nora_sys",
+            f"_nora_sys.path.insert(0, {str(lib_dir)!r})",
+        ]
+        if py_tool is not None:
+            pkg_dir = nora_python_pkg_dir(py_tool.binary)
+            preamble_lines.append(
+                f"_nora_sys.path.insert(0, {str(pkg_dir)!r})"
+            )
+        preamble_lines.append("del _nora_sys")
+        preamble_lines.append(
+            "# ----- Nora preamble above; researcher code below -----"
         )
+        preamble = "\n".join(preamble_lines) + "\n\n"
         path = run_dir / "script.py"
         path.write_text(preamble + code + "\n", encoding="utf-8")
         return path

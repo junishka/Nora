@@ -28,7 +28,13 @@ Hardening:
   * Repos / index URLs are hard-coded. There is no parameter the model
     can pass to redirect to a custom mirror.
   * R installs target ``Sys.getenv("R_LIBS_USER")`` (auto-created on
-    first install). Python uses ``pip install --user``. Stata uses
+    first install). Python installs go to ``nora_python_pkg_dir()``
+    via ``pip install --target`` — NOT ``--user``. ``--user`` writes
+    to a path the executor's ``-I`` mode and the sandbox both refuse
+    to read; ``--target`` writes to a Nora-managed dir we explicitly
+    add to the script preamble's ``sys.path`` and the sandbox read
+    allowlist. ``--target`` also works inside a venv (``--user`` is
+    rejected when user site-packages are not visible). Stata uses
     ``ssc install``. None require sudo.
   * Subprocess args go through ``argv``-form ``subprocess.run`` —
     no ``shell=True``, no string interpolation into a shell command.
@@ -37,6 +43,7 @@ Hardening:
 from __future__ import annotations
 
 import asyncio
+import os
 import re
 import subprocess
 import time
@@ -45,12 +52,78 @@ from pathlib import Path
 from typing import Any, Literal
 
 
-# Package-name allowlist. The same pattern works for CRAN, PyPI, and
-# SSC names: letters, digits, dot, underscore, dash. Anything else is
-# rejected before it reaches the shell. Length cap keeps a stray
-# multi-megabyte input from slipping past.
-_NAME_RE = re.compile(r"^[A-Za-z0-9._-]+$")
+# Package-name allowlist. The same character set works for CRAN, PyPI,
+# and SSC names: letters, digits, dot, underscore, dash. Crucially the
+# FIRST character must be alphanumeric — without that anchor, a leading
+# ``-`` (e.g. ``-r``, ``-e``, ``--no-index``) or a bare ``.`` / ``..``
+# matches the original ``[A-Za-z0-9._-]+`` and pip happily interprets
+# the value as an option or a local-path install rather than a registry
+# package name. The tightened anchor + the ``--`` end-of-options
+# separator we splice into the pip argv close that escape jointly.
+_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 _NAME_MAX_LEN = 80
+
+
+# Where Nora installs Python packages. Must satisfy two constraints
+# the prior ``pip install --user`` path violated:
+#
+#   1. The executor invokes Python with ``-I`` (isolated mode), which
+#      drops the per-user site-packages dir from ``sys.path``. Anything
+#      installed via ``--user`` is therefore invisible to script runs.
+#      The fix is to install to a directory we explicitly add to the
+#      preamble's ``sys.path`` (see ``executor._write_script``) so the
+#      install location matches the import location.
+#
+#   2. The script subprocess runs under ``sandbox-exec`` with a
+#      tightly scoped read allowlist. ``~/.local`` (the typical
+#      ``--user`` target) is not on it, so even without ``-I`` the
+#      sandbox would deny reads of user-installed packages. The
+#      sandbox profile re-allows reads under ``nora_python_pkg_dir()``
+#      explicitly.
+#
+# Per-version subdir is required because pip ``--target`` writes
+# wheel-version-specific code (numpy / pandas C extensions are
+# tagged for a specific CPython ABI). Mixing 3.11 and 3.12 wheels in
+# the same directory crashes at import.
+_NORA_PKG_BASE_ENV_VAR = "NORA_PYTHON_PKG_BASE"
+
+
+def _python_version_tag(binary: str) -> str:
+    """Return a ``"3.11"`` / ``"3.12"`` tag for the given interpreter,
+    or ``"unknown"`` if the probe fails. Used to namespace the install
+    directory so wheels with C extensions don't collide across
+    interpreter versions."""
+    try:
+        out = subprocess.run(
+            [
+                binary, "-c",
+                "import sys; print(f'{sys.version_info.major}."
+                "{sys.version_info.minor}')",
+            ],
+            capture_output=True, text=True, timeout=5,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return "unknown"
+    if out.returncode != 0:
+        return "unknown"
+    tag = (out.stdout or "").strip()
+    return tag if re.fullmatch(r"\d+\.\d+", tag) else "unknown"
+
+
+def nora_python_pkg_dir(binary: str) -> Path:
+    """Return the absolute path to Nora's Python package install
+    directory for the interpreter at ``binary``.
+
+    Single source of truth — used by the installer (write target),
+    the executor's preamble (sys.path entry), the sandbox profile
+    (read allowlist), and the env-detect import probe (PYTHONPATH).
+    Drift between any of those would re-open the original bug.
+
+    Honors ``$NORA_PYTHON_PKG_BASE`` for tests that need a temp dir.
+    """
+    base_env = os.environ.get(_NORA_PKG_BASE_ENV_VAR)
+    base = Path(base_env) if base_env else Path.home() / ".nora-packages" / "python"
+    return base / _python_version_tag(binary)
 
 # Per-action wall-clock cap. Network installs of ~10 packages can be
 # slow on a cold cache; 5 minutes is generous enough for most real
@@ -154,24 +227,48 @@ def _r_command(binary: str, packages: list[str], action: Action) -> list[str]:
 
 
 # ---------------------------------------------------------------------------
-# Python: pip install --user / pip uninstall
+# Python: pip install --target <nora_python_pkg_dir> / pip uninstall
 # ---------------------------------------------------------------------------
 
 def _python_command(binary: str, packages: list[str], action: Action) -> list[str]:
-    """Build a ``python -m pip ...`` invocation. ``--user`` writes to
-    the per-user site-packages so no sudo is needed; respects an
-    active virtualenv (in which case pip rejects ``--user`` and we
-    drop the flag — see _python_runtime_args).
+    """Build a ``python -m pip ...`` invocation that writes to (and
+    reads from) ``nora_python_pkg_dir(binary)``.
+
+    Why ``--target`` instead of ``--user``: see the docstring on
+    ``nora_python_pkg_dir``. ``--user`` writes to a path the executor's
+    ``-I`` mode and the sandbox both refuse, so the prior install path
+    looked like it succeeded but every subsequent ``submit_script``
+    failed with ``ModuleNotFoundError``. ``--target`` writes to a path
+    we explicitly own and grant access to.
+
+    Why the ``--`` end-of-options terminator before package names:
+    even with the tightened ``_NAME_RE``, defense-in-depth — pip stops
+    interpreting tokens as flags after ``--``, so a future relaxation
+    of the validator (or a bug in it) cannot smuggle ``-r requirements``
+    / ``-e .`` etc. through.
     """
+    target = nora_python_pkg_dir(binary)
+    target.mkdir(parents=True, exist_ok=True)
     if action == "remove":
-        return [binary, "-m", "pip", "uninstall", "-y", *packages]
-    base = [binary, "-m", "pip", "install", "--user"]
+        # ``pip uninstall`` has no ``--target``; it locates the
+        # package via ``sys.path``. The caller passes
+        # ``PYTHONPATH=<target>`` in ``env`` so pip can see what we
+        # installed under ``--target``.
+        return [
+            binary, "-m", "pip", "uninstall", "-y", "--", *packages,
+        ]
+    # ``--upgrade`` so a re-install of an already-present package
+    # picks up newer wheels rather than no-op'ing. ``reinstall`` adds
+    # ``--force-reinstall --no-deps`` so the model's refresh request
+    # does not yank the entire dep tree.
+    base: list[str] = [
+        binary, "-m", "pip", "install",
+        "--target", str(target),
+        "--upgrade",
+    ]
     if action == "reinstall":
-        # --force-reinstall + --no-deps to avoid yanking everything in
-        # the dep tree; the model asked to refresh THESE packages, not
-        # the world.
-        base = [binary, "-m", "pip", "install", "--user", "--force-reinstall", "--no-deps"]
-    return [*base, *packages]
+        base += ["--force-reinstall", "--no-deps"]
+    return [*base, "--", *packages]
 
 
 # ---------------------------------------------------------------------------
@@ -180,18 +277,27 @@ def _python_command(binary: str, packages: list[str], action: Action) -> list[st
 
 def _stata_command(binary: str, packages: list[str], action: Action) -> list[str]:
     """Build a Stata batch invocation. ``ssc install`` is the canonical
-    SSC package fetch; ``ado uninstall`` removes. We construct one do
-    string per package so a single bad name doesn't mask the others'
-    progress.
+    SSC package fetch; ``ado uninstall`` removes.
+
+    Commands are joined with NEWLINES, not semicolons — Stata's default
+    line delimiter inside a do-file is ``\\n``. The previous ``;``
+    join produced a single line like
+    ``capture ado uninstall foo; ssc install foo, replace`` which Stata
+    parsed as one command with a stray semicolon, failing even on
+    a single ``reinstall`` request. Switching the separator (rather
+    than emitting ``#delimit ;`` + trailing-``;``) is simpler and
+    matches what every Nora-emitted .ado file already does.
     """
     if action == "remove":
-        cmds = "; ".join(f"ado uninstall {p}" for p in packages)
+        lines = [f"ado uninstall {p}" for p in packages]
     elif action == "reinstall":
-        cmds = "; ".join(
-            f"capture ado uninstall {p}; ssc install {p}, replace" for p in packages
-        )
+        lines = []
+        for p in packages:
+            lines.append(f"capture ado uninstall {p}")
+            lines.append(f"ssc install {p}, replace")
     else:
-        cmds = "; ".join(f"ssc install {p}, replace" for p in packages)
+        lines = [f"ssc install {p}, replace" for p in packages]
+    cmds = "\n".join(lines) + "\n"
     return [binary, "-b", "-q", "do", "/dev/stdin"], cmds  # type: ignore[return-value]
 
 
@@ -246,6 +352,7 @@ async def install_packages(
     from nora.env_detect import detect_environment
 
     env = detect_environment()
+    subprocess_env: dict[str, str] | None = None
     if language == "R":
         if env.r is None:
             return InstallResult(
@@ -266,6 +373,18 @@ async def install_packages(
             )
         cmd = _python_command(env.python.binary, valid, action)  # type: ignore[arg-type]
         proc_stdin = None
+        # ``pip uninstall`` has no ``--target``; route the Nora pkg
+        # dir through ``PYTHONPATH`` so pip resolves the package via
+        # ``sys.path`` and removes the right copy. Install commands
+        # are unaffected by this (``--target`` is explicit on argv)
+        # but it's harmless to pass — pip ignores PYTHONPATH for
+        # ``--target`` installs.
+        target_dir = nora_python_pkg_dir(env.python.binary)
+        existing = os.environ.get("PYTHONPATH", "")
+        new_pp = (
+            f"{target_dir}{os.pathsep}{existing}" if existing else str(target_dir)
+        )
+        subprocess_env = {**os.environ, "PYTHONPATH": new_pp}
     else:  # Stata
         if env.stata is None:
             return InstallResult(
@@ -289,6 +408,7 @@ async def install_packages(
             capture_output=True,
             text=True,
             timeout=_INSTALL_TIMEOUT_SECONDS,
+            env=subprocess_env,
         )
     except subprocess.TimeoutExpired as e:
         return InstallResult(
