@@ -123,15 +123,16 @@ def _resolve_variable(
     ``search_schema`` for wide datasets.
     """
     columns = list(df.columns)
-    # Stage 1: exact raw match (fast path; the common case where the
-    # column name didn't need sanitization).
-    if requested in df.columns:
-        return requested
-    # Stage 2: sanitized match. Build a safe_key → [raw_names] map and
-    # look up the requested name. Multiple raw columns can sanitize to
-    # the same safe form — a real risk for datasets with long names
-    # whose first 40 chars happen to coincide, or with embedded
-    # control characters that strip identically.
+    # Build the sanitized → [raw_names] map first, with NO fast path
+    # for "exact raw match." A prior version returned ``requested``
+    # immediately when ``requested in df.columns``, but that bypassed
+    # the collision check: with columns ``"A B"`` and ``"A\nB"`` (both
+    # sanitize to ``"A B"``), a model-issued ``request_data(variable=
+    # "A B")`` would silently resolve to the raw ``"A B"`` column even
+    # though the lookup is genuinely ambiguous from the model's seat
+    # (it only saw the sanitized name). The model must see the same
+    # collision denial regardless of whether the sanitized form
+    # happens to equal a raw column name.
     safe_to_raw: dict[str, list[str]] = {}
     for col in columns:
         safe_to_raw.setdefault(safe_key(str(col)), []).append(str(col))

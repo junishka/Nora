@@ -292,6 +292,12 @@ def _python_missing_packages(
     (interpreter crash, timeout) is conservatively reported as
     "all packages missing" so the executor's missing-packages
     branch trips and surfaces a coherent error to the researcher.
+
+    The probe runs with ``PYTHONPATH`` set to include the Nora pkg
+    dir so packages installed via ``install_packages`` (which writes
+    to ``--target <nora_python_pkg_dir>``) count as present. Without
+    this the executor's preflight refuses runs even after a
+    successful Nora install.
     """
     if not required:
         return ()
@@ -305,12 +311,25 @@ def _python_missing_packages(
         "        missing.append(pkg)\n"
         "sys.stdout.write(json.dumps(missing))\n"
     )
+    # Lazy import: ``package_installer`` is a sibling module and
+    # cheap to import, but keeping it lazy avoids any import-cycle
+    # surprise if env_detect ever gets pulled in earlier in startup.
+    from nora.package_installer import nora_python_pkg_dir
+    pkg_dir = str(nora_python_pkg_dir(binary))
+    existing = os.environ.get("PYTHONPATH", "")
+    probe_env = {
+        **os.environ,
+        "PYTHONPATH": (
+            f"{pkg_dir}{os.pathsep}{existing}" if existing else pkg_dir
+        ),
+    }
     try:
         out = subprocess.run(
             [binary, "-c", probe],
             capture_output=True,
             text=True,
             timeout=10,
+            env=probe_env,
         )
     except (OSError, subprocess.TimeoutExpired):
         return tuple(required)

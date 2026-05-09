@@ -1200,8 +1200,21 @@ def _sanitize_crosstab(
 
     # Validate nested shape and collect a flattened view for suppression.
     # Row + col keys are level *names* from the data — sanitize before
-    # use. Do this BEFORE the dict is built so collisions (if any) fold
-    # together safely rather than bypassing the cleaner.
+    # use. A prior version did ``clean_counts[(safe_row, safe_col)] = v``
+    # unconditionally, which let two raw labels that sanitize to the
+    # same safe_key SILENTLY OVERWRITE each other in the dict. Concrete
+    # leak: raw row ``"A\nB"`` with count 2 (suppressible) overwritten
+    # by raw row ``"A B"`` with count 100 (visible) leaves the model
+    # seeing the visible count under a label that's actually ambiguous
+    # — and worse, secondary suppression accounting now operates on
+    # the wrong value.
+    #
+    # Detection: a duplicate (safe_row, safe_col) tuple in the build
+    # loop means either (a) two raw row keys sanitized to the same
+    # safe_row, or (b) two raw col keys within a row sanitized to
+    # the same safe_col. Either is genuinely ambiguous; the SDC
+    # posture is to deny rather than guess. The fix matches the
+    # equivalent gate in ``data_request._resolve_variable``.
     clean_counts: dict[tuple[str, str], int] = {}
     col_levels: set[str] = set()
     for row_key, inner in raw_counts.items():
@@ -1239,6 +1252,20 @@ def _sanitize_crosstab(
                     ),
                 )
             safe_col = safe_key(col_key)
+            if (safe_row, safe_col) in clean_counts:
+                return SanitizerResult(
+                    ok=False, analysis_type="crosstab",
+                    rejection_reason=(
+                        f"label collision after sanitization at cell "
+                        f"({safe_row!r}, {safe_col!r}): two distinct raw "
+                        f"row/col labels in this crosstab sanitize to the "
+                        f"same safe_key, which would silently overwrite "
+                        f"counts (and break suppression accounting). "
+                        f"Rename the colliding levels in the source script "
+                        f"— e.g. strip embedded whitespace / control "
+                        f"characters before the crosstab — and re-run."
+                    ),
+                )
             clean_counts[(safe_row, safe_col)] = v
             col_levels.add(safe_col)
 

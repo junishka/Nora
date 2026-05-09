@@ -1405,6 +1405,72 @@ def test_crosstab_accepts_at_cell_cap():
     assert r.ok
 
 
+def test_crosstab_row_label_collision_after_sanitization_rejects():
+    """Two raw row labels that ``safe_key`` collapses to the same
+    sanitized form must not silently overwrite each other in
+    ``clean_counts``. Reviewer's reproduction: a suppressed
+    ``"A\\nB"`` cell (count 2) replaced by a visible ``"A B"`` cell
+    (count 100) — the visible value rides under an ambiguous label
+    and the suppression accounting forgets the dropped row entirely.
+    The fix is a structured rejection before clean_counts is built."""
+    from nora.text_safety import safe_key
+    raw_a = "A B"
+    raw_b = "A\nB"
+    assert safe_key(raw_a) == safe_key(raw_b)  # prerequisite
+    r = sanitize({
+        "type": "crosstab",
+        "row_variable": "r",
+        "col_variable": "c",
+        "counts": {
+            raw_a: {"x": 100},
+            raw_b: {"x": 2},
+        },
+    })
+    assert not r.ok
+    msg = (r.rejection_reason or "").lower()
+    assert "collision" in msg
+    assert "sanit" in msg
+    # Raw bytes (the newline form) must not be echoed — the rejection
+    # reason quotes only the safe_key form. ``"A\\nB"`` literally
+    # never appears.
+    assert "a\nb" not in (r.rejection_reason or "")
+
+
+def test_crosstab_col_label_collision_after_sanitization_rejects():
+    """Same bug shape on the column axis: two col labels in a single
+    row that sanitize to the same safe_key would overwrite each
+    other. Reject."""
+    from nora.text_safety import safe_key
+    assert safe_key("col 1") == safe_key("col\n1")  # prerequisite
+    r = sanitize({
+        "type": "crosstab",
+        "row_variable": "r",
+        "col_variable": "c",
+        "counts": {
+            "row1": {"col 1": 100, "col\n1": 2},
+        },
+    })
+    assert not r.ok
+    assert "collision" in (r.rejection_reason or "").lower()
+
+
+def test_crosstab_distinct_labels_with_same_prefix_pass():
+    """Sanity check: labels that differ AFTER sanitization are
+    fine. The rejection only fires on a true safe_key collision.
+    Without this guard, the new check could over-reject benign
+    inputs."""
+    r = sanitize({
+        "type": "crosstab",
+        "row_variable": "r",
+        "col_variable": "c",
+        "counts": {
+            "row_a": {"col_x": 100, "col_y": 100},
+            "row_b": {"col_x": 100, "col_y": 100},
+        },
+    })
+    assert r.ok
+
+
 def test_magnitude_table_rejects_over_cell_cap():
     cells = {
         f"grp_{i}": {"value": 1000.0, "n": 100, "max_share": 0.1}

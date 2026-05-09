@@ -28,6 +28,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import secrets
 from pathlib import Path
 from typing import Any
@@ -63,55 +64,96 @@ _PLOT_HELPER_NAME_MAX_LEN = 80
 # actually decides whether to forward the message at all.
 _PLOT_HELPER_MESSAGE_MAX_LEN = 160
 
-# Allowlist of substrings that mark a helper-error message as
-# "diagnostically useful and safe to forward verbatim" — primarily
-# import / dependency errors that the model can act on by suggesting
-# ``pip install`` or telling the researcher to install a package.
-# The matcher is case-insensitive, substring-based, deliberately
-# narrow: anything outside this set is replaced with a redacted
-# placeholder so a user-script-authored exception body can't smuggle
-# raw cell values through the model-visible tool result.
-_PLOT_HELPER_MESSAGE_PATTERNS: tuple[str, ...] = (
-    "no module named",
-    "modulenotfounderror",
-    "matplotlib", "scipy", "statsmodels", "numpy", "pandas",
-    "haven", "ggplot2", "rmarkdown", "knitr",
-    # Stata helper diagnostics — file-not-found shapes that point at
-    # an env issue, not row data.
-    "command not found", "executable not found",
-    "no display", "could not import", "cannot import name",
-    # Generic shape-mismatch wording the helpers themselves emit
-    # (``_helper_failed("plot_residuals", "fitted object has no
-    # .resid; skipping")`` etc.). These come from Nora-authored
-    # strings, not from the researcher's code, but we still keep
-    # them here so they pass the allowlist.
-    "fitted object has no",
-    "params", "coef_table", "summary_frame",
+# Anchored full-string regexes for canonical import / dependency
+# error shapes the model can act on. Each pattern matches the
+# ENTIRE cleaned message; a partial match is not enough. The
+# package-name character class is restricted to identifier
+# characters so a hostile exception like
+# ``ModuleNotFoundError: No module named 'matplotlib' (secret=foo)``
+# does not match.
+#
+# Why exact-anchored shapes and not substring tokens: prior versions
+# allowlisted bare words like ``params`` / ``pandas`` / ``numpy``,
+# which let any row-derived exception body containing those words
+# (trivial — pandas formatters routinely embed them) bypass the
+# gate verbatim. The gate is defense-in-depth around the SDC
+# boundary; it has to refuse anything it can't structurally vouch
+# for, even at the cost of redacting some legitimate diagnostic
+# text.
+_PLOT_HELPER_IMPORT_REGEXES: tuple[re.Pattern[str], ...] = (
+    # Python: ``ModuleNotFoundError: No module named 'matplotlib'``
+    # and the bare ``No module named '...'`` form (R / generic).
+    re.compile(r"(?:ModuleNotFoundError: )?No module named ['\"][A-Za-z_][\w.\-]*['\"]"),
+    # Python: ``ImportError: cannot import name 'X' from 'Y'``
+    re.compile(
+        r"(?:ImportError: )?cannot import name ['\"][A-Za-z_]\w*['\"]"
+        r"(?: from ['\"][A-Za-z_][\w.\-]*['\"])?"
+    ),
+    # Python: ``could not import statsmodels.api`` (helper-emitted
+    # phrasing, identifier-only).
+    re.compile(r"could not import [A-Za-z_][\w.]*"),
+    # R: ``could not find function "read_dta"``.
+    re.compile(r"could not find function ['\"][A-Za-z_][\w.]*['\"]"),
+    # R: ``there is no package called 'haven'``.
+    re.compile(r"there is no package called ['\"][A-Za-z_][\w.]*['\"]"),
+    # Stata: helper-emitted, fully structural — no row data path.
+    # See ``nora_plot_residuals.ado`` and siblings.
+    re.compile(
+        r"plot_\w+ failed at step \w+ with _rc=\d+; "
+        r"check stderr\.log for the underlying error"
+    ),
+)
+
+# Exact-match Nora-authored helper-failure messages. These come
+# from ``_helper_failed`` call sites that pass a fully-static
+# string (no f-string interpolation of caller-controlled values).
+# Stems with interpolated values are deliberately excluded — the
+# interpolated coef / column / dict-key can carry row data.
+_PLOT_HELPER_NORA_AUTHORED_EXACT: frozenset[str] = frozenset({
+    "fitted object has no .resid / .fittedvalues; skipping",
+    "numpy missing",
+    "fitted object has no .params; need a statsmodels-style fit",
+    "nothing to plot after dropping intercept term",
+    "`models` must be a dict of at least 2 fits keyed by label",
+    "`coef` must be a coefficient name string",
+    # R-side equivalent of the var-must-be-string guard.
+    "nora$plot_interaction: `var` must be a single name string",
+})
+
+_PLOT_HELPER_REDACTED_PLACEHOLDER = (
+    "(error message redacted; full text in researcher's run log)"
 )
 
 
 def _safe_helper_error_message(raw: object) -> str:
-    """Forward only well-known import / dependency error patterns
-    verbatim; replace anything else with a redacted placeholder.
+    """Forward only structurally-recognizable import / dependency
+    errors and an exact-match set of Nora-authored helper messages;
+    redact anything else.
 
     Helper exceptions are written by user-authored scripts, and
-    Python exception formatters (especially pandas / numpy) can
+    Python / R exception formatters (pandas, numpy, base R) routinely
     embed raw cell values in their message bodies. ``safe_text``
-    alone caps length and strips control characters but a 160-char
-    excerpt of cell values would still leak. The allowlist here is
-    the actual gate: the only messages forwarded verbatim are the
-    ones the model can usefully act on (import errors, helper-
-    emitted shape diagnostics).
+    alone caps length and strips control characters, but a 160-char
+    excerpt of cell values would still leak. The gate is therefore
+    structural: the message must FULLY match one of the anchored
+    import-error regexes (whose character classes are restricted to
+    identifier characters) or be exactly equal to a known Nora-
+    authored string. Any other input — including messages that
+    happen to contain a recognized word like ``pandas`` or
+    ``params`` alongside row data — is replaced with a redacted
+    placeholder.
     """
     if not isinstance(raw, str):
         raw = str(raw) if raw is not None else ""
     cleaned = safe_text(raw, max_len=_PLOT_HELPER_MESSAGE_MAX_LEN)
     if not cleaned:
         return ""
-    lower = cleaned.lower()
-    if any(p in lower for p in _PLOT_HELPER_MESSAGE_PATTERNS):
+    if cleaned in _PLOT_HELPER_NORA_AUTHORED_EXACT:
         return cleaned
-    return "(error message redacted; full text in researcher's run log)"
+    for pattern in _PLOT_HELPER_IMPORT_REGEXES:
+        if pattern.fullmatch(cleaned):
+            return cleaned
+    return _PLOT_HELPER_REDACTED_PLACEHOLDER
 
 
 # Single source of truth for tool name + description + arg shape lives
@@ -688,7 +730,7 @@ def _summarize_plot_helpers(run_dir: Any) -> dict[str, Any] | None:
             # exception body would be at best confusing and at
             # worst smuggle an attacker-controlled instruction
             # through a separate field.
-            if "redacted" not in row["message"]:
+            if row["message"] != _PLOT_HELPER_REDACTED_PLACEHOLDER:
                 raw_fix = entry.get("fix")
                 if raw_fix:
                     cleaned_fix = safe_text(
