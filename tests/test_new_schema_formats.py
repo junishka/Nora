@@ -90,7 +90,11 @@ def test_extract_parquet_round_trip(tmp_path: Path) -> None:
     # categorical heuristic (nunique <= 20 AND nunique <= n // 20).
     assert by_name["treatment"]["type"] == "categorical"
     assert by_name["outcome"]["type"] == "numeric"
-    assert by_name["outcome"]["na_count"] == 1
+    # na_count of 1 is a re-identification channel (it points at the
+    # single missing observation), so the schema summary suppresses
+    # rare counts via the same primary-cell-suppression rule used
+    # elsewhere. Marker shape mirrors ``nora.sdc.suppression_marker``.
+    assert by_name["outcome"]["na_count"] == "<10"
 
 
 def test_extract_parquet_load_data_returns_dataframe(tmp_path: Path) -> None:
@@ -132,7 +136,9 @@ def test_extract_jsonl(tmp_path: Path) -> None:
     assert set(by_name) == {"id", "score", "label"}
     assert by_name["id"]["type"] == "integer"
     assert by_name["score"]["type"] == "numeric"
-    assert by_name["score"]["na_count"] == 1
+    # Suppressed: only 3 rows total, 1 missing. The rare-count
+    # filter fires on either side. See _suppress_rare_count.
+    assert by_name["score"]["na_count"] == "<10"
 
 
 def test_extract_ndjson_alias(tmp_path: Path) -> None:

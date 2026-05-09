@@ -482,6 +482,30 @@ def get_store(cwd: Path) -> ResultStore:
     return store
 
 
+def open_store_uncached(cwd: Path) -> ResultStore:
+    """Open a fresh store for ``cwd`` without inserting it into the
+    process-wide cache.
+
+    Used by one-shot scans across many sessions
+    (``list_results_global``, the cross-session recall path) so a
+    broad listing doesn't permanently retain a SQLite connection per
+    session it touched. Caller MUST ``close()`` the returned store
+    when done — otherwise the file descriptor leaks until the
+    process exits.
+
+    If a cached store already exists for the same cwd (e.g. the
+    active session's own store, opened earlier by a model-facing
+    tool), the cached one is returned instead so we don't double-
+    open the same DB. The "don't pin a fresh handle" property only
+    needs to hold for sessions that aren't already cached.
+    """
+    key = cwd.resolve()
+    existing = _stores.get(key)
+    if existing is not None:
+        return existing
+    return ResultStore(key / STORE_SUBDIR / DB_FILENAME)
+
+
 def close_store(cwd: Path) -> None:
     """Close and drop the cached store for ``cwd``.
 

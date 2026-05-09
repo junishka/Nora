@@ -20,6 +20,7 @@ from pathlib import Path
 
 from nora.policy import (
     DEFAULT_MAX_DEPTH,
+    FAIL_CLOSED_MAX_DEPTH,
     VALID_DEPTHS,
     NoraPolicy,
     DatasetPolicy,
@@ -44,31 +45,37 @@ def test_load_missing_file_returns_default(tmp_path: Path):
     assert p.datasets == {}
 
 
-def test_load_corrupted_json_falls_back_to_default(tmp_path: Path):
-    """A broken JSON file must not lock the researcher out of Nora.
-    Default policy applies silently — the safe fallback is the
-    conservative one."""
+def test_load_corrupted_json_fails_closed(tmp_path: Path):
+    """A broken JSON file must not lock the researcher out of Nora,
+    but it must NOT silently expose metadata the researcher had
+    previously restricted. Fail closed: the in-memory default drops
+    to the strictest tier so schema requests are denied until the
+    file is repaired."""
     policy_path(tmp_path).parent.mkdir()
     policy_path(tmp_path).write_text("{ this is not valid JSON }")
     p = load_policy(tmp_path)
-    assert p.default_max_depth == DEFAULT_MAX_DEPTH
+    assert p.default_max_depth == FAIL_CLOSED_MAX_DEPTH
     assert p.datasets == {}
 
 
-def test_load_unknown_version_falls_back_to_default(tmp_path: Path):
-    """Future versions should have a migration path; until one exists,
-    bail to default rather than risk misinterpreting."""
+def test_load_unknown_version_fails_closed(tmp_path: Path):
+    """Future versions should have a migration path; until one
+    exists, fail closed rather than misinterpret. A version-skewed
+    file wasn't written for this code path; treating its absent
+    entries as 'no opinion' would silently re-open access the newer
+    version may have tightened."""
     policy_path(tmp_path).parent.mkdir()
     policy_path(tmp_path).write_text(
         json.dumps({"version": 99, "default_max_depth": "names_types_labels"})
     )
     p = load_policy(tmp_path)
-    assert p.default_max_depth == DEFAULT_MAX_DEPTH
+    assert p.default_max_depth == FAIL_CLOSED_MAX_DEPTH
 
 
-def test_load_unknown_depth_in_default_falls_back(tmp_path: Path):
-    """An invalid depth name in the policy file must not be forwarded
-    — silently correct to the conservative default."""
+def test_load_unknown_depth_in_default_fails_closed(tmp_path: Path):
+    """An invalid depth name in the policy file must not be silently
+    upgraded to the rich default — clamp to the strictest tier so a
+    typo can't accidentally widen the ceiling."""
     policy_path(tmp_path).parent.mkdir()
     policy_path(tmp_path).write_text(
         json.dumps({
@@ -77,11 +84,14 @@ def test_load_unknown_depth_in_default_falls_back(tmp_path: Path):
         })
     )
     p = load_policy(tmp_path)
-    assert p.default_max_depth == DEFAULT_MAX_DEPTH
+    assert p.default_max_depth == FAIL_CLOSED_MAX_DEPTH
 
 
-def test_load_unknown_depth_in_per_dataset_falls_back(tmp_path: Path):
-    """Same for per-dataset entries — unknown depth → conservative."""
+def test_load_unknown_depth_in_per_dataset_fails_closed(tmp_path: Path):
+    """Per-dataset entries with an unknown depth clamp to the
+    strictest tier. The researcher had an explicit opinion (the
+    entry exists) — falling back to the file-wide default could be
+    more permissive than they intended."""
     policy_path(tmp_path).parent.mkdir()
     policy_path(tmp_path).write_text(
         json.dumps({
@@ -92,7 +102,16 @@ def test_load_unknown_depth_in_per_dataset_falls_back(tmp_path: Path):
         })
     )
     p = load_policy(tmp_path)
-    assert p.datasets["survey.csv"].max_depth == DEFAULT_MAX_DEPTH
+    assert p.datasets["survey.csv"].max_depth == FAIL_CLOSED_MAX_DEPTH
+
+
+def test_load_non_dict_root_fails_closed(tmp_path: Path):
+    """A JSON file whose root is a list / string / number is shape-
+    invalid; same fail-closed posture as malformed JSON."""
+    policy_path(tmp_path).parent.mkdir()
+    policy_path(tmp_path).write_text(json.dumps(["not", "a", "dict"]))
+    p = load_policy(tmp_path)
+    assert p.default_max_depth == FAIL_CLOSED_MAX_DEPTH
 
 
 def test_load_valid_policy(tmp_path: Path):

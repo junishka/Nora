@@ -707,6 +707,118 @@ def test_ols_vcov_clamped_to_sigfigs_for_n():
     assert r.sanitized["vcov"]["x"]["x"] == 0.9877
 
 
+def test_ols_vcov_long_coef_name_keeps_matrix_aligned():
+    """Coefficient names longer than safe_key's 40-char cap are
+    truncated when they reach ``coefficients`` / ``standard_errors``
+    (those go through ``_collect_allowed`` which sanitizes inner-
+    dict keys). The vcov path used to compare the RAW row/col keys
+    against the already-sanitized allowlist, so the entire
+    covariance row for the long-named coefficient was silently
+    dropped while its coefficient and SE survived. Guard: sanitize
+    vcov keys with the same ``safe_key`` so the comparison is
+    apples-to-apples and the matrix stays consistent with the rest
+    of the regression payload."""
+    long_name = "very_long_coefficient_name_that_exceeds_the_safe_key_cap_xxxx"
+    assert len(long_name) > 40  # would clamp under safe_key
+    payload = {
+        "type": "linear_regression",
+        "n": 1000,
+        "response_variable": "y",
+        "predictor_variables": [long_name, "x"],
+        "coefficients": {"(Intercept)": 1.0, long_name: 2.0, "x": 3.0},
+        "standard_errors": {"(Intercept)": 0.1, long_name: 0.1, "x": 0.1},
+        "r_squared": 0.5,
+        "vcov": {
+            "(Intercept)": {"(Intercept)": 0.01, long_name: 0.001, "x": 0.002},
+            long_name: {"(Intercept)": 0.001, long_name: 0.01, "x": 0.005},
+            "x": {"(Intercept)": 0.002, long_name: 0.005, "x": 0.01},
+        },
+    }
+    r = sanitize(payload)
+    assert r.ok, r.rejection_reason
+    assert "vcov" in r.sanitized
+    # The long name appears in vcov rows AND columns under the same
+    # sanitized form that ``coefficients`` got. Pre-fix: this row
+    # was dropped entirely as "undeclared" because the raw key
+    # didn't match the safe_key-clamped allowlist.
+    sanitized_long = next(
+        k for k in r.sanitized["coefficients"] if k != "(Intercept)" and k != "x"
+    )
+    assert sanitized_long in r.sanitized["vcov"]
+    assert sanitized_long in r.sanitized["vcov"]["x"]
+    # The cross-row covariance survives both directions (symmetry of
+    # the matrix preserved end-to-end).
+    assert r.sanitized["vcov"][sanitized_long]["x"] != 0
+    assert r.sanitized["vcov"]["x"][sanitized_long] != 0
+
+
+def test_ols_vcov_drops_alien_keys_after_sanitization():
+    """Alien row/col keys are still dropped — sanitizing keys
+    doesn't widen the cross-field key filter."""
+    payload = {
+        "type": "linear_regression",
+        "n": 1000,
+        "response_variable": "y",
+        "predictor_variables": ["x"],
+        "coefficients": {"(Intercept)": 1.0, "x": 2.0},
+        "standard_errors": {"(Intercept)": 0.1, "x": 0.1},
+        "r_squared": 0.5,
+        "vcov": {
+            "(Intercept)": {"(Intercept)": 0.01, "x": 0.001},
+            "x": {"(Intercept)": 0.001, "x": 0.01, "leak_col": 9.9},
+            "leak_row": {"x": 9.9},
+        },
+    }
+    r = sanitize(payload)
+    assert r.ok
+    assert sorted(r.sanitized["vcov"].keys()) == ["(Intercept)", "x"]
+    assert sorted(r.sanitized["vcov"]["x"].keys()) == ["(Intercept)", "x"]
+
+
+def test_ols_vcov_collision_after_sanitization_does_not_overwrite():
+    """If two raw keys clean to the same sanitized name, drop the
+    duplicate rather than silently overwriting the earlier cell.
+    The ``vcov`` log entry tells the caller a collision happened."""
+    # Both raw names exceed 40 chars and share the first 40 — they
+    # collapse to the same safe_key form.
+    long_a = (
+        "name_collision_prefix_padding_xxxxxxxxxx_one_extra_tail"
+    )
+    long_b = (
+        "name_collision_prefix_padding_xxxxxxxxxx_two_extra_tail"
+    )
+    assert len(long_a) > 40 and len(long_b) > 40
+    # Use only the FIRST raw form in coefficients/SE/predictors so
+    # the allowlist has a single sanitized entry. The vcov payload
+    # then references both raw names in the same row, which clean
+    # to the same safe_key — the second cell would have silently
+    # overwritten the first under the old code path.
+    payload = {
+        "type": "linear_regression",
+        "n": 1000,
+        "response_variable": "y",
+        "predictor_variables": [long_a, "x"],
+        "coefficients": {"(Intercept)": 1.0, long_a: 2.0, "x": 3.0},
+        "standard_errors": {"(Intercept)": 0.1, long_a: 0.1, "x": 0.1},
+        "r_squared": 0.5,
+        "vcov": {
+            "x": {long_a: 1.0, long_b: 99.0, "x": 0.01},
+        },
+    }
+    r = sanitize(payload)
+    assert r.ok
+    # Only one cell survived for the collided column. The exact
+    # winner is implementation-defined, but it is NOT the second
+    # raw value silently overwriting the first.
+    sanitized_long = next(
+        k for k in r.sanitized["coefficients"] if k not in {"(Intercept)", "x"}
+    )
+    assert sanitized_long in r.sanitized["vcov"]["x"]
+    # The collision shows up in the transformations log so a caller
+    # auditing the SDC report can see what happened.
+    assert any("collid" in t for t in r.transformations), r.transformations
+
+
 def test_ols_condition_number_passes_through():
     """``condition_number`` is a scalar derived from the design
     matrix's singular values — pure aggregate. Must survive the

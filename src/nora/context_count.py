@@ -48,6 +48,13 @@ _HISTORY_UI_ONLY_FIELDS: frozenset[str] = frozenset({
     "raw_stderr",
     "plots",
     "plot_diagnostic",
+    # ``images`` on a ``user_message`` is the persisted base64 blob
+    # for each composer-attached image, kept so a reload still
+    # renders the evidence the researcher sent. The image bytes
+    # rode into the request via the provider's images channel (not
+    # the text body), so they shouldn't count toward the next
+    # turn's text-side chip pressure.
+    "images",
 })
 
 

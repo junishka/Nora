@@ -661,13 +661,24 @@ function replayEvent(evt) {
       if (replayTailTurn && !replayTailTurn.hasVisibleReply) {
         dropNodes(replayTailTurn.nodes);
       }
-      // ``attachments`` may be a list of script filenames (the
-      // backend persists the names that travelled with this
-      // message) OR a legacy ``int`` count for image attachments.
-      // Only the list form renders chips; the count form is for
-      // older sessions and we just drop it.
+      // ``attachments`` is a list of script filenames (the backend
+      // persists the names that travelled with this message).
       const att = Array.isArray(evt.attachments) ? evt.attachments : [];
-      const userEl = appendUser(evt.text || '', att);
+      // ``images`` is the persisted ``[{data, mime}]`` list. Convert
+      // to the data-URL shape ``appendUser`` expects so the bubble
+      // shows the actual thumbnails on reload, not a phantom "you
+      // sent an image" with no preview. Older histories carry only
+      // ``image_count`` (no bytes) — fall through to the no-images
+      // path; better a bare text bubble than a broken thumb.
+      const imgs = Array.isArray(evt.images)
+        ? evt.images
+            .filter((i) => i && typeof i.data === 'string')
+            .map((i) => ({
+              url: `data:${i.mime || 'image/png'};base64,${i.data}`,
+              mime: i.mime || 'image/png',
+            }))
+        : [];
+      const userEl = appendUser(evt.text || '', att, imgs);
       replayTailTurn = { nodes: [userEl], hasVisibleReply: false };
       break;
     }

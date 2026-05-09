@@ -974,6 +974,18 @@ class SessionRunner:
                 # stream without a terminal — synthesise one so the
                 # JS state machine never wedges.
                 saw_terminal = False
+                # Distinguish a clean ``TurnDone`` from a yielded
+                # ``TurnError`` / ``AuthFailure``. The Python
+                # exception branches below already restore prefix /
+                # diff / plot state so a thrown failure can be
+                # retried with full context. The provider can also
+                # emit those failures as normal events without
+                # throwing (e.g. an HTTP-level auth failure caught
+                # inside the SDK and surfaced via ``yield``); without
+                # this flag the loop would treat that path as a
+                # successful completion and consume the carried
+                # context that the next attempt still needs.
+                turn_failed_event = False
                 try:
                     async for evt in session.send(
                         prompt,
@@ -981,6 +993,8 @@ class SessionRunner:
                     ):
                         if isinstance(evt, (TurnDone, TurnError, AuthFailure)):
                             saw_terminal = True
+                            if isinstance(evt, (TurnError, AuthFailure)):
+                                turn_failed_event = True
                         # Capture any plots produced by submit_script
                         # so they're available on the NEXT user turn.
                         from nora.provider import ToolCallResult
@@ -988,6 +1002,12 @@ class SessionRunner:
                             self._capture_plots(Path(evt.run_dir))
                         emit(_event_to_dict(evt))
                     if not saw_terminal:
+                        # Treat a missing terminal as a failure too —
+                        # the synthesised ``turn_error`` below tells
+                        # the JS state machine the turn didn't
+                        # complete, so the next attempt should rebuild
+                        # the same context as a thrown-error retry.
+                        turn_failed_event = True
                         emit({
                             "type": "turn_error",
                             "message": (
@@ -996,6 +1016,27 @@ class SessionRunner:
                                 "resend if the chat feels stuck"
                             ),
                         })
+                    if turn_failed_event:
+                        # Same restoration posture as the cancel /
+                        # exception branches: a failed turn means the
+                        # researcher's next attempt should see the
+                        # warm-start prefix, dataset diff, and plot
+                        # attachments that this turn consumed but
+                        # never got to use. Mentioned files / images
+                        # do NOT carry — the composer chip already
+                        # cleared on send, so re-prepending would
+                        # smuggle attachments the researcher no
+                        # longer sees.
+                        if carried_prefix:
+                            self.needs_context_prefix = True
+                        if carried_dataset_diff:
+                            self.known_datasets = (
+                                self.known_datasets - carried_dataset_diff
+                            )
+                        if attached_plots:
+                            self.pending_plot_images = (
+                                attached_plots + self.pending_plot_images
+                            )
                     # Persist the durable session snapshot.
                     try:
                         from nora.session_state import write_session_state

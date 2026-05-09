@@ -45,7 +45,7 @@ from nora.policy import (
 from nora import sanitizer
 from nora.provider.tool_schemas import build_tool_specs
 from nora.sanitizer import sanitize
-from nora.store import get_store
+from nora.store import get_store, open_store_uncached
 from nora.text_safety import safe_text
 
 
@@ -2501,24 +2501,65 @@ async def list_results_global(args: dict[str, Any]) -> dict[str, Any]:
         db_path = child / ".nora" / "results.db"
         if not db_path.is_file():
             continue
+        # Open uncached + close after reading. ``get_store`` keeps a
+        # SQLite connection per cwd in a process-wide dict so the
+        # interactive tool calls reuse one handle per session, but
+        # this scan touches every other session on the machine —
+        # using the cached path would permanently retain a
+        # connection per visited session even though the scan needs
+        # the rows once. Long-lived UI processes that call this tool
+        # would slowly burn through file descriptors and hold stale
+        # handles to sessions the researcher had since deleted.
+        # ``open_store_uncached`` reuses the cache when an entry
+        # already exists (so the active session's own handle isn't
+        # double-opened) but doesn't insert new entries — the
+        # ``finally`` closes whatever this iteration opened.
+        store = None
         try:
-            store = get_store(child)
+            store = open_store_uncached(child)
             rows = store.list_all()
         except Exception:  # noqa: BLE001 — never let one bad db kill the listing
+            from nora.store import _stores
+            if (
+                store is not None
+                and _stores.get(child.resolve()) is not store
+            ):
+                try:
+                    store.close()
+                except Exception:  # noqa: BLE001
+                    pass
             continue
-        for r in rows:
-            label = r.label or ""
-            atype = r.analysis_type or ""
-            if query and query not in label.lower() and query not in atype.lower():
-                continue
-            rows_out.append({
-                "session_path": str(child),
-                "session_name": child.name,
-                "id": r.id,
-                "label": label,
-                "analysis_type": atype,
-                "created_at": r.created_at,
-            })
+        try:
+            for r in rows:
+                label = r.label or ""
+                atype = r.analysis_type or ""
+                if (
+                    query
+                    and query not in label.lower()
+                    and query not in atype.lower()
+                ):
+                    continue
+                rows_out.append({
+                    "session_path": str(child),
+                    "session_name": child.name,
+                    "id": r.id,
+                    "label": label,
+                    "analysis_type": atype,
+                    "created_at": r.created_at,
+                })
+        finally:
+            # Always close: the cached path returns the same
+            # singleton, which has its own lifecycle and shouldn't
+            # be torn down here. ``open_store_uncached`` only
+            # returns the cached store when one already exists, so
+            # closing in that case would surprise other callers.
+            # Tell them apart by re-checking the cache.
+            from nora.store import _stores
+            if store is not None and _stores.get(child.resolve()) is not store:
+                try:
+                    store.close()
+                except Exception:  # noqa: BLE001
+                    pass
     total = len(rows_out)
     # Newest-first so the model sees recent sessions before old ones.
     rows_out.sort(
@@ -3425,9 +3466,21 @@ async def list_session_files(args: dict[str, Any]) -> dict[str, Any]:
         from nora.run_files import enumerate_run_dir_scripts
         from nora.session_files import visible_run_dir_names
         visible_runs = visible_run_dir_names(cwd)
+        # Reserved names: any top-level row already emitted above. We
+        # pass them into the enumeration so a colliding run-dir script
+        # gets a disambiguating ``(short_id)`` suffix appended to its
+        # display name rather than being silently dropped (which left
+        # the model unable to fetch a prior script of the same name)
+        # or shadowed by ``read_attached_file`` (which resolves
+        # top-level cwd files first). Lookup uses the same reserved
+        # set to reproduce the suffix.
+        reserved_names = frozenset(
+            r["name"] for r in rows if r.get("name")
+        )
         seen_paths = {r.get("name") for r in rows}
         for entry in enumerate_run_dir_scripts(
             cwd, visible_run_dirs=visible_runs,
+            reserved_names=reserved_names,
         ):
             name = safe_text(entry.display_name)
             if not name or name in seen_paths:
@@ -3490,6 +3543,22 @@ _SEARCH_FILES_FILE_BYTE_CAP = 256 * 1024
 # Per-line excerpt cap so a 5000-char line in a generated log doesn't
 # blow up the response payload.
 _SEARCH_FILES_LINE_EXCERPT_CAP = 240
+# Whole-response budgets. The per-file caps above are necessary but
+# not sufficient: a broad query (a common verb, an analysis variable
+# name) over a session with dozens of small scripts can satisfy the
+# per-file ceiling on every file and still ship a megabyte of
+# match payload back to the model. These global ceilings stop the
+# scan early — the response shape includes ``total`` /
+# ``truncated`` so the model knows it didn't see everything and can
+# narrow the query.
+_SEARCH_FILES_TOTAL_MATCHES_CAP = 200
+_SEARCH_FILES_TOTAL_FILES_CAP = 50
+# Approximate char cap on the rendered ``matches`` payload across
+# all files. Sized so the JSON-encoded result stays under ~64 KiB of
+# text before the MCP wrapping. Hit when many files each carry near-
+# excerpt-cap matches; stops early with a truncation flag rather
+# than streaming an oversized tool result.
+_SEARCH_FILES_TOTAL_CHARS_CAP = 60_000
 # Extensions whose lines can be returned verbatim to the model. These
 # are plain source files: the bytes ARE the model's mental model of
 # what the script does, and nothing in them was computed from the
@@ -3605,14 +3674,52 @@ async def search_in_session_files(args: dict[str, Any]) -> dict[str, Any]:
         search_entries.append((name, child, kind))
     if "script" in keep_kinds:
         from nora.run_files import enumerate_run_dir_scripts
-        for entry in enumerate_run_dir_scripts(cwd):
+        # Same disambiguation contract as list_session_files: pass
+        # the already-emitted top-level names as reserved so a
+        # colliding run-dir script gets a ``(short_id)`` suffix
+        # rather than being silently dropped here.
+        reserved_names = frozenset(seen_names)
+        for entry in enumerate_run_dir_scripts(
+            cwd, reserved_names=reserved_names,
+        ):
             name = safe_text(entry.display_name)
             if not name or name in seen_names:
                 continue
             seen_names.add(name)
             search_entries.append((name, entry.path, "script"))
 
+    # Track when a global cap fires so the response can flag truncation.
+    response_truncated = False
+    response_truncated_reason: str | None = None
+    rendered_chars = 0
+
     for name, child, kind in search_entries:
+        # Global response budgets. Each one stops the scan immediately,
+        # records the reason, and lets the loop fall through to the
+        # response build below — the partial results we already have
+        # are still useful, and the truncation flag tells the model
+        # to narrow the query.
+        if len(results) >= _SEARCH_FILES_TOTAL_FILES_CAP:
+            response_truncated = True
+            response_truncated_reason = (
+                f"hit the {_SEARCH_FILES_TOTAL_FILES_CAP}-file response "
+                f"cap; narrow the query or filter by ``kinds``"
+            )
+            break
+        if total_matches >= _SEARCH_FILES_TOTAL_MATCHES_CAP:
+            response_truncated = True
+            response_truncated_reason = (
+                f"hit the {_SEARCH_FILES_TOTAL_MATCHES_CAP}-match "
+                f"response cap; narrow the query"
+            )
+            break
+        if rendered_chars >= _SEARCH_FILES_TOTAL_CHARS_CAP:
+            response_truncated = True
+            response_truncated_reason = (
+                f"hit the {_SEARCH_FILES_TOTAL_CHARS_CAP}-char response "
+                f"payload cap; narrow the query"
+            )
+            break
         ext = child.suffix.lower()
         try:
             st = child.stat()
@@ -3679,22 +3786,33 @@ async def search_in_session_files(args: dict[str, Any]) -> dict[str, Any]:
                     break
         if matches:
             total_matches += len(matches)
-            results.append({
+            row = {
                 "name": name,
                 "kind": kind,
                 "excerpts": excerpts_allowed,
                 "matches": matches,
                 "truncated": len(matches) >= max_per_file,
-            })
+            }
+            results.append(row)
+            # Approximate char cost of the row's match payload. Excerpts
+            # dominate; line-only entries add a fixed ~12 chars each.
+            # Used purely for the global-char-cap test on the next
+            # iteration — undercount is fine, overcount is fine.
+            for m in matches:
+                rendered_chars += 12 + len(m.get("text", ""))
 
-    return _as_mcp_text({
+    response: dict[str, Any] = {
         "status": "ok",
         "query": query,
         "files_searched": files_searched,
         "total_matches": total_matches,
         "results": results,
         "skipped": skipped,
-    })
+        "truncated": response_truncated,
+    }
+    if response_truncated_reason is not None:
+        response["truncated_reason"] = response_truncated_reason
+    return _as_mcp_text(response)
 
 
 # ---------------------------------------------------------------------------
