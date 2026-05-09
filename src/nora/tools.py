@@ -1449,6 +1449,23 @@ def _attach_status_metadata(
                 f"script failed (exit code {exec_result.exit_code}); "
                 f"inspect raw log in UI"
             )
+        # Localize the crash inside a labelled multi-spec run by
+        # prepending the most-recent ok payload's label. The
+        # extractor's idiom names the failing operation but not WHICH
+        # iteration of a loop produced it — without this, "object 'x'
+        # not found" inside a 12-spec sweep leaves the model guessing
+        # which spec hit the missing column. Skip the prefix when no
+        # ok payload landed (no localization to add) or when the
+        # payload's label matches the script-level label (same info,
+        # no value).
+        last_ok_label: str | None = None
+        for r in results:
+            if r.get("status") == "ok":
+                lbl = r.get("label") or ""
+                if lbl and lbl != label:
+                    last_ok_label = lbl
+        if last_ok_label:
+            excerpt = f"[crashed after spec: {last_ok_label}]\n{excerpt}"
         response["debug_excerpt"] = excerpt
 
         if overall_status == "execution_failed":
@@ -3165,6 +3182,71 @@ async def search_in_session_files(args: dict[str, Any]) -> dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
+# Tool: install_packages
+# ---------------------------------------------------------------------------
+
+@tool("install_packages")
+async def install_packages(args: dict[str, Any]) -> dict[str, Any]:
+    """Install / remove / reinstall language packages out-of-band.
+
+    Network + library-write happens here, not in submit_script. The
+    confirm-with-the-researcher flow is enforced by the system prompt
+    (the model asks in chat, the researcher answers, the model then
+    calls this tool); this handler does NOT pop a UI dialog.
+    """
+    from nora.package_installer import install_packages as _do_install
+
+    language = args.get("language", "")
+    packages_arg = args.get("packages") or []
+    action = args.get("action") or "install"
+
+    if not isinstance(language, str):
+        return _as_mcp_text({
+            "status": "error",
+            "reason": "language must be a string ('R', 'Python', or 'Stata')",
+        })
+    if not isinstance(packages_arg, list):
+        return _as_mcp_text({
+            "status": "error",
+            "reason": "packages must be a list of names",
+        })
+    if not isinstance(action, str):
+        return _as_mcp_text({
+            "status": "error",
+            "reason": "action must be a string ('install', 'remove', or 'reinstall')",
+        })
+
+    result = await _do_install(language, list(packages_arg), action)
+
+    statuses = [
+        {"name": s.name, "status": s.status, "detail": s.detail}
+        for s in result.statuses
+    ]
+    if result.error:
+        return _as_mcp_text({
+            "status": "error",
+            "language": result.language,
+            "action": result.action,
+            "reason": result.error,
+            "statuses": statuses,
+            "duration_seconds": round(result.duration_seconds, 2),
+            # Truncate raw output so a noisy installer log doesn't
+            # blow the model's context. Stderr is more informative for
+            # failures than stdout, so we keep it longer.
+            "raw_stdout_excerpt": (result.raw_stdout or "")[-1500:],
+            "raw_stderr_excerpt": (result.raw_stderr or "")[-3000:],
+        })
+    return _as_mcp_text({
+        "status": "ok",
+        "language": result.language,
+        "action": result.action,
+        "statuses": statuses,
+        "duration_seconds": round(result.duration_seconds, 2),
+        "raw_stdout_excerpt": (result.raw_stdout or "")[-1500:],
+    })
+
+
+# ---------------------------------------------------------------------------
 # Server registration
 # ---------------------------------------------------------------------------
 
@@ -3184,6 +3266,7 @@ REGISTERED_TOOLS: tuple[Any, ...] = (
     read_attached_file,
     list_session_files,
     search_in_session_files,
+    install_packages,
 )
 
 # Tool names Claude will see are prefixed: mcp__<server>__<tool>.
@@ -3202,6 +3285,7 @@ ALLOWED_TOOL_NAMES: tuple[str, ...] = (
     f"mcp__{SERVER_NAME}__read_attached_file",
     f"mcp__{SERVER_NAME}__list_session_files",
     f"mcp__{SERVER_NAME}__search_in_session_files",
+    f"mcp__{SERVER_NAME}__install_packages",
 )
 
 
