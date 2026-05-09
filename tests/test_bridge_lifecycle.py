@@ -51,6 +51,89 @@ def test_bridge_without_cwd_has_no_runners():
 
 
 # ---------------------------------------------------------------------------
+# Staging cleanup — partial-session orphans
+# ---------------------------------------------------------------------------
+#
+# The fresh session dir is created BEFORE files are copied. If a copy
+# raises mid-way, an unguarded path leaves the dir (with whatever was
+# already copied) under ~/.nora-sessions/, where the global session
+# listing later surfaces it as if it were a real session. The all-
+# or-nothing contract requires tearing the dir down on any failure.
+
+
+def test_stage_session_removes_dir_on_copy_failure(
+    tmp_path: Path, monkeypatch,
+):
+    """A mid-staging OSError must remove the freshly-created session
+    dir AND any files already copied into it."""
+    import shutil as _shutil
+    import nora.ui as ui_mod
+
+    bridge = NoraBridge.__new__(NoraBridge)
+    bridge._set_cwd = lambda p: {"ok": True, "state": "ready"}
+
+    session_dir = tmp_path / "session_under_test"
+    session_dir.mkdir()
+    monkeypatch.setattr(ui_mod, "_new_session_dir", lambda: session_dir)
+
+    real_copy = _shutil.copy2
+    call_count = {"n": 0}
+
+    def flaky_copy(src, dst, **kw):
+        call_count["n"] += 1
+        if call_count["n"] == 2:
+            raise OSError("simulated disk full")
+        return real_copy(src, dst, **kw)
+
+    monkeypatch.setattr(ui_mod.shutil, "copy2", flaky_copy)
+
+    src_a = tmp_path / "a.csv"
+    src_a.write_text("a")
+    src_b = tmp_path / "b.csv"
+    src_b.write_text("b")
+
+    result = bridge._stage_session([str(src_a), str(src_b)])
+    assert result["ok"] is False
+    assert "copy failed" in result["reason"]
+    # Cleanup invariant: the dir is gone, including the partial
+    # first-file copy.
+    assert not session_dir.exists()
+
+
+def test_stage_session_from_blobs_removes_dir_on_write_failure(
+    tmp_path: Path, monkeypatch,
+):
+    """Same all-or-nothing contract for the drag-drop path."""
+    import nora.ui as ui_mod
+
+    bridge = NoraBridge.__new__(NoraBridge)
+    bridge._set_cwd = lambda p: {"ok": True, "state": "ready"}
+
+    session_dir = tmp_path / "session_blobs"
+    session_dir.mkdir()
+    monkeypatch.setattr(ui_mod, "_new_session_dir", lambda: session_dir)
+
+    # Patch Path.write_bytes to fail on the second call.
+    real_write_bytes = Path.write_bytes
+    call_count = {"n": 0}
+
+    def flaky_write(self, data):
+        call_count["n"] += 1
+        if call_count["n"] == 2:
+            raise OSError("simulated disk full")
+        return real_write_bytes(self, data)
+
+    monkeypatch.setattr(Path, "write_bytes", flaky_write)
+
+    result = bridge._stage_session_from_blobs([
+        ("a.csv", b"a"),
+        ("b.csv", b"b"),
+    ])
+    assert result["ok"] is False
+    assert not session_dir.exists()
+
+
+# ---------------------------------------------------------------------------
 # _persist_event — routes by event session_cwd, falls back to bridge focus
 # ---------------------------------------------------------------------------
 

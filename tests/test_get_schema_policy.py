@@ -228,3 +228,35 @@ def test_ok_response_always_includes_policy_max_depth(tmp_path: Path):
         resp = _call_get_schema({"dataset": "d.csv", "depth": d})
         assert resp["status"] == "ok"
         assert "policy_max_depth" in resp
+
+
+# ---------------------------------------------------------------------------
+# Schema parse failures must not surface raw row content to the model.
+# Pandas / pyreadstat parse-error messages can quote the offending row
+# verbatim — forwarding that contradicts the schema tool's promise of
+# never returning individual observation values.
+# ---------------------------------------------------------------------------
+
+def test_schema_parse_error_does_not_echo_row_content(tmp_path: Path) -> None:
+    """A malformed CSV should yield a generic ``failed to read`` reason
+    that names the exception class but not its message body."""
+    set_cwd(tmp_path)
+    # Pandas C-engine ParserError quotes the offending line in its
+    # message. We craft a CSV whose header has 2 columns but one row
+    # has a 5-column overflow including a recognizable secret value.
+    secret_value = "PII_PATIENT_42_SSN_123_45_6789"
+    bad = tmp_path / "broken.csv"
+    bad.write_text(
+        f"a,b\n1,2\n3,4,5,6,{secret_value}\n",
+        encoding="utf-8",
+    )
+    resp = _call_get_schema({"dataset": "broken.csv", "depth": "names_types"})
+    assert resp["status"] == "error"
+    reason = resp.get("reason", "")
+    # The exception class name CAN be in the response (helps the
+    # model decide between a malformed-CSV vs malformed-Stata fix);
+    # the row content MUST NOT be.
+    assert secret_value not in reason
+    # Generic phrasing tells the model the file is malformed without
+    # quoting any data.
+    assert "malformed" in reason.lower() or "corrupted" in reason.lower()

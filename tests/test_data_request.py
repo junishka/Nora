@@ -82,6 +82,26 @@ def test_categorical_levels_all_common(sample_csv: Path):
     assert r.answer["suppressed_level_count"] == 0
 
 
+def test_categorical_levels_caps_visible_list(sample_csv: Path):
+    """A high-cardinality column with many common values would
+    otherwise dump thousands of strings in one tool result. The cap
+    bounds the discovery surface and surfaces a truncated flag so
+    the model knows to refine."""
+    # 300 distinct levels, each with count well above threshold (10).
+    rows: list[str] = []
+    for i in range(300):
+        rows.extend([f"level_{i:04d}"] * 15)
+    df = pd.DataFrame({"cat": rows})
+    p = sample_csv.parent / "highcard.csv"
+    df.to_csv(p, index=False)
+    r = handle(p, "categorical_levels", "cat")
+    assert r.status == "granted"
+    assert r.answer["visible_level_count_total"] == 300
+    assert len(r.answer["visible_levels"]) == 200
+    assert r.answer["visible_levels_truncated"] is True
+    assert "frequency_table" in r.answer["note"]
+
+
 def test_tight_threshold_hides_more(sample_csv: Path):
     """Raising the threshold makes more levels suppress."""
     strict = SDCConfig(cell_suppression_threshold=25)
@@ -117,13 +137,37 @@ def test_numeric_bounds_rejects_non_numeric(sample_csv: Path):
 
 
 def test_numeric_bounds_denies_small_sample(sample_csv: Path):
-    """A variable with <10 non-NA observations should be denied."""
+    """A variable with <30 non-NA observations should be denied — at
+    small N the 5th/95th percentiles interpolate close to the min/max
+    and would identify the tail individuals."""
     df = pd.DataFrame({"v": [1.0, 2.0, 3.0, np.nan, np.nan]})
     p = sample_csv.parent / "tiny.csv"
     df.to_csv(p, index=False)
     r = handle(p, "numeric_bounds", "v")
     assert r.status == "denied"
     assert "too few" in r.reason.lower()
+
+
+def test_numeric_bounds_denies_n_below_30(sample_csv: Path) -> None:
+    """N=10 was the prior threshold but is too small: pandas's
+    p5/p95 at N=10 sit between the 1st-and-2nd / 9th-and-10th order
+    statistics, which round (even at 2 sig figs) to values
+    effectively identifying the tail observations. We require N>=30."""
+    df = pd.DataFrame({"v": [float(i) for i in range(20)]})
+    p = sample_csv.parent / "n20.csv"
+    df.to_csv(p, index=False)
+    r = handle(p, "numeric_bounds", "v")
+    assert r.status == "denied"
+    assert "too few" in r.reason.lower()
+
+
+def test_numeric_bounds_grants_at_n_30(sample_csv: Path) -> None:
+    """The boundary: N=30 passes."""
+    df = pd.DataFrame({"v": [float(i) for i in range(30)]})
+    p = sample_csv.parent / "n30.csv"
+    df.to_csv(p, index=False)
+    r = handle(p, "numeric_bounds", "v")
+    assert r.status == "granted"
 
 
 # ---------------------------------------------------------------------------

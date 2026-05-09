@@ -416,10 +416,21 @@ def sanitize(raw: dict[str, Any], config: SDCConfig = DEFAULT_CONFIG) -> Sanitiz
 
     handler = _HANDLERS.get(analysis_type)
     if handler is None:
+        # The script controls ``raw["type"]``; an adversarial payload
+        # could set it to a raw cell value (a row, a cell, a JSON
+        # blob) and trigger this branch to smuggle the value out
+        # through ``rejection_reason``, which submit_script forwards
+        # into both the inline result and the persisted diagnostic
+        # row. Echo the type only after ``safe_key`` (40-char cap,
+        # control-char strip) so the leak channel is bounded to a
+        # short token, and store the same sanitized form in
+        # ``analysis_type`` so the diagnostic row never carries the
+        # raw value either.
+        safe_type = safe_key(analysis_type)
         return SanitizerResult(
-            ok=False, analysis_type=analysis_type,
+            ok=False, analysis_type=safe_type,
             rejection_reason=(
-                f"unknown analysis type {analysis_type!r}. Supported in v0: "
+                f"unknown analysis type {safe_type!r}. Supported in v0: "
                 f"{sorted(_HANDLERS.keys())}"
             ),
         )
@@ -974,8 +985,30 @@ def _sanitize_frequency_table(
                 ),
             )
         # safe_key neutralizes control chars / length / newline injections
-        # in level names before they cross to Claude.
-        clean_counts[safe_key(k)] = v
+        # in level names before they cross to Claude. But the same
+        # normalisation also creates a collision surface: ``"A\nB"`` and
+        # ``"A B"`` both sanitize to ``"A B"``, and two long labels
+        # sharing the same 40-char prefix collapse to the same key. If
+        # we silently overwrote, a small (suppressible) cell could be
+        # hidden inside an aggregated total — defeating cell
+        # suppression, since the post-merge count would be above
+        # threshold even though one component was below it. Reject
+        # the payload outright so the script has to disambiguate
+        # before crossing the boundary.
+        clean_key = safe_key(k)
+        if clean_key in clean_counts:
+            return SanitizerResult(
+                ok=False, analysis_type="frequency_table",
+                rejection_reason=(
+                    f"two distinct level names sanitize to the same "
+                    f"key {clean_key!r} (e.g. embedded newlines or "
+                    f"shared 40-char prefix). Collisions are rejected "
+                    f"because aggregating the counts would defeat "
+                    f"cell suppression on the smaller component. "
+                    f"Disambiguate the levels in the source data."
+                ),
+            )
+        clean_counts[clean_key] = v
 
     transformations: list[str] = []
     # `counts` is handled separately below (it gets SDC suppression). Strip
@@ -995,10 +1028,14 @@ def _sanitize_frequency_table(
     )
     primary_suppressed = len(primary.suppressed_keys)
     if primary_suppressed:
+        # Log the COUNT of suppressed cells, not their names. The level
+        # names of suppressed cells are themselves disclosive (knowing
+        # ``rare_diagnosis_X`` exists in this dataset identifies anyone
+        # with that diagnosis), so they never leave this sanitizer.
         transformations.append(
             f"primary suppression: {primary_suppressed} cell(s) with "
-            f"count < {config.cell_suppression_threshold}: "
-            f"{primary.suppressed_keys}"
+            f"count < {config.cell_suppression_threshold} "
+            f"(level names withheld — see [suppressed] bucket below)"
         )
 
     # Secondary suppression: when publishing `n`, exactly one primary-
@@ -1007,27 +1044,29 @@ def _sanitize_frequency_table(
     # least two unknowns.
     has_total = "n" in out
     after_secondary = enforce_back_calc_safety(primary, total_n_present=has_total)
-    secondary_added = set(after_secondary.suppressed_keys) - set(primary.suppressed_keys)
-    if secondary_added:
+    secondary_added_count = (
+        len(after_secondary.suppressed_keys) - len(primary.suppressed_keys)
+    )
+    if secondary_added_count:
         transformations.append(
-            f"secondary suppression: also suppressed {sorted(secondary_added)} "
-            f"because only one primary-suppressed cell was back-calculable "
-            f"from the total n"
+            f"secondary suppression: also suppressed "
+            f"{secondary_added_count} cell(s) because only one "
+            f"primary-suppressed cell was back-calculable from the "
+            f"total n (level name withheld)"
         )
-
-    out["counts"] = after_secondary.counts
 
     # Degenerate case: exactly one suppressed cell remains AND no other
     # cell was available for secondary (e.g. all cells < threshold, or
     # single-cell table). Without a sacrificial cell, the only way to
     # prevent back-calculation from the margin is to remove the margin
     # itself — drop `n` and `missing_count`.
-    suppressed_count = sum(
-        1 for v in out["counts"].values() if not isinstance(v, int)
-    )
-    if suppressed_count == 1 and has_total:
+    total_suppressed_distinct = len(after_secondary.suppressed_keys)
+    if total_suppressed_distinct == 1 and has_total:
         # No secondary was added and we still have a single suppressed
-        # cell + a published total. Strip the total.
+        # cell + a published total. Strip the total. Note: this check
+        # MUST run on the per-cell suppression result, before bucketing,
+        # because bucketing collapses N suppressed cells into a single
+        # entry — afterwards the dict no longer carries the count.
         for margin_field in ("n", "missing_count"):
             out.pop(margin_field, None)
         transformations.append(
@@ -1035,6 +1074,28 @@ def _sanitize_frequency_table(
             "suppressed and no secondary cell was available, so the "
             "margin would have made it back-calculable"
         )
+
+    # Bucket every suppressed entry under a single ``[suppressed]``
+    # key. The level names themselves are an SDC violation — knowing
+    # ``rare_disease_X`` exists in the dataset identifies someone with
+    # that diagnosis, regardless of whether the count is masked. The
+    # bucket carries the suppression marker as its value (``<10``);
+    # callers can read ``suppressed_cell_count`` for the count of
+    # distinct levels collapsed here. The bucket aggregate is
+    # back-calculable from ``n`` minus the visible cells, but only as
+    # a SUM across all bucketed levels — no individual level's count
+    # is recoverable.
+    bucketed_counts: dict[str, int | str] = {
+        k: v
+        for k, v in after_secondary.counts.items()
+        if isinstance(v, int)
+    }
+    if total_suppressed_distinct > 0:
+        bucketed_counts["[suppressed]"] = suppression_marker(
+            config.cell_suppression_threshold
+        )
+        out["suppressed_cell_count"] = total_suppressed_distinct
+    out["counts"] = bucketed_counts
 
     return SanitizerResult(
         ok=True, analysis_type="frequency_table",
@@ -1158,27 +1219,64 @@ def _sanitize_crosstab(
         transformations=transformations,
     )
 
-    # Primary suppression on the flat view, then reshape back to nested.
+    # Primary suppression on the flat view, then reshape back to
+    # nested with bucketing. Suppressed (row, col) labels themselves
+    # are disclosive — a row named ``rare_diagnosis`` whose only
+    # column counts are below threshold leaks the existence of that
+    # diagnosis even when its numbers are masked. We:
+    #
+    #   * Per surviving row: collapse all of its suppressed columns
+    #     into a single ``[suppressed]`` entry.
+    #   * Drop rows that have NO surviving (visible) cells entirely
+    #     — including their row label — and account for them in a
+    #     top-level ``suppressed_row_count`` field.
+    #
+    # The structural cap on table size keeps this loop cheap.
     threshold = config.cell_suppression_threshold
     marker = suppression_marker(threshold)
-    suppressed_cells: list[tuple[str, str]] = []
-    nested: dict[str, dict[str, int | str]] = {}
+    nested_raw: dict[str, dict[str, int | str]] = {}
+    suppressed_cell_count = 0
     for (r, c), v in clean_counts.items():
-        if r not in nested:
-            nested[r] = {}
+        if r not in nested_raw:
+            nested_raw[r] = {}
         if v < threshold:
-            nested[r][c] = marker
-            suppressed_cells.append((r, c))
+            nested_raw[r][c] = marker
+            suppressed_cell_count += 1
         else:
-            nested[r][c] = v
+            nested_raw[r][c] = v
 
-    if suppressed_cells:
-        # Log by (row, col) pairs for clarity.
-        pretty = [f"({r!r}, {c!r})" for r, c in suppressed_cells]
+    nested: dict[str, dict[str, int | str]] = {}
+    suppressed_row_count = 0
+    for row_label, row_cells in nested_raw.items():
+        visible_cols = {
+            c: v for c, v in row_cells.items() if isinstance(v, int)
+        }
+        if not visible_cols:
+            # Every cell in this row was suppressed — drop the row
+            # label too. Knowing the row exists (and is rare) is the
+            # leak we're closing here.
+            suppressed_row_count += 1
+            continue
+        n_suppressed_in_row = len(row_cells) - len(visible_cols)
+        if n_suppressed_in_row:
+            visible_cols["[suppressed]"] = marker
+        nested[row_label] = visible_cols
+
+    if suppressed_cell_count:
         transformations.append(
-            f"primary suppression: {len(suppressed_cells)} cell(s) with "
-            f"count < {threshold}: {pretty}"
+            f"primary suppression: {suppressed_cell_count} cell(s) "
+            f"with count < {threshold} (cell labels withheld — "
+            f"bucketed under '[suppressed]')"
         )
+    if suppressed_row_count:
+        transformations.append(
+            f"row suppression: {suppressed_row_count} row(s) had every "
+            f"cell below threshold; row labels withheld since their "
+            f"existence at this rarity is itself disclosive"
+        )
+        out["suppressed_row_count"] = suppressed_row_count
+    if suppressed_cell_count:
+        out["suppressed_cell_count"] = suppressed_cell_count
     out["counts"] = nested
 
     return SanitizerResult(
@@ -1269,8 +1367,16 @@ def _sanitize_magnitude_table(
     marker_n = suppression_marker(threshold_n)
 
     cleaned_cells: dict[str, Any] = {}
-    suppressed_by_n: list[str] = []
-    suppressed_by_dominance: list[str] = []
+    # Counts only — never the group labels. See the
+    # "suppressed cells leak labels" SDC fix: a cell whose label is
+    # ``rare_industry`` is disclosive even when the count and value
+    # are masked, since it tells the model that level exists in the
+    # data at small N. We track aggregate counts for the
+    # transformation log and bucket all suppressed groups under a
+    # single ``[suppressed]`` entry below.
+    n_suppressed_total = 0
+    n_suppressed_by_n = 0
+    n_suppressed_by_dominance = 0
 
     for raw_group, cell in raw_cells.items():
         if not isinstance(raw_group, str):
@@ -1323,40 +1429,49 @@ def _sanitize_magnitude_table(
         fails_dominance = dominance_fails(float(max_share), threshold=dom_threshold)
 
         if fails_n or fails_dominance:
-            # Suppress the whole cell — value and n together. Separately
-            # emitting n while hiding value still leaks "this group
-            # exists and is small"; safer to suppress the cell atomically.
-            cleaned_cells[safe_group] = {
-                "value": marker_n,
-                "n": marker_n,
-            }
+            # Don't emit a per-group entry at all — the group label
+            # is itself disclosive (``rare_industry`` exists with
+            # n < threshold identifies its members). Track counts
+            # only.
+            n_suppressed_total += 1
             if fails_n:
-                suppressed_by_n.append(safe_group)
+                n_suppressed_by_n += 1
             if fails_dominance:
-                suppressed_by_dominance.append(safe_group)
-        else:
-            # Precision-clamp the value at sigfigs appropriate for n.
-            cleaned_cells[safe_group] = {
-                "value": clamp_precision(float(value), n),
-                "n": n,
-            }
+                n_suppressed_by_dominance += 1
+            continue
+        # Precision-clamp the value at sigfigs appropriate for n.
+        cleaned_cells[safe_group] = {
+            "value": clamp_precision(float(value), n),
+            "n": n,
+        }
         # NEVER emit max_share. It's only used internally above.
 
-    if suppressed_by_n:
+    if n_suppressed_by_n:
         transformations.append(
-            f"primary suppression: {len(suppressed_by_n)} cell(s) with "
-            f"n < {threshold_n}: {suppressed_by_n}"
+            f"primary suppression: {n_suppressed_by_n} cell(s) with "
+            f"n < {threshold_n} (group labels withheld — bucketed "
+            f"under '[suppressed]')"
         )
-    if suppressed_by_dominance:
+    if n_suppressed_by_dominance:
         transformations.append(
-            f"dominance suppression: {len(suppressed_by_dominance)} cell(s) "
-            f"where one contributor exceeded {dom_threshold:.0%} of the "
-            f"total: {suppressed_by_dominance}"
+            f"dominance suppression: {n_suppressed_by_dominance} cell(s) "
+            f"where one contributor exceeded {dom_threshold:.0%} of "
+            f"the total (group labels withheld)"
         )
     transformations.append(
         "max_share stripped from every cell: dominance metric is internal "
         "to the sanitizer and never forwarded"
     )
+
+    if n_suppressed_total:
+        # Single bucketed entry for every suppressed group. The
+        # marker tells the model these cells exist but their labels
+        # and per-group n / value are deliberately withheld.
+        cleaned_cells["[suppressed]"] = {
+            "value": marker_n,
+            "n": marker_n,
+        }
+        out["suppressed_cell_count"] = n_suppressed_total
 
     out["cells"] = cleaned_cells
 

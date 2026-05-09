@@ -206,17 +206,44 @@ def _categorical_levels(
         else:
             suppressed_count += 1
 
+    # Hard cap on visible levels. Without it, a high-cardinality
+    # categorical (postcodes, NAICS codes, free-text labels with
+    # thousands of common values) ships its full distinct-value list
+    # in one tool result — bypassing the structural caps that the
+    # other discovery surfaces (frequency_table, schema value_labels,
+    # search_schema) all enforce. With the cap, the model has to ask
+    # for narrower categories, request a frequency_table for actual
+    # counts, or use ``search_schema`` for label substring queries.
+    MAX_VISIBLE_LEVELS = 200
+
+    visible_sorted = sorted(visible)
+    total_visible = len(visible_sorted)
+    truncated = total_visible > MAX_VISIBLE_LEVELS
+    visible_returned = visible_sorted[:MAX_VISIBLE_LEVELS]
+
+    note = (
+        f"levels with count < {threshold} are hidden entirely "
+        f"(names and counts). There are {suppressed_count} such "
+        f"level(s)."
+    )
+    if truncated:
+        note += (
+            f" The visible-levels list is capped at "
+            f"{MAX_VISIBLE_LEVELS}; {total_visible - MAX_VISIBLE_LEVELS} "
+            f"additional level(s) above threshold were not listed. "
+            f"Use frequency_table or refine the variable."
+        )
+
+    answer = {
+        "visible_levels": visible_returned,
+        "visible_level_count_total": total_visible,
+        "visible_levels_truncated": truncated,
+        "suppressed_level_count": suppressed_count,
+        "note": note,
+    }
     return RequestResult(
         status="granted",
-        answer={
-            "visible_levels": sorted(visible),
-            "suppressed_level_count": suppressed_count,
-            "note": (
-                f"levels with count < {threshold} are hidden entirely "
-                f"(names and counts). There are {suppressed_count} such "
-                f"level(s)."
-            ),
-        },
+        answer=answer,
     )
 
 
@@ -251,13 +278,25 @@ def _numeric_bounds(series: Any, n_total: int) -> RequestResult:
 
     non_na = series.dropna()
     n_effective = int(len(non_na))
-    if n_effective < 10:
+    # Tail percentiles (5th / 95th) at small N are interpolations
+    # adjacent to the min and max — at N=10, the 5th percentile sits
+    # between the 1st and 2nd order statistic and rounds, even at 2
+    # sig figs, to a value that effectively reveals the bottom
+    # outlier. We require N >= 30 so the percentile is averaged over
+    # roughly 1.5 - 2.5 observations on either tail rather than
+    # essentially echoing back the extremes. This is stricter than
+    # cell_suppression_threshold (10) on purpose: the extra factor
+    # of 3 buys real interpolation breadth.
+    NUMERIC_BOUNDS_MIN_N = 30
+    if n_effective < NUMERIC_BOUNDS_MIN_N:
         return RequestResult(
             status="denied",
             reason=(
                 f"variable has only {n_effective} non-missing observations "
-                f"— too few to publish bounds without identifying "
-                f"individuals."
+                f"— too few for tail-percentile bounds (need at least "
+                f"{NUMERIC_BOUNDS_MIN_N}). At small N the 5th and 95th "
+                f"percentiles interpolate close to the min and max and "
+                f"would identify the tail individuals."
             ),
         )
 

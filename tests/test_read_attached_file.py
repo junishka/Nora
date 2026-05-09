@@ -290,14 +290,19 @@ def test_resolves_run_dir_script_by_short_id_fallback(
     assert "use \"data.dta\"" in payload["content"]
 
 
-def test_run_dir_script_lookup_survives_rewind_hidden_label(
+def test_run_dir_script_lookup_blocked_after_rewind(
     tmp_path: Path,
 ) -> None:
-    """A rewind marks the result row's ``hidden_at`` timestamp but
-    leaves the row in the store and the script.do on disk. The
-    Files panel uses ``include_hidden=True`` so the labeled name
-    still surfaces; the recall path must do the same so the model
-    can fetch the script after a rewind clears the chat history."""
+    """A rewind hides results in the store; the on-disk run dir
+    remains. Earlier behaviour let the model still fetch the
+    script via ``read_attached_file`` (and discover it via
+    ``list_session_files``), defeating the rewind: the model could
+    re-fetch the discarded branch's analysis verbatim by name. The
+    model-facing path now filters run-dir lookups against the
+    visible (non-hidden) result set, so a hidden script is
+    not_found from the model's perspective. The Files panel
+    intentionally still shows it so the researcher can decide
+    whether to delete it."""
     set_cwd(tmp_path)
     run_dir = tmp_path / ".nora" / "runs" / "20260507T120200Z_cccccccc"
     run_dir.mkdir(parents=True)
@@ -321,9 +326,7 @@ def test_run_dir_script_lookup_survives_rewind_hidden_label(
     store.hide_results_not_in(set(), reason="rewind")
 
     payload = _text_payload(_call("M27-M38 base spec.do"))
-    assert payload["status"] == "ok"
-    assert payload["kind"] == "script"
-    assert "regress y x" in payload["content"]
+    assert payload["status"] == "not_found"
     # And confirm hide actually fired (otherwise the test is trivial).
     assert store.get(row.id) is None  # default include_hidden=False
 

@@ -45,18 +45,21 @@ def freq_table_with_total(draw, max_cells: int = 15, max_count: int = 500):
 
 @given(raw=freq_table_with_total())
 def test_never_exactly_one_suppressed_when_n_present(raw):
-    """Core SDC invariant: 0 or >=2 suppressed cells, never exactly one."""
+    """Core SDC invariant: 0 or >=2 suppressed DISTINCT cells, never
+    exactly one. Suppressed cells are now bucketed under a single
+    ``[suppressed]`` key in the output, so the count of distinct
+    suppressed cells lives in the ``suppressed_cell_count`` field."""
     result = sanitize(raw)
     if not result.ok:
         return
     sanitized = result.sanitized
     if "n" not in sanitized:
         return  # if N isn't published, back-calc isn't a concern
-    marker = suppression_marker(DEFAULT_CONFIG.cell_suppression_threshold)
-    suppressed = sum(1 for v in sanitized["counts"].values() if v == marker)
-    assert suppressed != 1, (
+    distinct_suppressed = sanitized.get("suppressed_cell_count", 0)
+    assert distinct_suppressed != 1, (
         f"exactly one cell suppressed with total n present — back-calc "
-        f"violation. Counts: {sanitized['counts']}"
+        f"violation. suppressed_cell_count={distinct_suppressed}, "
+        f"counts={sanitized['counts']}"
     )
 
 
@@ -66,8 +69,7 @@ def test_secondary_only_adds_when_necessary(raw):
     result = sanitize(raw)
     if not result.ok:
         return
-    marker = suppression_marker(DEFAULT_CONFIG.cell_suppression_threshold)
-    total_suppressed = sum(1 for v in result.sanitized["counts"].values() if v == marker)
+    distinct_suppressed = result.sanitized.get("suppressed_cell_count", 0)
     secondary_logged = any(
         "secondary suppression" in t for t in result.transformations
     )
@@ -81,9 +83,9 @@ def test_secondary_only_adds_when_necessary(raw):
         assert secondary_logged, (
             "expected secondary suppression but it didn't fire"
         )
-        assert total_suppressed == 2, (
+        assert distinct_suppressed == 2, (
             f"secondary should have added exactly one cell; got "
-            f"{total_suppressed} suppressed"
+            f"suppressed_cell_count={distinct_suppressed}"
         )
     else:
         assert not secondary_logged, (
@@ -94,18 +96,26 @@ def test_secondary_only_adds_when_necessary(raw):
 
 @given(raw=freq_table_with_total())
 def test_all_suppressed_cells_use_marker(raw):
-    """Suppressed cells always use the marker string, never anything else."""
+    """Visible cells are ints; the single ``[suppressed]`` bucket
+    carries the marker. No other shapes."""
     result = sanitize(raw)
     if not result.ok:
         return
     marker = suppression_marker(DEFAULT_CONFIG.cell_suppression_threshold)
-    for v in result.sanitized["counts"].values():
-        assert isinstance(v, int) or v == marker
+    for k, v in result.sanitized["counts"].items():
+        if k == "[suppressed]":
+            assert v == marker
+        else:
+            assert isinstance(v, int)
 
 
 def test_sample_back_calc_scenario():
-    """Concrete regression test for the exact case the invariant protects."""
-    # tiny=3 is primary-suppressed. n=653 would back-solve it unless secondary fires.
+    """Concrete regression test for the exact case the invariant protects.
+
+    With bucketing, both ``small`` and ``tiny`` get rolled into a
+    single ``[suppressed]`` entry; the back-calc invariant is now
+    enforced via the count of DISTINCT suppressed cells (which must
+    be 0 or >=2 when n is published)."""
     r = sanitize({
         "type": "frequency_table",
         "variable": "state",
@@ -118,5 +128,12 @@ def test_sample_back_calc_scenario():
     marker = suppression_marker(10)
     assert counts["big"] == 500
     assert counts["medium"] == 100
-    assert counts["small"] == marker   # secondary suppression
-    assert counts["tiny"] == marker    # primary suppression
+    # ``small`` and ``tiny`` are bucketed; their original labels
+    # don't appear in the output dict.
+    assert "small" not in counts
+    assert "tiny" not in counts
+    assert counts["[suppressed]"] == marker
+    # Exactly two distinct cells were suppressed → back-calc safe.
+    assert r.sanitized["suppressed_cell_count"] == 2
+    # n stays published since 2 cells were suppressed (not exactly 1).
+    assert "n" in r.sanitized

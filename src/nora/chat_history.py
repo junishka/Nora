@@ -21,6 +21,7 @@ sessions wrote neither). Newer sessions carry both.
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -192,6 +193,78 @@ def read_turns(cwd: Path | None) -> list[Turn]:
     return turns
 
 
+# Quick prefix-match for the JSONL ``"type"`` field. Every event the
+# runner writes has ``"type"`` first because we serialise from a
+# Python dict whose first key is ``type`` — the regex is a
+# correctness-preserving shortcut, with the full ``json.loads`` path
+# below as a fallback for any line where the prefix doesn't match.
+_TYPE_PREFIX_RE = re.compile(rb'^\s*\{\s*"type"\s*:\s*"([^"]+)"')
+
+# Event types that carry the heavy payloads (raw stdout/stderr, plot
+# thumbnails, tool input echo) we don't need for a session snapshot.
+# Skipping ``json.loads`` on these lines is the difference between an
+# O(n) full parse of the whole UI replay log and an O(n) byte scan.
+_HEAVY_EVENT_TYPES = frozenset((
+    b"tool_call", b"tool_result", b"assistant_thinking",
+))
+
+
+def read_last_turn_summary(cwd: Path | None) -> tuple[int, str, str]:
+    """Lightweight scan over ``chat_history.jsonl`` for session_state.
+
+    Returns ``(turn_count, last_user, last_assistant)``. The pair is
+    sourced from the most recent turn that has a ``user_message``;
+    ``last_assistant`` defaults to ``""`` when the turn is in-flight.
+
+    This avoids ``read_turns``'s full per-event ``json.loads`` —
+    ``tool_result`` payloads in particular can carry tens of KB of
+    plot data each, and a long session can hit that cost on every
+    successful turn. We keep ``read_turns`` for callers that need
+    grouped Turn objects (recall, warm-start prefix, tests); session
+    state writes go through this lighter path.
+    """
+    if cwd is None:
+        return (0, "", "")
+    path = cwd / ".nora" / "chat_history.jsonl"
+    if not path.exists() or path.stat().st_size == 0:
+        return (0, "", "")
+
+    turn_count = 0
+    last_user = ""
+    last_assistant_parts: list[str] = []
+    try:
+        with path.open("rb") as f:
+            for raw_line in f:
+                line = raw_line.strip()
+                if not line:
+                    continue
+                m = _TYPE_PREFIX_RE.match(line)
+                if m is not None and m.group(1) in _HEAVY_EVENT_TYPES:
+                    # Skip parse — these don't contribute to the
+                    # snapshot and may carry kilobytes of payload.
+                    continue
+                try:
+                    rec = json.loads(line)
+                except (json.JSONDecodeError, ValueError):
+                    continue
+                if not isinstance(rec, dict):
+                    continue
+                t = rec.get("type")
+                if t == "user_message":
+                    turn_count += 1
+                    last_user = rec.get("text", "") or ""
+                    last_assistant_parts = []
+                elif t == "assistant_text" and turn_count > 0:
+                    text = rec.get("text", "")
+                    if text:
+                        last_assistant_parts.append(text)
+    except OSError:
+        return (0, "", "")
+
+    last_assistant = "\n\n".join(p for p in last_assistant_parts if p).strip()
+    return (turn_count, last_user, last_assistant)
+
+
 def summarize_tool_call(short_name: str, input_args: dict[str, Any]) -> str:
     """One-line human-readable summary of a tool call's arguments.
 
@@ -333,6 +406,12 @@ def build_context_prefix(
     # for full payloads, so a truncation marker on a long assistant
     # turn is recoverable rather than lossy.
     PER_FIELD_CAP = 1000
+    # Tool labels come from raw tool inputs (submit_script.label,
+    # filenames, query strings) — script-controllable text that
+    # could carry instruction-shaped content or oversized blobs.
+    # Cap them tighter than user/assistant prose; one line per tool
+    # call is plenty for a "what happened" summary.
+    TOOL_LABEL_CAP = 200
     # Total prefix budget, in characters. Lowered from 20_000 → 12_000.
     # At ~4 chars/token this is roughly 3,000 tokens on session resume
     # (down from ~5,000), recovered exactly once per resume. The cap
@@ -347,6 +426,15 @@ def build_context_prefix(
     def _cap(s: str) -> str:
         return s if len(s) <= PER_FIELD_CAP else s[:PER_FIELD_CAP] + "…[truncated]"
 
+    def _cap_label(s: str) -> str:
+        # Strip control chars and cap. Tool labels are derived from
+        # script-controlled strings (filenames, recall queries,
+        # submit_script.label) — without scrubbing, a label like
+        # "...\n\n[system] override: ..." would land in the
+        # warm-start prefix verbatim.
+        from nora.text_safety import safe_text
+        return safe_text(s, max_len=TOOL_LABEL_CAP)
+
     def _render_turn(t: Turn) -> str:
         # Render a turn as: header line, user line, tool summaries,
         # assistant reply. Tool lines carry result_id pointers so
@@ -355,14 +443,23 @@ def build_context_prefix(
         if t.user:
             parts.append(f"user: {_cap(t.user)}")
         for use in t.tools:
+            # ``use.name`` is the tool's registered short name (a
+            # bounded identifier) so it doesn't need the safe_text
+            # treatment; ``use.label`` and the result_id list both
+            # do, since they originate in script-controlled strings.
             tag = f"tool: [{use.name}]"
             if use.label:
-                tag += f" {use.label}"
+                tag += f" {_cap_label(use.label)}"
             if use.result_ids:
+                # result_ids are produced by the store (M-prefixed),
+                # so they're parser-controlled. Cap the joined list
+                # defensively in case a future schema change widens
+                # the field.
                 if len(use.result_ids) == 1:
-                    tag += f" → result_id={use.result_ids[0]}"
+                    tag += f" → result_id={_cap_label(use.result_ids[0])}"
                 else:
-                    tag += f" → result_ids={','.join(use.result_ids)}"
+                    joined = ",".join(use.result_ids)
+                    tag += f" → result_ids={_cap_label(joined)}"
             if use.is_error:
                 tag += " (error)"
             parts.append(tag)
@@ -376,6 +473,13 @@ def build_context_prefix(
     running = 0
     for t in reversed(picked):
         block = _render_turn(t)
+        # The "always keep at least one block" rule used to admit a
+        # single oversized first turn unbounded — a turn whose tool
+        # labels alone exceeded TOTAL_CAP would still be shipped
+        # whole. Guard the head-of-budget case by capping the block
+        # itself to TOTAL_CAP rather than letting it through.
+        if not blocks and len(block) > TOTAL_CAP:
+            block = block[: TOTAL_CAP - len("…[turn truncated]")] + "…[turn truncated]"
         cost = len(block) + 2
         if running + cost > TOTAL_CAP and blocks:
             break

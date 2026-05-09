@@ -142,6 +142,107 @@ def test_extreme_oversize_message_capped_overall() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Exception-body data exfil — the channel a malicious script could use
+# to ship cell content out via a hand-crafted ``raise``.
+# ---------------------------------------------------------------------------
+
+def test_python_to_json_exfil_via_runtimeerror_is_redacted() -> None:
+    """``raise RuntimeError(df.iloc[0].to_json())`` would otherwise
+    forward a JSON dump of a row through the exception body. The
+    data-shape detector replaces the body with a redaction marker."""
+    stderr = (
+        'Traceback (most recent call last):\n'
+        '  File "/abs/x.py", line 3, in <module>\n'
+        '    raise RuntimeError(df.iloc[0].to_json())\n'
+        'RuntimeError: {"patient_id":42,"ssn":"123-45-6789","name":"Alice"}\n'
+    )
+    excerpt = extract_debug_excerpt("", stderr, 1, "Python")
+    assert excerpt is not None
+    assert "patient_id" not in excerpt
+    assert "123-45-6789" not in excerpt
+    assert "Alice" not in excerpt
+    # The exception type still surfaces so the model knows what
+    # happened; only the body is suppressed.
+    assert "RuntimeError" in excerpt
+
+
+def test_r_stop_exfil_long_message_is_truncated() -> None:
+    """``stop(paste(df$secret, collapse=','))`` would otherwise
+    pour a row of comma-separated cell values into the message
+    body. The data-shape detector + per-body cap together limit
+    the leak."""
+    secret_row = ",".join(f"value_{i}" for i in range(20))
+    stderr = f"Error in stop(...) : {secret_row}\n"
+    excerpt = extract_debug_excerpt("", stderr, 1, "R")
+    assert excerpt is not None
+    # The full 20-cell row is not present.
+    assert secret_row not in excerpt
+    # The framing IS — model still sees the call site.
+    assert "Error in stop" in excerpt
+
+
+def test_python_long_unquoted_message_is_capped() -> None:
+    """A message body longer than ``MAX_EXCEPTION_MSG_BYTES`` is
+    truncated even when it doesn't trip the data-shape detector
+    (e.g. a long English sentence assembled from row values)."""
+    long_body = "the offending row contains " + ("extremely_long_cell_value " * 20)
+    stderr = (
+        'Traceback (most recent call last):\n'
+        '  File "/abs/x.py", line 1, in <module>\n'
+        '    raise ValueError(msg)\n'
+        f'ValueError: {long_body}\n'
+    )
+    excerpt = extract_debug_excerpt("", stderr, 1, "Python")
+    assert excerpt is not None
+    assert long_body not in excerpt
+    assert "truncated" in excerpt
+
+
+def test_short_python_keyerror_passes_through() -> None:
+    """The cap must NOT break the legitimate use case: a short
+    ``KeyError: 'typo'`` should still surface the column name so
+    the model can fix the script."""
+    stderr = (
+        'Traceback (most recent call last):\n'
+        '  File "/abs/x.py", line 3, in <module>\n'
+        "    df['typo']\n"
+        "KeyError: 'typo'\n"
+    )
+    excerpt = extract_debug_excerpt("", stderr, 1, "Python")
+    assert excerpt is not None
+    assert "'typo'" in excerpt
+    assert "KeyError" in excerpt
+
+
+def test_short_r_object_not_found_passes_through() -> None:
+    """Same legitimate-use guarantee for R: a short
+    ``object 'wage' not found`` body must still reach the model."""
+    stderr = (
+        "Error in eval(predvars, data, env) : object 'wage' not found\n"
+    )
+    excerpt = extract_debug_excerpt("", stderr, 1, "R")
+    assert excerpt is not None
+    assert "'wage'" in excerpt
+    assert "Error in eval" in excerpt
+
+
+def test_python_filenotfound_errno_pattern_passes_through() -> None:
+    """``FileNotFoundError: [Errno 2] No such file: 'foo.csv'`` is
+    a common, legitimate pattern. The data-shape regex must not
+    treat ``[Errno 2]`` as a data dump."""
+    stderr = (
+        'Traceback (most recent call last):\n'
+        '  File "/abs/x.py", line 1, in <module>\n'
+        "    open('foo.csv')\n"
+        "FileNotFoundError: [Errno 2] No such file or directory: 'foo.csv'\n"
+    )
+    excerpt = extract_debug_excerpt("", stderr, 1, "Python")
+    assert excerpt is not None
+    assert "FileNotFoundError" in excerpt
+    assert "foo.csv" in excerpt
+
+
+# ---------------------------------------------------------------------------
 # Credentials embedded in raw output
 # ---------------------------------------------------------------------------
 

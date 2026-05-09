@@ -192,6 +192,67 @@ def test_list_results_clamps_above_hard_cap(tmp_path: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
+# recall_conversation must clamp tail / max_chars to hard ceilings.
+# Without these, a model that asked for tail=1_000_000 / max_chars=10_000_000
+# would get essentially the full persisted conversation in one shot — both
+# a memory/context blow and an unintended re-exposure path for content
+# already trimmed earlier.
+# ---------------------------------------------------------------------------
+
+def test_recall_conversation_clamps_tail(tmp_path: Path) -> None:
+    """An over-cap tail value clamps to MAX_TAIL and surfaces the
+    clamp in the response."""
+    events: list[dict] = []
+    for i in range(50):
+        events.append({"type": "user_message", "text": f"q{i}"})
+        events.append({"type": "assistant_text", "text": f"a{i}"})
+    _write_jsonl(tmp_path, events)
+    with use_cwd(tmp_path):
+        res = asyncio.run(
+            HANDLERS["recall_conversation"]({"tail": 1_000_000})
+        )
+    body = _mcp_text(res)
+    assert body["status"] == "ok"
+    assert body.get("tail_clamped_to") == 200
+    # turn_count is 50 (well under cap) so all returned, but tail's
+    # clamp still surfaces so the model knows it asked for too much.
+    assert body["returned"] <= 50
+
+
+def test_recall_conversation_clamps_max_chars(tmp_path: Path) -> None:
+    """An over-cap max_chars clamps to MAX_CHARS_CEILING and surfaces."""
+    _write_jsonl(tmp_path, [
+        {"type": "user_message", "text": "hi"},
+        {"type": "assistant_text", "text": "hello"},
+    ])
+    with use_cwd(tmp_path):
+        res = asyncio.run(
+            HANDLERS["recall_conversation"]({"max_chars": 10_000_000})
+        )
+    body = _mcp_text(res)
+    assert body["status"] == "ok"
+    assert body.get("max_chars_clamped_to") == 64 * 1024
+
+
+def test_recall_conversation_does_not_signal_clamp_when_within_bounds(
+    tmp_path: Path,
+) -> None:
+    """No clamp metadata when the request is within ceilings."""
+    _write_jsonl(tmp_path, [
+        {"type": "user_message", "text": "hi"},
+        {"type": "assistant_text", "text": "hello"},
+    ])
+    with use_cwd(tmp_path):
+        res = asyncio.run(
+            HANDLERS["recall_conversation"]({"tail": 5, "max_chars": 4000})
+        )
+    body = _mcp_text(res)
+    assert body["status"] == "ok"
+    assert "tail_clamped_to" not in body
+    assert "max_chars_clamped_to" not in body
+
+
+# ---------------------------------------------------------------------------
 # Fix 3: recall_conversation budget includes tools / result_ids size
 # ---------------------------------------------------------------------------
 
