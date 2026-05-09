@@ -306,23 +306,54 @@ program define nora_result_regress
     *     parse. Only meaningful for OLS, so gated on
     *     ``e(cmd) == "regress"``; logit / probit / Poisson use
     *     pseudo-R² and chi² omnibus stats instead.
-    tempname _evals _evecs
-    capture matrix symeigen `_evecs' `_evals' = `Vmat'
-    if !_rc {
-        local _ne = colsof(`_evals')
-        if `_ne' > 0 {
-            local _emax = `_evals'[1, 1]
-            local _emin = `_evals'[1, 1]
-            forvalues j = 2/`_ne' {
-                if !missing(`_evals'[1, `j']) {
-                    if `_evals'[1, `j'] > `_emax' local _emax = `_evals'[1, `j']
-                    if `_evals'[1, `j'] < `_emin' local _emin = `_evals'[1, `j']
-                }
+    * Condition number on the ESTIMABLE submatrix only.
+    *
+    * Factor-variable models (``regress y i.foreign mpg``) populate
+    * e(V) with a row/column for the structurally omitted base level
+    * whose variance is exactly 0. Running symeigen across the full
+    * e(V) puts a 0 eigenvalue into the spectrum, the ``_emin > 0``
+    * guard fails, and condition_number is silently dropped — even
+    * though the *estimable* design has a finite condition number.
+    * The fix is to build a square submatrix of e(V) restricted to
+    * columns whose diagonal variance is strictly positive, then run
+    * symeigen on that. Non-estimable / dropped / base columns drop
+    * out cleanly and the resulting eigenvalue spectrum reflects the
+    * actual design.
+    local _kest = 0
+    forvalues i = 1/`k' {
+        if !missing(`Vmat'[`i', `i']) & `Vmat'[`i', `i'] > 0 {
+            local _kest = `_kest' + 1
+            local _eidx`_kest' = `i'
+        }
+    }
+    if `_kest' >= 1 {
+        tempname _Vsub
+        matrix `_Vsub' = J(`_kest', `_kest', 0)
+        forvalues a = 1/`_kest' {
+            local _ia = `_eidx`a''
+            forvalues b = 1/`_kest' {
+                local _ib = `_eidx`b''
+                matrix `_Vsub'[`a', `b'] = `Vmat'[`_ia', `_ib']
             }
-            if !missing(`_emin') & !missing(`_emax') & `_emin' > 0 {
-                local _cn = sqrt(`_emax' / `_emin')
-                local _x = strofreal(`_cn', "%21.17e")
-                file write `fh' `","condition_number":`_x'"'
+        }
+        tempname _evals _evecs
+        capture matrix symeigen `_evecs' `_evals' = `_Vsub'
+        if !_rc {
+            local _ne = colsof(`_evals')
+            if `_ne' > 0 {
+                local _emax = `_evals'[1, 1]
+                local _emin = `_evals'[1, 1]
+                forvalues j = 2/`_ne' {
+                    if !missing(`_evals'[1, `j']) {
+                        if `_evals'[1, `j'] > `_emax' local _emax = `_evals'[1, `j']
+                        if `_evals'[1, `j'] < `_emin' local _emin = `_evals'[1, `j']
+                    }
+                }
+                if !missing(`_emin') & !missing(`_emax') & `_emin' > 0 {
+                    local _cn = sqrt(`_emax' / `_emin')
+                    local _x = strofreal(`_cn', "%21.17e")
+                    file write `fh' `","condition_number":`_x'"'
+                }
             }
         }
     }

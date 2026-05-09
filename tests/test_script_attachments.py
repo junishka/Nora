@@ -264,6 +264,117 @@ def test_send_message_persists_attachment_names(tmp_path: Path) -> None:
     assert record["text"] == "what does this do?"
 
 
+# ---------------------------------------------------------------------------
+# Queued-send attachment freezing — closes the race where a second
+# queued message swallowed the first one's chips
+# ---------------------------------------------------------------------------
+
+def test_queued_send_freeze_isolates_per_message_attachments(
+    tmp_path: Path,
+) -> None:
+    """Two queued messages, each with its OWN script chip, must fire
+    with the right script — not race for whichever happens to be in
+    runner.pending_script_attachments at flush time.
+
+    The earlier shape left ``pending_script_attachments`` global, so
+    queueing message 1 + staging script B for message 2 left the
+    runner with [A, B] when message 1 fired, then [] when message 2
+    fired. Net effect: message 1 swallowed B, message 2 sent
+    nothing. The freeze/restore token closes the race."""
+    bridge = _make_bridge(tmp_path)
+    cwd_str = str(bridge.cwd)
+
+    # User stages script A, then queues message 1.
+    bridge.add_files_from_blobs([{
+        "name": "a.py",
+        "content": base64.b64encode(b"# script A\n").decode("ascii"),
+    }])
+    assert [a["name"] for a in bridge._pending_script_attachments] == ["a.py"]
+
+    token1 = bridge.freeze_pending_attachments(cwd_str)
+    assert isinstance(token1, str) and len(token1) > 0
+    # Runner's pending state is now CLEARED — script A is frozen
+    # under token1.
+    assert bridge._pending_script_attachments == []
+
+    # User stages script B (intended for message 2) and queues msg 2.
+    bridge.add_files_from_blobs([{
+        "name": "b.py",
+        "content": base64.b64encode(b"# script B\n").decode("ascii"),
+    }])
+    assert [a["name"] for a in bridge._pending_script_attachments] == ["b.py"]
+
+    token2 = bridge.freeze_pending_attachments(cwd_str)
+    assert token2 != token1
+    assert bridge._pending_script_attachments == []
+
+    # Message 1 fires: restore token1.
+    runner = bridge._active_runner()
+    assert runner is not None
+    assert runner.restore_frozen_pending(token1) is True
+    assert [a["name"] for a in runner.pending_script_attachments] == ["a.py"], (
+        "message 1 must fire with ONLY its own staged attachment"
+    )
+    # Simulate consume: clear pending after the turn fires.
+    runner.pending_script_attachments = []
+
+    # Message 2 fires: restore token2.
+    assert runner.restore_frozen_pending(token2) is True
+    assert [a["name"] for a in runner.pending_script_attachments] == ["b.py"], (
+        "message 2 must fire with ONLY its own staged attachment "
+        "(the earlier shape leaked to message 1)"
+    )
+
+
+def test_freeze_token_is_consumed_on_restore(tmp_path: Path) -> None:
+    """Restoring a token deletes the entry — restoring the same
+    token twice fires only once (the second call is a no-op).
+    Without this, a duplicated send would re-prepend stale
+    attachments."""
+    bridge = _make_bridge(tmp_path)
+    bridge.add_files_from_blobs([{
+        "name": "once.py",
+        "content": base64.b64encode(b"x = 1\n").decode("ascii"),
+    }])
+    token = bridge.freeze_pending_attachments(str(bridge.cwd))
+    assert token
+
+    runner = bridge._active_runner()
+    assert runner.restore_frozen_pending(token) is True
+    runner.pending_script_attachments = []  # simulate consume
+
+    # Second restore: token already popped → False, pending stays empty.
+    assert runner.restore_frozen_pending(token) is False
+    assert runner.pending_script_attachments == []
+
+
+def test_discard_frozen_pending_drops_token_without_restoring(
+    tmp_path: Path,
+) -> None:
+    """Stop / rewind cancels queued messages. The cancelled message's
+    frozen state must NOT come back through a later restore."""
+    bridge = _make_bridge(tmp_path)
+    bridge.add_files_from_blobs([{
+        "name": "cancelled.py",
+        "content": base64.b64encode(b"# cancelled\n").decode("ascii"),
+    }])
+    token = bridge.freeze_pending_attachments(str(bridge.cwd))
+    assert bridge.discard_pending_attachments_token(str(bridge.cwd), token) is True
+
+    runner = bridge._active_runner()
+    assert runner.restore_frozen_pending(token) is False
+    assert runner.pending_script_attachments == []
+
+
+def test_freeze_returns_none_for_unknown_session(tmp_path: Path) -> None:
+    """The bridge can be queried for a cwd that has no live runner
+    (e.g., session was just deleted). The freeze call must not
+    crash; ``None`` lets the JS fall back to fire-without-token."""
+    bridge = _make_bridge(tmp_path)
+    bogus = str(tmp_path / "no_such_session")
+    assert bridge.freeze_pending_attachments(bogus) is None
+
+
 def test_image_drop_saves_to_cwd_and_stages_for_vision(tmp_path: Path) -> None:
     """An image dragged into the composer must (a) land on disk in
     the session cwd so the researcher can reference it later, and
@@ -422,6 +533,54 @@ def test_upload_files_under_cap_still_works(
     assert (bridge.cwd / "small.csv").read_text() == "a,b\n1,2\n"
 
 
+def test_upload_files_aggregate_cap_blocks_multi_file_drop(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Each individual file passes the per-file cap, but their
+    combined decoded bytes exceed the aggregate threshold. Earlier
+    code accepted the drop and held all blobs concurrently in memory
+    — five near-cap files could push the JS heap and Python decode
+    over multiple GB. The aggregate cap rejects the whole drop with
+    a clear count + total."""
+    import nora.ui as ui_mod
+    monkeypatch.setattr(ui_mod, "_DRAG_DROP_MAX_BYTES", 1024)
+
+    bridge = NoraBridge()  # landing-page state
+    # Three files, each 700 bytes raw — under the 1024-byte per-file
+    # cap individually, but ~2.1 KB combined > 1 KB cap.
+    payload = [
+        {"name": f"f{i}.csv",
+         "content": base64.b64encode(b"x" * 700).decode("ascii")}
+        for i in range(3)
+    ]
+    res = bridge.upload_files(payload)
+    assert res["ok"] is False
+    assert "Total drop size" in res["reason"]
+    assert "drag-drop is capped at" in res["reason"]
+
+
+def test_add_files_from_blobs_aggregate_cap_blocks_multi_file_drop(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Composer-drop variant of the aggregate cap. Same shape —
+    multiple under-cap files whose combined size exceeds the total
+    must be refused before the writes hit disk."""
+    import nora.ui as ui_mod
+    monkeypatch.setattr(ui_mod, "_DRAG_DROP_MAX_BYTES", 1024)
+
+    bridge = _make_bridge(tmp_path)
+    payload = [
+        {"name": f"data{i}.csv",
+         "content": base64.b64encode(b"y" * 700).decode("ascii")}
+        for i in range(3)
+    ]
+    res = bridge.add_files_from_blobs(payload)
+    assert res["ok"] is False
+    assert "Total drop size" in res["reason"]
+    # First file may have written before the aggregate flipped — but
+    # the user sees the rejection so the partial state is bounded.
+
+
 def test_js_drop_handler_gates_on_file_size() -> None:
     """The JS drag-drop handlers must check ``file.size`` BEFORE
     calling FileReader. Without this, a researcher who drops a
@@ -445,3 +604,65 @@ def test_js_drop_handler_gates_on_file_size() -> None:
     assert "MAX_DRAG_DROP_BYTES" in composer_drop, (
         "composer drop handler missing size gate"
     )
+
+
+def test_js_landing_drop_has_aggregate_cap() -> None:
+    """The landing handler must reject a multi-file drop whose total
+    size exceeds the cap, BEFORE accumulating each file's base64
+    string in JS memory. Earlier code only checked the per-file cap,
+    so 5 × 400 MB files passed but held ~3 GB of base64 strings
+    concurrently in the JS heap."""
+    src = (Path(__file__).resolve().parent.parent
+           / "src" / "nora" / "web" / "app.js").read_text(encoding="utf-8")
+    landing_drop = src.split("landingEl.addEventListener('drop'", 1)[1]
+    landing_drop = landing_drop.split("function readFileAsBase64", 1)[0]
+    # The handler computes sum-of-file.size and gates against the
+    # same MAX_DRAG_DROP_BYTES cap as per-file.
+    assert ".reduce(" in landing_drop, (
+        "landing-page drop handler missing aggregate-size accumulator"
+    )
+    # The error path mentions the aggregate.
+    assert (
+        "Total drop size" in landing_drop
+        or "aggregate" in landing_drop.lower()
+    ), "landing drop missing aggregate-cap error message"
+
+
+def test_js_image_drop_short_circuits_data_path_on_image_rejection() -> None:
+    """When ``stageImageFile`` rejects an image (over the 5 MB
+    vision cap, or wrong MIME), the caller MUST NOT then run
+    ``stageDataFile`` — that path has a 512 MB cap, so an oversize
+    image would slip through and freeze the bridge on a 100 MB
+    screenshot. The fix returns a boolean from stageImageFile and
+    gates the data-path call on it.
+    """
+    src = (Path(__file__).resolve().parent.parent
+           / "src" / "nora" / "web" / "app.js").read_text(encoding="utf-8")
+    # stageImageFile returns true/false on accept/reject.
+    assert "return true;" in src
+    # Both drop and paste handlers gate stageDataFile on the return.
+    drop_block = src.split(
+        "landingEl.addEventListener('drop'", 1
+    )[1] if "landingEl.addEventListener('drop'" in src else src
+    # Locate the composer drop handler and the paste handler — both
+    # should use ``await stageImageFile(...)`` and gate on its
+    # return value before calling stageDataFile.
+    composer_block = src.split(
+        "form.addEventListener('drop'", 1
+    )[1].split("input.focus()", 1)[0] if "form.addEventListener('drop'" in src else ""
+    paste_block = src.split(
+        "input.addEventListener('paste'", 1
+    )[1].split("\n  });\n}", 1)[0] if "input.addEventListener('paste'" in src else ""
+    for label, block in (("composer drop", composer_block),
+                         ("paste", paste_block)):
+        if not block:
+            continue
+        assert "stageImageFile" in block, f"{label}: missing stageImageFile call"
+        # The accepted-gating idiom: capture return then conditional.
+        assert (
+            "const accepted = await stageImageFile" in block
+            or "if (await stageImageFile" in block
+        ), (
+            f"{label}: stageImageFile result not used to gate "
+            f"stageDataFile — oversize images can fall through"
+        )

@@ -393,6 +393,15 @@ class NoraBridge:
             return {"ok": False, "reason": "no files"}
         import base64
         decoded: list[tuple[str, bytes]] = []
+        # Aggregate cap on decoded bytes: each file passes the
+        # per-file cap, but a multi-file drop accumulates them all
+        # in this list before staging. Five 400 MB files would each
+        # pass ``_DRAG_DROP_MAX_BYTES`` per-file yet hold ~2 GB of
+        # decoded bytes in this scope. Bound the total too — same
+        # threshold as per-file so the rule reads consistently from
+        # the user's side ("drag-drop moves up to 512 MB total").
+        # The JS side gates first; this is defense-in-depth.
+        aggregate_bytes = 0
         for item in files:
             name = item.get("name", "")
             content_b64 = item.get("content", "")
@@ -422,6 +431,19 @@ class NoraBridge:
                     "ok": False,
                     "reason": _drag_drop_oversize_message(
                         name, mb, "Choose Files…",
+                    ),
+                }
+            aggregate_bytes += len(blob)
+            if aggregate_bytes > _DRAG_DROP_MAX_BYTES:
+                agg_mb = aggregate_bytes // (1024 * 1024)
+                cap_mb = _DRAG_DROP_MAX_BYTES // (1024 * 1024)
+                return {
+                    "ok": False,
+                    "reason": (
+                        f"Total drop size is {agg_mb} MB — drag-drop is "
+                        f"capped at {cap_mb} MB total. Use Choose Files… "
+                        f"to import larger batches with no aggregate "
+                        f"limit."
                     ),
                 }
             decoded.append((Path(name).name, blob))
@@ -627,11 +649,86 @@ class NoraBridge:
             text, images=images, target_cwd=session_cwd,
         )
 
+    # -------- queued-send attachment freezing --------
+    #
+    # Two endpoints that the JS-side queue uses to freeze the runner's
+    # current pending_* lists into a per-message snapshot, then thaw
+    # the snapshot back when the queued message fires. See
+    # ``Runner.freeze_pending_for_queue`` / ``restore_frozen_pending``
+    # for the race these endpoints close.
+
+    def freeze_pending_attachments(self, session_cwd: str) -> str | None:
+        """Snapshot the runner's pending_* lists under a fresh token,
+        clear the runner's pending state, and return the token.
+
+        Called by the JS submit handler when the user hits Send while
+        a turn is already running — the queued message owns the
+        snapshot, and any attachments staged AFTER the queue (for a
+        later message) land in a fresh runner slot. Returns ``None``
+        if the named session has no live runner; the JS path then
+        falls back to the older fire-without-token shape so the
+        message at least sends.
+        """
+        if not session_cwd:
+            return None
+        try:
+            resolved = Path(session_cwd).resolve()
+        except (OSError, RuntimeError):
+            return None
+        runner = self._runners.get(str(resolved))
+        if runner is None:
+            return None
+        token = uuid.uuid4().hex[:16]
+        runner.freeze_pending_for_queue(token)
+        return token
+
+    def discard_pending_attachments_token(
+        self, session_cwd: str, token: str,
+    ) -> bool:
+        """Drop a frozen snapshot without firing it. Used when a
+        queued message gets cancelled (Stop fires, rewind drops the
+        queue). Returns ``True`` if a token was dropped, ``False`` if
+        the runner / token couldn't be found."""
+        if not session_cwd or not token:
+            return False
+        try:
+            resolved = Path(session_cwd).resolve()
+        except (OSError, RuntimeError):
+            return False
+        runner = self._runners.get(str(resolved))
+        if runner is None:
+            return False
+        had = token in runner.frozen_pending_attachments
+        runner.discard_frozen_pending(token)
+        return had
+
+    def send_message_with_token_to_session(
+        self, session_cwd: str, text: str, token: str,
+    ) -> str | None:
+        """Like :meth:`send_message_to_session`, but restore the
+        named frozen snapshot into ``pending_*`` first so the queued
+        message rides with EXACTLY the attachments it owned at queue
+        time. Missing token = no-op restore (the send still fires;
+        relevant when an older JS path didn't capture a token)."""
+        return self._send_to_active(
+            text, images=None, target_cwd=session_cwd, frozen_token=token,
+        )
+
+    def send_message_with_images_and_token_to_session(
+        self, session_cwd: str, text: str,
+        images: list[dict[str, Any]], token: str,
+    ) -> str | None:
+        """Image+token combination of the queued send."""
+        return self._send_to_active(
+            text, images=images, target_cwd=session_cwd, frozen_token=token,
+        )
+
     def _send_to_active(
         self,
         text: str,
         images: list[dict[str, Any]] | None,
         target_cwd: str | None,
+        frozen_token: str | None = None,
     ) -> str | None:
         """Schedule a turn on a runner.
 
@@ -707,6 +804,13 @@ class NoraBridge:
                 })
                 return None
             runner = self._ensure_runner_for_cwd(self.cwd)
+        # Restore the queued message's frozen attachments BEFORE
+        # the user-message bookkeeping (so any logged context counts
+        # see them) and BEFORE scheduling the turn coroutine (which
+        # consumes pending_*). Missing tokens are silent no-ops:
+        # the older fire-without-token path stays valid.
+        if frozen_token:
+            runner.restore_frozen_pending(frozen_token)
         self._record_user_message(runner, text, image_count=len(images or []))
         # 16 hex chars = 64 bits of entropy. Vastly more than enough
         # for a per-session non-collision guarantee, short enough to
@@ -926,6 +1030,18 @@ class NoraBridge:
         # (see add_files() for the same guard on the native-dialog
         # path).
         skipped_existing: list[str] = []
+        # Aggregate-bytes accumulator for the data/script copy path.
+        # The per-file cap protects each individual decode, but a
+        # multi-file drop accumulates blobs in this method's scope
+        # before writing to disk. Five 400 MB .dta files would each
+        # pass per-file yet hold ~2 GB of decoded bytes concurrently
+        # in transient heap. Bound the total at the same threshold so
+        # the drag-drop rule reads the same as the landing page.
+        # Images are NOT counted (5 MB cap each, capped count) — a
+        # researcher who drops a screenshot alongside data files
+        # shouldn't see the data files rejected because of the
+        # image's bytes.
+        aggregate_data_bytes = 0
 
         for item in files:
             name = item.get("name", "")
@@ -980,6 +1096,19 @@ class NoraBridge:
             except Exception:  # noqa: BLE001
                 return {"ok": False, "reason": f"could not decode {name!r}"}
             if ext in _COPY_EXTS:
+                aggregate_data_bytes += len(blob)
+                if aggregate_data_bytes > _DRAG_DROP_MAX_BYTES:
+                    agg_mb = aggregate_data_bytes // (1024 * 1024)
+                    cap_mb = _DRAG_DROP_MAX_BYTES // (1024 * 1024)
+                    return {
+                        "ok": False,
+                        "reason": (
+                            f"Total drop size is {agg_mb} MB — drag-drop "
+                            f"is capped at {cap_mb} MB total. Use the + "
+                            f"button next to the composer to import "
+                            f"larger batches with no aggregate limit."
+                        ),
+                    }
                 dst = self.cwd / safe_name
                 if dst.exists():
                     skipped_existing.append(safe_name)

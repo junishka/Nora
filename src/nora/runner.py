@@ -233,6 +233,12 @@ class SessionRunner:
         # any plots / images the researcher pointed at by name.
         self.pending_mentioned_files: list[str] = []
         self.pending_mentioned_images: list[dict[str, Any]] = []
+        # Per-token frozen snapshots of the pending lists. Populated
+        # by ``freeze_pending_for_queue`` when the JS queues a
+        # message client-side; consumed by ``restore_frozen_pending``
+        # when the queued message fires. See the freeze/restore
+        # docstrings below for the race the snapshots close.
+        self.frozen_pending_attachments: dict[str, dict[str, list[Any]]] = {}
 
     def clear_pending_attachments(self) -> None:
         """Drop everything staged for the next turn.
@@ -254,6 +260,89 @@ class SessionRunner:
         self.pending_mentioned_files.clear()
         self.pending_mentioned_images.clear()
         self.pending_plot_images.clear()
+        # Queued-message frozen attachments belong to messages that
+        # would have flushed AFTER the rewound point. Drop them too —
+        # the rewound conversation no longer expects those messages.
+        self.frozen_pending_attachments.clear()
+
+    # -------- queued-send attachment freezing --------
+    #
+    # When a turn is in flight and the user hits Send on a follow-up,
+    # the JS queues the message client-side. Earlier code left the
+    # backend's ``pending_*`` lists alone — but those lists are
+    # global per-session, so attachments staged for a LATER queued
+    # message would accumulate alongside the FIRST queued message's
+    # attachments, and the running turn's terminal-event handler
+    # would consume them all into whichever queued message fired
+    # next. Net effect: queued message #1 swallowed message #2's
+    # script chip, and message #2 fired with nothing attached.
+    #
+    # The fix: at queue time, JS calls ``freeze_pending_attachments``
+    # on the bridge. The bridge moves the runner's current pending
+    # lists into a per-token dict and clears the runner's state so
+    # subsequent stages go to a fresh slot. When the queued message
+    # fires, JS passes the token back; the bridge restores the
+    # frozen state into ``pending_*`` just before send, then deletes
+    # the entry. Two queued messages each get exactly the
+    # attachments staged at THEIR queue moment.
+    #
+    # ``frozen_pending_attachments`` lives on the runner (not the
+    # bridge) so the same per-session lock that protects the regular
+    # pending lists also protects this one — and so a runner kill
+    # / session swap drops the frozen state alongside the rest of
+    # the runner.
+
+    def freeze_pending_for_queue(self, token: str) -> None:
+        """Snapshot the current pending_* lists under ``token`` and
+        clear the runner's pending state.
+
+        Called by the bridge when JS queues a message client-side.
+        Subsequent attachment stages land in a fresh runner state.
+        """
+        self.frozen_pending_attachments[token] = {
+            "scripts": list(self.pending_script_attachments),
+            "mentioned_files": list(self.pending_mentioned_files),
+            "mentioned_images": list(self.pending_mentioned_images),
+            # ``plot_images`` are NOT included here — those are
+            # computed from the previous turn's run dir manifest, not
+            # researcher-staged. They belong to the NEXT turn that
+            # fires regardless of which queued message it is.
+        }
+        self.pending_script_attachments = []
+        self.pending_mentioned_files = []
+        self.pending_mentioned_images = []
+
+    def restore_frozen_pending(self, token: str) -> bool:
+        """Restore the named frozen state into ``pending_*`` and
+        delete the entry.
+
+        Returns ``True`` if the token was found and restored,
+        ``False`` if it was absent (a no-op token is fine — falls
+        through to whatever ``pending_*`` looks like, which may be
+        the case when JS misses the token round-trip).
+        """
+        frozen = self.frozen_pending_attachments.pop(token, None)
+        if frozen is None:
+            return False
+        # Prepend rather than replace so any plot_images captured
+        # mid-queue (from a finished run) still ride the queued
+        # turn alongside the frozen researcher-staged attachments.
+        self.pending_script_attachments = (
+            frozen["scripts"] + self.pending_script_attachments
+        )
+        self.pending_mentioned_files = (
+            frozen["mentioned_files"] + self.pending_mentioned_files
+        )
+        self.pending_mentioned_images = (
+            frozen["mentioned_images"] + self.pending_mentioned_images
+        )
+        return True
+
+    def discard_frozen_pending(self, token: str) -> None:
+        """Drop a frozen entry without restoring it. Used when a
+        queued message is cancelled (Stop fires, or a rewind drops
+        the queue)."""
+        self.frozen_pending_attachments.pop(token, None)
 
     # -------- session lifecycle --------
 

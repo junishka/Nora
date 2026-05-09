@@ -190,6 +190,31 @@ def test_bad_lines_summary_surfaces_linenos_past_first_five():
     assert "and lines 13,17,22 also failed" in msg
 
 
+def test_bad_lines_summary_tail_is_bounded():
+    """A buggy script can emit thousands of malformed lines. The
+    advisory must NOT enumerate every one of them — earlier code
+    appended every line number after the first 5, producing a
+    multi-KB string in ``warnings`` for a 1000-bad-line run.
+    The tail caps at 20 line numbers and adds ``+ N more`` so the
+    message stays readable + bounded."""
+    bad_lines = [f"line {i}: invalid json" for i in range(6, 6 + 100)]
+    msg = _format_bad_lines_summary(bad_lines, payload_count=0)
+    assert "100 malformed result line(s) skipped (0 valid preserved)" in msg
+    # First 5 line numbers appear in detail form (5..10 inclusive
+    # for this input — the head slice is bad_lines[:5], i.e., lines
+    # 6, 7, 8, 9, 10).
+    for ln in range(6, 11):
+        assert f"line {ln}: invalid json" in msg
+    # Tail enumerates AT MOST 20 line numbers.
+    assert "and lines " in msg
+    tail = msg.split("and lines ", 1)[1]
+    enum_part = tail.split(" also failed", 1)[0]
+    enumerated = [s.strip() for s in enum_part.split(",")]
+    assert 1 <= len(enumerated) <= 20, f"tail enumerated {len(enumerated)} entries"
+    # Overflow disclosure: 100 - 5 (head) - 20 (enumerated) = 75 more.
+    assert "+ 75 more" in msg
+
+
 def test_bad_lines_summary_exact_five_omits_tail():
     """Boundary: 5 entries fits in detail form, no tail needed."""
     bad_lines = [f"line {i}: invalid json" for i in (1, 2, 3, 4, 5)]

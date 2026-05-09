@@ -284,11 +284,17 @@ def _format_bad_lines_summary(bad_lines: list[str], payload_count: int) -> str:
     """Render the malformed-lines advisory.
 
     Shows full detail for the first 5 entries and surfaces the line
-    numbers (only) for any that follow, so a 12-corrupt-line debug
+    numbers (only) for the next chunk, so a 12-corrupt-line debug
     session reads as ``lines 6,7,8,9,10,11,12 also failed`` rather
-    than an opaque ``…``. The line-number tail is bounded by the
-    bad-line count, not by an arbitrary cap — the message is
-    diagnostic, the researcher reads it once and moves on.
+    than an opaque ``…``.
+
+    Both head and tail are capped: the tail keeps at most
+    ``_BAD_LINES_TAIL_CAP`` line numbers and appends an ``and N more``
+    suffix beyond that. A bug emitting thousands of malformed lines
+    would otherwise produce a multi-KB string in ``warnings`` /
+    ``error``, flooding the model context and the UI. The advisory
+    is diagnostic — the researcher reads it once, opens the run dir
+    if the line numbers don't tell the whole story.
     """
     head = "; ".join(bad_lines[:5])
     tail_msg = ""
@@ -304,13 +310,30 @@ def _format_bad_lines_summary(bad_lines: list[str], payload_count: int) -> str:
                     entry.split(":", 1)[0].removeprefix("line ").strip()
                 )
         if extra_linenos:
-            tail_msg = f" … and lines {','.join(extra_linenos)} also failed"
+            shown = extra_linenos[:_BAD_LINES_TAIL_CAP]
+            overflow = len(extra_linenos) - len(shown)
+            if overflow > 0:
+                tail_msg = (
+                    f" … and lines {','.join(shown)} also failed "
+                    f"(+ {overflow} more)"
+                )
+            else:
+                tail_msg = (
+                    f" … and lines {','.join(shown)} also failed"
+                )
         else:
             tail_msg = f" … and {len(bad_lines) - 5} more"
     return (
         f"{len(bad_lines)} malformed result line(s) skipped "
         f"({payload_count} valid preserved): " + head + tail_msg
     )
+
+
+# Tail-cap on the bad-line summary's enumerated line numbers. 20 is
+# enough to scan visually for clustering ("lines 12-31 all bad → it's
+# helper #2") without letting a 1000-bad-line bug ship 1000 line
+# numbers into the model's context.
+_BAD_LINES_TAIL_CAP = 20
 
 
 def _parse_result_jsonl(
@@ -807,6 +830,7 @@ def _stage_runtime(run_dir: Path, language: Language) -> Path:
             "nora_result_sum.ado",
             "nora_result_tab.ado",
             "nora_result_magnitude.ado",
+            "nora_result_correlation.ado",
             "nora_plot_residuals.ado",
             "nora_plot_coefficients.ado",
             "nora_plot_interaction.ado",
@@ -1157,6 +1181,25 @@ def _build_profile(
         if p:
             read_subpaths.append(_quote(p))
 
+    # Carve ``.nora`` out of the cwd allow. The cwd allow gives scripts
+    # the analysis workspace, but ``<cwd>/.nora`` holds Nora's own
+    # session state — chat_history.jsonl, results.db, prior run scripts
+    # and stdout/stderr logs, helper plot manifests. Those files are
+    # exactly the raw / pre-sanitization material the tool layer keeps
+    # out of model-visible context. A model-authored script left to
+    # roam under ``<cwd>/.nora`` could read them and smuggle excerpts
+    # back through any sanitizer-allowed channel (label fields, helper
+    # error bodies, even an unsanitized stdout line on a non-result
+    # path), or corrupt the persisted session state to influence
+    # future turns.
+    #
+    # SBPL rule precedence is "last match wins", so we re-emit the
+    # allow for cwd, follow it with a deny for ``<cwd>/.nora``, and
+    # finish with a re-allow for the current ``run_dir`` (which IS
+    # under ``<cwd>/.nora/runs/<id>/`` — the script needs to read
+    # its staged runtime library and write its result.json there).
+    # Anything else under ``.nora`` falls through to the deny.
+    nora_dir = cwd / ".nora"
     return (
         "(version 1)\n"
         "(deny default)\n"
@@ -1185,10 +1228,26 @@ def _build_profile(
         + "".join(f"    (subpath {p})\n" for p in read_subpaths)
         + ")\n"
         "\n"
+        "; Carve ``.nora`` out of the cwd read allow — Nora's session\n"
+        "; state (chat_history.jsonl, results.db, prior run logs) must\n"
+        "; never be readable by a script. Re-allow only the current\n"
+        "; run_dir below so the runtime library + result.json still\n"
+        "; resolve.\n"
+        f"(deny file-read* (subpath {_quote(nora_dir)}))\n"
+        f"(allow file-read* (subpath {_quote(run_dir)}))\n"
+        "\n"
         "; File writes restricted to the run's scratch dir and temp\n"
         "; paths used by R/Stata for internal staging.\n"
         "(allow file-write*\n"
         + "".join(f"    (subpath {p})\n" for p in write_subpaths)
         + "".join(f"    (literal {p})\n" for p in write_literals)
         + "    (regex #\"^/dev/ttys[0-9]+$\"))\n"
+        "\n"
+        "; Same carve-out on writes: a script must not modify Nora's\n"
+        "; session state (which would let it influence future turns by\n"
+        "; tampering with results.db / chat_history.jsonl). Re-allow\n"
+        "; only the current run_dir so result.json + stdout/stderr\n"
+        "; logs land where the executor reads them.\n"
+        f"(deny file-write* (subpath {_quote(nora_dir)}))\n"
+        f"(allow file-write* (subpath {_quote(run_dir)}))\n"
     )

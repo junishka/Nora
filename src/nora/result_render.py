@@ -155,6 +155,16 @@ def _compose_layout_inner(
     header = ["Outcome", *col_labels]
     rows: list[list[str]] = []
 
+    # ``any_unresolved`` must persist across ALL groups: the legend
+    # describes what the failure glyphs (``—`` / ``·`` / ``n/a``)
+    # mean, and once any group emits one, the legend is needed
+    # regardless of whether later groups happen to render cleanly.
+    # Resetting this inside the per-group loop (the prior shape)
+    # silently dropped the legend whenever the FINAL group resolved
+    # cleanly even though earlier groups had failures — leaving the
+    # rendered table with unexplained glyphs.
+    any_unresolved = False
+
     for group in groups:
         if not isinstance(group, dict):
             return None
@@ -167,7 +177,6 @@ def _compose_layout_inner(
             # Markdown pipe tables don't support row spans, so a
             # blank-cells header row is the conventional shape.
             rows.append([f"**{group_label.strip()}**", *([""] * len(col_ids))])
-        any_unresolved = False
         for row in group_rows:
             if not isinstance(row, dict):
                 return None
@@ -281,10 +290,33 @@ def _compose_cell(
             return "·" if in_model else "n/a"
         return "—"
 
-    e_str = (_fmt_num(e) if e is not None else "") or "·"
-    s_str = (_fmt_num(s) if s is not None else "") or "·"
-    p_str = (_fmt_pvalue(p) if p is not None else "") or "·"
-    return f"{e_str} ({s_str}) [{p_str}]"
+    # Coefficient is present but a within-cell component (SE or
+    # p-value) may be missing. Earlier code rendered every missing
+    # component as ``·`` (the same glyph the legend defines as
+    # "term in model but no estimate (often collinearity)"), which
+    # made cells like ``2 (0.2) [·]`` ambiguous: the ``·`` looked
+    # like a per-term collinearity marker even when the term IS
+    # estimated and the sanitizer simply dropped p-values from the
+    # payload (e.g., scripts that emit coef + SE without t-stats).
+    # Drop the missing component's punctuation entirely instead —
+    # the format gracefully degrades from ``est (SE) [p]`` through
+    # ``est (SE)`` / ``est [p]`` to bare ``est``, with no glyph
+    # collisions. ``_has_unresolved_term`` already fires only when
+    # the coefficient itself is missing, which is consistent with
+    # this rendering.
+    e_str = _fmt_num(e) if e is not None else None
+    s_str = _fmt_num(s) if s is not None else None
+    p_str = _fmt_pvalue(p) if p is not None else None
+    parts: list[str] = []
+    # If the coefficient itself didn't format (rare — ``_fmt_num`` of
+    # a non-numeric), fall back to the in-model glyph so the cell
+    # isn't empty.
+    parts.append(e_str if e_str else "·")
+    if s_str:
+        parts.append(f"({s_str})")
+    if p_str:
+        parts.append(f"[{p_str}]")
+    return " ".join(parts)
 
 
 # ---------------------------------------------------------------------------
