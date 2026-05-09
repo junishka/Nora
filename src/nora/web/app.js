@@ -442,19 +442,20 @@ async function loadLandingSessions() {
       btn.className = 'landing-session';
       btn.title = s.path;
 
-      const when = document.createElement('div');
-      when.className = 'landing-session-when';
-      when.textContent = formatSessionWhen(s.timestamp);
-      btn.appendChild(when);
-
-      const meta = document.createElement('div');
-      meta.className = 'landing-session-meta';
-      const dsText = s.datasets.length
+      // Title = the resolved session title (custom name if set, else
+      // the dataset filename, else "+N more"). Renders single-line
+      // with the relative-age label pinned to the right.
+      const title = document.createElement('span');
+      title.className = 'landing-session-title';
+      title.textContent = s.title || (s.datasets.length
         ? s.datasets.join(', ')
-        : '(no data files)';
-      const sizeText = typeof s.size === 'number' ? formatBytes(s.size) : '';
-      meta.textContent = sizeText ? `${sizeText} · ${dsText}` : dsText;
-      btn.appendChild(meta);
+        : '(no data files)');
+      btn.appendChild(title);
+
+      const age = document.createElement('span');
+      age.className = 'landing-session-age';
+      age.textContent = formatSessionAge(s.timestamp);
+      btn.appendChild(age);
 
       btn.addEventListener('click', () => switchSession(s.path, false));
       listEl.appendChild(btn);
@@ -2242,6 +2243,10 @@ window.nora_event = function (evt) {
       // shifted up by ~80 px. Re-apply the top-anchor so the
       // researcher still lands on the answer's first line.
       reapplyAssistantTopAnchor();
+      // Refresh the sidebar so the just-active session bubbles to
+      // the top — list_sessions sorts by chat_history.jsonl mtime,
+      // which the persist path bumped during this turn.
+      if (typeof loadSessions === 'function') loadSessions();
       break;
     case 'auth_failure':
       // Auth failures matter cross-session: even a background
@@ -2411,6 +2416,11 @@ function append(kind, text, markdown, attachments, images) {
     copyBtn.addEventListener('click', (e) => {
       e.stopPropagation();
       copyMessageBubble(wrapper, copyBtn);
+      // Drop focus so the actions row hides when the cursor leaves
+      // the message — without this, the button keeps focus and any
+      // ``:focus-within``-style rule would pin the row visible after
+      // a mouse click.
+      copyBtn.blur();
     });
     actions.appendChild(copyBtn);
     // Edit button — user bubbles only. Provenance boundary: editing
@@ -3501,9 +3511,12 @@ function enterEditMode(wrapper) {
   textarea.value = wrapper.__noraRawText || '';
   textarea.rows = Math.min(12, Math.max(2, textarea.value.split('\n').length + 1));
   textarea.addEventListener('keydown', (e) => {
-    // Enter (no shift) submits — same affordance as the composer.
-    // Shift+Enter / Cmd+Enter newline.
-    if (e.key === 'Enter' && !e.shiftKey && !e.metaKey && !e.ctrlKey) {
+    // Submit on Enter (no modifier) and on Cmd/Ctrl+Enter — same
+    // affordances as the composer. Shift+Enter inserts a newline.
+    const isEnter = e.key === 'Enter';
+    const submitPlain = isEnter && !e.shiftKey && !e.metaKey && !e.ctrlKey;
+    const submitModifier = isEnter && (e.metaKey || e.ctrlKey) && !e.shiftKey;
+    if (submitPlain || submitModifier) {
       e.preventDefault();
       runEditedMessage(wrapper);
     } else if (e.key === 'Escape') {
@@ -4390,41 +4403,28 @@ function renderSessions(sessions, currentPath) {
     // background sessions the user isn't currently looking at.
     btn.dataset.path = s.path;
     if (busySessions.has(s.path)) btn.classList.add('busy');
-    const when = document.createElement('div');
-    when.className = 'session-when';
-    // Busy dot lives INSIDE the title line so it pulses right
-    // next to the timestamp instead of off in the corner. CSS
-    // hides it by default; ``.busy`` on the parent reveals it.
+    // Single-line layout: [title …] [age | busy-dot]
+    // ``s.title`` already resolves to custom_name if the researcher
+    // set one, otherwise to the dataset filename ("+N more" for
+    // multi-file sessions), otherwise to a session-stamp fallback.
+    // The busy dot lives in the same right-side slot as the age and
+    // CSS flips visibility — pulse replaces "1d" while a turn runs.
+    const titleEl = document.createElement('span');
+    titleEl.className = 'session-title';
+    titleEl.textContent = s.title || (s.datasets.length
+      ? s.datasets.join(', ')
+      : '(no data files)');
+    btn.appendChild(titleEl);
+
+    const ageEl = document.createElement('span');
+    ageEl.className = 'session-age';
+    ageEl.textContent = formatSessionAge(s.timestamp);
+    btn.appendChild(ageEl);
+
     const dot = document.createElement('span');
     dot.className = 'session-busy-dot';
     dot.setAttribute('aria-hidden', 'true');
-    when.appendChild(dot);
-    const whenText = document.createElement('span');
-    whenText.className = 'session-when-text';
-    // When the researcher has set a custom name, show it as the
-    // primary label (where the timestamp normally goes) and demote
-    // the timestamp into the meta line below. Default sessions
-    // keep the original timestamp-on-top layout.
-    const hasCustom = !!s.custom_name;
-    whenText.textContent = hasCustom ? s.custom_name : formatSessionWhen(s.timestamp);
-    when.appendChild(whenText);
-    btn.appendChild(when);
-
-    const meta = document.createElement('div');
-    meta.className = 'session-datasets';
-    const dsText = s.datasets.length
-      ? s.datasets.join(', ')
-      : '(no data files)';
-    const sizeText = typeof s.size === 'number' ? formatBytes(s.size) : '';
-    // Renamed sessions: timestamp moves into the meta line (it's
-    // no longer the primary label), so order is date · datasets · size.
-    // Default sessions: timestamp is already the primary label above,
-    // so meta keeps the original size · datasets layout.
-    const baseMeta = sizeText ? `${dsText} · ${sizeText}` : dsText;
-    meta.textContent = hasCustom
-      ? `${formatSessionWhen(s.timestamp)} · ${baseMeta}`
-      : (sizeText ? `${sizeText} · ${dsText}` : dsText);
-    btn.appendChild(meta);
+    btn.appendChild(dot);
 
     btn.addEventListener('click', () =>
       switchSession(s.path, s.path === currentPath)
@@ -4446,7 +4446,7 @@ function renderSessions(sessions, currentPath) {
       // refresh redraws the row from server state.
       const editor = document.createElement('div');
       editor.className = 'session-item session-item-editing';
-      editor.textContent = hasCustom ? s.custom_name : formatSessionWhen(s.timestamp);
+      editor.textContent = s.custom_name || s.title || '';
       row.replaceChild(editor, btn);
       beginRenameSession(editor, s.path);
     });
@@ -4633,6 +4633,23 @@ function formatSessionWhen(epochSeconds) {
   if (sameDay) return time;
   if (sameYear) return `${date}, ${time}`;
   return `${date}, ${d.getFullYear()}`;
+}
+
+function formatSessionAge(epochSeconds) {
+  /* Compact "time since inception" label for the session list.
+   * < 1 min : "now"
+   * < 1 h   : "Xm"
+   * < 1 d   : "Xh"
+   * < 30 d  : "Xd"
+   * else    : "Xmo"
+   */
+  if (!epochSeconds) return '';
+  const secs = Math.max(0, Math.floor(Date.now() / 1000 - epochSeconds));
+  if (secs < 60) return 'now';
+  if (secs < 3600) return Math.floor(secs / 60) + 'm';
+  if (secs < 86400) return Math.floor(secs / 3600) + 'h';
+  if (secs < 86400 * 30) return Math.floor(secs / 86400) + 'd';
+  return Math.floor(secs / (86400 * 30)) + 'mo';
 }
 
 async function switchSession(path, isCurrent) {

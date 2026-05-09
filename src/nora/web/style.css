@@ -82,7 +82,8 @@
     --text-dim: #8a7a82;         /* muted mauve-gray — secondary text */
     --accent: #ee8ba9;           /* pink — focus, tool-name (palette highlight) */
     --accent-soft: #a87382;      /* dusty mauve — soft accents */
-    --sage: #5a8aa0;             /* muted teal — info states */
+    --sage: #ee8ba9;             /* dark accent pink — success status, cohesive with the rest of the dark theme (light mode used teal) */
+    --hot-pink: #d96979;         /* deeper rose-red — error status (light mode's #e05a8b reads pink in dark; this is clearly redder for danger semantics) */
     --border: #3a2a30;
     --code-bg: #120d10;
     --code-text: #e6d5c7;
@@ -103,7 +104,8 @@
   --text-dim: #8a7a82;
   --accent: #ee8ba9;
   --accent-soft: #a87382;
-  --sage: #5a8aa0;
+  --sage: #ee8ba9;
+  --hot-pink: #d96979;
   --border: #3a2a30;
   --code-bg: #120d10;
   --code-text: #e6d5c7;
@@ -442,7 +444,7 @@ kbd {
 
 .landing-hero {
   display: block;
-  width: 320px;
+  width: 480px;
   max-width: 100%;
   /* Top margin pushes the wordmark down off the card's top edge so
    * the image's bounding box stops crowding the heading / lead
@@ -623,7 +625,9 @@ kbd {
 }
 
 .landing-session {
-  display: block;
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
   width: 100%;
   padding: 10px 14px;
   border: 1px solid var(--border);
@@ -642,18 +646,20 @@ kbd {
   background: var(--bg);
 }
 
-.landing-session-when {
-  font-weight: 500;
-  margin-bottom: 2px;
-}
-
-.landing-session-meta {
-  font-size: 11px;
-  color: var(--text-dim);
-  font-family: var(--font-mono);
+.landing-session-title {
+  flex: 1 1 auto;
+  min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+  font-weight: 500;
+}
+
+.landing-session-age {
+  flex: 0 0 auto;
+  font-size: 11px;
+  color: var(--text-dim);
+  font-family: var(--font-mono);
 }
 
 .chat {
@@ -830,15 +836,16 @@ kbd {
 }
 
 .session-item {
-  /* Each past session renders as a two-line item: timestamp on top,
-   * size + dataset filenames below. Click to switch cwd.
-   * ``flex: 1 1 0`` with basis 0 (rather than auto) means the item
-   * starts from zero width and grows to fill the row, ignoring the
-   * content's intrinsic width. Combined with overflow: hidden, this
-   * keeps a session with long dataset names from pushing the whole
-   * sidebar wider than 240px. */
+  /* Single-line row: [busy-dot] [title…] [age]. ``flex: 1 1 0`` with
+   * basis 0 means the item starts from zero width and grows to fill
+   * the row; combined with overflow:hidden + a flexible title that
+   * truncates, this keeps a session with long dataset names from
+   * pushing the sidebar wider than its locked width. */
   flex: 1 1 0;
   min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 6px;
   overflow: hidden;
   padding: 8px 10px;
   border: none;
@@ -853,16 +860,10 @@ kbd {
 
 /* Busy dot — visible only when a turn is in flight for this
  * session, including when the researcher is looking at a different
- * session. Sits inline RIGHT BEFORE the title text so the pulse
- * reads as "this chat is working" rather than as a corner badge.
- * Hidden by default; ``.busy`` on the ``.session-item`` parent
- * reveals it. */
-.session-when {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-}
-
+ * session. Sits in the same right-side slot as ``.session-age`` and
+ * REPLACES the age label while the turn runs (CSS hides the age and
+ * reveals the dot together), so the pulse reads as "this chat is
+ * working" without crowding the title. */
 .session-busy-dot {
   flex: 0 0 auto;
   width: 7px;
@@ -871,6 +872,10 @@ kbd {
   background: var(--accent);
   display: none;
   pointer-events: none;
+}
+
+.session-item.busy .session-age {
+  display: none;
 }
 
 .session-item.busy .session-busy-dot {
@@ -883,12 +888,21 @@ kbd {
   50%      { opacity: 0.35; transform: scale(0.65); }
 }
 
-.session-when-text {
-  flex: 0 1 auto;
+.session-title {
+  flex: 1 1 auto;
   min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+  font-weight: 500;
+  color: var(--text);
+}
+
+.session-age {
+  flex: 0 0 auto;
+  font-size: 11px;
+  color: var(--text-dim);
+  font-family: var(--font-mono);
 }
 
 .session-item:focus-visible {
@@ -962,21 +976,6 @@ kbd {
   flex: 1 1 0;
   min-width: 0;
   padding: 8px 10px;
-}
-
-.session-when {
-  font-weight: 500;
-  color: var(--text);
-}
-
-.session-datasets {
-  margin-top: 2px;
-  font-size: 11px;
-  color: var(--text-dim);
-  font-family: var(--font-mono);
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
 }
 
 .sidebar-list-empty {
@@ -2481,7 +2480,7 @@ kbd {
 }
 
 .message:hover .message-actions,
-.message-actions:focus-within {
+.message-actions:has(:focus-visible) {
   opacity: 1;
   pointer-events: auto;
 }

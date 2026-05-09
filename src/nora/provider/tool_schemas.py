@@ -454,6 +454,34 @@ _LIST_SESSION_FILES_DESC = (
 )
 
 
+_INSTALL_PACKAGES_DESC = (
+    "Install, remove, or reinstall packages on the researcher's "
+    "machine for R, Python, or Stata. Out-of-band from submit_script "
+    "(which runs sandboxed with no network); this tool runs the "
+    "language's package manager directly so it CAN reach CRAN / PyPI "
+    "/ SSC and write the user library.\n\n"
+    "Confirm with the researcher in chat BEFORE calling this tool. "
+    "When a script fails because a package is missing, name the "
+    "missing packages and ask 'install these?' Wait for an explicit "
+    "yes. Don't install on your own initiative.\n\n"
+    "Privacy: an install fetches public package code from a "
+    "canonical registry and writes to the user's library; no "
+    "researcher data participates. Repos / index URLs are hard-"
+    "coded (CRAN cloud mirror for R, default index for pip, SSC for "
+    "Stata) — there is no parameter to redirect to a custom mirror.\n\n"
+    "Names: only canonical-registry package names. The validator "
+    "accepts ``[A-Za-z0-9._-]+`` only; spaces, quotes, slashes, "
+    "version pins (``pkg==1.2.3``), and pip extras (``pkg[extra]``) "
+    "are rejected. Install whatever's on the registry; if the "
+    "researcher needs a specific version, they can pin it by hand.\n\n"
+    "Arguments:\n"
+    "  language: 'R', 'Python', or 'Stata'.\n"
+    "  packages: list of package names to act on. Required.\n"
+    "  action: 'install' (default), 'remove', or 'reinstall'. "
+    "'reinstall' first removes (best-effort) then installs fresh."
+)
+
+
 _SEARCH_IN_SESSION_FILES_DESC = (
     "Search the contents of script and log files in the session for "
     "a case-insensitive substring. Returns matching lines with file "
@@ -714,6 +742,19 @@ def build_tool_specs() -> tuple[ToolSpec, ...]:
                 "max_matches_per_file": {"type": "integer"},
             },
             required=("query",),
+        ),
+        _spec(
+            "install_packages",
+            _INSTALL_PACKAGES_DESC,
+            properties={
+                "language": {"type": "string"},
+                "packages": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                },
+                "action": {"type": "string"},
+            },
+            required=("language", "packages"),
         ),
     )
 

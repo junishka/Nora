@@ -57,11 +57,15 @@ from pathlib import Path
 from typing import Optional
 
 
-# Hard caps. Intentionally generous on the per-arg side (so a
-# KeyError with a 50-char column name passes through verbatim) and
-# tight overall (so a single failure can't blow the budget).
-MAX_EXCERPT_BYTES = 1000
-MAX_QUOTED_ARG_BYTES = 200
+# Overall hard caps. Generous on both axes so a verbose R error
+# block or a many-frame Python traceback comes through intact — the
+# model diagnoses from the FULL idiom, not a single line of it.
+# The privacy guarantee comes from the tightly-anchored patterns
+# (only matched error idioms forward, never arbitrary stdout); the
+# cap is defense-in-depth, not the boundary itself, so it can sit
+# well above typical error sizes without changing the threat model.
+MAX_EXCERPT_BYTES = 8000
+MAX_QUOTED_ARG_BYTES = 400
 # Per-exception-body cap. Exception bodies are the one channel where
 # script-controlled text crosses the SDC boundary verbatim — a
 # script that calls ``raise RuntimeError(df.iloc[0].to_json())`` or
@@ -156,12 +160,14 @@ _PY_EXC_RE = re.compile(
 
 
 def _extract_python(stderr: str) -> Optional[str]:
-    """Pull the last user-code frame + final exception line.
+    """Pull the user-code call chain + final exception line.
 
     A typical Python traceback looks like::
 
         Traceback (most recent call last):
           File "/abs/path/script.py", line 17, in <module>
+            run_analysis(df)
+          File "/abs/path/script.py", line 9, in run_analysis
             df['typo']
           File "/.../pandas/core/frame.py", line 4090, in __getitem__
             indexer = self.columns.get_loc(key)
@@ -169,58 +175,53 @@ def _extract_python(stderr: str) -> Optional[str]:
             raise KeyError(key) from err
         KeyError: 'typo'
 
-    We want: ``File "script.py", line 17, in <module>`` + the
-    indented source line below it (if present) + ``KeyError: 'typo'``.
-    Library frames (pandas internals) are dropped - they're noise
-    and the path strip would lose context anyway.
+    We forward EVERY user-code frame (in source order) plus the final
+    exception line so the model sees the full call chain. Library
+    frames (site-packages, stdlib internals) are dropped — they're
+    noise and the basename strip would lose their context anyway.
+    Showing only the deepest user frame, as we used to, hid which
+    callsite invoked the broken function and pushed the model to
+    re-probe even when the chain was right there in the traceback.
     """
     frames = list(_PY_FRAME_RE.finditer(stderr))
     if not frames:
         # Bare exception (e.g. `raise SystemExit("x")` with no
         # traceback formatting). Still try to pluck the last
         # exception line.
-        exc = _last_python_exception_line(stderr)
-        return exc
+        return _last_python_exception_line(stderr)
 
-    # Walk frames newest-first, drop site-packages / stdlib paths,
-    # keep the first user-code one. "User code" heuristic:
-    # any path that does NOT live under a site-packages /
-    # dist-packages / typeshed / .venv / lib/python segment.
+    # "User code" heuristic: any path that does NOT live under a
+    # site-packages / dist-packages / typeshed / .venv / lib/python
+    # segment.
     LIB_PAT = re.compile(
         r"(?:/site-packages/|/dist-packages/|/lib/python[\d\.]+/"
         r"|/typeshed/|/\.venv/|/python\d+\.\d+/lib/)"
     )
-    user_frame = None
-    for m in reversed(frames):
-        if not LIB_PAT.search(m.group("path")):
-            user_frame = m
-            break
-    # If everything looks like library code (rare), still take the
-    # newest frame - better some location than none.
-    if user_frame is None:
-        user_frame = frames[-1]
-
-    # Grab the source-line below the frame (Python's traceback
-    # formatter indents it by 4 spaces). The line might be absent
-    # for tracebacks emitted via formatter overrides; that's fine.
-    source_line = ""
-    after = stderr[user_frame.end():]
-    nl = after.find("\n")
-    if nl != -1:
-        candidate = after[nl + 1:].split("\n", 1)[0]
-        if candidate.startswith("    ") and candidate.strip():
-            source_line = candidate.strip()
-
-    exc_line = _last_python_exception_line(stderr) or ""
+    user_frames = [m for m in frames if not LIB_PAT.search(m.group("path"))]
+    if not user_frames:
+        # All frames look like library code (rare — usually means the
+        # script is a one-liner with no user-frame in the trace).
+        # Fall back to the deepest frame so the model gets some
+        # location instead of none.
+        user_frames = [frames[-1]]
 
     parts: list[str] = []
-    path = Path(user_frame.group("path")).name
-    line = user_frame.group("line")
-    func = user_frame.group("func") or ""
-    in_func = f", in {func}" if func else ""
-    parts.append(f'File "{path}", line {line}{in_func}')
-    if source_line:
-        parts.append(f"    {source_line}")
+    for frame in user_frames:
+        path = Path(frame.group("path")).name
+        line = frame.group("line")
+        func = frame.group("func") or ""
+        in_func = f", in {func}" if func else ""
+        parts.append(f'File "{path}", line {line}{in_func}')
+        # Grab the indented source-line that Python's formatter prints
+        # below the frame, when present.
+        after = stderr[frame.end():]
+        nl = after.find("\n")
+        if nl != -1:
+            candidate = after[nl + 1:].split("\n", 1)[0]
+            if candidate.startswith("    ") and candidate.strip():
+                parts.append(f"    {candidate.strip()}")
+
+    exc_line = _last_python_exception_line(stderr) or ""
     if exc_line:
         parts.append(exc_line)
     return "\n".join(parts) if parts else None

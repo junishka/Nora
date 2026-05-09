@@ -1886,12 +1886,12 @@ class NoraBridge:
             pass
 
     def list_sessions(self) -> dict[str, Any]:
-        """Return a newest-first list of past Nora sessions living
-        under ``~/.nora-sessions/``. Each entry carries the
-        absolute path, the directory name, a human-friendly timestamp,
+        """Return a list of past Nora sessions living under
+        ``~/.nora-sessions/``, sorted most-recently-worked first. Each
+        entry carries the absolute path, the directory name, the
+        creation timestamp, the last-activity timestamp (drives sort),
         the names of the data files inside, and the on-disk size in
-        bytes so the sidebar can show what's heavy. Also flags the
-        session that's currently loaded.
+        bytes. Also flags the session that's currently loaded.
         """
         current = str(self.cwd.resolve()) if self.cwd else None
         entries: list[dict[str, Any]] = []
@@ -1910,6 +1910,15 @@ class NoraBridge:
             # `20260422T160059Z_f13630f4`. Fall back to mtime if the
             # prefix doesn't match (user manually renamed, etc.).
             ts = _parse_session_timestamp(child.name) or stat.st_mtime
+            # Last activity = mtime of chat_history.jsonl (appended on
+            # every turn), fallback to dir mtime, fallback to creation.
+            # Used for sort order so the most-recently-worked session
+            # rises to the top regardless of when it was created.
+            try:
+                hist_stat = (child / ".nora" / "chat_history.jsonl").stat()
+                last_activity = hist_stat.st_mtime
+            except OSError:
+                last_activity = stat.st_mtime or ts
             datasets: list[str] = []
             try:
                 for f in child.iterdir():
@@ -1933,13 +1942,14 @@ class NoraBridge:
             entries.append({
                 "path": str(child.resolve()),
                 "name": child.name,
-                "timestamp": ts,  # epoch seconds, JS formats
+                "timestamp": ts,  # epoch seconds (creation), JS formats
+                "last_activity": last_activity,  # epoch seconds, drives sort
                 "datasets": datasets,
                 "size": _dir_size(child),
                 "title": _session_title(child),
                 "custom_name": custom,
             })
-        entries.sort(key=lambda e: e["timestamp"], reverse=True)
+        entries.sort(key=lambda e: e["last_activity"], reverse=True)
         return {"ok": True, "sessions": entries, "current": current}
 
     def delete_session(self, path: str) -> dict[str, Any]:
