@@ -104,11 +104,60 @@ KIND_PRIORITY: dict[str, int] = {
 }
 
 
+def visible_run_dir_names(cwd: Path) -> set[str] | None:
+    """Return the set of run-dir basenames that are still associated
+    with a visible (non-rewound) stored result.
+
+    The chat-rewind path hides results in the store so the model
+    can't reach them through ``list_results`` / ``expand_result``,
+    but the on-disk run dirs (and their scripts / plot thumbnails)
+    remain. Without filtering, the model can still discover and
+    read those files via ``list_session_files`` /
+    ``read_attached_file``, defeating the rewind.
+
+    Returns ``None`` (signalling "don't filter") in three cases:
+
+      * The store is unavailable / can't be opened.
+      * The store has no rows at all (fresh session — no work to
+        filter against, and test fixtures that pre-create run dirs
+        without populating the store should still see their files).
+      * The store has rows but none are hidden (no rewind has
+        happened yet, so every existing run dir is current).
+
+    Returns a (possibly empty) set when at least one row IS hidden
+    — that's the actual rewind case, where we want to filter the
+    on-disk run dirs against the visible subset. An empty set means
+    every row is hidden; the model sees no run-dir files at all.
+    """
+    try:
+        from nora.store import get_store
+        store = get_store(cwd)
+        all_rows = store.list_all(include_hidden=True)
+    except Exception:  # noqa: BLE001 — store failure shouldn't strand callers
+        return None
+
+    if not all_rows:
+        return None
+    visible_rows = [
+        r for r in all_rows if getattr(r, "hidden_at", None) is None
+    ]
+    if len(visible_rows) == len(all_rows):
+        # Nothing hidden — no filter needed.
+        return None
+    names: set[str] = set()
+    for row in visible_rows:
+        raw_log_path = getattr(row, "raw_log_path", None)
+        if raw_log_path:
+            names.add(Path(raw_log_path).name)
+    return names
+
+
 def enumerate_session_files(
     cwd: Path,
     *,
     include_data: bool = True,
     include_run_scripts: bool = True,
+    visible_run_dirs: set[str] | None = None,
 ) -> list[dict[str, Any]]:
     """Walk a session cwd and return one dict per known file.
 
@@ -183,8 +232,18 @@ def enumerate_session_files(
 
     runs_root = cwd / ".nora" / "runs"
     if runs_root.is_dir():
+        # When ``visible_run_dirs`` is supplied, skip every run dir
+        # whose basename isn't in the set — this is how the model-
+        # facing ``list_session_files`` enforces rewind: hidden
+        # results' run dirs (and their plots / scripts) stay
+        # researcher-only. ``None`` means "no filter" (the Files
+        # panel uses this so the researcher can still see and
+        # decide what to delete after a rewind).
         try:
             for run_dir in runs_root.iterdir():
+                if (visible_run_dirs is not None
+                        and run_dir.name not in visible_run_dirs):
+                    continue
                 plots_dir = run_dir / "_nora_plots"
                 if plots_dir.is_dir():
                     try:
@@ -198,7 +257,9 @@ def enumerate_session_files(
 
         if include_run_scripts:
             from nora.run_files import enumerate_run_dir_scripts
-            for entry in enumerate_run_dir_scripts(cwd):
+            for entry in enumerate_run_dir_scripts(
+                cwd, visible_run_dirs=visible_run_dirs,
+            ):
                 ext = entry.path.suffix.lower()
                 kind = classify_ext(ext, include_data=include_data) or "script"
                 priority = KIND_PRIORITY.get(kind, KIND_PRIORITY["script"])

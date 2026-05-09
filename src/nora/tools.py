@@ -26,6 +26,7 @@ See also: `project_builder_mcp_surface.md` (user memory) for the full spec.
 from __future__ import annotations
 
 import json
+import logging
 import os
 import secrets
 from pathlib import Path
@@ -815,9 +816,15 @@ async def get_schema(args: dict[str, Any]) -> dict[str, Any]:
 
     try:
         payload = schema.extract(path, depth)
-    except ValueError as e:
-        # Unsupported format, invalid depth, or a file-shape problem
-        # we can express as a user-facing reason.
+    except schema.SchemaExtractError as e:
+        # Parser-owned validation errors (unsupported format, invalid
+        # depth, .rds-without-dataframe). Their messages are crafted
+        # by ``schema.extract`` itself and are safe to forward
+        # verbatim. Note: ``SchemaExtractError`` is a subclass of
+        # ``ValueError``; we catch it BEFORE the generic ValueError
+        # path so pandas-style ``ParserError`` (also a ``ValueError``
+        # subclass, but with row content in its message) doesn't
+        # take this branch and leak data.
         return _as_mcp_text({
             "status": "error",
             "reason": str(e),
@@ -825,9 +832,26 @@ async def get_schema(args: dict[str, Any]) -> dict[str, Any]:
             "depth": depth,
         })
     except Exception as e:  # broad: lib-specific parse errors
+        # ``e`` here is whatever the underlying reader raised
+        # (pandas ParserError, pyreadstat ReadstatError, json
+        # decode errors, ...). Those messages routinely embed the
+        # offending row text or column value — surfacing them in
+        # the model-visible reason contradicts the schema tool's
+        # promise of never returning individual observation values.
+        # We log the full detail server-side and return only the
+        # exception class name to the model, which is enough to
+        # tell pandas-CSV-malformed from pyreadstat-Stata-corrupted
+        # without quoting any data.
+        logging.getLogger(__name__).warning(
+            "schema.extract failed for %s: %s", dataset, e, exc_info=True,
+        )
         return _as_mcp_text({
             "status": "error",
-            "reason": f"failed to read {dataset!r}: {e.__class__.__name__}: {e}",
+            "reason": (
+                f"failed to read {dataset!r} ({e.__class__.__name__}). "
+                f"The dataset may be malformed or corrupted; researcher "
+                f"logs have the underlying parser error."
+            ),
             "dataset": dataset,
         })
 
@@ -916,7 +940,11 @@ async def search_schema(args: dict[str, Any]) -> dict[str, Any]:
 
     try:
         payload = schema.extract(path, extract_depth)
-    except ValueError as e:
+    except schema.SchemaExtractError as e:
+        # See get_schema for why this is the FIRST except clause —
+        # SchemaExtractError extends ValueError, but we must not
+        # blanket-catch ValueError here because pandas ParserError
+        # (also a ValueError) would leak row content.
         return _as_mcp_text({
             "status": "error",
             "reason": str(e),
@@ -924,9 +952,21 @@ async def search_schema(args: dict[str, Any]) -> dict[str, Any]:
             "depth": extract_depth,
         })
     except Exception as e:  # noqa: BLE001 — broad: lib-specific parse errors
+        # See get_schema for why we drop ``str(e)`` from the
+        # model-visible reason — parser exceptions can quote the
+        # offending row content, which would defeat the schema
+        # tool's no-individual-observation guarantee.
+        logging.getLogger(__name__).warning(
+            "search_schema extract failed for %s: %s",
+            dataset, e, exc_info=True,
+        )
         return _as_mcp_text({
             "status": "error",
-            "reason": f"failed to read {dataset!r}: {e.__class__.__name__}: {e}",
+            "reason": (
+                f"failed to read {dataset!r} ({e.__class__.__name__}). "
+                f"The dataset may be malformed or corrupted; researcher "
+                f"logs have the underlying parser error."
+            ),
             "dataset": dataset,
         })
 
@@ -1380,6 +1420,20 @@ def _build_response_envelope(
         # invocation when launching the native app.
         "_language": language,
     }
+    # Surface the script's process-level exit code on EVERY envelope
+    # where the subprocess actually ran. Earlier code only set
+    # ``exit_code`` on the failure branches (execution_failed /
+    # execution_failed_partial), which left the success path silently
+    # without an exit code — useful information for the model
+    # (confirms the script exited cleanly, not killed by sandbox /
+    # timeout) and required by tests that assert
+    # ``body["exit_code"] == 0`` on the clean-exit-with-warnings
+    # path. ``exit_code`` is None when the executor short-circuited
+    # before running the subprocess at all (sandbox preflight
+    # failure, missing interpreter); we omit the field then so the
+    # model isn't misled by a fake zero.
+    if exec_result.exit_code is not None:
+        response["exit_code"] = exec_result.exit_code
     if shared_transformations:
         response["transformations_summary"] = shared_transformations
     if inline_payload_omitted:
@@ -1430,13 +1484,15 @@ def _attach_status_metadata(
         )
 
     if overall_status in ("execution_failed", "execution_failed_partial"):
-        # Add the script-level error context: reason, exit code, and
-        # a bounded debug_excerpt of stdout/stderr so the model can
-        # diagnose the abort. The partial-success branch carries this
+        # Add the script-level error context: reason and a bounded
+        # debug_excerpt of stdout/stderr so the model can diagnose
+        # the abort. ``exit_code`` is already on the envelope from
+        # ``_build_response_envelope`` for every run that reached
+        # the subprocess; setting it again here would be redundant.
+        # The partial-success branch carries reason+excerpt
         # ALONGSIDE the partial results; the bare-failure branch
         # carries it alone (or alongside rejection-only rows).
         response["reason"] = exec_result.error
-        response["exit_code"] = exec_result.exit_code
         from nora.error_summary import extract_debug_excerpt
         excerpt = extract_debug_excerpt(
             exec_result.raw_stdout,
@@ -1790,8 +1846,12 @@ async def submit_script_file(args: dict[str, Any]) -> dict[str, Any]:
     if target is None:
         try:
             from nora.run_files import find_run_dir_script_by_name
+            from nora.session_files import visible_run_dir_names
             cwd = get_cwd()
-            candidate = find_run_dir_script_by_name(cwd, safe_name)
+            candidate = find_run_dir_script_by_name(
+                cwd, safe_name,
+                visible_run_dirs=visible_run_dir_names(cwd),
+            )
         except Exception:  # noqa: BLE001
             candidate = None
         if candidate is not None and candidate.is_file():
@@ -2051,6 +2111,107 @@ async def expand_result(args: dict[str, Any]) -> dict[str, Any]:
 # Tool: compose_results
 # ---------------------------------------------------------------------------
 
+# Hard caps on the layout spec. The model emits this object, and the
+# whole point of compose_results is to keep the comparison table
+# *out* of the conversation as raw numbers — instead the model names
+# IDs, and we render the table from sanitized payloads. Without caps
+# a malformed (or runaway) spec can produce a multi-MB markdown blob
+# that defeats the context-economy goal of the feature.
+#
+# Picked from operator experience: research papers rarely report a
+# composite table wider than ~12 model columns, and the longest
+# academic regression-table run we've seen had ~40 outcome rows
+# spread across ~6 groups. The caps below give 2× headroom on each
+# axis and a strict total-rows budget that stops a Cartesian
+# explosion (50 groups × 50 rows = 2,500 rendered rows). Spec
+# rejection is loud — a structured "too_large" denial — so the model
+# can split the call into pages instead of silently truncating.
+_COMPOSE_MAX_COLUMNS = 25
+_COMPOSE_MAX_GROUPS = 25
+_COMPOSE_MAX_ROWS_PER_GROUP = 100
+_COMPOSE_MAX_TOTAL_ROWS = 250
+_COMPOSE_MAX_LABEL_LEN = 200
+
+
+def _validate_compose_spec(spec: dict[str, Any]) -> str | None:
+    """Pre-render hard-cap validator. Returns an error reason on
+    over-size specs, or ``None`` when the spec passes.
+
+    Doesn't validate shape correctness — ``compose_layout`` already
+    rejects malformed specs with ``None``. This guard runs first so
+    a 10,000-row spec gets rejected with bytes-saved rather than
+    rendered into the model's context.
+    """
+    columns = spec.get("columns")
+    groups = spec.get("groups")
+    if isinstance(columns, list) and len(columns) > _COMPOSE_MAX_COLUMNS:
+        return (
+            f"spec.columns has {len(columns)} entries, over the "
+            f"{_COMPOSE_MAX_COLUMNS}-column cap. A wider table won't "
+            f"render usefully in the response — split into multiple "
+            f"compose_results calls grouped by topic."
+        )
+    if isinstance(groups, list) and len(groups) > _COMPOSE_MAX_GROUPS:
+        return (
+            f"spec.groups has {len(groups)} entries, over the "
+            f"{_COMPOSE_MAX_GROUPS}-group cap. Combine related groups "
+            f"or paginate into multiple compose_results calls."
+        )
+    total_rows = 0
+    if isinstance(groups, list):
+        for idx, group in enumerate(groups):
+            if not isinstance(group, dict):
+                continue
+            rows = group.get("rows")
+            if not isinstance(rows, list):
+                continue
+            if len(rows) > _COMPOSE_MAX_ROWS_PER_GROUP:
+                return (
+                    f"spec.groups[{idx}].rows has {len(rows)} entries, "
+                    f"over the {_COMPOSE_MAX_ROWS_PER_GROUP}-row "
+                    f"per-group cap. Split this group into smaller "
+                    f"groups."
+                )
+            total_rows += len(rows)
+            for row in rows:
+                if not isinstance(row, dict):
+                    continue
+                rlabel = row.get("label")
+                if (isinstance(rlabel, str)
+                        and len(rlabel) > _COMPOSE_MAX_LABEL_LEN):
+                    return (
+                        f"a row label is {len(rlabel)} chars, over "
+                        f"the {_COMPOSE_MAX_LABEL_LEN}-char label cap. "
+                        f"Shorten the label."
+                    )
+    if total_rows > _COMPOSE_MAX_TOTAL_ROWS:
+        return (
+            f"spec has {total_rows} total rows across all groups, "
+            f"over the {_COMPOSE_MAX_TOTAL_ROWS}-row total cap. "
+            f"Paginate into multiple compose_results calls."
+        )
+    if isinstance(columns, list):
+        for c in columns:
+            if not isinstance(c, dict):
+                continue
+            clabel = c.get("label")
+            if (isinstance(clabel, str)
+                    and len(clabel) > _COMPOSE_MAX_LABEL_LEN):
+                return (
+                    f"a column label is {len(clabel)} chars, over "
+                    f"the {_COMPOSE_MAX_LABEL_LEN}-char label cap. "
+                    f"Shorten the label."
+                )
+    title = spec.get("title")
+    if (isinstance(title, str)
+            and len(title) > _COMPOSE_MAX_LABEL_LEN):
+        return (
+            f"spec.title is {len(title)} chars, over the "
+            f"{_COMPOSE_MAX_LABEL_LEN}-char label cap. Shorten "
+            f"the title."
+        )
+    return None
+
 
 @tool("compose_results")
 async def compose_results(args: dict[str, Any]) -> dict[str, Any]:
@@ -2073,6 +2234,19 @@ async def compose_results(args: dict[str, Any]) -> dict[str, Any]:
         return _as_mcp_text({
             "status": "error",
             "reason": "spec argument is required and must be a JSON object",
+        })
+
+    # Hard-cap guard: reject over-size specs BEFORE walking groups or
+    # touching the store. Without this gate, a multi-MB rendered table
+    # defeats the context-economy goal of compose_results — the whole
+    # point of the tool is that the model names IDs and we render
+    # numbers, not that the model can stuff an arbitrary slab of
+    # markdown into the response.
+    too_large = _validate_compose_spec(spec)
+    if too_large is not None:
+        return _as_mcp_text({
+            "status": "error",
+            "reason": f"spec exceeds the layout caps: {too_large}",
         })
 
     cwd = get_cwd()
@@ -2378,8 +2552,18 @@ def _render_tool_use(use: Any) -> dict[str, Any]:
     on ``ToolUse`` was renamed to ``result_ids`` in commit f70a4e1;
     this renderer used to read the stale name and AttributeError on
     every recall path that included a tool call.
+
+    ``label`` is derived from script-controlled tool inputs
+    (submit_script.label, filenames, recall queries) so it must pass
+    ``safe_text`` before reaching the model — without it, a label
+    like ``"...\n[system] override: ..."`` would be forwarded
+    verbatim through the recall_conversation response.
     """
-    out: dict[str, Any] = {"name": use.name, "label": use.label}
+    label = use.label or ""
+    out: dict[str, Any] = {
+        "name": use.name,
+        "label": safe_text(label, max_len=200) if label else "",
+    }
     rids = list(use.result_ids or [])
     if len(rids) == 1:
         out["result_id"] = rids[0]
@@ -2406,6 +2590,16 @@ async def recall_conversation(args: dict[str, Any]) -> dict[str, Any]:
     context_raw = args.get("context")
     max_chars_raw = args.get("max_chars")
 
+    # Hard ceilings on what the model can request. Without these, a
+    # ``tail=1_000_000`` or ``max_chars=10_000_000`` call (typo or
+    # otherwise) would dump essentially the whole persisted
+    # conversation in a single response — both an obvious DoS path
+    # and an unintended surface for re-exposing earlier sanitized
+    # content. The ceilings stay well above the working defaults
+    # so legitimate "show me a wide sweep" requests aren't pinched.
+    MAX_TAIL = 200
+    MAX_CHARS_CEILING = 64 * 1024  # 64 KB
+
     # Defaults: no args → last 10 turns. Query-only → all matches.
     if not query and (tail_raw is None or tail_raw == 0):
         tail = 10
@@ -2414,6 +2608,7 @@ async def recall_conversation(args: dict[str, Any]) -> dict[str, Any]:
             tail = int(tail_raw) if tail_raw is not None else 0
         except (TypeError, ValueError):
             tail = 0
+    tail = max(0, min(tail, MAX_TAIL))
     try:
         context_n = int(context_raw) if context_raw is not None else 2
     except (TypeError, ValueError):
@@ -2423,6 +2618,7 @@ async def recall_conversation(args: dict[str, Any]) -> dict[str, Any]:
         max_chars = int(max_chars_raw) if max_chars_raw is not None else 8000
     except (TypeError, ValueError):
         max_chars = 8000
+    max_chars = max(256, min(max_chars, MAX_CHARS_CEILING))
 
     turns = _read_turns(get_cwd())
     if not turns:
@@ -2514,12 +2710,30 @@ async def recall_conversation(args: dict[str, Any]) -> dict[str, Any]:
     if chronological_output:
         rendered.reverse()
 
-    return _as_mcp_text({
+    response: dict[str, Any] = {
         "status": "ok",
         "turn_count": turn_count,
         "returned": len(rendered),
         "turns": rendered,
-    })
+    }
+    # Tell the model when we hit a clamp ceiling on either knob so it
+    # pages deliberately rather than silently re-asking for the same
+    # over-cap value.
+    if tail_raw is not None:
+        try:
+            asked_tail = int(tail_raw)
+        except (TypeError, ValueError):
+            asked_tail = None
+        if asked_tail is not None and asked_tail > MAX_TAIL:
+            response["tail_clamped_to"] = MAX_TAIL
+    if max_chars_raw is not None:
+        try:
+            asked_chars = int(max_chars_raw)
+        except (TypeError, ValueError):
+            asked_chars = None
+        if asked_chars is not None and asked_chars > MAX_CHARS_CEILING:
+            response["max_chars_clamped_to"] = MAX_CHARS_CEILING
+    return _as_mcp_text(response)
 
 
 # ---------------------------------------------------------------------------
@@ -2532,6 +2746,14 @@ async def recall_conversation(args: dict[str, Any]) -> dict[str, Any]:
 _RECALL_SCRIPT_EXTS: frozenset[str] = frozenset({
     ".py", ".do", ".r", ".rmd",
 })
+# Notebooks are JSON envelopes with a mix of code cells (safe) and
+# output cells (NOT safe — outputs may carry raw DataFrame prints,
+# ``list``/``summarize`` rows, etc., that the SDC sanitizer normally
+# strips). We extract the *source* of code and markdown cells, drop
+# all outputs, and surface the result as a script-like text payload.
+# Listed separately from ``_RECALL_SCRIPT_EXTS`` because the codepath
+# is different (parse → extract → assemble).
+_RECALL_NOTEBOOK_EXTS: frozenset[str] = frozenset({".ipynb"})
 _RECALL_IMAGE_MIMES: dict[str, str] = {
     ".png": "image/png",
     ".jpg": "image/jpeg",
@@ -2541,6 +2763,97 @@ _RECALL_IMAGE_MIMES: dict[str, str] = {
 # the existing sips-backed sidecar (same path the Files panel uses)
 # rather than shipping the original PDF — vision wants raster.
 _RECALL_RASTERIZE_EXTS: frozenset[str] = frozenset({".pdf", ".eps"})
+
+
+def _manifest_allowed_plot_kinds(plots_dir: Path, basename: str) -> str | None:
+    """Return the manifest-recorded ``kind`` for ``basename`` in
+    ``plots_dir``, or ``None`` if the file isn't manifest-listed.
+
+    The manifest is the SDC chokepoint: ``_capture_plots`` only
+    surfaces files whose entry has a ``kind`` in the allowlist
+    (``interaction`` / ``coefficients`` / ``marginal_effects``).
+    Files written into ``_nora_plots/`` without a manifest entry
+    (e.g. a ``residuals.png`` from ``nora.plot_residuals`` — kept
+    researcher-only because residual values are individual
+    observations) MUST NOT be recallable as image bytes either,
+    or the disclosure-control posture is undone via this side door.
+    """
+    manifest = plots_dir / "manifest.jsonl"
+    if not manifest.is_file():
+        return None
+    try:
+        text = manifest.read_text(encoding="utf-8")
+    except OSError:
+        return None
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        try:
+            entry = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(entry, dict):
+            continue
+        file = entry.get("file")
+        kind = entry.get("kind")
+        if (isinstance(file, str) and file == basename
+                and isinstance(kind, str)):
+            return kind
+    return None
+
+
+def _is_disclosure_safe_image(target: Path, cwd: Path) -> bool:
+    """Whether ``target`` is an image we may return through the recall
+    path without bypassing the SDC posture.
+
+    Two paths are safe:
+
+    1. The target lives under ``<cwd>/.nora/runs/<id>/_nora_plots/``
+       AND that run's ``manifest.jsonl`` lists the file with a kind
+       in the helper allowlist. These files were already eligible
+       to ride the next turn through ``_capture_plots`` — recall
+       just lets the model fetch one explicitly later.
+
+    2. (No other path is safe.) Arbitrary cwd PNGs (a researcher's
+       ``plt.savefig("scatter.png")`` from a non-helper script,
+       exported tables in PDF, etc.) are NOT vetted by any helper
+       and would be a vision side channel around the JSON
+       sanitizer. Same for ``.gph`` Stata files (rasterising those
+       reveals raw observations the JSON sanitizer would have
+       suppressed).
+
+    A researcher who wants the model to see an arbitrary plot can
+    drag-drop or @-mention it into the next message; that path runs
+    through the composer's vision-input flow and is the documented
+    "researcher-explicit" channel.
+    """
+    runs_root = (cwd / ".nora" / "runs").resolve() if cwd is not None else None
+    if runs_root is None:
+        return False
+    try:
+        target_resolved = target.resolve()
+    except OSError:
+        return False
+    if not target_resolved.is_relative_to(runs_root):
+        return False
+    # ``<runs_root>/<run_id>/_nora_plots/<basename>`` — the parent
+    # must be a ``_nora_plots`` directory directly under a run dir.
+    parent = target_resolved.parent
+    if parent.name != "_nora_plots":
+        return False
+    try:
+        parent.parent.relative_to(runs_root)
+    except ValueError:
+        return False
+    kind = _manifest_allowed_plot_kinds(parent, target_resolved.name)
+    if kind is None:
+        return False
+    # Import the runner's allowlist to keep a single source of
+    # truth for what kinds are disclosure-safe; avoids drift if
+    # the allowlist ever grows or shrinks.
+    from nora.runner import _PLOT_KIND_ALLOWLIST
+    return kind in _PLOT_KIND_ALLOWLIST
 # Per-file caps. Scripts: 96 KB. Most analysis scripts (Stata do-files,
 # Python pipelines, R scripts) fit whole. Over-cap files come back
 # head+tail-truncated (see below) so the imports up top AND the
@@ -2639,9 +2952,19 @@ async def read_attached_file(args: dict[str, Any]) -> dict[str, Any]:
                 cwd_resolved = cwd.resolve()
             except OSError:
                 cwd_resolved = None
+            # Rewind enforcement: only walk run dirs whose run is
+            # still associated with a visible (non-hidden) result.
+            # ``None`` from the helper means "store unavailable";
+            # treat that as "no rewind to enforce" so a fresh
+            # session before any results still works.
+            from nora.session_files import visible_run_dir_names
+            visible_runs = visible_run_dir_names(cwd)
             if cwd_resolved is not None:
                 try:
                     for run_dir in runs_root.iterdir():
+                        if (visible_runs is not None
+                                and run_dir.name not in visible_runs):
+                            continue
                         plots_dir = run_dir / "_nora_plots"
                         if not plots_dir.is_dir():
                             continue
@@ -2674,10 +2997,18 @@ async def read_attached_file(args: dict[str, Any]) -> dict[str, Any]:
     # model can pass back what it saw in ``list_session_files``
     # output. Containment back into cwd is implicit — the helper
     # only walks ``<cwd>/.nora/runs``.
+    #
+    # Same rewind enforcement as the plot-dir walk above: pass the
+    # visible-run-dir set so a script from a discarded branch can't
+    # be re-fetched by name.
     if target is None or not target.is_file():
         try:
             from nora.run_files import find_run_dir_script_by_name
-            candidate = find_run_dir_script_by_name(cwd, safe_name)
+            from nora.session_files import visible_run_dir_names
+            candidate = find_run_dir_script_by_name(
+                cwd, safe_name,
+                visible_run_dirs=visible_run_dir_names(cwd),
+            )
         except Exception:  # noqa: BLE001
             candidate = None
         if candidate is not None and candidate.is_file():
@@ -2689,6 +3020,65 @@ async def read_attached_file(args: dict[str, Any]) -> dict[str, Any]:
         })
 
     ext = target.suffix.lower()
+
+    # ----- notebook branch ---------------------------------------------
+    # ``list_session_files`` advertises ``.ipynb`` as a script-kind
+    # file, so the model expects to be able to recall it. Earlier the
+    # model got a "rejected" — the file existed and was advertised but
+    # not retrievable, a discoverability/recovery mismatch. We now
+    # extract the notebook's code + markdown cell source (dropping
+    # outputs, which can carry raw DataFrame rows that the JSON
+    # sanitizer would normally strip from a result) and return it as
+    # script-like text. Outputs are NOT included — that's the SDC line.
+    if ext in _RECALL_NOTEBOOK_EXTS:
+        try:
+            blob = target.read_bytes()
+        except OSError as e:
+            return _as_mcp_text({
+                "status": "error",
+                "reason": f"could not read {safe_name}: {e}",
+            })
+        original_size = len(blob)
+        text, code_cells, markdown_cells = _extract_notebook_source(blob)
+        if not text:
+            return _as_mcp_text({
+                "status": "error",
+                "reason": (
+                    f"{safe_name} parsed as a notebook but has no "
+                    f"recognisable cells (malformed JSON, or empty)"
+                ),
+            })
+        encoded = text.encode("utf-8")
+        truncated = False
+        if len(encoded) > _RECALL_SCRIPT_MAX_BYTES:
+            half = _RECALL_SCRIPT_MAX_BYTES // 2
+            head = encoded[:half]
+            tail = encoded[-half:]
+            elided = len(encoded) - len(head) - len(tail)
+            marker = (
+                f"\n\n# [... {elided} bytes elided by Nora's "
+                f"read_attached_file head+tail truncation ...]\n\n"
+            ).encode("utf-8")
+            text = (head + marker + tail).decode("utf-8", errors="replace")
+            truncated = True
+        return _as_mcp_text({
+            "status": "ok",
+            "name": safe_name,
+            "kind": "notebook",
+            "ext": ext,
+            "language": _ext_to_language(ext),
+            "size": original_size,
+            "code_cells": code_cells,
+            "markdown_cells": markdown_cells,
+            "truncated": truncated,
+            "content": text,
+            "note": (
+                "Notebook outputs are stripped to keep raw DataFrame "
+                "prints / list rows out of context — only cell source "
+                "is returned. To run the notebook's code, paste it "
+                "into submit_script with language='Python'."
+            ),
+        })
 
     # ----- script branch -----------------------------------------------
     if ext in _RECALL_SCRIPT_EXTS:
@@ -2741,6 +3131,28 @@ async def read_attached_file(args: dict[str, Any]) -> dict[str, Any]:
 
     # ----- image branch ------------------------------------------------
     if ext in _RECALL_IMAGE_MIMES or ext in _RECALL_RASTERIZE_EXTS:
+        # Disclosure-control gate: only manifest-allowlisted helper
+        # plots may cross to the model as vision bytes. Without this,
+        # a ``residuals.png`` from ``nora.plot_residuals`` (kind
+        # deliberately excluded from the per-turn capture path
+        # because residuals are individual observations) or an
+        # arbitrary ``plt.savefig`` PNG in cwd would slip past the
+        # JSON sanitizer via this side channel. See
+        # ``_is_disclosure_safe_image`` for the full rationale.
+        if not _is_disclosure_safe_image(target, cwd):
+            return _as_mcp_text({
+                "status": "rejected",
+                "reason": (
+                    f"{safe_name} is an image, but it isn't a helper-"
+                    f"sanitized plot (no manifest entry with an "
+                    f"SDC-allowed kind). Image recall is restricted to "
+                    f"plots produced by Nora's plot helpers "
+                    f"(plot_interaction / plot_coefficients / "
+                    f"plot_marginal_effects). Ask the researcher to "
+                    f"re-attach the file in their next message if you "
+                    f"need to see it again."
+                ),
+            })
         blob_path = target
         mime = _RECALL_IMAGE_MIMES.get(ext)
         if ext in _RECALL_RASTERIZE_EXTS:
@@ -2814,7 +3226,8 @@ async def read_attached_file(args: dict[str, Any]) -> dict[str, Any]:
         "status": "rejected",
         "reason": (
             f"{safe_name} is a {ext or 'unknown'} file; only scripts "
-            f"(.py / .do / .r / .rmd) and images (.png / .jpg / .jpeg / "
+            f"(.py / .do / .r / .rmd), notebooks (.ipynb — code + "
+            f"markdown cells only), and images (.png / .jpg / .jpeg / "
             f".pdf / .eps) can be recalled through this tool. For "
             f"datasets use get_schema; for stored results use "
             f"expand_result."
@@ -2830,12 +3243,81 @@ def _ext_to_language(ext: str) -> str:
         ".do": "Stata",
         ".r": "R",
         ".rmd": "R Markdown",
+        ".ipynb": "Python",
     }.get(ext, "unknown")
+
+
+def _extract_notebook_source(blob: bytes) -> tuple[str, int, int]:
+    """Extract the source of a Jupyter notebook's code + markdown cells,
+    discarding outputs.
+
+    Returns ``(text, code_cells, markdown_cells)``.
+
+    Output cells are dropped because they may carry raw DataFrame
+    prints, ``list``/``summarize`` rows, regression tables, etc.,
+    that the JSON sanitizer normally strips out of result payloads.
+    Re-surfacing them through the recall path would be a side
+    channel around SDC. The source (cell.source) IS the model's
+    legitimate target — same character of content as a ``.py``
+    script.
+
+    Markdown cells are kept as comment blocks (``# ...``) so the
+    researcher's narrative survives the round-trip; non-Python
+    content can't accidentally execute when the model later treats
+    the recall output as Python source.
+    """
+    try:
+        nb = json.loads(blob.decode("utf-8", errors="replace"))
+    except json.JSONDecodeError:
+        return "", 0, 0
+    cells = nb.get("cells")
+    if not isinstance(cells, list):
+        return "", 0, 0
+    parts: list[str] = []
+    code_cells = 0
+    markdown_cells = 0
+    for idx, cell in enumerate(cells, start=1):
+        if not isinstance(cell, dict):
+            continue
+        cell_type = cell.get("cell_type")
+        source = cell.get("source")
+        # nbformat stores source as either a list of lines or a single
+        # string. Normalize to one text blob.
+        if isinstance(source, list):
+            text = "".join(s for s in source if isinstance(s, str))
+        elif isinstance(source, str):
+            text = source
+        else:
+            continue
+        if not text:
+            continue
+        if cell_type == "code":
+            code_cells += 1
+            parts.append(f"# --- cell {idx} (code) ---\n{text.rstrip()}\n")
+        elif cell_type == "markdown":
+            markdown_cells += 1
+            commented = "\n".join(
+                f"# {line}" if line else "#"
+                for line in text.rstrip().splitlines()
+            )
+            parts.append(f"# --- cell {idx} (markdown) ---\n{commented}\n")
+        # raw cells: skip — not source the model can usefully read.
+    return "\n".join(parts), code_cells, markdown_cells
 
 
 # ---------------------------------------------------------------------------
 # Tool: list_session_files
 # ---------------------------------------------------------------------------
+
+# Caps mirror list_results: a busy project directory or a script that
+# emits dozens of plot files would otherwise ship the entire enumeration
+# into one tool result. Names are bounded data-origin strings (each
+# goes through ``safe_text``), so the listing is also a small but real
+# context channel — capping limits how much of it the model can pull
+# in a single round-trip.
+_LIST_SESSION_FILES_DEFAULT_LIMIT = 100
+_LIST_SESSION_FILES_HARD_CAP = 500
+
 
 @tool("list_session_files")
 async def list_session_files(args: dict[str, Any]) -> dict[str, Any]:
@@ -2846,6 +3328,12 @@ async def list_session_files(args: dict[str, Any]) -> dict[str, Any]:
     SDC schema-depth policy. Listing them through this tool would
     create a second discovery path that bypasses the policy story.
     The shared taxonomy lives in :mod:`nora.session_files`.
+
+    Capped at ``_LIST_SESSION_FILES_HARD_CAP`` rows mtime-desc. Same
+    posture as ``list_results``: ``total`` and ``truncated`` fields
+    let the model know when the listing was clipped, so it can
+    refine via ``search_in_session_files`` rather than scrolling
+    through hundreds of names.
     """
     from datetime import datetime, timezone
     from nora.session_files import NON_DATA_KINDS, classify_ext
@@ -2925,11 +3413,22 @@ async def list_session_files(args: dict[str, Any]) -> dict[str, Any]:
     # — the chat history may have scrolled away or been rewound, and
     # the Files panel surfaces them but the model's own tool view
     # didn't. The display name matches what the panel shows.
+    #
+    # Rewind-aware: ``visible_run_dir_names`` returns the basenames
+    # of run dirs that still have a non-hidden result. After a
+    # rewind, the on-disk run dir for a discarded branch is still
+    # there but its results are hidden — without this filter the
+    # model could still discover and read the script through this
+    # listing.
     if "script" in keep_kinds:
         from datetime import datetime as _dt, timezone as _tz
         from nora.run_files import enumerate_run_dir_scripts
+        from nora.session_files import visible_run_dir_names
+        visible_runs = visible_run_dir_names(cwd)
         seen_paths = {r.get("name") for r in rows}
-        for entry in enumerate_run_dir_scripts(cwd):
+        for entry in enumerate_run_dir_scripts(
+            cwd, visible_run_dirs=visible_runs,
+        ):
             name = safe_text(entry.display_name)
             if not name or name in seen_paths:
                 continue
@@ -2951,14 +3450,29 @@ async def list_session_files(args: dict[str, Any]) -> dict[str, Any]:
     # whatever order the tuple comparator gave us (rare in practice
     # — sub-second filesystem timestamps).
     rows.sort(key=lambda r: r["mtime"], reverse=True)
+    # Counts are computed from the FULL set so the model still sees
+    # honest totals when truncation fires. Then we cap the rendered
+    # ``files`` list at the hard cap; ``total`` and ``truncated``
+    # advertise the cut.
     counts = {k: 0 for k in NON_DATA_KINDS}
     for r in rows:
         counts[r["kind"]] += 1
+    requested_limit = args.get("limit", 0)
+    if not isinstance(requested_limit, int) or requested_limit <= 0:
+        limit = _LIST_SESSION_FILES_DEFAULT_LIMIT
+    else:
+        limit = min(requested_limit, _LIST_SESSION_FILES_HARD_CAP)
+    total = len(rows)
+    truncated = total > limit
+    listed = rows[:limit]
     return _as_mcp_text({
         "status": "ok",
-        "files": rows,
+        "files": listed,
         "counts": counts,
-        "total": len(rows),
+        "total": total,
+        "count": len(listed),
+        "limit": limit,
+        "truncated": truncated,
     })
 
 
@@ -3108,20 +3622,22 @@ async def search_in_session_files(args: dict[str, Any]) -> dict[str, Any]:
             # Recovery hint depends on whether read_attached_file
             # actually accepts this file type. The earlier message
             # said "use read_attached_file" universally, but that
-            # tool refuses .log / .smcl / .ipynb (their bytes can
-            # carry raw rows or cell outputs the SDC sanitizer
-            # normally strips, so they're outside the recall
-            # contract). Telling the model to call read_attached_file
-            # on a 256 KB+ log produced a guaranteed failed follow-up
-            # in a common path. For those, the right move is to ask
-            # the researcher for the relevant snippet directly.
-            if ext in _RECALL_SCRIPT_EXTS:
+            # tool refuses .log / .smcl (their bytes can carry raw
+            # rows that the SDC sanitizer normally strips, so they're
+            # outside the recall contract). Telling the model to call
+            # read_attached_file on a 256 KB+ log produced a
+            # guaranteed failed follow-up in a common path. For
+            # those, the right move is to ask the researcher for the
+            # relevant snippet directly. Notebooks (.ipynb) ARE
+            # recallable now (code + markdown cells, outputs
+            # stripped) so they fall into the script-recovery branch.
+            if ext in _RECALL_SCRIPT_EXTS or ext in _RECALL_NOTEBOOK_EXTS:
                 recover_hint = "use read_attached_file to fetch it"
             else:
                 recover_hint = (
                     "ask the researcher to paste the relevant snippet "
-                    "(read_attached_file refuses .log / .smcl / .ipynb "
-                    "to keep raw rows and cell outputs out of context)"
+                    "(read_attached_file refuses .log / .smcl to keep "
+                    "raw rows out of context)"
                 )
             skipped.append({
                 "name": name,

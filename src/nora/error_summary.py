@@ -57,15 +57,46 @@ from pathlib import Path
 from typing import Optional
 
 
-# Hard caps. Generous on both axes so a verbose R error block or a
-# many-frame Python traceback comes through intact — the model
-# diagnoses from the FULL idiom, not a single line of it. The
-# privacy guarantee comes from the tightly-anchored patterns
+# Overall hard caps. Generous on both axes so a verbose R error
+# block or a many-frame Python traceback comes through intact — the
+# model diagnoses from the FULL idiom, not a single line of it.
+# The privacy guarantee comes from the tightly-anchored patterns
 # (only matched error idioms forward, never arbitrary stdout); the
 # cap is defense-in-depth, not the boundary itself, so it can sit
 # well above typical error sizes without changing the threat model.
 MAX_EXCERPT_BYTES = 8000
 MAX_QUOTED_ARG_BYTES = 400
+# Per-exception-body cap. Exception bodies are the one channel where
+# script-controlled text crosses the SDC boundary verbatim — a
+# script that calls ``raise RuntimeError(df.iloc[0].to_json())`` or
+# ``stop(df$secret[1])`` would otherwise smuggle raw cell content
+# through here. Legitimate exception messages ("'typo'",
+# "object 'wage' not found", "[Errno 2] No such file") are well
+# under 80 chars; longer bodies are usually data dumps and get
+# truncated. The data-shape detector below handles the rest.
+MAX_EXCEPTION_MSG_BYTES = 80
+
+
+# Patterns that suggest an exception body is a data dump rather than
+# a parser-owned diagnostic. Conservative on purpose — must not fire
+# on common shapes like ``[Errno 2]`` or ``KeyError: ['col1','col2']``.
+# The two patterns target the canonical exfil shapes:
+#
+#   * JSON dict from ``df.iloc[0].to_json()`` — at least one
+#     ``key:value`` pair inside braces.
+#   * Multi-cell row from ``df.to_csv()`` / ``str(row)`` —
+#     six-or-more comma-separated tokens (low enough to catch
+#     row dumps, high enough that ``KeyError: ['a','b','c','d']``
+#     still passes through).
+#
+# Anything narrower than these patterns rides the
+# ``MAX_EXCEPTION_MSG_BYTES`` cap. Documented residual risk in
+# ``_scrub_exception_body``.
+_DATA_SHAPED_RE = re.compile(
+    r'\{[^{}\n]*:[^{}\n]*\}'             # JSON-ish dict (key:value)
+    r'|(?:[^,\n]{1,40},\s*){5,}'         # 6+ comma-separated tokens
+)
+_REDACTED_DATA_BODY = "[message body suppressed: looked data-shaped]"
 
 
 # -----------------------------------------------------------------
@@ -210,11 +241,7 @@ def _last_python_exception_line(stderr: str) -> Optional[str]:
     flush = [m for m in matches if not stderr[max(m.start() - 1, 0)].isspace()]
     chosen = flush[-1] if flush else matches[-1]
     msg = chosen.group("msg") or ""
-    # Truncate a single dumpy arg in place. Length-aware: if the
-    # whole message body is huge (a 5KB pandas repr), keep only
-    # the head.
-    if len(msg) > MAX_QUOTED_ARG_BYTES:
-        msg = msg[:MAX_QUOTED_ARG_BYTES] + "…[truncated]"
+    msg = _scrub_exception_body(msg)
     return f"{chosen.group('type')}: {msg}" if msg else chosen.group("type")
 
 
@@ -258,7 +285,16 @@ def _extract_r(stderr: str) -> Optional[str]:
     if not matches:
         return None
     last = matches[-1]
-    block = last.group(0).strip()
+    # Reconstruct the block from its parts so we can scrub the
+    # message body (data-origin text — see ``_scrub_exception_body``)
+    # while keeping the parser-owned framing intact. Using
+    # ``last.group(0)`` would forward script-controlled text verbatim.
+    call = last.group("call")
+    msg = _scrub_exception_body(last.group("msg") or "")
+    if call:
+        block = f"Error in {call} : {msg}".rstrip() if msg else f"Error in {call} :"
+    else:
+        block = f"Error : {msg}".rstrip() if msg else "Error :"
 
     # Look for a Calls: line in the slice immediately after the
     # error block (within the next 200 chars - the chain is always
@@ -349,6 +385,45 @@ def _extract_stata(stdout: str) -> Optional[str]:
     # logical block.
     block = scan[cmd.start(): rc.end()].rstrip()
     return block
+
+
+# -----------------------------------------------------------------
+# Exception-body scrub
+# -----------------------------------------------------------------
+
+def _scrub_exception_body(msg: str) -> str:
+    """Treat exception message bodies as data-origin text.
+
+    The exception type (``KeyError``) and traceback frame (file +
+    line) are parser-owned — Python / R themselves emit those in a
+    fixed shape we can verify. The body that follows the type, on the
+    other hand, is whatever the script chose to put there:
+    ``raise RuntimeError(df.iloc[0].to_json())`` would otherwise ship
+    raw cell content out as a "diagnostic". This scrub:
+
+      1. Suppresses bodies whose shape looks like a data dump (JSON
+         dicts, comma-separated rows, pipe-separated cells).
+      2. Caps surviving bodies at ``MAX_EXCEPTION_MSG_BYTES`` to
+         bound the leak per call even when the shape detector
+         misses (e.g. a single short cell value the model
+         deliberately formatted as a plain word).
+
+    Residual risk: a body that is both short AND not data-shaped
+    (a single column name, a number, a few words) still passes
+    through. Eliminating that residual would require dropping all
+    bodies, which kills the feature's debugging value (column names
+    and missing-file paths are exactly what the model needs). The
+    cap reduces per-call payload, the system prompt directs the
+    model not to do this, and persisted run logs preserve the audit
+    trail.
+    """
+    if not msg:
+        return msg
+    if _DATA_SHAPED_RE.search(msg):
+        return _REDACTED_DATA_BODY
+    if len(msg) > MAX_EXCEPTION_MSG_BYTES:
+        return msg[:MAX_EXCEPTION_MSG_BYTES] + "…[truncated]"
+    return msg
 
 
 # -----------------------------------------------------------------

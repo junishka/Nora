@@ -177,6 +177,82 @@ def test_extract_tsv(tmp_path: Path) -> None:
 # Unsupported extension still rejects with a clear error
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Stata value-label caps
+# ---------------------------------------------------------------------------
+
+def test_stata_value_labels_capped_per_variable(tmp_path: Path) -> None:
+    """A codebook-heavy .dta (industry codes, geographic codes) used
+    to forward every value-label entry into the schema response. Cap
+    per-variable at 50 entries with a ``value_labels_truncated``
+    flag so the model knows the codebook is partial."""
+    pyreadstat = pytest.importorskip("pyreadstat")
+
+    # Build a NAICS-shaped value-label set: 1000 entries.
+    n = 1000
+    df = pd.DataFrame({
+        "industry": [i % n for i in range(2 * n)],
+        "y": [float(i) for i in range(2 * n)],
+    })
+    variable_value_labels = {
+        "industry": {i: f"industry-{i:04d}" for i in range(n)},
+    }
+    path = tmp_path / "codebook_heavy.dta"
+    pyreadstat.write_dta(
+        df, str(path),
+        variable_value_labels=variable_value_labels,
+    )
+
+    out = schema.extract(path, "names_types_labels")
+    assert out["status"] == "ok"
+    by_name = {v["name"]: v for v in out["variables"]}
+    industry = by_name["industry"]
+    assert "value_labels" in industry
+    assert len(industry["value_labels"]) <= 50
+    assert industry.get("value_labels_truncated") is True
+    assert industry.get("value_labels_total") == n
+
+
+def test_stata_value_labels_total_cap_across_variables(tmp_path: Path) -> None:
+    """Beyond the per-variable cap, the total across all variables
+    is also bounded at 500 so a file with many medium-sized label
+    sets can't spend the whole context."""
+    pyreadstat = pytest.importorskip("pyreadstat")
+
+    # 20 variables, each with a 40-entry label set. Per-variable cap
+    # (50) wouldn't trip; only the total (500) does.
+    n_vars = 20
+    n_labels = 40
+    cols: dict[str, list] = {}
+    variable_value_labels: dict[str, dict] = {}
+    for v in range(n_vars):
+        col = f"var_{v}"
+        cols[col] = [i % n_labels for i in range(80)]
+        variable_value_labels[col] = {
+            i: f"v{v}-label-{i}" for i in range(n_labels)
+        }
+    df = pd.DataFrame(cols)
+    path = tmp_path / "many_codebooks.dta"
+    pyreadstat.write_dta(
+        df, str(path),
+        variable_value_labels=variable_value_labels,
+    )
+
+    out = schema.extract(path, "names_types_labels")
+    assert out["status"] == "ok"
+    total_emitted = sum(
+        len(v.get("value_labels", {})) for v in out["variables"]
+    )
+    assert total_emitted <= 500
+    # At least one variable should be marked truncated since
+    # 20 vars × 40 entries = 800 > 500 budget.
+    truncated_count = sum(
+        1 for v in out["variables"]
+        if v.get("value_labels_truncated") is True
+    )
+    assert truncated_count >= 1
+
+
 def test_unsupported_format_lists_all_supported(tmp_path: Path) -> None:
     """A researcher who drops a ``.xlsx`` should get a message that
     names what Nora actually accepts — not just a ``KeyError`` from

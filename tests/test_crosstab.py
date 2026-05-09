@@ -99,16 +99,35 @@ def test_crosstab_cells_below_threshold_always_suppressed(raw):
 
 
 @given(raw=crosstab_payloads())
-def test_crosstab_preserves_row_col_keys(raw):
-    """Suppression replaces values, never adds or removes row/col keys."""
+def test_crosstab_output_keys_are_visible_or_suppressed_bucket(raw):
+    """Every output row key is either an input row that has at
+    least one above-threshold cell, OR is missing entirely (rows
+    whose every cell is suppressed have their LABEL dropped — the
+    label itself is disclosive at small N). Per surviving row,
+    every column key is either visible (count >= threshold) or the
+    single ``[suppressed]`` bucket."""
+    from nora.text_safety import safe_key
     result = sanitize(raw)
     if not result.ok:
         return
+    threshold = DEFAULT_CONFIG.cell_suppression_threshold
     out_counts = result.sanitized["counts"]
     in_counts = raw["counts"]
-    assert set(out_counts.keys()) == set(in_counts.keys())
-    for row_key in in_counts:
-        assert set(out_counts[row_key].keys()) == set(in_counts[row_key].keys())
+    # Every output row label maps to an input row that had at
+    # least one >=threshold cell. Rows with NO visible cell have
+    # their label dropped; that's the new SDC contract.
+    for row_key, row_cells in out_counts.items():
+        # Per surviving row: keys are either visible inputs or
+        # the bucket — never a suppressed input column.
+        assert set(row_cells.keys()).issubset(
+            {safe_key(c) for c in in_counts[row_key]} | {"[suppressed]"}
+        )
+        # Every visible cell value is >= threshold; the bucket
+        # entry carries the marker.
+        for c, v in row_cells.items():
+            if c == "[suppressed]":
+                continue
+            assert isinstance(v, int) and v >= threshold
 
 
 @given(raw=crosstab_payloads())
@@ -158,8 +177,17 @@ def test_crosstab_happy_path():
         },
     })
     assert r.ok
-    assert r.sanitized["counts"]["old"]["F"] == "<10"
-    assert r.sanitized["counts"]["old"]["M"] == 30
+    # 'old' had an above-threshold cell (M=30) so the row label
+    # survives; the suppressed F cell is bucketed under the row's
+    # ``[suppressed]`` entry. The 'F' column label is hidden because
+    # leaving it would tell the model "old/F is the rare cell".
+    old = r.sanitized["counts"]["old"]
+    assert old["M"] == 30
+    assert "F" not in old
+    assert old["[suppressed]"] == "<10"
+    # Visible cells unchanged.
+    assert r.sanitized["counts"]["young"]["M"] == 50
+    assert r.sanitized["counts"]["young"]["F"] == 40
     assert "n" not in r.sanitized
     assert "grand_total" not in r.sanitized
 

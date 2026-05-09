@@ -82,6 +82,26 @@ def test_categorical_levels_all_common(sample_csv: Path):
     assert r.answer["suppressed_level_count"] == 0
 
 
+def test_categorical_levels_caps_visible_list(sample_csv: Path):
+    """A high-cardinality column with many common values would
+    otherwise dump thousands of strings in one tool result. The cap
+    bounds the discovery surface and surfaces a truncated flag so
+    the model knows to refine."""
+    # 300 distinct levels, each with count well above threshold (10).
+    rows: list[str] = []
+    for i in range(300):
+        rows.extend([f"level_{i:04d}"] * 15)
+    df = pd.DataFrame({"cat": rows})
+    p = sample_csv.parent / "highcard.csv"
+    df.to_csv(p, index=False)
+    r = handle(p, "categorical_levels", "cat")
+    assert r.status == "granted"
+    assert r.answer["visible_level_count_total"] == 300
+    assert len(r.answer["visible_levels"]) == 200
+    assert r.answer["visible_levels_truncated"] is True
+    assert "frequency_table" in r.answer["note"]
+
+
 def test_tight_threshold_hides_more(sample_csv: Path):
     """Raising the threshold makes more levels suppress."""
     strict = SDCConfig(cell_suppression_threshold=25)
@@ -117,13 +137,37 @@ def test_numeric_bounds_rejects_non_numeric(sample_csv: Path):
 
 
 def test_numeric_bounds_denies_small_sample(sample_csv: Path):
-    """A variable with <10 non-NA observations should be denied."""
+    """A variable with <30 non-NA observations should be denied — at
+    small N the 5th/95th percentiles interpolate close to the min/max
+    and would identify the tail individuals."""
     df = pd.DataFrame({"v": [1.0, 2.0, 3.0, np.nan, np.nan]})
     p = sample_csv.parent / "tiny.csv"
     df.to_csv(p, index=False)
     r = handle(p, "numeric_bounds", "v")
     assert r.status == "denied"
     assert "too few" in r.reason.lower()
+
+
+def test_numeric_bounds_denies_n_below_30(sample_csv: Path) -> None:
+    """N=10 was the prior threshold but is too small: pandas's
+    p5/p95 at N=10 sit between the 1st-and-2nd / 9th-and-10th order
+    statistics, which round (even at 2 sig figs) to values
+    effectively identifying the tail observations. We require N>=30."""
+    df = pd.DataFrame({"v": [float(i) for i in range(20)]})
+    p = sample_csv.parent / "n20.csv"
+    df.to_csv(p, index=False)
+    r = handle(p, "numeric_bounds", "v")
+    assert r.status == "denied"
+    assert "too few" in r.reason.lower()
+
+
+def test_numeric_bounds_grants_at_n_30(sample_csv: Path) -> None:
+    """The boundary: N=30 passes."""
+    df = pd.DataFrame({"v": [float(i) for i in range(30)]})
+    p = sample_csv.parent / "n30.csv"
+    df.to_csv(p, index=False)
+    r = handle(p, "numeric_bounds", "v")
+    assert r.status == "granted"
 
 
 # ---------------------------------------------------------------------------
@@ -160,6 +204,70 @@ def test_nonexistent_variable_denied(sample_csv: Path):
     r = handle(sample_csv, "numeric_bounds", "does_not_exist")
     assert r.status == "denied"
     assert "not found" in r.reason.lower()
+
+
+def test_nonexistent_variable_caps_column_listing(tmp_path: Path):
+    """A typo against a wide dataset must NOT ship the full column list
+    in the denial reason. The cap mirrors search_schema's posture:
+    show enough to scan, name the total, point at search_schema for
+    the rest."""
+    # A wide synthetic dataset — 200 columns is small for genomics
+    # and large enough to exceed the 50-column denial cap.
+    n_cols = 200
+    df = pd.DataFrame(
+        {f"col_{i:04d}": np.arange(20) for i in range(n_cols)}
+    )
+    p = tmp_path / "wide.csv"
+    df.to_csv(p, index=False)
+    r = handle(p, "numeric_bounds", "typo_does_not_exist")
+    assert r.status == "denied"
+    # The reason must NOT enumerate all 200 columns.
+    assert r.reason.count("col_") <= 50
+    # Total count is reported honestly so the model knows the listing
+    # was clipped.
+    assert "200" in r.reason
+    # Recovery hint points at the right tool for wide datasets.
+    assert "search_schema" in r.reason
+
+
+def test_sanitized_variable_resolves_back_to_raw(tmp_path: Path):
+    """A column name that safe_key truncates (>40 chars) is shown to
+    the model under its sanitized form. The model must be able to
+    pass that sanitized name back to request_data and have it resolve
+    — otherwise every long-named column is unqueryable."""
+    long_raw = "extremely_verbose_column_name_that_exceeds_the_safe_key_cap_x"
+    df = pd.DataFrame({long_raw: np.arange(20)})
+    p = tmp_path / "longname.csv"
+    df.to_csv(p, index=False)
+
+    from nora.text_safety import safe_key
+    sanitized = safe_key(long_raw)
+    assert sanitized != long_raw  # would otherwise be a no-op test
+
+    # Direct lookup with the sanitized name resolves to the raw column.
+    r = handle(p, "numeric_bounds", sanitized)
+    assert r.status == "granted", r.reason
+
+
+def test_sanitized_collision_returns_structured_denial(tmp_path: Path):
+    """Two raw column names that sanitize to the same safe_key cannot
+    be safely disambiguated for the model (the raw bytes are an
+    injection surface and we won't echo them). The denial must name
+    the collision so the model knows the path forward is to rename
+    upstream rather than retry."""
+    # Two long names whose first 40-cap-chars coincide.
+    raw1 = "x" * 100 + "_first"
+    raw2 = "x" * 100 + "_second"
+    from nora.text_safety import safe_key
+    assert safe_key(raw1) == safe_key(raw2)  # prerequisite
+
+    df = pd.DataFrame({raw1: np.arange(20), raw2: np.arange(20)})
+    p = tmp_path / "colliding.csv"
+    df.to_csv(p, index=False)
+
+    r = handle(p, "numeric_bounds", safe_key(raw1))
+    assert r.status == "denied"
+    assert "collide" in r.reason.lower() or "colliding" in r.reason.lower()
 
 
 def test_supported_request_types_are_expected():

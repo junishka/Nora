@@ -35,7 +35,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from nora.chat_history import read_turns
+from nora.chat_history import read_last_turn_summary
 
 
 SESSION_STATE_FILENAME = "session_state.json"
@@ -179,15 +179,20 @@ def write_session_state(
     #    assistant turns out to be empty, the sidebar shows
     #    "what the researcher just asked, no answer yet" — accurate
     #    to the current state, never a false pairing.
-    turns = read_turns(cwd)
-    last_user = ""
-    last_assistant = ""
-    for t in reversed(turns):
-        if t.user:
-            last_user = _truncate(t.user, _LAST_MESSAGE_CAP)
-            if t.assistant:
-                last_assistant = _truncate(t.assistant, _LAST_MESSAGE_CAP)
-            break
+    #
+    #    Uses ``read_last_turn_summary`` rather than the heavier
+    #    ``read_turns`` so this snapshot stays cheap as the persisted
+    #    UI replay log grows: ``read_turns`` json.loads every
+    #    tool_result event (each carrying raw stdout/stderr and any
+    #    plot thumbnail payload), and the writer runs after every
+    #    successful turn — full reparse on every turn would make
+    #    each turn slower than the last in a long session.
+    turn_count, last_user_raw, last_assistant_raw = read_last_turn_summary(cwd)
+    last_user = _truncate(last_user_raw, _LAST_MESSAGE_CAP) if last_user_raw else ""
+    last_assistant = (
+        _truncate(last_assistant_raw, _LAST_MESSAGE_CAP)
+        if last_assistant_raw else ""
+    )
 
     # 2. Pull recent results. Either from the injected list (tests)
     #    or by opening the store ourselves. If opening fails (missing
@@ -243,7 +248,7 @@ def write_session_state(
         state = SessionState(
             version=SESSION_STATE_VERSION,
             last_active_at=datetime.now(timezone.utc).isoformat(timespec="seconds"),
-            turn_count=len(turns),
+            turn_count=turn_count,
             last_user_message=last_user,
             last_assistant_summary=last_assistant,
             recent_results=recent,

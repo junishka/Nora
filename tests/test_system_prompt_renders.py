@@ -320,6 +320,19 @@ def test_stata_plot_coefficients_in_stage_runtime_list(tmp_path: Path) -> None:
     assert (lib / "nora_plot_coefficients.ado").is_file()
 
 
+def test_stata_correlation_helper_is_staged(tmp_path: Path) -> None:
+    """``nora_result_correlation`` emits the correlation_matrix payload
+    (Pearson / Spearman / Kendall dispatch) for Stata. The .ado must
+    reach the run's adopath at runtime — without it, scripts that
+    call ``nora_result_correlation`` get ``command not found`` even
+    though the file exists in the package."""
+    from nora.executor import _stage_runtime
+    run = tmp_path / "run"
+    run.mkdir()
+    lib = _stage_runtime(run, "Stata")
+    assert (lib / "nora_result_correlation.ado").is_file()
+
+
 def test_stata_self_contained_ttest_helper_is_staged(tmp_path: Path) -> None:
     """``nora_ttest`` is the self-contained ttest helper that runs
     the appropriate ``ttest`` form itself, eliminating the r()-

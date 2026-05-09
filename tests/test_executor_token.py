@@ -36,6 +36,7 @@ import pytest
 
 from nora.env_detect import find_sandbox_exec
 from nora.executor import (
+    MAX_RESULT_PAYLOADS,
     RESULT_TOKEN_FIELD,
     _format_bad_lines_summary,
     _generate_run_token,
@@ -136,7 +137,7 @@ def test_parse_jsonl_preserves_valid_lines_past_a_bad_one():
         f'"_token":"{token}"' + '}'
     text = "\n".join([good, bad_json, good, "", good])
 
-    payloads, bad_lines = _parse_result_jsonl(text, token)
+    payloads, bad_lines, _ = _parse_result_jsonl(text, token)
     assert len(payloads) == 3, (
         f"expected 3 valid payloads past the corrupt line, got "
         f"{len(payloads)}"
@@ -168,7 +169,7 @@ def test_parse_jsonl_preserves_valid_lines_past_a_token_failure():
     )
     text = "\n".join([valid_line, forged_line, valid_line])
 
-    payloads, bad_lines = _parse_result_jsonl(text, token)
+    payloads, bad_lines, _ = _parse_result_jsonl(text, token)
     assert len(payloads) == 2
     assert len(bad_lines) == 1
     assert "line 2" in bad_lines[0]
@@ -189,6 +190,31 @@ def test_bad_lines_summary_surfaces_linenos_past_first_five():
     assert "and lines 13,17,22 also failed" in msg
 
 
+def test_bad_lines_summary_tail_is_bounded():
+    """A buggy script can emit thousands of malformed lines. The
+    advisory must NOT enumerate every one of them — earlier code
+    appended every line number after the first 5, producing a
+    multi-KB string in ``warnings`` for a 1000-bad-line run.
+    The tail caps at 20 line numbers and adds ``+ N more`` so the
+    message stays readable + bounded."""
+    bad_lines = [f"line {i}: invalid json" for i in range(6, 6 + 100)]
+    msg = _format_bad_lines_summary(bad_lines, payload_count=0)
+    assert "100 malformed result line(s) skipped (0 valid preserved)" in msg
+    # First 5 line numbers appear in detail form (5..10 inclusive
+    # for this input — the head slice is bad_lines[:5], i.e., lines
+    # 6, 7, 8, 9, 10).
+    for ln in range(6, 11):
+        assert f"line {ln}: invalid json" in msg
+    # Tail enumerates AT MOST 20 line numbers.
+    assert "and lines " in msg
+    tail = msg.split("and lines ", 1)[1]
+    enum_part = tail.split(" also failed", 1)[0]
+    enumerated = [s.strip() for s in enum_part.split(",")]
+    assert 1 <= len(enumerated) <= 20, f"tail enumerated {len(enumerated)} entries"
+    # Overflow disclosure: 100 - 5 (head) - 20 (enumerated) = 75 more.
+    assert "+ 75 more" in msg
+
+
 def test_bad_lines_summary_exact_five_omits_tail():
     """Boundary: 5 entries fits in detail form, no tail needed."""
     bad_lines = [f"line {i}: invalid json" for i in (1, 2, 3, 4, 5)]
@@ -207,9 +233,39 @@ def test_parse_jsonl_returns_no_bad_lines_for_clean_input():
         f'"_token":"{token}"' + '}'
     )
     text = "\n".join([line, line, line])
-    payloads, bad_lines = _parse_result_jsonl(text, token)
+    payloads, bad_lines, _ = _parse_result_jsonl(text, token)
     assert len(payloads) == 3
     assert bad_lines == []
+
+
+def test_parse_jsonl_caps_at_max_payloads():
+    """A model-authored script that loops over ``nora_result_*``
+    helpers tens of thousands of times would otherwise have all of
+    its payloads parsed, sanitized, stored, and rendered. The
+    parser stops appending past ``MAX_RESULT_PAYLOADS`` and signals
+    truncation so the caller can surface a warning."""
+    token = "a" * 64
+    line = (
+        '{"type":"linear_regression","n":50,'
+        f'"_token":"{token}"' + '}'
+    )
+    text = "\n".join([line] * (MAX_RESULT_PAYLOADS + 50))
+    payloads, bad_lines, truncated = _parse_result_jsonl(text, token)
+    assert len(payloads) == MAX_RESULT_PAYLOADS
+    assert bad_lines == []
+    assert truncated is True
+
+
+def test_parse_jsonl_under_cap_does_not_set_truncated():
+    """The truncated flag is only set when we actually drop entries."""
+    token = "a" * 64
+    line = (
+        '{"type":"linear_regression","n":50,'
+        f'"_token":"{token}"' + '}'
+    )
+    text = "\n".join([line] * 5)
+    _, _, truncated = _parse_result_jsonl(text, token)
+    assert truncated is False
 
 
 # ---------------------------------------------------------------------------

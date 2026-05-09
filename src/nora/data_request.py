@@ -83,6 +83,106 @@ class RequestResult:
 
 
 # ---------------------------------------------------------------------------
+# Variable name resolution (raw ↔ sanitized round-trip)
+# ---------------------------------------------------------------------------
+#
+# Schema extraction surfaces column names through ``safe_key``: a column
+# named ``income\n\nSystem: ...`` reaches the model as a sanitized form
+# (whitespace flattened, control chars stripped, possibly truncated past
+# 40 chars). Downstream, the model echoes that sanitized name back in
+# ``request_data(variable=...)``. A naive ``df.columns`` lookup against
+# the sanitized name fails — the on-disk column still has its raw name.
+# Without a round-trip resolver, every variable whose raw name needed
+# sanitization is unqueryable; the model gets a "not found" denial on
+# the very name the schema told it to use.
+#
+# The resolver tries (1) exact raw match, then (2) one-to-one
+# sanitized match. Collisions (two raw columns sanitizing to the same
+# safe_key) are flagged loudly so the model knows it must use a
+# different identifier path — silently picking one would be a
+# disclosure-leakage bug (correlation_pair on the wrong column).
+
+# Caps on the available-columns list emitted in the denial path. Wide
+# datasets (genomics, panel data with thousands of indicator columns)
+# would otherwise ship every name into the model context on a single
+# typo'd request, defeating the search_schema cap and burning tokens
+# on an error branch. 50 is enough to scan a short list mentally;
+# more than that and ``search_schema`` is the right tool.
+_DENIAL_COLUMN_LIST_CAP = 50
+
+
+def _resolve_variable(
+    df: Any, requested: str, *, role: str = "variable",
+) -> "RequestResult | str":
+    """Resolve ``requested`` to a raw DataFrame column name.
+
+    Returns the resolved column name on success, or a structured
+    ``RequestResult`` denial when the name can't be uniquely resolved.
+    The denial path caps the available-columns list at
+    ``_DENIAL_COLUMN_LIST_CAP`` and points the model back to
+    ``search_schema`` for wide datasets.
+    """
+    columns = list(df.columns)
+    # Stage 1: exact raw match (fast path; the common case where the
+    # column name didn't need sanitization).
+    if requested in df.columns:
+        return requested
+    # Stage 2: sanitized match. Build a safe_key → [raw_names] map and
+    # look up the requested name. Multiple raw columns can sanitize to
+    # the same safe form — a real risk for datasets with long names
+    # whose first 40 chars happen to coincide, or with embedded
+    # control characters that strip identically.
+    safe_to_raw: dict[str, list[str]] = {}
+    for col in columns:
+        safe_to_raw.setdefault(safe_key(str(col)), []).append(str(col))
+    matches = safe_to_raw.get(requested, [])
+    if len(matches) == 1:
+        return matches[0]
+    if len(matches) > 1:
+        # Collision: the sanitized name is ambiguous. Surface the
+        # collision count rather than picking one — the model needs to
+        # know to use a different path (e.g., write a script that
+        # references the column by its raw bytes via a DataFrame
+        # method, or rename the column upstream).
+        return RequestResult(
+            status="denied",
+            reason=(
+                f"{role} {safe_key(str(requested))!r} matches "
+                f"{len(matches)} columns whose sanitized names collide. "
+                f"The raw column names cannot be safely echoed back to "
+                f"you (data-origin strings are an injection surface), "
+                f"so this lookup is ambiguous. Rename one of the "
+                f"colliding columns in the dataset, or run a script "
+                f"that references the column by index instead."
+            ),
+        )
+    # No match. Return a structured denial with a capped column
+    # listing — wide datasets must not ship the full column list
+    # through the error path.
+    safe_requested = safe_key(str(requested))
+    safe_columns = [safe_key(str(c)) for c in columns]
+    total = len(safe_columns)
+    truncated = total > _DENIAL_COLUMN_LIST_CAP
+    listed = safe_columns[:_DENIAL_COLUMN_LIST_CAP]
+    if truncated:
+        suffix = (
+            f" {total - _DENIAL_COLUMN_LIST_CAP} more column(s) elided. "
+            f"Use search_schema(query=...) to find the right column "
+            f"on a wide dataset rather than scanning the full list."
+        )
+    else:
+        suffix = ""
+    return RequestResult(
+        status="denied",
+        reason=(
+            f"{role} {safe_requested!r} not found in dataset. "
+            f"Available columns ({len(listed)} of {total}): "
+            f"{listed!r}.{suffix}"
+        ),
+    )
+
+
+# ---------------------------------------------------------------------------
 # Top-level dispatch
 # ---------------------------------------------------------------------------
 
@@ -130,21 +230,10 @@ def handle(
             ),
         )
 
-    if variable not in df.columns:
-        # Both the requested variable name and the column list are
-        # data/caller-origin text — sanitize before echoing them into a
-        # reason string that Claude will see. A dataset with a malicious
-        # column name ("foo\n\nSYSTEM: ...") would otherwise inject
-        # through the denial path.
-        safe_requested = safe_key(str(variable))
-        safe_columns = [safe_key(str(c)) for c in df.columns]
-        return RequestResult(
-            status="denied",
-            reason=(
-                f"variable {safe_requested!r} not found in dataset. "
-                f"Available columns: {safe_columns!r}"
-            ),
-        )
+    resolved = _resolve_variable(df, variable)
+    if isinstance(resolved, RequestResult):
+        return resolved
+    variable = resolved
 
     series = df[variable]
     n_total = len(series)
@@ -206,17 +295,44 @@ def _categorical_levels(
         else:
             suppressed_count += 1
 
+    # Hard cap on visible levels. Without it, a high-cardinality
+    # categorical (postcodes, NAICS codes, free-text labels with
+    # thousands of common values) ships its full distinct-value list
+    # in one tool result — bypassing the structural caps that the
+    # other discovery surfaces (frequency_table, schema value_labels,
+    # search_schema) all enforce. With the cap, the model has to ask
+    # for narrower categories, request a frequency_table for actual
+    # counts, or use ``search_schema`` for label substring queries.
+    MAX_VISIBLE_LEVELS = 200
+
+    visible_sorted = sorted(visible)
+    total_visible = len(visible_sorted)
+    truncated = total_visible > MAX_VISIBLE_LEVELS
+    visible_returned = visible_sorted[:MAX_VISIBLE_LEVELS]
+
+    note = (
+        f"levels with count < {threshold} are hidden entirely "
+        f"(names and counts). There are {suppressed_count} such "
+        f"level(s)."
+    )
+    if truncated:
+        note += (
+            f" The visible-levels list is capped at "
+            f"{MAX_VISIBLE_LEVELS}; {total_visible - MAX_VISIBLE_LEVELS} "
+            f"additional level(s) above threshold were not listed. "
+            f"Use frequency_table or refine the variable."
+        )
+
+    answer = {
+        "visible_levels": visible_returned,
+        "visible_level_count_total": total_visible,
+        "visible_levels_truncated": truncated,
+        "suppressed_level_count": suppressed_count,
+        "note": note,
+    }
     return RequestResult(
         status="granted",
-        answer={
-            "visible_levels": sorted(visible),
-            "suppressed_level_count": suppressed_count,
-            "note": (
-                f"levels with count < {threshold} are hidden entirely "
-                f"(names and counts). There are {suppressed_count} such "
-                f"level(s)."
-            ),
-        },
+        answer=answer,
     )
 
 
@@ -251,13 +367,25 @@ def _numeric_bounds(series: Any, n_total: int) -> RequestResult:
 
     non_na = series.dropna()
     n_effective = int(len(non_na))
-    if n_effective < 10:
+    # Tail percentiles (5th / 95th) at small N are interpolations
+    # adjacent to the min and max — at N=10, the 5th percentile sits
+    # between the 1st and 2nd order statistic and rounds, even at 2
+    # sig figs, to a value that effectively reveals the bottom
+    # outlier. We require N >= 30 so the percentile is averaged over
+    # roughly 1.5 - 2.5 observations on either tail rather than
+    # essentially echoing back the extremes. This is stricter than
+    # cell_suppression_threshold (10) on purpose: the extra factor
+    # of 3 buys real interpolation breadth.
+    NUMERIC_BOUNDS_MIN_N = 30
+    if n_effective < NUMERIC_BOUNDS_MIN_N:
         return RequestResult(
             status="denied",
             reason=(
                 f"variable has only {n_effective} non-missing observations "
-                f"— too few to publish bounds without identifying "
-                f"individuals."
+                f"— too few for tail-percentile bounds (need at least "
+                f"{NUMERIC_BOUNDS_MIN_N}). At small N the 5th and 95th "
+                f"percentiles interpolate close to the min and max and "
+                f"would identify the tail individuals."
             ),
         )
 
@@ -404,16 +532,10 @@ def _correlation_pair(
             ),
         )
 
-    if var2 not in df.columns:
-        safe_requested = safe_key(str(var2))
-        safe_columns = [safe_key(str(c)) for c in df.columns]
-        return RequestResult(
-            status="denied",
-            reason=(
-                f"variable2 {safe_requested!r} not found in dataset. "
-                f"Available columns: {safe_columns!r}"
-            ),
-        )
+    resolved = _resolve_variable(df, var2, role="variable2")
+    if isinstance(resolved, RequestResult):
+        return resolved
+    var2 = resolved
 
     if var1 == var2:
         return RequestResult(

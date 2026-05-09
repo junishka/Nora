@@ -103,10 +103,10 @@ def load_data(dataset_path: Path) -> Any:
         import pyreadr
         result = pyreadr.read_r(str(dataset_path))
         if not result:
-            raise ValueError(f".rds file contains no objects: {dataset_path}")
+            raise SchemaExtractError(f".rds file contains no objects: {dataset_path}")
         obj = next(iter(result.values()))
         if not hasattr(obj, "columns"):
-            raise ValueError(
+            raise SchemaExtractError(
                 f".rds at {dataset_path} does not contain a data frame; "
                 f"got {type(obj).__name__}"
             )
@@ -128,7 +128,7 @@ def load_data(dataset_path: Path) -> Any:
         # to make sense of it); researchers can convert with `jq`
         # if needed.
         return pd.read_json(dataset_path, lines=True)
-    raise ValueError(
+    raise SchemaExtractError(
         f"unsupported format: {suffix!r}. Nora reads "
         ".dta, .rds, .csv, .tsv, .parquet, .jsonl, .ndjson."
     )
@@ -259,7 +259,7 @@ def extract(dataset_path: Path, depth: str) -> dict[str, Any]:
     catches them and returns a policy-shaped error payload).
     """
     if depth not in _VALID_DEPTHS:
-        raise ValueError(
+        raise SchemaExtractError(
             f"invalid depth: {depth!r}; valid: {sorted(_VALID_DEPTHS)}"
         )
     suffix = dataset_path.suffix.lower()
@@ -275,7 +275,7 @@ def extract(dataset_path: Path, depth: str) -> dict[str, Any]:
         return _extract_parquet(dataset_path, depth)
     if suffix in (".jsonl", ".ndjson"):
         return _extract_jsonl(dataset_path, depth)
-    raise ValueError(
+    raise SchemaExtractError(
         f"unsupported format: {suffix!r}. Nora currently reads "
         ".dta (Stata), .rds (R), .csv, .tsv, .parquet, .jsonl, .ndjson. "
         "Other formats (.rda, .xlsx, .sav, .feather) are not supported yet."
@@ -285,6 +285,33 @@ def extract(dataset_path: Path, depth: str) -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 # Stata — .dta via pyreadstat
 # ---------------------------------------------------------------------------
+
+# Per-variable cap on emitted value-label entries. A codebook-heavy
+# .dta (e.g. an industry classification with thousands of NAICS codes)
+# would otherwise pour every label into the schema response, blowing
+# context and creating a large data-origin text channel even after
+# per-string sanitization. We surface the count and a hint so the
+# model can request the full codebook through a different path if
+# it actually needs it.
+_MAX_VALUE_LABELS_PER_VAR = 50
+# Total cap across all variables in one schema response, so a file
+# with many medium-sized label sets can't blow the budget either.
+_MAX_VALUE_LABELS_TOTAL = 500
+
+
+class SchemaExtractError(ValueError):
+    """Raised by ``schema.extract`` for parser-OWNED validation errors.
+
+    These messages are crafted by this module (unsupported format,
+    invalid depth, .rds-without-dataframe, etc.) and are safe to
+    forward verbatim — they do not embed row content or library
+    diagnostics. The tool layer relies on the class to distinguish
+    them from data-leak-prone pandas / pyreadstat / pyreadr
+    exceptions (some of which are also ``ValueError`` subclasses,
+    notably ``pandas.errors.ParserError`` whose message quotes the
+    offending CSV row).
+    """
+
 
 def _extract_stata(path: Path, depth: str) -> dict[str, Any]:
     import pyreadstat
@@ -298,6 +325,7 @@ def _extract_stata(path: Path, depth: str) -> dict[str, Any]:
         df, meta = pyreadstat.read_dta(str(path), metadataonly=True)
 
     variables: list[dict[str, Any]] = []
+    labels_emitted_total = 0
     for idx, name in enumerate(meta.column_names):
         # Variable names originate in the data file and are forwarded to
         # Claude — pass through the injection defense.
@@ -316,14 +344,35 @@ def _extract_stata(path: Path, depth: str) -> dict[str, Any]:
                     # surface in a typical .dta. Sanitize aggressively.
                     var["label"] = safe_text(str(label))
             # Value labels, if this column is tied to a label set. Both
-            # the codes (keys) and labels (values) originate in the data.
+            # the codes (keys) and labels (values) originate in the data,
+            # so we sanitize each entry AND cap the count: a codebook-
+            # heavy file (industry classifications, geographic codes)
+            # could otherwise emit thousands of labels per variable
+            # and tens of thousands across the file, spending the
+            # context window and providing a wide data-origin text
+            # channel.
             label_set = meta.variable_to_label.get(name)
             if label_set and label_set in meta.value_labels:
                 raw = meta.value_labels[label_set]
+                total_in_set = len(raw)
+                budget_remaining = max(
+                    0, _MAX_VALUE_LABELS_TOTAL - labels_emitted_total
+                )
+                effective_cap = min(
+                    _MAX_VALUE_LABELS_PER_VAR, budget_remaining
+                )
+                # Stable insertion order from pyreadstat; take the
+                # first ``effective_cap`` entries so repeated calls
+                # against the same file return the same view.
+                items = list(raw.items())[:effective_cap]
                 var["value_labels"] = {
                     safe_key(str(k)): safe_text(str(v))
-                    for k, v in raw.items()
+                    for k, v in items
                 }
+                labels_emitted_total += len(items)
+                if total_in_set > len(items):
+                    var["value_labels_total"] = total_in_set
+                    var["value_labels_truncated"] = True
 
         # Use the ORIGINAL name as the key when reading df (to match pandas),
         # but report the SANITIZED name to Claude.
@@ -379,13 +428,13 @@ def _extract_rds(path: Path, depth: str) -> dict[str, Any]:
     # .rds holds a single object. pyreadr returns an OrderedDict keyed
     # either by the saved name or by `None` if nameless. Take the first.
     if not result:
-        raise ValueError(f".rds file contains no objects: {path}")
+        raise SchemaExtractError(f".rds file contains no objects: {path}")
     obj_key = next(iter(result))
     df = result[obj_key]
     # pyreadr can return non-DataFrame objects (lists, etc.). We only
     # handle data frames in v0.
     if not hasattr(df, "columns"):
-        raise ValueError(
+        raise SchemaExtractError(
             f".rds file at {path} does not contain a data frame; got "
             f"{type(df).__name__}. Convert to a data frame in R and "
             f"re-save with saveRDS()."

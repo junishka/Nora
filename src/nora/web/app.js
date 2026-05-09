@@ -815,6 +815,27 @@ landingEl.addEventListener('drop', async (e) => {
     );
     return;
   }
+  // Aggregate cap: each file passes the per-file cap (above), but
+  // the loop below accumulates every file's base64 string in
+  // memory before calling upload_files. Five 400 MB files would
+  // each pass the per-file cap yet hold ~3 GB of base64 in the JS
+  // heap concurrently, freezing or crashing the page. Bound the
+  // total too. Same threshold as per-file so the user sees a
+  // consistent rule: "the drag-drop path can move up to 512 MB at
+  // a time, regardless of how many files."
+  const aggregateBytes = accepted.reduce((s, f) => s + f.size, 0);
+  if (aggregateBytes > MAX_DRAG_DROP_BYTES) {
+    const aggMb = Math.round(aggregateBytes / (1024 * 1024));
+    const capMb = Math.round(MAX_DRAG_DROP_BYTES / (1024 * 1024));
+    setLandingError(
+      `Total drop size is ${aggMb} MB across ${accepted.length} files — ` +
+      `drag-drop is capped at ${capMb} MB total because each file is ` +
+      `read fully into memory and the base64-encoded copies coexist ` +
+      `during the bridge transfer. Use Choose Files… below — it ` +
+      `copies directly from disk with no aggregate limit.`,
+    );
+    return;
+  }
   try {
     // Read serially with a progress message so large drops don't
     // look frozen. readAsDataURL loads the whole file into memory —
@@ -1004,11 +1025,11 @@ function renderAttachments() {
 async function stageImageFile(file) {
   if (!ALLOWED_IMAGE_MIMES.has(file.type)) {
     appendError('Only PNG, JPEG, WebP, and GIF images are supported.');
-    return;
+    return false;
   }
   if (file.size > MAX_IMAGE_BYTES) {
     appendError('Image too large — max 5 MB per file.');
-    return;
+    return false;
   }
   const data = await new Promise((resolve, reject) => {
     const reader = new FileReader();
@@ -1026,6 +1047,7 @@ async function stageImageFile(file) {
     url: URL.createObjectURL(file),
   });
   renderAttachments();
+  return true;
 }
 
 // Extensions we accept on composer drop/paste alongside images.
@@ -1195,8 +1217,18 @@ if (form) {
         // image on later turns. Earlier behavior was vision-only,
         // which made dropped images one-shot while native "+ Add
         // Files" persisted them — confusing inconsistency.
-        await stageImageFile(file);
-        await stageDataFile(file);
+        //
+        // Critical: only persist via stageDataFile WHEN the image
+        // passed the vision cap. Earlier code unconditionally ran
+        // both, so a 100 MB screenshot rejected by the 5 MB vision
+        // cap STILL got FileReader-base64'd and bridge-sent under
+        // the 512 MB drag-drop cap, freezing the UI on the very
+        // payload the image cap was meant to refuse. Treat the
+        // image cap as the floor for both paths.
+        const accepted = await stageImageFile(file);
+        if (accepted) {
+          await stageDataFile(file);
+        }
       } else {
         await stageDataFile(file);
       }
@@ -1223,9 +1255,14 @@ if (input) {
     for (const f of usable) {
       if (ALLOWED_IMAGE_MIMES.has(f.type)) {
         // Stage for vision AND persist — same dual-tracking as the
-        // drop handler so paste and drop produce identical state.
-        await stageImageFile(f);
-        await stageDataFile(f);
+        // drop handler. The image-cap-rejection short-circuit also
+        // applies here: an oversize pasted screenshot must not slip
+        // through the data path's larger cap. See the drop handler
+        // above for the full rationale.
+        const accepted = await stageImageFile(f);
+        if (accepted) {
+          await stageDataFile(f);
+        }
       } else {
         await stageDataFile(f);
       }
@@ -1575,16 +1612,32 @@ async function fireQueuedMessage(cwd, item) {
   // to the focused cwd would persist / execute the queued message
   // against the WRONG session. The ``_to_session`` variants route to
   // the runner whose cwd matches ``cwd``, regardless of focus.
+  //
+  // ``item.attachmentToken`` is the per-queued-message attachment
+  // snapshot the bridge took at queue time. The token-bearing send
+  // variants restore that exact snapshot into runner.pending_* just
+  // before sending, so two queued messages with different staged
+  // scripts each fire with their OWN attachments rather than racing
+  // for whatever happens to be in the global pending lists.
   const api = window.pywebview.api;
+  const supportsTokenedSend = (
+    typeof api.send_message_with_token_to_session === 'function'
+    && typeof api.send_message_with_images_and_token_to_session === 'function'
+  );
   const supportsTargeted = (
     typeof api.send_message_to_session === 'function'
     && typeof api.send_message_with_images_to_session === 'function'
   );
   try {
     let turnId = null;
+    const token = item.attachmentToken || '';
     if (item.images.length > 0) {
       const payload = item.images.map((img) => ({ data: img.data, mime: img.mime }));
-      if (supportsTargeted) {
+      if (supportsTokenedSend && token) {
+        turnId = await api.send_message_with_images_and_token_to_session(
+          cwd, item.text, payload, token,
+        );
+      } else if (supportsTargeted) {
         turnId = await api.send_message_with_images_to_session(cwd, item.text, payload);
       } else if (typeof api.send_message_with_images === 'function') {
         // Older bridge: fall back to focused-cwd send. Cross-session
@@ -1601,6 +1654,8 @@ async function fireQueuedMessage(cwd, item) {
         setSending(false, cwd);
         return;
       }
+    } else if (supportsTokenedSend && token) {
+      turnId = await api.send_message_with_token_to_session(cwd, item.text, token);
     } else if (supportsTargeted) {
       turnId = await api.send_message_to_session(cwd, item.text);
     } else {
@@ -1631,10 +1686,26 @@ function drainPendingFor(cwd) {
   const q = pendingByCwd.get(cwd);
   if (!q || q.length === 0) return 0;
   const drained = q.length;
+  const api = window.pywebview && window.pywebview.api;
   for (const item of q) {
     item.userEl.classList.remove('queued');
     item.userEl.classList.add('not-sent');
     item.userEl.title = 'Stopped before this message could send.';
+    // Drop each cancelled item's frozen attachment snapshot from
+    // the runner — without this, a Stop+resend cycle would leak
+    // the snapshots and any attachments restored later by a
+    // misrouted token would carry stale state.
+    if (
+      item.attachmentToken
+      && api
+      && typeof api.discard_pending_attachments_token === 'function'
+    ) {
+      try {
+        api.discard_pending_attachments_token(cwd, item.attachmentToken);
+      } catch (err) {
+        console.warn('discard_pending_attachments_token failed', err);
+      }
+    }
   }
   q.length = 0;
   return drained;
@@ -1702,10 +1773,32 @@ form.addEventListener('submit', async (e) => {
   if (turnInFlight) {
     userEl.classList.add('queued');
     userEl.title = 'Queued — will send when the current turn finishes.';
+    // Freeze the runner's current pending_* lists into a per-message
+    // snapshot. The bridge clears the runner's pending state, so any
+    // attachments the user stages NEXT (for a later queued message)
+    // land in a fresh slot. When this queued item fires below, the
+    // backend will restore THIS snapshot into pending_* — closing
+    // the race where the second queued send used to consume the
+    // first message's script chip.
+    let attachmentToken = '';
+    const api = window.pywebview && window.pywebview.api;
+    if (api && typeof api.freeze_pending_attachments === 'function') {
+      try {
+        const t = await api.freeze_pending_attachments(currentCwd);
+        if (typeof t === 'string') attachmentToken = t;
+      } catch (err) {
+        // If freezing fails for any reason, fall through to the
+        // older fire-without-token path. The race is back, but the
+        // message at least sends — silent failure here would be
+        // worse for the user.
+        console.warn('freeze_pending_attachments failed', err);
+      }
+    }
     pendingFor(currentCwd).push({
       text,
       images: images.map((img) => ({ data: img.data, mime: img.mime })),
       attachments: messageAttachments,
+      attachmentToken,
       userEl,
     });
     return;

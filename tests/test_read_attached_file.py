@@ -4,14 +4,17 @@ recall path for files the researcher attached earlier in the session.
 Covers:
   - Script return shape (text content, language hint, size, truncation
     marker on >64 KB files).
-  - Image return shape (MCP image content block + text descriptor).
+  - Image return shape (MCP image content block + text descriptor) for
+    *manifest-allowlisted helper plots only* — arbitrary cwd PNGs and
+    non-manifest plots are rejected (the SDC gate).
   - PDF / EPS rasterisation via the existing sips sidecar (skipped
     when the converter isn't available).
   - Datasets and arbitrary other extensions are refused with a clear
     "use get_schema" hint.
   - Path-traversal attempts are refused.
-  - Files in a helper-plot subdir resolve correctly (so the model can
-    recall a manifest plot like ``residuals_lm1.png``).
+  - Files in a helper-plot subdir resolve correctly *and* pass the
+    manifest gate (so the model can recall an allowlisted plot like
+    ``coefficients_lm1.png``).
 """
 
 from __future__ import annotations
@@ -25,6 +28,15 @@ import pytest
 
 from nora.config import set_cwd
 from nora.tools import read_attached_file
+
+
+def _write_plot_manifest(plots_dir: Path, file: str, kind: str) -> None:
+    """Append a manifest entry for ``file`` with ``kind`` (helper-only
+    fixture for the image-recall tests)."""
+    manifest = plots_dir / "manifest.jsonl"
+    line = json.dumps({"file": file, "kind": kind}) + "\n"
+    with manifest.open("a", encoding="utf-8") as f:
+        f.write(line)
 
 
 # A 1×1 transparent PNG - same fixture as the @-mention tests use.
@@ -126,14 +138,17 @@ def test_script_oversize_is_head_and_tail_truncated_with_marker(
 # ---------------------------------------------------------------------------
 
 def test_image_returned_as_mcp_image_block(tmp_path: Path) -> None:
-    """A PNG mention should come back with an MCP image content
-    block alongside a text descriptor. The Anthropic provider
-    forwards the image to the model; the descriptor keeps the
-    response from being empty on text-only providers."""
+    """A manifest-allowlisted helper plot comes back with an MCP image
+    content block alongside a text descriptor. The Anthropic provider
+    forwards the image to the model; the descriptor keeps the response
+    from being empty on text-only providers."""
     set_cwd(tmp_path)
-    (tmp_path / "residuals.png").write_bytes(_TINY_PNG)
+    plots_dir = tmp_path / ".nora" / "runs" / "run-001" / "_nora_plots"
+    plots_dir.mkdir(parents=True)
+    (plots_dir / "coefficients_lm1.png").write_bytes(_TINY_PNG)
+    _write_plot_manifest(plots_dir, "coefficients_lm1.png", "coefficients")
 
-    result = _call("residuals.png")
+    result = _call("coefficients_lm1.png")
     blocks = result["content"]
     assert any(b.get("type") == "image" for b in blocks), (
         "image content block missing from result - model wouldn't "
@@ -147,13 +162,144 @@ def test_image_returned_as_mcp_image_block(tmp_path: Path) -> None:
     text = _text_payload(result)
     assert text["status"] == "ok"
     assert text["kind"] == "image"
-    assert text["name"] == "residuals.png"
+    assert text["name"] == "coefficients_lm1.png"
+
+
+def test_arbitrary_cwd_image_is_rejected(tmp_path: Path) -> None:
+    """A PNG dropped at the cwd top-level (e.g., ``plt.savefig`` from a
+    non-helper script, or an exported scatterplot) is NOT a helper-
+    sanitized plot. Recall must refuse it — otherwise the image is a
+    vision side channel around the JSON SDC sanitizer.
+
+    The researcher can still re-attach via the composer's vision flow
+    if they want the model to look at it again."""
+    set_cwd(tmp_path)
+    (tmp_path / "scatter.png").write_bytes(_TINY_PNG)
+    payload = _text_payload(_call("scatter.png"))
+    assert payload["status"] == "rejected"
+    assert "helper" in payload["reason"].lower()
+
+
+def test_residuals_plot_recall_is_rejected(tmp_path: Path) -> None:
+    """``nora.plot_residuals`` writes ``residuals.png`` into the run's
+    ``_nora_plots/`` and records a manifest entry with kind=residuals
+    — but ``_PLOT_KIND_ALLOWLIST`` deliberately excludes ``residuals``
+    from per-turn capture (residuals are individual observations).
+
+    Recall must enforce the same rule, or the model can fetch the
+    plot bytes after the fact and reconstruct row-level data."""
+    set_cwd(tmp_path)
+    plots_dir = tmp_path / ".nora" / "runs" / "run-002" / "_nora_plots"
+    plots_dir.mkdir(parents=True)
+    (plots_dir / "residuals_lm1.png").write_bytes(_TINY_PNG)
+    _write_plot_manifest(plots_dir, "residuals_lm1.png", "residuals")
+
+    payload = _text_payload(_call("residuals_lm1.png"))
+    assert payload["status"] == "rejected"
+
+
+def test_unmanifested_plot_dir_image_is_rejected(tmp_path: Path) -> None:
+    """A file in ``_nora_plots/`` with NO manifest entry — e.g., a
+    rogue ``plt.savefig`` writing into the run dir — is also rejected.
+    The manifest is the SDC chokepoint; files without one never
+    crossed to the model on the original turn either."""
+    set_cwd(tmp_path)
+    plots_dir = tmp_path / ".nora" / "runs" / "run-003" / "_nora_plots"
+    plots_dir.mkdir(parents=True)
+    (plots_dir / "rogue.png").write_bytes(_TINY_PNG)
+    # no manifest write
+
+    payload = _text_payload(_call("rogue.png"))
+    assert payload["status"] == "rejected"
+
+
+# ---------------------------------------------------------------------------
+# Notebooks — .ipynb code + markdown cell extraction
+# ---------------------------------------------------------------------------
+
+def test_notebook_extracts_code_and_markdown_cells(tmp_path: Path) -> None:
+    """Notebooks are advertised as scripts in list_session_files but
+    couldn't be recalled. read_attached_file now extracts code +
+    markdown cell sources (outputs dropped, since they may carry raw
+    DataFrame rows the SDC sanitizer would normally strip)."""
+    set_cwd(tmp_path)
+    nb = {
+        "cells": [
+            {
+                "cell_type": "markdown",
+                "source": ["# Analysis title\n", "Brief notes."],
+            },
+            {
+                "cell_type": "code",
+                "source": [
+                    "import pandas as pd\n",
+                    "df = pd.read_csv('data.csv')\n",
+                ],
+                "outputs": [
+                    # Outputs MUST be stripped — they may carry raw rows.
+                    {"output_type": "stream", "text": "RAW_DATA_DO_NOT_LEAK\n"},
+                    {"output_type": "execute_result",
+                     "data": {"text/plain": "200 rows of leaked data..."}},
+                ],
+            },
+            {
+                "cell_type": "code",
+                "source": "df.head(10)\n",
+                "outputs": [
+                    {"output_type": "stream", "text": "MORE_RAW_DATA"},
+                ],
+            },
+        ],
+        "metadata": {"kernelspec": {"name": "python3"}},
+        "nbformat": 4,
+    }
+    (tmp_path / "analysis.ipynb").write_text(
+        json.dumps(nb), encoding="utf-8"
+    )
+
+    payload = _text_payload(_call("analysis.ipynb"))
+    assert payload["status"] == "ok"
+    assert payload["kind"] == "notebook"
+    assert payload["language"] == "Python"
+    assert payload["code_cells"] == 2
+    assert payload["markdown_cells"] == 1
+
+    content = payload["content"]
+    # Code cell sources survive.
+    assert "import pandas as pd" in content
+    assert "df = pd.read_csv" in content
+    assert "df.head(10)" in content
+    # Markdown survives as comments.
+    assert "Analysis title" in content
+    assert "Brief notes" in content
+    # Outputs are STRIPPED — the SDC line.
+    assert "RAW_DATA_DO_NOT_LEAK" not in content
+    assert "MORE_RAW_DATA" not in content
+    assert "200 rows" not in content
+
+
+def test_notebook_with_no_cells_returns_error(tmp_path: Path) -> None:
+    """Empty / malformed notebooks return a clear error so the model
+    knows the recall couldn't produce useful content."""
+    set_cwd(tmp_path)
+    (tmp_path / "empty.ipynb").write_text(
+        json.dumps({"cells": []}), encoding="utf-8"
+    )
+    payload = _text_payload(_call("empty.ipynb"))
+    assert payload["status"] == "error"
+    assert "no recognisable cells" in payload["reason"]
 
 
 def test_image_oversize_refused(tmp_path: Path) -> None:
+    """The size cap fires after the disclosure-control gate, so the
+    fixture must use a manifest-allowlisted location."""
     set_cwd(tmp_path)
-    huge = tmp_path / "huge.png"
+    plots_dir = tmp_path / ".nora" / "runs" / "run-004" / "_nora_plots"
+    plots_dir.mkdir(parents=True)
+    huge = plots_dir / "huge.png"
     huge.write_bytes(b"\0" * (6 * 1024 * 1024))  # 6 MB
+    _write_plot_manifest(plots_dir, "huge.png", "interaction")
+
     payload = _text_payload(_call("huge.png"))
     assert payload["status"] == "error"
     assert "5 MB" in payload["reason"]
@@ -213,16 +359,17 @@ def test_missing_name_arg_returns_error(tmp_path: Path) -> None:
 
 def test_resolves_files_under_helper_plot_dir(tmp_path: Path) -> None:
     """Plots produced by ``nora.plot_*`` helpers live under
-    ``.nora/runs/<id>/_nora_plots/``. The Files panel exposes them;
-    so the recall tool should resolve them too - otherwise the
-    model can see them in a tool result, but can't fetch them by
-    name later."""
+    ``.nora/runs/<id>/_nora_plots/`` and are listed in
+    ``manifest.jsonl``. The Files panel exposes them; the recall tool
+    should resolve them too — gated on a manifest entry whose ``kind``
+    is in the SDC allowlist."""
     set_cwd(tmp_path)
-    plots_dir = tmp_path / ".nora" / "runs" / "run-001" / "_nora_plots"
+    plots_dir = tmp_path / ".nora" / "runs" / "run-recall" / "_nora_plots"
     plots_dir.mkdir(parents=True)
-    (plots_dir / "residuals_lm1.png").write_bytes(_TINY_PNG)
+    (plots_dir / "interaction_lm1.png").write_bytes(_TINY_PNG)
+    _write_plot_manifest(plots_dir, "interaction_lm1.png", "interaction")
 
-    result = _call("residuals_lm1.png")
+    result = _call("interaction_lm1.png")
     text = _text_payload(result)
     assert text["status"] == "ok"
     assert text["kind"] == "image"
@@ -290,14 +437,19 @@ def test_resolves_run_dir_script_by_short_id_fallback(
     assert "use \"data.dta\"" in payload["content"]
 
 
-def test_run_dir_script_lookup_survives_rewind_hidden_label(
+def test_run_dir_script_lookup_blocked_after_rewind(
     tmp_path: Path,
 ) -> None:
-    """A rewind marks the result row's ``hidden_at`` timestamp but
-    leaves the row in the store and the script.do on disk. The
-    Files panel uses ``include_hidden=True`` so the labeled name
-    still surfaces; the recall path must do the same so the model
-    can fetch the script after a rewind clears the chat history."""
+    """A rewind hides results in the store; the on-disk run dir
+    remains. Earlier behaviour let the model still fetch the
+    script via ``read_attached_file`` (and discover it via
+    ``list_session_files``), defeating the rewind: the model could
+    re-fetch the discarded branch's analysis verbatim by name. The
+    model-facing path now filters run-dir lookups against the
+    visible (non-hidden) result set, so a hidden script is
+    not_found from the model's perspective. The Files panel
+    intentionally still shows it so the researcher can decide
+    whether to delete it."""
     set_cwd(tmp_path)
     run_dir = tmp_path / ".nora" / "runs" / "20260507T120200Z_cccccccc"
     run_dir.mkdir(parents=True)
@@ -321,9 +473,7 @@ def test_run_dir_script_lookup_survives_rewind_hidden_label(
     store.hide_results_not_in(set(), reason="rewind")
 
     payload = _text_payload(_call("M27-M38 base spec.do"))
-    assert payload["status"] == "ok"
-    assert payload["kind"] == "script"
-    assert "regress y x" in payload["content"]
+    assert payload["status"] == "not_found"
     # And confirm hide actually fired (otherwise the test is trivial).
     assert store.get(row.id) is None  # default include_hidden=False
 
@@ -387,15 +537,17 @@ def test_resolves_plot_with_truncated_long_filename(tmp_path: Path) -> None:
     """Same round-trip as the cwd case but for plot files under
     ``.nora/runs/<id>/_nora_plots/``. A model that recalls a plot from
     a run with autogenerated long filenames should still resolve via
-    the displayed name."""
+    the displayed name. The manifest entry uses the ON-DISK basename
+    (which is what the helper wrote and what the bridge reads)."""
     from nora.text_safety import safe_text
 
     set_cwd(tmp_path)
-    plots_dir = tmp_path / ".nora" / "runs" / "run-002" / "_nora_plots"
+    plots_dir = tmp_path / ".nora" / "runs" / "run-trunc" / "_nora_plots"
     plots_dir.mkdir(parents=True)
-    long_stem = "residuals_lm_fit_" + ("z" * 200)
+    long_stem = "interaction_lm_fit_" + ("z" * 200)
     on_disk = plots_dir / f"{long_stem}.png"
     on_disk.write_bytes(_TINY_PNG)
+    _write_plot_manifest(plots_dir, on_disk.name, "interaction")
 
     displayed = safe_text(on_disk.name)
     assert "[TRUNCATED]" in displayed

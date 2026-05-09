@@ -116,6 +116,29 @@ DEFAULT_TIMEOUT_SECONDS = _resolve_default_timeout()
 # Where per-run scratch dirs live, relative to cwd.
 RUNS_SUBDIR = ".nora/runs"
 
+# Hard caps on the JSONL result file. A model-authored script can
+# loop and call ``nora_result_*`` thousands of times — each call
+# emits one JSONL line. Without caps, the executor would parse,
+# token-validate, sanitize, store, render, and ship every payload,
+# blowing memory and conversation context regardless of the inline-
+# trim that ``submit_script`` applies later. We trim at the FIRST
+# point the runtime can refuse: when reading the result file.
+#
+#   * 8 MB on file size — enough for a few hundred wide regressions
+#     (a typical regression payload is 5–20 KB after auth-token
+#     framing).
+#   * 256 entries — beyond this we're either looping unintentionally
+#     or producing more results than a researcher will inspect in one
+#     turn. The ceiling is intentionally well above legitimate
+#     batch sizes (a 24-spec sweep is comfortable) but well below
+#     anything that would suggest a control-flow bug or exfil loop.
+#
+# When a cap is hit we KEEP the early payloads (so a partial result
+# still surfaces) and raise a warning so the caller knows results
+# were truncated.
+MAX_RESULT_FILE_BYTES = 8 * 1024 * 1024
+MAX_RESULT_PAYLOADS = 256
+
 # Name of the payload field the runtime library embeds to prove the
 # payload came from the library (rather than being hand-crafted by
 # Claude's script). Starts with underscore so it doesn't collide with
@@ -261,11 +284,17 @@ def _format_bad_lines_summary(bad_lines: list[str], payload_count: int) -> str:
     """Render the malformed-lines advisory.
 
     Shows full detail for the first 5 entries and surfaces the line
-    numbers (only) for any that follow, so a 12-corrupt-line debug
+    numbers (only) for the next chunk, so a 12-corrupt-line debug
     session reads as ``lines 6,7,8,9,10,11,12 also failed`` rather
-    than an opaque ``…``. The line-number tail is bounded by the
-    bad-line count, not by an arbitrary cap — the message is
-    diagnostic, the researcher reads it once and moves on.
+    than an opaque ``…``.
+
+    Both head and tail are capped: the tail keeps at most
+    ``_BAD_LINES_TAIL_CAP`` line numbers and appends an ``and N more``
+    suffix beyond that. A bug emitting thousands of malformed lines
+    would otherwise produce a multi-KB string in ``warnings`` /
+    ``error``, flooding the model context and the UI. The advisory
+    is diagnostic — the researcher reads it once, opens the run dir
+    if the line numbers don't tell the whole story.
     """
     head = "; ".join(bad_lines[:5])
     tail_msg = ""
@@ -281,7 +310,17 @@ def _format_bad_lines_summary(bad_lines: list[str], payload_count: int) -> str:
                     entry.split(":", 1)[0].removeprefix("line ").strip()
                 )
         if extra_linenos:
-            tail_msg = f" … and lines {','.join(extra_linenos)} also failed"
+            shown = extra_linenos[:_BAD_LINES_TAIL_CAP]
+            overflow = len(extra_linenos) - len(shown)
+            if overflow > 0:
+                tail_msg = (
+                    f" … and lines {','.join(shown)} also failed "
+                    f"(+ {overflow} more)"
+                )
+            else:
+                tail_msg = (
+                    f" … and lines {','.join(shown)} also failed"
+                )
         else:
             tail_msg = f" … and {len(bad_lines) - 5} more"
     return (
@@ -290,9 +329,16 @@ def _format_bad_lines_summary(bad_lines: list[str], payload_count: int) -> str:
     )
 
 
+# Tail-cap on the bad-line summary's enumerated line numbers. 20 is
+# enough to scan visually for clustering ("lines 12-31 all bad → it's
+# helper #2") without letting a 1000-bad-line bug ship 1000 line
+# numbers into the model's context.
+_BAD_LINES_TAIL_CAP = 20
+
+
 def _parse_result_jsonl(
     text: str, run_token: str
-) -> tuple[list[dict[str, Any]], list[str]]:
+) -> tuple[list[dict[str, Any]], list[str], bool]:
     """Parse a JSONL result file line by line, skipping bad lines.
 
     A single corrupt line (e.g. a degenerate Stata fit that emitted a
@@ -303,19 +349,29 @@ def _parse_result_jsonl(
     1 of 8 corrupt lines becomes "7 results + 1 documented error", not
     "0 results + 1 documented error".
 
-    Returns ``(payloads, bad_line_messages)``. ``payloads`` carries
-    every line that parsed AND token-validated, in emission order;
-    ``bad_line_messages`` carries one short string per failed line for
-    the caller to surface back to the model.
+    Stops appending payloads once ``MAX_RESULT_PAYLOADS`` is reached
+    so a runaway loop in the script can't blow memory / context. The
+    file-byte cap is enforced one level up in ``run_script`` before
+    calling here.
+
+    Returns ``(payloads, bad_line_messages, truncated)``. ``payloads``
+    carries every line that parsed AND token-validated, in emission
+    order; ``bad_line_messages`` carries one short string per failed
+    line for the caller to surface back to the model; ``truncated``
+    is ``True`` iff the entry-count cap kicked in.
     """
     import json
 
     payloads: list[dict[str, Any]] = []
     bad_lines: list[str] = []
+    truncated = False
     for lineno, raw_line in enumerate(text.splitlines(), start=1):
         line = raw_line.strip()
         if not line:
             continue
+        if len(payloads) >= MAX_RESULT_PAYLOADS:
+            truncated = True
+            break
         try:
             raw_payload = json.loads(line)
         except json.JSONDecodeError as je:
@@ -326,7 +382,7 @@ def _parse_result_jsonl(
             bad_lines.append(f"line {lineno}: {auth_err}")
             continue
         payloads.append(cleaned)
-    return payloads, bad_lines
+    return payloads, bad_lines, truncated
 
 
 @lru_cache(maxsize=1)
@@ -665,11 +721,33 @@ def run_script(
         )
     else:
         try:
-            text = result_path.read_text(encoding="utf-8")
+            # Enforce the file-byte cap up front so we don't allocate
+            # a huge string for parsing. If the file is over-cap we
+            # read just the first MAX_RESULT_FILE_BYTES bytes — any
+            # JSONL line straddling the cut is dropped by the parser
+            # via JSONDecodeError, and the truncation flag is set.
+            file_size = result_path.stat().st_size
+            byte_truncated = file_size > MAX_RESULT_FILE_BYTES
+            with result_path.open("r", encoding="utf-8", errors="replace") as fh:
+                if byte_truncated:
+                    text = fh.read(MAX_RESULT_FILE_BYTES)
+                else:
+                    text = fh.read()
         except OSError as oe:
             error = f"could not read result file: {oe}"
         else:
-            payloads, bad_lines = _parse_result_jsonl(text, run_token)
+            payloads, bad_lines, count_truncated = _parse_result_jsonl(text, run_token)
+            if byte_truncated or count_truncated:
+                cap_label = (
+                    f"{MAX_RESULT_PAYLOADS} payload entries"
+                    if count_truncated
+                    else f"{MAX_RESULT_FILE_BYTES // (1024 * 1024)} MB result-file size"
+                )
+                warnings.append(
+                    f"result truncated at {cap_label}; later helper "
+                    f"emissions were dropped. If this is intentional, "
+                    f"split the run into smaller batches."
+                )
             if bad_lines:
                 bad_msg = _format_bad_lines_summary(bad_lines, len(payloads))
                 # Two paths, two meanings:
@@ -752,6 +830,7 @@ def _stage_runtime(run_dir: Path, language: Language) -> Path:
             "nora_result_sum.ado",
             "nora_result_tab.ado",
             "nora_result_magnitude.ado",
+            "nora_result_correlation.ado",
             "nora_plot_residuals.ado",
             "nora_plot_coefficients.ado",
             "nora_plot_interaction.ado",
@@ -1102,6 +1181,25 @@ def _build_profile(
         if p:
             read_subpaths.append(_quote(p))
 
+    # Carve ``.nora`` out of the cwd allow. The cwd allow gives scripts
+    # the analysis workspace, but ``<cwd>/.nora`` holds Nora's own
+    # session state — chat_history.jsonl, results.db, prior run scripts
+    # and stdout/stderr logs, helper plot manifests. Those files are
+    # exactly the raw / pre-sanitization material the tool layer keeps
+    # out of model-visible context. A model-authored script left to
+    # roam under ``<cwd>/.nora`` could read them and smuggle excerpts
+    # back through any sanitizer-allowed channel (label fields, helper
+    # error bodies, even an unsanitized stdout line on a non-result
+    # path), or corrupt the persisted session state to influence
+    # future turns.
+    #
+    # SBPL rule precedence is "last match wins", so we re-emit the
+    # allow for cwd, follow it with a deny for ``<cwd>/.nora``, and
+    # finish with a re-allow for the current ``run_dir`` (which IS
+    # under ``<cwd>/.nora/runs/<id>/`` — the script needs to read
+    # its staged runtime library and write its result.json there).
+    # Anything else under ``.nora`` falls through to the deny.
+    nora_dir = cwd / ".nora"
     return (
         "(version 1)\n"
         "(deny default)\n"
@@ -1130,10 +1228,26 @@ def _build_profile(
         + "".join(f"    (subpath {p})\n" for p in read_subpaths)
         + ")\n"
         "\n"
+        "; Carve ``.nora`` out of the cwd read allow — Nora's session\n"
+        "; state (chat_history.jsonl, results.db, prior run logs) must\n"
+        "; never be readable by a script. Re-allow only the current\n"
+        "; run_dir below so the runtime library + result.json still\n"
+        "; resolve.\n"
+        f"(deny file-read* (subpath {_quote(nora_dir)}))\n"
+        f"(allow file-read* (subpath {_quote(run_dir)}))\n"
+        "\n"
         "; File writes restricted to the run's scratch dir and temp\n"
         "; paths used by R/Stata for internal staging.\n"
         "(allow file-write*\n"
         + "".join(f"    (subpath {p})\n" for p in write_subpaths)
         + "".join(f"    (literal {p})\n" for p in write_literals)
         + "    (regex #\"^/dev/ttys[0-9]+$\"))\n"
+        "\n"
+        "; Same carve-out on writes: a script must not modify Nora's\n"
+        "; session state (which would let it influence future turns by\n"
+        "; tampering with results.db / chat_history.jsonl). Re-allow\n"
+        "; only the current run_dir so result.json + stdout/stderr\n"
+        "; logs land where the executor reads them.\n"
+        f"(deny file-write* (subpath {_quote(nora_dir)}))\n"
+        f"(allow file-write* (subpath {_quote(run_dir)}))\n"
     )
