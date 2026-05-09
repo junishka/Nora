@@ -140,6 +140,59 @@ def test_list_surfaces_run_dir_scripts_with_label(tmp_path: Path):
     assert "M27-M38 base spec.do" in names, names
 
 
+def test_list_hides_run_dir_scripts_after_rewind(tmp_path: Path):
+    """A rewind hides results in the store; the on-disk run dirs
+    remain. Without filtering, the model could still discover and
+    read scripts from the discarded branch via ``list_session_files``,
+    defeating the rewind. The model-facing tool now restricts run-dir
+    enumeration to dirs whose run is referenced by a non-hidden
+    result."""
+    from nora.store import get_store, reset_store_for_tests
+    reset_store_for_tests()
+    set_cwd(tmp_path)
+
+    # Two run dirs, two scripts, two stored results.
+    visible_run = tmp_path / ".nora" / "runs" / "20260507T120000Z_visible0"
+    visible_run.mkdir(parents=True)
+    (visible_run / "script.do").write_text("regress y x\n")
+    rewound_run = tmp_path / ".nora" / "runs" / "20260507T120100Z_hidden00"
+    rewound_run.mkdir(parents=True)
+    (rewound_run / "script.do").write_text("regress y other\n")
+
+    store = get_store(tmp_path)
+    kept_row = store.insert(
+        label="kept analysis",
+        analysis_type="linear_regression",
+        sanitized_payload={"type": "linear_regression"},
+        language="Stata",
+        script_code="regress y x\n",
+        transformations=[],
+        raw_log_path=str(visible_run),
+        script_run_id="run-visible0",
+    )
+    store.insert(
+        label="discarded analysis",
+        analysis_type="linear_regression",
+        sanitized_payload={"type": "linear_regression"},
+        language="Stata",
+        script_code="regress y other\n",
+        transformations=[],
+        raw_log_path=str(rewound_run),
+        script_run_id="run-hidden00",
+    )
+    # Simulate a rewind: keep only the first, hide everything else.
+    store.hide_results_not_in({kept_row.id}, reason="rewind")
+
+    out = _list({})
+    names = {row["name"] for row in out["files"]}
+    # Visible run's script appears.
+    assert "kept analysis.do" in names
+    # Rewound run's script does NOT appear.
+    assert "discarded analysis.do" not in names
+    # And nothing fishy like the short_id fallback either.
+    assert not any("hidden00" in n for n in names)
+
+
 def test_list_surfaces_run_dir_scripts_with_short_id_fallback(
     tmp_path: Path,
 ):

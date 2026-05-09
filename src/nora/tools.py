@@ -26,6 +26,7 @@ See also: `project_builder_mcp_surface.md` (user memory) for the full spec.
 from __future__ import annotations
 
 import json
+import logging
 import os
 import secrets
 from pathlib import Path
@@ -815,9 +816,15 @@ async def get_schema(args: dict[str, Any]) -> dict[str, Any]:
 
     try:
         payload = schema.extract(path, depth)
-    except ValueError as e:
-        # Unsupported format, invalid depth, or a file-shape problem
-        # we can express as a user-facing reason.
+    except schema.SchemaExtractError as e:
+        # Parser-owned validation errors (unsupported format, invalid
+        # depth, .rds-without-dataframe). Their messages are crafted
+        # by ``schema.extract`` itself and are safe to forward
+        # verbatim. Note: ``SchemaExtractError`` is a subclass of
+        # ``ValueError``; we catch it BEFORE the generic ValueError
+        # path so pandas-style ``ParserError`` (also a ``ValueError``
+        # subclass, but with row content in its message) doesn't
+        # take this branch and leak data.
         return _as_mcp_text({
             "status": "error",
             "reason": str(e),
@@ -825,9 +832,26 @@ async def get_schema(args: dict[str, Any]) -> dict[str, Any]:
             "depth": depth,
         })
     except Exception as e:  # broad: lib-specific parse errors
+        # ``e`` here is whatever the underlying reader raised
+        # (pandas ParserError, pyreadstat ReadstatError, json
+        # decode errors, ...). Those messages routinely embed the
+        # offending row text or column value — surfacing them in
+        # the model-visible reason contradicts the schema tool's
+        # promise of never returning individual observation values.
+        # We log the full detail server-side and return only the
+        # exception class name to the model, which is enough to
+        # tell pandas-CSV-malformed from pyreadstat-Stata-corrupted
+        # without quoting any data.
+        logging.getLogger(__name__).warning(
+            "schema.extract failed for %s: %s", dataset, e, exc_info=True,
+        )
         return _as_mcp_text({
             "status": "error",
-            "reason": f"failed to read {dataset!r}: {e.__class__.__name__}: {e}",
+            "reason": (
+                f"failed to read {dataset!r} ({e.__class__.__name__}). "
+                f"The dataset may be malformed or corrupted; researcher "
+                f"logs have the underlying parser error."
+            ),
             "dataset": dataset,
         })
 
@@ -916,7 +940,11 @@ async def search_schema(args: dict[str, Any]) -> dict[str, Any]:
 
     try:
         payload = schema.extract(path, extract_depth)
-    except ValueError as e:
+    except schema.SchemaExtractError as e:
+        # See get_schema for why this is the FIRST except clause —
+        # SchemaExtractError extends ValueError, but we must not
+        # blanket-catch ValueError here because pandas ParserError
+        # (also a ValueError) would leak row content.
         return _as_mcp_text({
             "status": "error",
             "reason": str(e),
@@ -924,9 +952,21 @@ async def search_schema(args: dict[str, Any]) -> dict[str, Any]:
             "depth": extract_depth,
         })
     except Exception as e:  # noqa: BLE001 — broad: lib-specific parse errors
+        # See get_schema for why we drop ``str(e)`` from the
+        # model-visible reason — parser exceptions can quote the
+        # offending row content, which would defeat the schema
+        # tool's no-individual-observation guarantee.
+        logging.getLogger(__name__).warning(
+            "search_schema extract failed for %s: %s",
+            dataset, e, exc_info=True,
+        )
         return _as_mcp_text({
             "status": "error",
-            "reason": f"failed to read {dataset!r}: {e.__class__.__name__}: {e}",
+            "reason": (
+                f"failed to read {dataset!r} ({e.__class__.__name__}). "
+                f"The dataset may be malformed or corrupted; researcher "
+                f"logs have the underlying parser error."
+            ),
             "dataset": dataset,
         })
 
@@ -1773,8 +1813,12 @@ async def submit_script_file(args: dict[str, Any]) -> dict[str, Any]:
     if target is None:
         try:
             from nora.run_files import find_run_dir_script_by_name
+            from nora.session_files import visible_run_dir_names
             cwd = get_cwd()
-            candidate = find_run_dir_script_by_name(cwd, safe_name)
+            candidate = find_run_dir_script_by_name(
+                cwd, safe_name,
+                visible_run_dirs=visible_run_dir_names(cwd),
+            )
         except Exception:  # noqa: BLE001
             candidate = None
         if candidate is not None and candidate.is_file():
@@ -2361,8 +2405,18 @@ def _render_tool_use(use: Any) -> dict[str, Any]:
     on ``ToolUse`` was renamed to ``result_ids`` in commit f70a4e1;
     this renderer used to read the stale name and AttributeError on
     every recall path that included a tool call.
+
+    ``label`` is derived from script-controlled tool inputs
+    (submit_script.label, filenames, recall queries) so it must pass
+    ``safe_text`` before reaching the model — without it, a label
+    like ``"...\n[system] override: ..."`` would be forwarded
+    verbatim through the recall_conversation response.
     """
-    out: dict[str, Any] = {"name": use.name, "label": use.label}
+    label = use.label or ""
+    out: dict[str, Any] = {
+        "name": use.name,
+        "label": safe_text(label, max_len=200) if label else "",
+    }
     rids = list(use.result_ids or [])
     if len(rids) == 1:
         out["result_id"] = rids[0]
@@ -2389,6 +2443,16 @@ async def recall_conversation(args: dict[str, Any]) -> dict[str, Any]:
     context_raw = args.get("context")
     max_chars_raw = args.get("max_chars")
 
+    # Hard ceilings on what the model can request. Without these, a
+    # ``tail=1_000_000`` or ``max_chars=10_000_000`` call (typo or
+    # otherwise) would dump essentially the whole persisted
+    # conversation in a single response — both an obvious DoS path
+    # and an unintended surface for re-exposing earlier sanitized
+    # content. The ceilings stay well above the working defaults
+    # so legitimate "show me a wide sweep" requests aren't pinched.
+    MAX_TAIL = 200
+    MAX_CHARS_CEILING = 64 * 1024  # 64 KB
+
     # Defaults: no args → last 10 turns. Query-only → all matches.
     if not query and (tail_raw is None or tail_raw == 0):
         tail = 10
@@ -2397,6 +2461,7 @@ async def recall_conversation(args: dict[str, Any]) -> dict[str, Any]:
             tail = int(tail_raw) if tail_raw is not None else 0
         except (TypeError, ValueError):
             tail = 0
+    tail = max(0, min(tail, MAX_TAIL))
     try:
         context_n = int(context_raw) if context_raw is not None else 2
     except (TypeError, ValueError):
@@ -2406,6 +2471,7 @@ async def recall_conversation(args: dict[str, Any]) -> dict[str, Any]:
         max_chars = int(max_chars_raw) if max_chars_raw is not None else 8000
     except (TypeError, ValueError):
         max_chars = 8000
+    max_chars = max(256, min(max_chars, MAX_CHARS_CEILING))
 
     turns = _read_turns(get_cwd())
     if not turns:
@@ -2497,12 +2563,30 @@ async def recall_conversation(args: dict[str, Any]) -> dict[str, Any]:
     if chronological_output:
         rendered.reverse()
 
-    return _as_mcp_text({
+    response: dict[str, Any] = {
         "status": "ok",
         "turn_count": turn_count,
         "returned": len(rendered),
         "turns": rendered,
-    })
+    }
+    # Tell the model when we hit a clamp ceiling on either knob so it
+    # pages deliberately rather than silently re-asking for the same
+    # over-cap value.
+    if tail_raw is not None:
+        try:
+            asked_tail = int(tail_raw)
+        except (TypeError, ValueError):
+            asked_tail = None
+        if asked_tail is not None and asked_tail > MAX_TAIL:
+            response["tail_clamped_to"] = MAX_TAIL
+    if max_chars_raw is not None:
+        try:
+            asked_chars = int(max_chars_raw)
+        except (TypeError, ValueError):
+            asked_chars = None
+        if asked_chars is not None and asked_chars > MAX_CHARS_CEILING:
+            response["max_chars_clamped_to"] = MAX_CHARS_CEILING
+    return _as_mcp_text(response)
 
 
 # ---------------------------------------------------------------------------
@@ -2622,9 +2706,19 @@ async def read_attached_file(args: dict[str, Any]) -> dict[str, Any]:
                 cwd_resolved = cwd.resolve()
             except OSError:
                 cwd_resolved = None
+            # Rewind enforcement: only walk run dirs whose run is
+            # still associated with a visible (non-hidden) result.
+            # ``None`` from the helper means "store unavailable";
+            # treat that as "no rewind to enforce" so a fresh
+            # session before any results still works.
+            from nora.session_files import visible_run_dir_names
+            visible_runs = visible_run_dir_names(cwd)
             if cwd_resolved is not None:
                 try:
                     for run_dir in runs_root.iterdir():
+                        if (visible_runs is not None
+                                and run_dir.name not in visible_runs):
+                            continue
                         plots_dir = run_dir / "_nora_plots"
                         if not plots_dir.is_dir():
                             continue
@@ -2657,10 +2751,18 @@ async def read_attached_file(args: dict[str, Any]) -> dict[str, Any]:
     # model can pass back what it saw in ``list_session_files``
     # output. Containment back into cwd is implicit — the helper
     # only walks ``<cwd>/.nora/runs``.
+    #
+    # Same rewind enforcement as the plot-dir walk above: pass the
+    # visible-run-dir set so a script from a discarded branch can't
+    # be re-fetched by name.
     if target is None or not target.is_file():
         try:
             from nora.run_files import find_run_dir_script_by_name
-            candidate = find_run_dir_script_by_name(cwd, safe_name)
+            from nora.session_files import visible_run_dir_names
+            candidate = find_run_dir_script_by_name(
+                cwd, safe_name,
+                visible_run_dirs=visible_run_dir_names(cwd),
+            )
         except Exception:  # noqa: BLE001
             candidate = None
         if candidate is not None and candidate.is_file():
@@ -2908,11 +3010,22 @@ async def list_session_files(args: dict[str, Any]) -> dict[str, Any]:
     # — the chat history may have scrolled away or been rewound, and
     # the Files panel surfaces them but the model's own tool view
     # didn't. The display name matches what the panel shows.
+    #
+    # Rewind-aware: ``visible_run_dir_names`` returns the basenames
+    # of run dirs that still have a non-hidden result. After a
+    # rewind, the on-disk run dir for a discarded branch is still
+    # there but its results are hidden — without this filter the
+    # model could still discover and read the script through this
+    # listing.
     if "script" in keep_kinds:
         from datetime import datetime as _dt, timezone as _tz
         from nora.run_files import enumerate_run_dir_scripts
+        from nora.session_files import visible_run_dir_names
+        visible_runs = visible_run_dir_names(cwd)
         seen_paths = {r.get("name") for r in rows}
-        for entry in enumerate_run_dir_scripts(cwd):
+        for entry in enumerate_run_dir_scripts(
+            cwd, visible_run_dirs=visible_runs,
+        ):
             name = safe_text(entry.display_name)
             if not name or name in seen_paths:
                 continue

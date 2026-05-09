@@ -314,11 +314,39 @@ def test_freq_cells_below_threshold_all_suppressed(raw):
 
 
 @given(raw=frequency_table_payloads())
-def test_freq_output_cells_match_input_keys(raw):
-    """Suppression never adds or removes levels."""
+def test_freq_output_keys_are_visible_or_suppressed_bucket(raw):
+    """Every output key is either an input level whose count met the
+    threshold, OR the single ``[suppressed]`` bucket. Input levels
+    that fell below the threshold do NOT appear in the output —
+    their names themselves are disclosive (knowing
+    ``rare_diagnosis_X`` exists in this dataset identifies someone
+    with that diagnosis), so they're collapsed under the bucket."""
+    from nora.text_safety import safe_key
     result = sanitize(raw)
     assume(result.ok)
-    assert set(result.sanitized["counts"].keys()) == set(raw["counts"].keys())
+    threshold = DEFAULT_CONFIG.cell_suppression_threshold
+    output_keys = set(result.sanitized["counts"].keys())
+    visible_input_keys = {
+        safe_key(k) for k, v in raw["counts"].items() if v >= threshold
+    }
+    bucket_keys = {"[suppressed]"}
+    # Every output key is either a visible input or the bucket.
+    assert output_keys.issubset(visible_input_keys | bucket_keys)
+    # If any input was suppressed, the bucket appears; otherwise it doesn't.
+    has_suppressed = any(
+        v < threshold for v in raw["counts"].values()
+    )
+    if has_suppressed:
+        assert "[suppressed]" in output_keys
+    # No suppressed level name leaks through.
+    suppressed_input_keys = {
+        safe_key(k) for k, v in raw["counts"].items() if v < threshold
+    }
+    leaks = output_keys & suppressed_input_keys
+    # ``leaks`` may contain a key that ALSO happens to appear visible
+    # somewhere else (a label collision is rejected upstream so this
+    # is empty in practice).
+    assert leaks == set(), f"suppressed keys leaked into output: {leaks}"
 
 
 # ---------------------------------------------------------------------------
@@ -403,9 +431,14 @@ def test_freq_suppression_marker_format():
         "missing_count": 0,
     })
     assert result.ok
-    assert result.sanitized["counts"]["big"] == 500
-    assert result.sanitized["counts"]["small"] == "<10"
-    assert result.sanitized["counts"]["tiny"] == "<10"
+    counts = result.sanitized["counts"]
+    # Visible cell unchanged.
+    assert counts["big"] == 500
+    # Suppressed cell labels withheld — bucketed under [suppressed].
+    assert "small" not in counts
+    assert "tiny" not in counts
+    assert counts["[suppressed]"] == "<10"
+    assert result.sanitized["suppressed_cell_count"] == 2
 
 
 def test_custom_config_lower_threshold():
@@ -419,8 +452,10 @@ def test_custom_config_lower_threshold():
         "missing_count": 0,
     }, config=permissive)
     assert result.ok
-    # 5 >= 2, so it survives.
+    # 5 >= 2, so it survives — and survives under its own label since
+    # nothing was suppressed.
     assert result.sanitized["counts"]["small"] == 5
+    assert "[suppressed]" not in result.sanitized["counts"]
 
 
 # ---------------------------------------------------------------------------
@@ -1069,6 +1104,162 @@ def test_frequency_table_rejects_over_cell_cap():
     })
     assert not r.ok
     assert "structural cap" in (r.rejection_reason or "")
+
+
+def test_frequency_table_rejects_collision_after_safe_key() -> None:
+    """Two distinct level names that collapse to the same key after
+    ``safe_key`` (newline → space, length cap) must be rejected.
+    Silently overwriting would let a small (suppressible) cell hide
+    inside a larger sibling — the post-merge total is above
+    threshold even though one component was below it, defeating
+    cell suppression on the smaller cell."""
+    # Newline collision: "A\nB" and "A B" both sanitize to "A B".
+    r = sanitize({
+        "type": "frequency_table",
+        "variable": "x",
+        "counts": {"A\nB": 3, "A B": 100},
+        "n": 103,
+        "missing_count": 0,
+    })
+    assert not r.ok
+    assert "collide" in (r.rejection_reason or "").lower() or "sanitize" in (r.rejection_reason or "").lower()
+
+
+def test_frequency_table_rejects_long_prefix_collision() -> None:
+    """Two long labels sharing the same 40-char prefix collide
+    after safe_key truncates."""
+    long_a = "x" * 40 + "_first_distinct"
+    long_b = "x" * 40 + "_second_distinct"
+    r = sanitize({
+        "type": "frequency_table",
+        "variable": "x",
+        "counts": {long_a: 3, long_b: 100},
+        "n": 103,
+        "missing_count": 0,
+    })
+    assert not r.ok
+    assert "collide" in (r.rejection_reason or "").lower() or "sanitize" in (r.rejection_reason or "").lower()
+
+
+def test_freq_suppressed_level_names_never_reach_output() -> None:
+    """A frequency table over a sensitive categorical: the rare
+    diagnoses must not be revealed by name even when their counts
+    are suppressed. Knowing a label exists at small N identifies
+    its members regardless of whether the count is masked."""
+    result = sanitize({
+        "type": "frequency_table",
+        "variable": "diagnosis",
+        "counts": {
+            "common_condition": 500,
+            "another_common": 200,
+            "rare_disease_X": 3,
+            "extremely_rare_Y": 1,
+        },
+        "n": 704,
+        "missing_count": 0,
+    })
+    assert result.ok
+    counts = result.sanitized["counts"]
+    # Rare labels are GONE — not in the output dict at all.
+    assert "rare_disease_X" not in counts
+    assert "extremely_rare_Y" not in counts
+    # And their names don't appear anywhere else in the response —
+    # not in transformations, not in any field.
+    response_text = str(result.sanitized) + " ".join(result.transformations)
+    assert "rare_disease_X" not in response_text
+    assert "extremely_rare_Y" not in response_text
+    # Common labels survive intact.
+    assert counts["common_condition"] == 500
+    # Single bucket carries the suppression marker.
+    assert counts["[suppressed]"] == "<10"
+    assert result.sanitized["suppressed_cell_count"] == 2
+
+
+def test_crosstab_suppressed_cell_labels_bucketed() -> None:
+    """Crosstab: suppressed columns within a row are collapsed under
+    a single ``[suppressed]`` column. A row whose every cell is
+    suppressed has its row label dropped entirely (the row's
+    existence at this rarity is itself disclosive)."""
+    result = sanitize({
+        "type": "crosstab",
+        "row_variable": "diagnosis",
+        "col_variable": "outcome",
+        "counts": {
+            "common_condition": {"recovered": 200, "died": 150, "rare_outcome": 2},
+            "another_common": {"recovered": 50, "died": 30, "rare_outcome": 1},
+            "rare_diagnosis_Z": {"recovered": 1, "died": 1, "rare_outcome": 1},
+        },
+    })
+    assert result.ok
+    nested = result.sanitized["counts"]
+    # ``rare_diagnosis_Z`` had every cell suppressed — its row label
+    # MUST NOT appear anywhere.
+    response_text = str(result.sanitized) + " ".join(result.transformations)
+    assert "rare_diagnosis_Z" not in response_text
+    assert "rare_outcome" not in nested.get("common_condition", {})
+    # The surviving rows have their suppressed-column count bucketed.
+    assert nested["common_condition"]["[suppressed]"] == "<10"
+    assert "rare_outcome" not in response_text or "[suppressed]" in response_text
+    assert result.sanitized["suppressed_row_count"] == 1
+
+
+def test_magnitude_table_suppressed_group_labels_bucketed() -> None:
+    """Magnitude table: groups with n < threshold or dominance
+    failure are bucketed under ``[suppressed]`` so the group label
+    (e.g. ``rare_industry_NAICS_xxxxx``) doesn't leak."""
+    result = sanitize({
+        "type": "magnitude_table",
+        "value_variable": "revenue",
+        "row_variable": "industry",
+        "aggregation": "sum",
+        "cells": {
+            "tech": {"value": 1e9, "n": 500, "max_share": 0.05},
+            "finance": {"value": 2e9, "n": 300, "max_share": 0.05},
+            "rare_industry_NAICS_99999": {
+                "value": 5e6, "n": 3, "max_share": 0.5,
+            },
+            "another_rare": {
+                "value": 1e6, "n": 2, "max_share": 0.5,
+            },
+        },
+    })
+    assert result.ok
+    cells = result.sanitized["cells"]
+    response_text = str(result.sanitized) + " ".join(result.transformations)
+    # Rare group labels never appear in any output channel.
+    assert "rare_industry_NAICS_99999" not in response_text
+    assert "another_rare" not in response_text
+    # Visible groups remain labelled.
+    assert "tech" in cells
+    assert "finance" in cells
+    # Single bucket carries the marker.
+    assert "[suppressed]" in cells
+    assert cells["[suppressed]"]["n"] == "<10"
+    assert result.sanitized["suppressed_cell_count"] == 2
+
+
+def test_unknown_analysis_type_rejection_does_not_echo_raw_payload() -> None:
+    """A script that sets ``type`` to a raw cell value would otherwise
+    leak that value through the sanitizer's rejection_reason and the
+    ``analysis_type`` field on the SanitizerResult. Both must be
+    bounded by ``safe_key`` (40 chars, control chars stripped)."""
+    # Build a payload whose ``type`` carries cell-shaped data with
+    # newlines and a long blob.
+    raw_secret = (
+        "patient_42 ssn=123-45-6789 dob=1980-01-15 ... "
+        "and a very long blob that should be truncated by safe_key "
+        "at 40 chars not the whole 200 char arg cap"
+    )
+    r = sanitize({"type": raw_secret})
+    assert not r.ok
+    # Bounded length: safe_key caps at 40 chars (plus the truncation
+    # marker), so the full secret can't fit.
+    assert raw_secret not in (r.rejection_reason or "")
+    assert raw_secret not in (r.analysis_type or "")
+    # Echoed type field is bounded.
+    assert len(r.analysis_type or "") <= 50  # 40 + truncation marker
+    # Newlines stripped — wouldn't have crossed safe_key.
+    assert "\n" not in (r.analysis_type or "")
 
 
 def test_crosstab_rejects_over_cell_cap():

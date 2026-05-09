@@ -128,40 +128,46 @@ def test_suppressed_cells_have_both_markers(raw):
 
 @given(raw=magnitude_payloads())
 def test_small_n_cells_always_suppressed(raw):
-    """Any raw cell with n below threshold must be suppressed in output."""
+    """Any raw cell with n below threshold must NOT appear under its
+    own group label in the output. The cell goes into the single
+    ``[suppressed]`` bucket — the group label itself is disclosive
+    at small N (knowing a rare industry exists with these
+    dominance characteristics identifies its members)."""
     r = sanitize(raw)
     if not r.ok:
         return
     threshold = DEFAULT_CONFIG.cell_suppression_threshold
-    marker = suppression_marker(threshold)
     for raw_key, raw_cell in raw["cells"].items():
         if raw_cell["n"] < threshold:
-            # Find the key in the sanitized output (the sanitizer
-            # applies safe_key which may rewrite, but for our ASCII
-            # strategy the key is unchanged).
-            out_cell = r.sanitized["cells"].get(raw_key)
-            assert out_cell is not None
-            assert out_cell["value"] == marker
+            # The original key must NOT be in the output cells.
+            assert raw_key not in r.sanitized["cells"], (
+                f"suppressed cell {raw_key!r} leaked its group label"
+            )
+    # If any cell was suppressed, the bucket appears.
+    n_suppressed = sum(
+        1 for c in raw["cells"].values()
+        if c["n"] < threshold or c["max_share"] > DEFAULT_CONFIG.dominance_threshold
+    )
+    if n_suppressed:
+        assert "[suppressed]" in r.sanitized["cells"]
 
 
 @given(raw=magnitude_payloads())
 def test_dominant_cells_always_suppressed(raw):
-    """Any raw cell with max_share > dominance threshold must be suppressed."""
+    """Any raw cell that fails dominance must NOT appear under its
+    own group label in the output (bucketed under [suppressed])."""
     r = sanitize(raw)
     if not r.ok:
         return
     threshold_dom = DEFAULT_CONFIG.dominance_threshold
     threshold_n = DEFAULT_CONFIG.cell_suppression_threshold
-    marker = suppression_marker(threshold_n)
     for raw_key, raw_cell in raw["cells"].items():
         # Only check cells that pass the n threshold — so we isolate
         # the dominance rule's contribution.
         if raw_cell["n"] >= threshold_n and raw_cell["max_share"] > threshold_dom:
-            out_cell = r.sanitized["cells"].get(raw_key)
-            assert out_cell is not None
-            assert out_cell["value"] == marker, (
+            assert raw_key not in r.sanitized["cells"], (
                 f"cell {raw_key!r} had max_share={raw_cell['max_share']} "
-                f"> {threshold_dom} but was not suppressed"
+                f"> {threshold_dom} but its group label leaked into output"
             )
 
 
@@ -190,7 +196,8 @@ def test_happy_path_well_distributed():
 
 
 def test_dominance_fires_exactly_over_threshold():
-    """Threshold is inclusive — 0.85 passes, 0.851 fails."""
+    """Threshold is inclusive — 0.85 passes, 0.851 fails. The
+    failing cell's group label is hidden (bucketed)."""
     r = sanitize({
         "type": "magnitude_table",
         "row_variable": "g",
@@ -203,8 +210,9 @@ def test_dominance_fires_exactly_over_threshold():
     })
     assert r.ok
     marker = suppression_marker(DEFAULT_CONFIG.cell_suppression_threshold)
-    assert r.sanitized["cells"]["edge"]["value"] == 1000.0  # passes
-    assert r.sanitized["cells"]["over"]["value"] == marker  # fails
+    assert r.sanitized["cells"]["edge"]["value"] == 1000.0  # passes under own label
+    assert "over" not in r.sanitized["cells"]
+    assert r.sanitized["cells"]["[suppressed]"]["value"] == marker
 
 
 def test_custom_dominance_threshold():
@@ -218,7 +226,8 @@ def test_custom_dominance_threshold():
     }, config=strict)
     assert r.ok
     marker = suppression_marker(10)
-    assert r.sanitized["cells"]["A"]["value"] == marker
+    assert "A" not in r.sanitized["cells"]
+    assert r.sanitized["cells"]["[suppressed]"]["value"] == marker
 
 
 def test_rejects_non_sum_mean_aggregation():
@@ -245,7 +254,10 @@ def test_rejects_cell_missing_max_share():
 
 
 def test_transformations_name_suppression_reasons():
-    """The log distinguishes n-failures from dominance-failures."""
+    """The log distinguishes n-failures from dominance-failures.
+    Crucially, the group LABELS of suppressed cells must NOT appear
+    in the transformation log either — the labels themselves are
+    disclosive at small N. Counts only."""
     r = sanitize({
         "type": "magnitude_table",
         "row_variable": "g",
@@ -261,5 +273,11 @@ def test_transformations_name_suppression_reasons():
     logged = " ".join(r.transformations)
     assert "primary suppression" in logged
     assert "dominance suppression" in logged
-    assert "'tiny'" in logged
-    assert "'dom'" in logged
+    # Suppressed group labels must NOT leak into the log as quoted
+    # values (the prior format was ``...: ['tiny', 'dom']``). The
+    # substring ``"dom"`` happens to appear as part of ``dominance``;
+    # match the prior format-style quoted-list pattern instead.
+    assert "'tiny'" not in logged
+    assert "'dom'" not in logged
+    assert "[tiny]" not in logged
+    assert "[dom]" not in logged

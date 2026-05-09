@@ -116,6 +116,29 @@ DEFAULT_TIMEOUT_SECONDS = _resolve_default_timeout()
 # Where per-run scratch dirs live, relative to cwd.
 RUNS_SUBDIR = ".nora/runs"
 
+# Hard caps on the JSONL result file. A model-authored script can
+# loop and call ``nora_result_*`` thousands of times — each call
+# emits one JSONL line. Without caps, the executor would parse,
+# token-validate, sanitize, store, render, and ship every payload,
+# blowing memory and conversation context regardless of the inline-
+# trim that ``submit_script`` applies later. We trim at the FIRST
+# point the runtime can refuse: when reading the result file.
+#
+#   * 8 MB on file size — enough for a few hundred wide regressions
+#     (a typical regression payload is 5–20 KB after auth-token
+#     framing).
+#   * 256 entries — beyond this we're either looping unintentionally
+#     or producing more results than a researcher will inspect in one
+#     turn. The ceiling is intentionally well above legitimate
+#     batch sizes (a 24-spec sweep is comfortable) but well below
+#     anything that would suggest a control-flow bug or exfil loop.
+#
+# When a cap is hit we KEEP the early payloads (so a partial result
+# still surfaces) and raise a warning so the caller knows results
+# were truncated.
+MAX_RESULT_FILE_BYTES = 8 * 1024 * 1024
+MAX_RESULT_PAYLOADS = 256
+
 # Name of the payload field the runtime library embeds to prove the
 # payload came from the library (rather than being hand-crafted by
 # Claude's script). Starts with underscore so it doesn't collide with
@@ -292,7 +315,7 @@ def _format_bad_lines_summary(bad_lines: list[str], payload_count: int) -> str:
 
 def _parse_result_jsonl(
     text: str, run_token: str
-) -> tuple[list[dict[str, Any]], list[str]]:
+) -> tuple[list[dict[str, Any]], list[str], bool]:
     """Parse a JSONL result file line by line, skipping bad lines.
 
     A single corrupt line (e.g. a degenerate Stata fit that emitted a
@@ -303,19 +326,29 @@ def _parse_result_jsonl(
     1 of 8 corrupt lines becomes "7 results + 1 documented error", not
     "0 results + 1 documented error".
 
-    Returns ``(payloads, bad_line_messages)``. ``payloads`` carries
-    every line that parsed AND token-validated, in emission order;
-    ``bad_line_messages`` carries one short string per failed line for
-    the caller to surface back to the model.
+    Stops appending payloads once ``MAX_RESULT_PAYLOADS`` is reached
+    so a runaway loop in the script can't blow memory / context. The
+    file-byte cap is enforced one level up in ``run_script`` before
+    calling here.
+
+    Returns ``(payloads, bad_line_messages, truncated)``. ``payloads``
+    carries every line that parsed AND token-validated, in emission
+    order; ``bad_line_messages`` carries one short string per failed
+    line for the caller to surface back to the model; ``truncated``
+    is ``True`` iff the entry-count cap kicked in.
     """
     import json
 
     payloads: list[dict[str, Any]] = []
     bad_lines: list[str] = []
+    truncated = False
     for lineno, raw_line in enumerate(text.splitlines(), start=1):
         line = raw_line.strip()
         if not line:
             continue
+        if len(payloads) >= MAX_RESULT_PAYLOADS:
+            truncated = True
+            break
         try:
             raw_payload = json.loads(line)
         except json.JSONDecodeError as je:
@@ -326,7 +359,7 @@ def _parse_result_jsonl(
             bad_lines.append(f"line {lineno}: {auth_err}")
             continue
         payloads.append(cleaned)
-    return payloads, bad_lines
+    return payloads, bad_lines, truncated
 
 
 @lru_cache(maxsize=1)
@@ -665,11 +698,33 @@ def run_script(
         )
     else:
         try:
-            text = result_path.read_text(encoding="utf-8")
+            # Enforce the file-byte cap up front so we don't allocate
+            # a huge string for parsing. If the file is over-cap we
+            # read just the first MAX_RESULT_FILE_BYTES bytes — any
+            # JSONL line straddling the cut is dropped by the parser
+            # via JSONDecodeError, and the truncation flag is set.
+            file_size = result_path.stat().st_size
+            byte_truncated = file_size > MAX_RESULT_FILE_BYTES
+            with result_path.open("r", encoding="utf-8", errors="replace") as fh:
+                if byte_truncated:
+                    text = fh.read(MAX_RESULT_FILE_BYTES)
+                else:
+                    text = fh.read()
         except OSError as oe:
             error = f"could not read result file: {oe}"
         else:
-            payloads, bad_lines = _parse_result_jsonl(text, run_token)
+            payloads, bad_lines, count_truncated = _parse_result_jsonl(text, run_token)
+            if byte_truncated or count_truncated:
+                cap_label = (
+                    f"{MAX_RESULT_PAYLOADS} payload entries"
+                    if count_truncated
+                    else f"{MAX_RESULT_FILE_BYTES // (1024 * 1024)} MB result-file size"
+                )
+                warnings.append(
+                    f"result truncated at {cap_label}; later helper "
+                    f"emissions were dropped. If this is intentional, "
+                    f"split the run into smaller batches."
+                )
             if bad_lines:
                 bad_msg = _format_bad_lines_summary(bad_lines, len(payloads))
                 # Two paths, two meanings:

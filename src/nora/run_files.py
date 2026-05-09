@@ -136,6 +136,7 @@ class RunDirScript:
 
 def enumerate_run_dir_scripts(
     cwd: Path, *, max_count: int = 12,
+    visible_run_dirs: set[str] | None = None,
 ) -> list[RunDirScript]:
     """Return the ``max_count`` most recently-modified run-dir scripts.
 
@@ -145,6 +146,15 @@ def enumerate_run_dir_scripts(
     otherwise. Same-name collisions get the short_id appended in
     parens. Symlinks are skipped both at the run dir and at the
     script file level — only real files in real run dirs participate.
+
+    ``visible_run_dirs``: when supplied, only run dirs whose
+    basename is in the set are considered. Used by the model-facing
+    ``list_session_files`` / ``read_attached_file`` paths to enforce
+    chat-rewind boundaries — a rewind hides results from the store
+    but the on-disk run dirs remain, and without filtering the
+    model can still discover scripts from a discarded conversation
+    branch. ``None`` (the default) leaves every run dir visible
+    (researcher-only Files panel).
     """
     runs_root = cwd / ".nora" / "runs"
     if not runs_root.is_dir():
@@ -156,6 +166,9 @@ def enumerate_run_dir_scripts(
     try:
         for run_dir in runs_root.iterdir():
             if not run_dir.is_dir() or run_dir.is_symlink():
+                continue
+            if (visible_run_dirs is not None
+                    and run_dir.name not in visible_run_dirs):
                 continue
             for ext in _SCRIPT_EXTS:
                 cand = run_dir / f"script{ext}"
@@ -201,6 +214,8 @@ def enumerate_run_dir_scripts(
 
 def find_run_dir_script_by_name(
     cwd: Path, name: str,
+    *,
+    visible_run_dirs: set[str] | None = None,
 ) -> Path | None:
     """Resolve a Files-panel display name back to its on-disk path.
 
@@ -215,11 +230,19 @@ def find_run_dir_script_by_name(
     not the same string as ``entry.display_name``. Match on both the
     raw display name AND its sanitised form so the round-trip works
     regardless of which side a researcher's label hit the cap on.
+
+    ``visible_run_dirs`` mirrors ``enumerate_run_dir_scripts``: pass
+    a set to restrict to rewind-visible runs. The model-facing
+    ``read_attached_file`` MUST pass the visible set so a rewound
+    script can't be re-fetched by the name the model still
+    remembers from the discarded chat branch.
     """
     if not name:
         return None
     from nora.text_safety import safe_text
-    for entry in enumerate_run_dir_scripts(cwd, max_count=64):
+    for entry in enumerate_run_dir_scripts(
+        cwd, max_count=64, visible_run_dirs=visible_run_dirs,
+    ):
         if entry.display_name == name or safe_text(entry.display_name) == name:
             return entry.path
     return None

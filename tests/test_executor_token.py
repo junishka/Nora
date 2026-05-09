@@ -36,6 +36,7 @@ import pytest
 
 from nora.env_detect import find_sandbox_exec
 from nora.executor import (
+    MAX_RESULT_PAYLOADS,
     RESULT_TOKEN_FIELD,
     _format_bad_lines_summary,
     _generate_run_token,
@@ -136,7 +137,7 @@ def test_parse_jsonl_preserves_valid_lines_past_a_bad_one():
         f'"_token":"{token}"' + '}'
     text = "\n".join([good, bad_json, good, "", good])
 
-    payloads, bad_lines = _parse_result_jsonl(text, token)
+    payloads, bad_lines, _ = _parse_result_jsonl(text, token)
     assert len(payloads) == 3, (
         f"expected 3 valid payloads past the corrupt line, got "
         f"{len(payloads)}"
@@ -168,7 +169,7 @@ def test_parse_jsonl_preserves_valid_lines_past_a_token_failure():
     )
     text = "\n".join([valid_line, forged_line, valid_line])
 
-    payloads, bad_lines = _parse_result_jsonl(text, token)
+    payloads, bad_lines, _ = _parse_result_jsonl(text, token)
     assert len(payloads) == 2
     assert len(bad_lines) == 1
     assert "line 2" in bad_lines[0]
@@ -207,9 +208,39 @@ def test_parse_jsonl_returns_no_bad_lines_for_clean_input():
         f'"_token":"{token}"' + '}'
     )
     text = "\n".join([line, line, line])
-    payloads, bad_lines = _parse_result_jsonl(text, token)
+    payloads, bad_lines, _ = _parse_result_jsonl(text, token)
     assert len(payloads) == 3
     assert bad_lines == []
+
+
+def test_parse_jsonl_caps_at_max_payloads():
+    """A model-authored script that loops over ``nora_result_*``
+    helpers tens of thousands of times would otherwise have all of
+    its payloads parsed, sanitized, stored, and rendered. The
+    parser stops appending past ``MAX_RESULT_PAYLOADS`` and signals
+    truncation so the caller can surface a warning."""
+    token = "a" * 64
+    line = (
+        '{"type":"linear_regression","n":50,'
+        f'"_token":"{token}"' + '}'
+    )
+    text = "\n".join([line] * (MAX_RESULT_PAYLOADS + 50))
+    payloads, bad_lines, truncated = _parse_result_jsonl(text, token)
+    assert len(payloads) == MAX_RESULT_PAYLOADS
+    assert bad_lines == []
+    assert truncated is True
+
+
+def test_parse_jsonl_under_cap_does_not_set_truncated():
+    """The truncated flag is only set when we actually drop entries."""
+    token = "a" * 64
+    line = (
+        '{"type":"linear_regression","n":50,'
+        f'"_token":"{token}"' + '}'
+    )
+    text = "\n".join([line] * 5)
+    _, _, truncated = _parse_result_jsonl(text, token)
+    assert truncated is False
 
 
 # ---------------------------------------------------------------------------
