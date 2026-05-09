@@ -253,6 +253,63 @@ def test_pty_regex_present(example_profile: str):
 # Paths injected into the profile are SBPL-escaped
 # ---------------------------------------------------------------------------
 
+def test_nora_subtree_denied_for_reads(example_profile: str):
+    """``<cwd>/.nora`` must NOT be readable by scripts. It holds
+    chat_history.jsonl, results.db, prior run logs, and helper
+    manifests — exactly the raw/pre-sanitizer material the tool
+    layer keeps out of model-visible context. A script that could
+    read this directory would smuggle excerpts back through label
+    fields, helper error bodies, or any other channel that survives
+    sanitization."""
+    deny_line = '(deny file-read* (subpath "/Users/testuser/project/.nora"))'
+    assert deny_line in example_profile, (
+        f"missing deny for .nora reads: profile must include\n  {deny_line}"
+    )
+
+
+def test_nora_subtree_denied_for_writes(example_profile: str):
+    """Same carve-out for writes — a script must not modify
+    Nora's session state (results.db / chat_history.jsonl) to
+    influence future turns by tampering with persisted records."""
+    deny_line = '(deny file-write* (subpath "/Users/testuser/project/.nora"))'
+    assert deny_line in example_profile, (
+        f"missing deny for .nora writes: profile must include\n  {deny_line}"
+    )
+
+
+def test_run_dir_re_allowed_after_nora_deny(example_profile: str):
+    """The current ``run_dir`` lives under ``<cwd>/.nora/runs/<id>/``,
+    so the .nora deny would block reading the runtime library and
+    writing result.json. Re-allow rules for the run_dir must come
+    AFTER the deny in profile order — SBPL takes the last matching
+    rule, so deny-then-allow gives "allow run_dir, deny everything
+    else under .nora"."""
+    nora_deny_idx = example_profile.find(
+        '(deny file-read* (subpath "/Users/testuser/project/.nora"))'
+    )
+    run_dir_allow_idx = example_profile.find(
+        '(allow file-read* (subpath '
+        '"/private/var/folders/ab/cdefg/T/nora/run-1234"))'
+    )
+    assert nora_deny_idx >= 0 and run_dir_allow_idx >= 0
+    assert run_dir_allow_idx > nora_deny_idx, (
+        "run_dir re-allow must come AFTER the .nora deny, otherwise "
+        "the deny overrides the allow and result.json becomes "
+        "unreadable"
+    )
+
+    # Same precedence requirement on the write side.
+    nora_write_deny_idx = example_profile.find(
+        '(deny file-write* (subpath "/Users/testuser/project/.nora"))'
+    )
+    run_dir_write_allow_idx = example_profile.find(
+        '(allow file-write* (subpath '
+        '"/private/var/folders/ab/cdefg/T/nora/run-1234"))'
+    )
+    assert nora_write_deny_idx >= 0 and run_dir_write_allow_idx >= 0
+    assert run_dir_write_allow_idx > nora_write_deny_idx
+
+
 def test_paths_with_special_chars_are_escaped():
     """A cwd containing a double-quote or backslash (extremely unusual
     on macOS, but defensible) must not break out of the SBPL string."""

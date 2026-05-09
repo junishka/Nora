@@ -796,6 +796,101 @@ def test_compose_layout_trichotomy_distinguishes_failure_modes() -> None:
     assert "not part of this model" in md
 
 
+def test_compose_layout_legend_persists_across_groups() -> None:
+    """A failure glyph in an EARLIER group must still trigger the
+    legend even when the FINAL group renders cleanly.
+
+    Earlier shape reset ``any_unresolved`` inside the per-group loop,
+    so a clean last group silently dropped the legend — leaving the
+    table with unexplained ``—`` / ``·`` / ``n/a`` glyphs from
+    earlier groups."""
+    payloads = {
+        "M_OK": {
+            "type": "linear_regression",
+            "coefficients": {"x": 0.5},
+            "standard_errors": {"x": 0.05},
+            "p_values": {"x": 0.001},
+            "predictor_variables": ["x"],
+        },
+        # M_BAD is intentionally missing from payloads → renders ``—``
+    }
+    spec = {
+        "columns": [{"id": "x", "label": "x"}],
+        "groups": [
+            {"label": "first", "rows": [
+                {"result_id": "M_BAD", "label": "missing-row"},
+            ]},
+            {"label": "second", "rows": [
+                {"result_id": "M_OK", "label": "clean-row"},
+            ]},
+        ],
+    }
+    md = compose_layout(spec, payloads)
+    assert md is not None
+    # The em-dash from the first group must explain via legend even
+    # though the second (final) group has no failure glyphs.
+    assert "—" in md
+    assert "Legend:" in md, (
+        "Legend was dropped because final group resolved cleanly — "
+        "any_unresolved must persist across groups"
+    )
+
+
+def test_compose_layout_missing_pvalues_render_without_dot() -> None:
+    """A payload with coefficients + SEs but no p-values must NOT
+    render cells like ``2 (0.2) [·]`` — the ``·`` glyph would be
+    misread as the legend's collinearity marker even though the term
+    IS estimated. The format degrades to ``2 (0.2)`` instead.
+    Same posture for missing SEs."""
+    payloads = {
+        "M_NO_P": {
+            "type": "linear_regression",
+            "coefficients": {"x": 0.5},
+            "standard_errors": {"x": 0.05},
+            # no p_values dict at all
+            "predictor_variables": ["x"],
+        },
+        "M_NO_SE": {
+            "type": "linear_regression",
+            "coefficients": {"y": 0.7},
+            # no standard_errors dict
+            "p_values": {"y": 0.001},
+            "predictor_variables": ["y"],
+        },
+    }
+    spec = {
+        "columns": [
+            {"id": "x", "label": "x"},
+            {"id": "y", "label": "y"},
+        ],
+        "groups": [{"label": None, "rows": [
+            {"result_id": "M_NO_P", "label": "row-no-p"},
+            {"result_id": "M_NO_SE", "label": "row-no-se"},
+        ]}],
+    }
+    md = compose_layout(spec, payloads)
+    assert md is not None
+    # Locate the rendered cells.
+    def _cells(line_substr: str) -> list[str]:
+        line = next(ln for ln in md.splitlines() if line_substr in ln)
+        return [c.strip() for c in line.split("|") if c.strip()]
+
+    no_p = _cells("row-no-p")
+    # x cell: coef + SE present, p missing → ``0.5 (0.05)`` with no
+    # ``[·]`` glyph appended.
+    assert no_p[1].startswith("0.5")
+    assert "(0.05)" in no_p[1]
+    assert "·" not in no_p[1], f"missing-p cell shouldn't carry ·: {no_p[1]!r}"
+    assert "[" not in no_p[1], f"empty p-brackets leaked: {no_p[1]!r}"
+
+    no_se = _cells("row-no-se")
+    # y cell: coef + p present, SE missing → ``0.7 [0.001]`` (or
+    # similar) with no ``(·)`` glyph.
+    assert no_se[2].startswith("0.7")
+    assert "·" not in no_se[2], f"missing-SE cell shouldn't carry ·: {no_se[2]!r}"
+    assert "(" not in no_se[2], f"empty SE parens leaked: {no_se[2]!r}"
+
+
 def test_compose_layout_no_legend_when_all_cells_resolve() -> None:
     """When every cell resolves to a data value, the legend is
     suppressed — its only purpose is to disambiguate failure glyphs
@@ -1157,6 +1252,79 @@ def test_compose_results_tool_rejects_malformed_spec(tmp_path: Path) -> None:
             assert body["status"] == "error"
             assert "columns" in body["reason"]
             assert "groups" in body["reason"]
+    finally:
+        reset_store_for_tests()
+
+
+def test_compose_results_tool_rejects_oversized_spec(tmp_path: Path) -> None:
+    """A spec that exceeds any layout cap (columns, groups,
+    rows-per-group, total rows, label length) must be rejected
+    BEFORE rendering. The whole point of compose_results is
+    context-economy — a runaway spec rendered into one tool result
+    defeats the feature.
+    """
+    cwd = tmp_path / "session"
+    cwd.mkdir()
+    reset_store_for_tests()
+    try:
+        with use_cwd(cwd):
+            # Too many columns (cap is 25).
+            big_columns = {
+                "columns": [{"id": f"c{i}", "label": f"col {i}"}
+                            for i in range(40)],
+                "groups": [
+                    {"rows": [{"result_id": "X", "label": "row"}]},
+                ],
+            }
+            body = _mcp_text(asyncio.run(
+                HANDLERS["compose_results"]({"spec": big_columns})
+            ))
+            assert body["status"] == "error"
+            assert "columns" in body["reason"]
+
+            # Too many groups (cap is 25).
+            big_groups = {
+                "columns": [{"id": "c0", "label": "c"}],
+                "groups": [
+                    {"rows": [{"result_id": "X", "label": "row"}]}
+                    for _ in range(60)
+                ],
+            }
+            body = _mcp_text(asyncio.run(
+                HANDLERS["compose_results"]({"spec": big_groups})
+            ))
+            assert body["status"] == "error"
+            assert "groups" in body["reason"]
+
+            # Total rows over the budget (cap is 250 across all groups).
+            wide_rows = {
+                "columns": [{"id": "c0", "label": "c"}],
+                "groups": [
+                    {"rows": [{"result_id": "X", "label": "r"}
+                              for _ in range(80)]}
+                    for _ in range(20)  # 20 × 80 = 1600 total rows
+                ],
+            }
+            body = _mcp_text(asyncio.run(
+                HANDLERS["compose_results"]({"spec": wide_rows})
+            ))
+            assert body["status"] == "error"
+            assert "row" in body["reason"].lower()
+
+            # Pathological row label (cap is 200 chars).
+            long_label_spec = {
+                "columns": [{"id": "c0", "label": "c"}],
+                "groups": [
+                    {"rows": [
+                        {"result_id": "X", "label": "y" * 1000},
+                    ]},
+                ],
+            }
+            body = _mcp_text(asyncio.run(
+                HANDLERS["compose_results"]({"spec": long_label_spec})
+            ))
+            assert body["status"] == "error"
+            assert "label" in body["reason"].lower()
     finally:
         reset_store_for_tests()
 

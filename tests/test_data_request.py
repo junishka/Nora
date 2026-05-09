@@ -162,6 +162,70 @@ def test_nonexistent_variable_denied(sample_csv: Path):
     assert "not found" in r.reason.lower()
 
 
+def test_nonexistent_variable_caps_column_listing(tmp_path: Path):
+    """A typo against a wide dataset must NOT ship the full column list
+    in the denial reason. The cap mirrors search_schema's posture:
+    show enough to scan, name the total, point at search_schema for
+    the rest."""
+    # A wide synthetic dataset — 200 columns is small for genomics
+    # and large enough to exceed the 50-column denial cap.
+    n_cols = 200
+    df = pd.DataFrame(
+        {f"col_{i:04d}": np.arange(20) for i in range(n_cols)}
+    )
+    p = tmp_path / "wide.csv"
+    df.to_csv(p, index=False)
+    r = handle(p, "numeric_bounds", "typo_does_not_exist")
+    assert r.status == "denied"
+    # The reason must NOT enumerate all 200 columns.
+    assert r.reason.count("col_") <= 50
+    # Total count is reported honestly so the model knows the listing
+    # was clipped.
+    assert "200" in r.reason
+    # Recovery hint points at the right tool for wide datasets.
+    assert "search_schema" in r.reason
+
+
+def test_sanitized_variable_resolves_back_to_raw(tmp_path: Path):
+    """A column name that safe_key truncates (>40 chars) is shown to
+    the model under its sanitized form. The model must be able to
+    pass that sanitized name back to request_data and have it resolve
+    — otherwise every long-named column is unqueryable."""
+    long_raw = "extremely_verbose_column_name_that_exceeds_the_safe_key_cap_x"
+    df = pd.DataFrame({long_raw: np.arange(20)})
+    p = tmp_path / "longname.csv"
+    df.to_csv(p, index=False)
+
+    from nora.text_safety import safe_key
+    sanitized = safe_key(long_raw)
+    assert sanitized != long_raw  # would otherwise be a no-op test
+
+    # Direct lookup with the sanitized name resolves to the raw column.
+    r = handle(p, "numeric_bounds", sanitized)
+    assert r.status == "granted", r.reason
+
+
+def test_sanitized_collision_returns_structured_denial(tmp_path: Path):
+    """Two raw column names that sanitize to the same safe_key cannot
+    be safely disambiguated for the model (the raw bytes are an
+    injection surface and we won't echo them). The denial must name
+    the collision so the model knows the path forward is to rename
+    upstream rather than retry."""
+    # Two long names whose first 40-cap-chars coincide.
+    raw1 = "x" * 100 + "_first"
+    raw2 = "x" * 100 + "_second"
+    from nora.text_safety import safe_key
+    assert safe_key(raw1) == safe_key(raw2)  # prerequisite
+
+    df = pd.DataFrame({raw1: np.arange(20), raw2: np.arange(20)})
+    p = tmp_path / "colliding.csv"
+    df.to_csv(p, index=False)
+
+    r = handle(p, "numeric_bounds", safe_key(raw1))
+    assert r.status == "denied"
+    assert "collide" in r.reason.lower() or "colliding" in r.reason.lower()
+
+
 def test_supported_request_types_are_expected():
     """Lock down the allowlist so expansions are deliberate, not accidents."""
     assert set(SUPPORTED_REQUEST_TYPES) == {
