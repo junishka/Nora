@@ -350,9 +350,25 @@ async def install_packages(
     # Resolve the interpreter binary lazily — env_detect is an
     # already-imported sibling module, so the import is cheap.
     from nora.env_detect import detect_environment
+    from nora.executor import _filter_env
 
     env = detect_environment()
-    subprocess_env: dict[str, str] | None = None
+    # Build the installer subprocess env from the same allowlist the
+    # executor uses for analysis scripts. Package install hooks
+    # (pip's setup.py / wheel build steps; R's ``configure``,
+    # ``.onLoad`` post-install scripts; Stata's much rarer ado-side
+    # post-install) execute with network access OUTSIDE the script
+    # sandbox, so any ``ANTHROPIC_API_KEY`` / ``OPENAI_API_KEY`` /
+    # AWS credential / arbitrary user secret in the parent process
+    # env was previously visible to whatever code those hooks ran.
+    # The executor solved this for analysis runs via the same
+    # ``_filter_env`` allowlist; the installer was the missing
+    # symmetric path. Without this filter, ``install_packages`` is
+    # the highest-leverage exfiltration channel in the codebase
+    # (network-permitted, no sandbox, attacker controls the package
+    # contents).
+    base_env = _filter_env(dict(os.environ))
+    subprocess_env: dict[str, str] = base_env
     if language == "R":
         if env.r is None:
             return InstallResult(
@@ -380,11 +396,11 @@ async def install_packages(
         # but it's harmless to pass — pip ignores PYTHONPATH for
         # ``--target`` installs.
         target_dir = nora_python_pkg_dir(env.python.binary)
-        existing = os.environ.get("PYTHONPATH", "")
+        existing = base_env.get("PYTHONPATH", "")
         new_pp = (
             f"{target_dir}{os.pathsep}{existing}" if existing else str(target_dir)
         )
-        subprocess_env = {**os.environ, "PYTHONPATH": new_pp}
+        subprocess_env = {**base_env, "PYTHONPATH": new_pp}
     else:  # Stata
         if env.stata is None:
             return InstallResult(
@@ -456,6 +472,22 @@ async def install_packages(
             f"installer exited {completed.returncode} — see raw_stderr "
             "for details"
         )
+
+    # Invalidate the executor's cached environment probe whenever a
+    # successful run mutated the package set. The probe records which
+    # optional packages are present (haven, ggplot2, statsmodels, …);
+    # after install / remove / reinstall that snapshot is stale, and
+    # the next ``run_script`` would dispatch with the pre-install view
+    # — most visibly producing the wrong runtime block in the system
+    # prompt for whichever next turn rebuilds it from cache. The
+    # uncached ``detect_environment()`` call sites (system_prompt, the
+    # web UI status pane) already pick up the change on their own; the
+    # cache invalidation aligns the executor with them. Skipped on
+    # failure so a non-mutating error doesn't trigger an unnecessary
+    # re-probe (each one spawns the language interpreter).
+    if completed.returncode == 0:
+        from nora.executor import clear_environment_cache
+        clear_environment_cache()
 
     return InstallResult(
         language=language,  # type: ignore[arg-type]

@@ -402,10 +402,23 @@ class NoraBridge:
         # the user's side ("drag-drop moves up to 512 MB total").
         # The JS side gates first; this is defense-in-depth.
         aggregate_bytes = 0
+        rejected_exts: list[str] = []
         for item in files:
             name = item.get("name", "")
             content_b64 = item.get("content", "")
             if not name or not isinstance(content_b64, str):
+                continue
+            # Server-side extension gate. JS already filters via
+            # ``acceptedByDropZone`` / ``COMPOSER_DATA_EXTS``, but a
+            # forged ``add_dropped_files`` call from a different
+            # frontend path would otherwise let arbitrary extensions
+            # land in the session dir. Compare against the basename's
+            # final suffix (lowercased), normalising ``Path`` so a
+            # name like ``data/csv.zip`` cannot smuggle the ``.zip``
+            # past the ``.csv`` substring.
+            ext = Path(name).suffix.lower()
+            if ext not in _DRAG_DROP_ALLOWED_EXTS:
+                rejected_exts.append(Path(name).name)
                 continue
             # Strip any data URL prefix JS may have added.
             if "," in content_b64:
@@ -448,6 +461,17 @@ class NoraBridge:
                 }
             decoded.append((Path(name).name, blob))
         if not decoded:
+            if rejected_exts:
+                # Every file was rejected on extension. Tell the user
+                # which ones and why so they can re-export.
+                return {
+                    "ok": False,
+                    "reason": (
+                        f"Drop rejected — {', '.join(rejected_exts)}: "
+                        f"only data, script, log, and image files are "
+                        f"accepted on the landing zone."
+                    ),
+                }
             return {"ok": False, "reason": "no valid files in drop"}
         return self._stage_session_from_blobs(decoded)
 
@@ -992,6 +1016,25 @@ class NoraBridge:
             else:
                 skipped.append(src.name)
 
+        # Mark every file the researcher staged this call as known to
+        # the provenance manifest. Both data files (``added``) and
+        # images (``images``) are explicit researcher actions; the
+        # manifest's append-only contract means a re-stage of the
+        # same name is a no-op. ``read_attached_file`` /
+        # ``submit_script_file`` consult ``is_known`` to refuse cwd
+        # top-level source files that didn't come through this path
+        # (the SDC-bypass channel where a sandboxed script writes a
+        # ``.R`` file containing raw rows and the model later asks to
+        # read it back).
+        try:
+            from nora.file_provenance import mark_known
+            mark_known(
+                self.cwd,
+                [*added, *(img["name"] for img in images)],
+            )
+        except Exception:  # noqa: BLE001 — provenance is best-effort
+            pass
+
         return {
             "ok": True,
             "added": added,
@@ -1069,6 +1112,18 @@ class NoraBridge:
                 content_b64 = content_b64.split(",", 1)[1]
             safe_name = Path(name).name
             ext = Path(safe_name).suffix.lower()
+            # Server-side extension gate. JS already filters via
+            # ``acceptedByComposer``; this is defense-in-depth for any
+            # client that bypasses it, AND a perf win — without it,
+            # an unknown-extension drop would still flow through
+            # ``base64.b64decode`` (allocating up to 512 MB of bytes)
+            # before being silently dropped by the dispatch below.
+            # Surface the name in ``skipped`` so the researcher gets a
+            # clear "we ignored these" signal rather than the file
+            # vanishing without a trace.
+            if ext not in _COPY_EXTS and ext not in _IMAGE_EXTS_MIMES:
+                skipped.append(f"{safe_name} (unsupported file type)")
+                continue
             # Pre-decode size gate. Both data/script files (capped at
             # _DRAG_DROP_MAX_BYTES, 512 MB) and images (capped at
             # _IMAGE_MAX_BYTES, 5 MB) are checked BEFORE the
@@ -1081,15 +1136,12 @@ class NoraBridge:
             # to the composer uses the native picker and has no size
             # limit.
             if ext in _COPY_EXTS:
-                cap: int | None = _DRAG_DROP_MAX_BYTES
+                cap: int = _DRAG_DROP_MAX_BYTES
                 hint = "the + button next to the composer"
-            elif ext in _IMAGE_EXTS_MIMES:
+            else:  # ext in _IMAGE_EXTS_MIMES
                 cap = _IMAGE_MAX_BYTES
                 hint = ""  # images skipped silently below, not error-returned
-            else:
-                cap = None
-                hint = ""
-            if cap is not None and _b64_oversize(content_b64, cap):
+            if _b64_oversize(content_b64, cap):
                 approx_mb = (len(content_b64) * 3 // 4) // (1024 * 1024)
                 # Images skip via the per-file ``skipped`` list (the
                 # researcher dragged a folder of mixed sizes; the
@@ -1171,6 +1223,20 @@ class NoraBridge:
                 })
             else:
                 skipped.append(safe_name)
+
+        # Mark every file the researcher just dropped/pasted as known
+        # to the provenance manifest — same rationale as ``add_files``
+        # above. Without this hook, files staged through the
+        # composer drop path would be presumed sandbox-output the
+        # next time the model tried to read them.
+        try:
+            from nora.file_provenance import mark_known
+            mark_known(
+                self.cwd,
+                [*added, *(img["name"] for img in images)],
+            )
+        except Exception:  # noqa: BLE001 — provenance is best-effort
+            pass
 
         return {
             "ok": True,
@@ -2167,6 +2233,19 @@ class NoraBridge:
         """
         new_cwd = path.resolve()
         self.cwd = new_cwd
+        # Snapshot the cwd top-level into the staged-files manifest
+        # so subsequent ``read_attached_file`` / ``submit_script_file``
+        # calls can distinguish researcher-known files from sandbox-
+        # output. Idempotent: re-opening an existing session merges
+        # the snapshot with the existing manifest, so this also
+        # serves as the upgrade path for sessions that pre-date the
+        # provenance feature. Best-effort — a manifest write failure
+        # mustn't block the session opening.
+        try:
+            from nora.file_provenance import initialize as _init_staged
+            _init_staged(new_cwd)
+        except Exception:  # noqa: BLE001 — provenance must not block opens
+            pass
         # Lazy-create the runner for this cwd, applying any
         # recorded ``active_model`` preference. Existing runners
         # (including the one we may be switching AWAY from) are
@@ -2802,6 +2881,22 @@ class NoraBridge:
             }
         hidden_count = len(hidden_ids)
 
+        # Past the commit point. Rollback via ``unhide_results`` is no
+        # longer in play, so it's safe to drop the verbatim
+        # ``script_code`` column on the hidden rows. Rationale: a
+        # researcher who pasted a credential or PII into a script
+        # (``api_key = "sk-…"``, an SSN string-literal in an
+        # exploratory block) would otherwise leave that text on disk
+        # in ``results.db`` indefinitely — the row is invisible to
+        # the model but the bytes remain, and anyone who later
+        # exfiltrates the file (or queries it via ``sqlite3``) sees
+        # the secret. Best-effort: a failure here doesn't undo the
+        # rewind, since the rewind has already committed.
+        try:
+            store.purge_script_code(hidden_ids)
+        except Exception:  # noqa: BLE001 — best-effort
+            pass
+
         # 5. Clear runner pending state. Anything queued for the
         # original next turn is no longer relevant — the rewind
         # creates a new branch.
@@ -3207,6 +3302,33 @@ _MENTION_VISION_MAX_BYTES = 5 * 1024 * 1024
 # backend's matching defense-in-depth check, in case a client bypasses
 # the JS gate or sends a forged base64 string from a non-browser path.
 _DRAG_DROP_MAX_BYTES = 512 * 1024 * 1024
+
+
+# Server-side mirror of the JS-side ``COMPOSER_DATA_EXTS`` plus the
+# ``ALLOWED_IMAGE_MIMES`` extension set in ``web/app.js``. The JS
+# filter is the primary UX gate (skipped files surface as a friendly
+# error in the chat); this set is defense-in-depth for any client that
+# bypasses the JS check — most realistically a custom JS handler the
+# researcher writes for testing, or a pywebview API call from a
+# different origin if a future change loads remote content. Without it
+# a forged ``add_dropped_files`` call could write arbitrary
+# extensions (``.sh``, ``.app``, ``.dylib``) into the session dir,
+# from which a researcher's own tooling might later auto-execute.
+# Updating: keep in sync with ``COMPOSER_DATA_EXTS`` in
+# ``src/nora/web/app.js``. Both lists carry the same per-set rationale.
+_DRAG_DROP_ALLOWED_EXTS: frozenset[str] = frozenset({
+    # Data — must mirror schema.DATA_EXTENSIONS plus the JS aliases.
+    ".csv", ".tsv", ".dta", ".rds", ".parquet", ".jsonl", ".ndjson",
+    # Scripts the researcher might want alongside their data.
+    ".do", ".r", ".py", ".ipynb",
+    # Stata graph + log formats.
+    ".gph", ".log", ".smcl",
+    # R Markdown.
+    ".rmd",
+    # Image formats accepted by the chat composer (ALLOWED_IMAGE_MIMES
+    # in app.js — png/jpeg/webp/gif).
+    ".png", ".jpg", ".jpeg", ".webp", ".gif",
+})
 
 
 def _b64_oversize(content_b64: str, max_decoded_bytes: int) -> bool:

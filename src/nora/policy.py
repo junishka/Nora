@@ -66,6 +66,8 @@ Design notes:
 from __future__ import annotations
 
 import json
+import os
+import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -263,10 +265,37 @@ def save_policy(cwd: Path, policy: NoraPolicy) -> None:
             for name, dp in policy.datasets.items()
         },
     }
-    p.write_text(
-        json.dumps(data, indent=2, sort_keys=True) + "\n",
-        encoding="utf-8",
+    # Write atomically via a sibling tmp file + ``os.replace``. Direct
+    # ``write_text`` truncates ``policy.json`` and then streams bytes;
+    # a crash mid-write (or a second writer that wins the race) leaves
+    # a half-written file on disk, which the next ``load_policy`` reads
+    # as malformed JSON and silently falls back to defaults — silently
+    # widening every dataset's max_depth ceiling. Two known concurrent-
+    # writer paths exist today: the web UI's policy editor and the
+    # researcher TUI both call ``save_policy``, and the researcher can
+    # have both open. ``NamedTemporaryFile(dir=p.parent)`` puts the tmp
+    # file on the same filesystem so ``os.replace`` is a true atomic
+    # rename (cross-fs ``os.replace`` falls back to copy-then-unlink,
+    # which loses atomicity).
+    payload = json.dumps(data, indent=2, sort_keys=True) + "\n"
+    fd, tmp_name = tempfile.mkstemp(
+        prefix=".policy.json.", suffix=".tmp", dir=p.parent,
     )
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(payload)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp_name, p)
+    except Exception:
+        # Best-effort cleanup of the orphan tmp file. ``os.replace``
+        # consumes the source on success, so this only matters when
+        # the write or rename failed.
+        try:
+            os.unlink(tmp_name)
+        except OSError:
+            pass
+        raise
 
 
 # ---------------------------------------------------------------------------

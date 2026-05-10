@@ -75,6 +75,14 @@ done
 # Confirm prompts honour --yes / NORA_RELEASE_YES. When neither is set
 # AND stdin isn't a TTY, refuse instead of blocking forever — CI logs
 # would otherwise stall silently on a never-arriving newline.
+# Both regexes match either the single-letter form (y / Y / n / N) or
+# the full word (yes / YES / Yes, no / NO / No). Empty input falls
+# through to whichever default the helper enforces. Explicit "no"
+# typed at a default-yes prompt should mean no, not "garbage → default
+# → yes" which is what an over-strict ^[Nn]$ would do.
+_RE_YES='^[Yy]([Ee][Ss])?$'
+_RE_NO='^[Nn]([Oo])?$'
+
 confirm() {
     local prompt="$1"
     if [[ "$ASSUME_YES" == "true" ]]; then
@@ -89,7 +97,27 @@ confirm() {
     local ans=""
     echo -n "    $prompt [y/N] "
     read -r ans
-    [[ "$ans" =~ ^[Yy]$ ]]
+    [[ "$ans" =~ $_RE_YES ]]
+}
+
+# Default-yes counterpart of ``confirm``. Use for prompts where the
+# obvious / expected answer is yes (e.g. "pull now?") so the user can
+# accept by just hitting Enter. Non-TTY runs silently accept — CI's
+# explicit choice is to not interact, and a default-yes prompt's whole
+# point is that yes is the safe path.
+confirm_yes() {
+    local prompt="$1"
+    if [[ "$ASSUME_YES" == "true" ]]; then
+        echo "    $prompt [Y/n] y  (auto)"
+        return 0
+    fi
+    if [[ ! -t 0 ]]; then
+        return 0
+    fi
+    local ans=""
+    echo -n "    $prompt [Y/n] "
+    read -r ans
+    [[ ! "$ans" =~ $_RE_NO ]]
 }
 
 # ── Pre-flight ────────────────────────────────────────────────────────
@@ -183,8 +211,24 @@ if /usr/bin/git rev-parse --abbrev-ref --symbolic-full-name @{u} >/dev/null 2>&1
         BEHIND="$(/usr/bin/git rev-list --count "HEAD..@{u}" 2>/dev/null || echo 0)"
         if [[ "$BEHIND" -gt 0 ]]; then
             echo "  ⚠ Local '$BRANCH' is $BEHIND commit(s) behind origin/$BRANCH."
-            confirm "Pull first to ship the latest, or continue anyway?" \
-                || { echo "Run 'git pull' and re-run." >&2; exit 1; }
+            # Single-purpose prompt with the obvious default. The
+            # earlier two-actions-in-one wording ("Pull first, or
+            # continue anyway?") forced the user to puzzle out which
+            # answer meant which action, then dumped the work back on
+            # them as a manual ``git pull`` re-run. Now: just ask, just
+            # do it.
+            if confirm_yes "Pull now?"; then
+                if /usr/bin/git pull --ff-only --quiet; then
+                    NEW_HEAD="$(/usr/bin/git log -1 --format='%h %s' HEAD)"
+                    echo "  ✓ Pulled — now at $NEW_HEAD"
+                else
+                    echo "  ✗ Pull failed (divergence or unmerged paths)." >&2
+                    echo "    Resolve manually with 'git pull' and re-run." >&2
+                    exit 1
+                fi
+            else
+                echo "  ⚠ Continuing with stale source."
+            fi
         else
             echo "  ✓ Up to date with origin/$BRANCH"
         fi
@@ -270,6 +314,29 @@ if [[ "$APP_ONLY" == "false" ]] && [[ -f "$DMG" ]]; then
         echo "    xcrun stapler validate \"$DMG\"" >&2
         exit 1
     fi
+
+    # Emit a SHA-256 sidecar file alongside the .dmg. Researchers and
+    # downstream packagers (homebrew-cask, internal IT distribution,
+    # mirrors) need a way to verify the binary they got matches what
+    # we shipped. Apple's notarization signs the bundle but doesn't
+    # publish a per-release fingerprint anyone can check from the
+    # outside, and Gatekeeper only catches "Apple no longer trusts
+    # this developer" — not "the .dmg was modified after we built
+    # it." A SHA-256 in the same dist directory is the conventional
+    # fix; ``shasum -a 256`` ships with macOS so there's no toolchain
+    # cost. The ``.sha256`` file format mirrors what GitHub Releases
+    # accepts so users can ``shasum -a 256 -c Nora.dmg.sha256`` after
+    # downloading both. Recompute on every release so the file always
+    # corresponds to the .dmg next to it.
+    SHA256_FILE="$DMG.sha256"
+    # ``shasum`` writes ``<hash>  <path>``; rewrite to use the
+    # basename so verification works regardless of where the user
+    # downloaded the artifacts to.
+    DMG_BASENAME="$(basename "$DMG")"
+    DMG_HASH="$(/usr/bin/shasum -a 256 "$DMG" | awk '{print $1}')"
+    printf '%s  %s\n' "$DMG_HASH" "$DMG_BASENAME" > "$SHA256_FILE"
+    echo "  ✓ DMG SHA-256 written to $(basename "$SHA256_FILE")"
+    echo "    $DMG_HASH"
 fi
 
 # ── Install ───────────────────────────────────────────────────────────
@@ -333,4 +400,7 @@ echo "Done."
 echo "  App: $APP"
 if [[ "$APP_ONLY" == "false" ]] && [[ -f "$DMG" ]]; then
     echo "  DMG: $DMG  ($(du -h "$DMG" | cut -f1))"
+    if [[ -f "$DMG.sha256" ]]; then
+        echo "  SHA: $DMG.sha256"
+    fi
 fi

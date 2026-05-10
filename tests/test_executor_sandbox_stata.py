@@ -116,13 +116,24 @@ nora_result_regress, label("stata-happy-path")
     # chi-squared test, so neither ``chi_squared`` nor
     # ``chi_squared_p_value`` may appear in an OLS payload. The
     # helper gates these on ``e(chi2)`` being populated, which
-    # ``regress`` leaves empty. (Stata's ``regress`` also does not
-    # populate ``e(p)`` for OLS — the F-test p-value lives in the
-    # display output as ``Prob > F`` but is not stored in ``e()``,
-    # which is why this test does not assert ``f_p_value``.)
+    # ``regress`` leaves empty.
     assert "f_statistic" in payload, (
         "regress emits e(F); the helper must surface it as f_statistic"
     )
+    # Stata's ``regress`` does not populate ``e(p)`` for OLS — the
+    # F-test p-value lives in the display output as ``Prob > F`` but
+    # is not stored in ``e()``. The helper now computes it from
+    # ``Ftail(e(df_m), e(df_r), e(F))`` so Stata OLS cards carry
+    # ``f_p_value`` like R's ``lm()`` and Python's statsmodels OLS
+    # do — closing the cross-language consistency gap that previously
+    # left a Stata regression with ``f_statistic`` but no companion
+    # p-value.
+    assert "f_p_value" in payload, (
+        "regress emits e(F)+e(df_m)+e(df_r); the helper must compute "
+        "Ftail and surface it as f_p_value"
+    )
+    assert isinstance(payload["f_p_value"], float)
+    assert 0.0 <= payload["f_p_value"] <= 1.0
     assert "chi_squared" not in payload, (
         "regress does not run a chi-squared test; e(chi2) is empty, "
         "so no chi_squared field should appear"

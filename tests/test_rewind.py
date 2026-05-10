@@ -94,6 +94,56 @@ def test_get_include_hidden_returns_row(tmp_path: Path) -> None:
     assert row.hidden_reason == "rewind"
 
 
+def test_purge_script_code_blanks_only_named_rows(tmp_path: Path) -> None:
+    """``purge_script_code`` should drop the verbatim script text on
+    only the rows whose ids are passed in, leaving every other column
+    intact and untouched rows fully intact. This is the rewind
+    commit-point hook: post-truncate, the rewind no longer needs the
+    original ``script_code`` for those hidden rows, and keeping it
+    risks leaving pasted credentials / PII on disk indefinitely."""
+    store = _fresh_store(tmp_path)
+    secret = "API_KEY = 'sk-live-1234567890abcdef'\nload_data()"
+    benign = "summary(model)"
+    store.insert(
+        label="hidden", analysis_type="t",
+        sanitized_payload={"i": 1}, language="R",
+        script_code=secret, transformations=[],
+    )
+    store.insert(
+        label="kept", analysis_type="t",
+        sanitized_payload={"i": 2}, language="R",
+        script_code=benign, transformations=[],
+    )
+
+    n = store.purge_script_code(["M1"])
+    assert n == 1
+
+    # M1's script_code is gone but the row + payload still exist for
+    # audit (include_hidden surfaces the row).
+    m1 = store.get("M1", include_hidden=True)
+    assert m1 is not None
+    assert m1.script_code == ""
+    assert m1.label == "hidden"
+    assert m1.sanitized_payload == {"i": 1}
+
+    # M2 is fully untouched — purge respects the named-rows
+    # restriction. (No row IDs other than the one passed in.)
+    m2 = store.get("M2", include_hidden=True)
+    assert m2 is not None
+    assert m2.script_code == benign
+
+
+def test_purge_script_code_empty_input_no_op(tmp_path: Path) -> None:
+    """Empty id list returns 0 without touching the DB — symmetric
+    with ``unhide_results``'s treatment of the same edge case."""
+    store = _fresh_store(tmp_path)
+    _insert_n(store, 2)
+    assert store.purge_script_code([]) == 0
+    # Neither row's script_code was disturbed.
+    assert store.get("M1").script_code == "x=1"
+    assert store.get("M2").script_code == "x=1"
+
+
 def test_hide_results_not_in_idempotent(tmp_path: Path) -> None:
     """Re-running the same hide set MUST NOT re-stamp already-hidden
     rows. The rewind that originally hid them is the historical

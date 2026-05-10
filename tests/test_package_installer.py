@@ -284,3 +284,94 @@ def test_nora_python_pkg_dir_namespaces_by_version(tmp_path, monkeypatch) -> Non
     expected_tag = f"{sys.version_info.major}.{sys.version_info.minor}"
     assert d.parent == tmp_path
     assert d.name == expected_tag
+
+
+# ---------------------------------------------------------------------------
+# Subprocess env scrub — installer must not leak parent secrets
+# ---------------------------------------------------------------------------
+
+def test_install_subprocess_env_drops_parent_secrets(
+    tmp_path, monkeypatch,
+) -> None:
+    """``install_packages`` runs pip / R / Stata installers with
+    network access AND OUTSIDE the analysis sandbox, so any secret
+    in the parent process env (API keys, AWS creds) is reachable
+    by the installer's post-install hooks. The fix mirrors the
+    executor's allowlist: the subprocess inherits only the env
+    vars on ``_SUBPROCESS_ENV_ALLOWLIST``. Verify the symmetric
+    contract by intercepting ``subprocess.run`` and inspecting
+    the ``env`` argument it would have received.
+    """
+    import asyncio
+    import sys as _sys
+
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-leaktest-anthropic")
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-leaktest-openai")
+    monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "leaktest-aws")
+    monkeypatch.setenv("PATH", os.environ.get("PATH", "/usr/bin"))
+    monkeypatch.setenv("NORA_PYTHON_PKG_BASE", str(tmp_path / "pkgs"))
+
+    captured: dict[str, dict[str, str] | None] = {"env": None}
+
+    def fake_run(*args, **kwargs):
+        captured["env"] = dict(kwargs.get("env") or {})
+
+        class _R:
+            returncode = 0
+            stdout = ""
+            stderr = ""
+        return _R()
+
+    import subprocess as _sp
+    monkeypatch.setattr(_sp, "run", fake_run)
+    # Run the install branch synchronously so the test doesn't
+    # depend on the asyncio thread-pool executor seeing our patched
+    # ``subprocess.run`` (which it does, but reasoning about the
+    # capture order is simpler this way).
+    async def _sync_to_thread(func, *args, **kwargs):
+        return func(*args, **kwargs)
+    monkeypatch.setattr(asyncio, "to_thread", _sync_to_thread)
+
+    # Patch ``detect_environment`` to a fixed fake Environment.
+    # Without this, the real env_detect calls ``subprocess.run`` to
+    # probe interpreters — but ``run`` is patched to a no-op
+    # returning empty output, so the probe sees no python and
+    # ``install_packages`` bails before reaching the audited path.
+    # ``install_packages`` imports ``detect_environment`` lazily, so
+    # the patch lives on ``nora.env_detect`` (the source module),
+    # not on ``nora.package_installer``.
+    import nora.env_detect as _env_detect
+    from nora.env_detect import Environment, Tool
+
+    fake_env = Environment(
+        python=Tool(
+            name="Python", binary="/usr/bin/python3",
+            version="Python 3.12.0",
+            missing_packages=(), optional_missing_packages=(),
+            extra_read_paths=(),
+        ),
+        r=None, stata=None, sandbox_exec=None,
+    )
+    monkeypatch.setattr(_env_detect, "detect_environment", lambda: fake_env)
+
+    from nora.package_installer import install_packages
+
+    asyncio.run(install_packages(
+        language="Python", packages=["pandas"], action="install",
+    ))
+
+    env = captured["env"]
+    assert env is not None, "subprocess.run was not called with an env dict"
+    # The three secrets we set MUST NOT cross to the installer.
+    for leak in ("ANTHROPIC_API_KEY", "OPENAI_API_KEY", "AWS_SECRET_ACCESS_KEY"):
+        assert leak not in env, (
+            f"{leak} leaked into installer env — package post-install "
+            f"hooks run outside the analysis sandbox with network "
+            f"access, so this is a credential-exfil channel"
+        )
+    # PATH (allowlisted) survives so pip can find python tooling.
+    assert "PATH" in env
+    # PYTHONPATH is the install-target injection — must point at our
+    # nora pkg dir so ``pip uninstall`` resolves the right copy.
+    assert "PYTHONPATH" in env
+    assert str(tmp_path / "pkgs") in env["PYTHONPATH"]

@@ -48,6 +48,20 @@ def _text_payload(response: dict) -> dict:
 
 
 def _call(args: dict) -> dict:
+    """Drive the tool handler. Snapshots the active cwd's top-level
+    files into the ``file_provenance`` manifest before each call so
+    test fixtures that wrote a script directly to ``tmp_path`` are
+    treated as researcher-staged. The submit_script_file SDC gate
+    refuses cwd top-level scripts that aren't in the manifest (the
+    "model wrote a fake script via submit_script and now wants to
+    re-run it" channel); these tests exercise the legitimate
+    researcher-staged path."""
+    from nora.config import get_cwd
+    from nora.file_provenance import initialize as _init_staged
+    try:
+        _init_staged(get_cwd())
+    except Exception:  # noqa: BLE001 — manifest is best-effort
+        pass
     return _text_payload(asyncio.run(HANDLERS["submit_script_file"](args)))
 
 
