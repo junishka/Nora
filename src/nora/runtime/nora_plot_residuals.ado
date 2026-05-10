@@ -82,12 +82,22 @@ program define nora_plot_residuals
         local _step "export"
         _nora_export_plot using "`rundir'/_nora_plots", ///
             basename("residuals") width(1600)
-        restore
+        * Read r(file) / r(format) / r(last_rc) BEFORE ``restore``:
+        * ``restore`` clears r() (Stata's documented behaviour), so
+        * the previous order left ``_file`` and ``_fmt`` empty and
+        * the helper bailed via the "every export format failed"
+        * branch — except ``r(last_rc)`` was also empty, evaluating
+        * to 0, so the helper returned cleanly with NO manifest
+        * entry. Plot file on disk, nothing registered. Other plot
+        * helpers (coefficients, estimate_comparison) read r()
+        * BEFORE restore; residuals had the inversion.
         local _file = "`r(file)'"
         local _fmt  = "`r(format)'"
+        local _last_rc = `r(last_rc)'
+        restore
         if "`_file'" == "" {
-            display as error "nora_plot_residuals: every export format failed (last _rc=`r(last_rc)')"
-            exit `r(last_rc)'
+            display as error "nora_plot_residuals: every export format failed (last _rc=`_last_rc')"
+            exit `_last_rc'
         }
 
         local _step "manifest"
@@ -96,6 +106,18 @@ program define nora_plot_residuals
         if "`lab'" == "" local lab "Residual diagnostics"
         local lab : subinstr local lab "\" "\\", all
         local lab : subinstr local lab `"""' `"\""', all
+        * RFC 8259 §7 forbids raw U+0000..U+001F inside JSON strings;
+        * `json.loads` rejects the line and the executor's parser drops
+        * the whole payload silently. Replace every control char with
+        * a space (same posture as the original \t/\n/\r handling) so
+        * a label byte from a Stata-imported automated-export dataset
+        * can't make the manifest line invalid.
+        forvalues _cc = 1/31 {
+            if `_cc' != 9 & `_cc' != 10 & `_cc' != 13 {
+                local lab : subinstr local lab "`=char(`_cc')'" " ", all
+            }
+        }
+        local lab : subinstr local lab "`=char(127)'" " ", all
         local lab : subinstr local lab "`=char(10)'" " ", all
         local lab : subinstr local lab "`=char(13)'" " ", all
         local lab : subinstr local lab "`=char(9)'" " ", all

@@ -441,7 +441,7 @@ them by surprise.
 | File | What's there |
 |---|---|
 | `src/nora/system_prompt.py` | The model's full system prompt + dataset listing. Single source of truth for both providers |
-| `src/nora/tools.py` | The six MCP tools. Start here to understand the model's surface |
+| `src/nora/tools.py` | The MCP tools (14 currently, listed in `ALLOWED_TOOL_NAMES`). Start here to understand the model's surface |
 | `src/nora/provider/__init__.py` + `base.py` | `ProviderSession` Protocol, Event types, `open_session(provider, …)` factory |
 | `src/nora/provider/anthropic.py` + `openai.py` | Per-provider session implementations |
 | `src/nora/provider/catalog.py` | Model registry + pricing URLs |

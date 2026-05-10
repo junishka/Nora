@@ -62,11 +62,50 @@ nora$.json_escape_str <- function(s) {
   s <- gsub("\n", "\\n", s, fixed = TRUE)
   s <- gsub("\r", "\\r", s, fixed = TRUE)
   s <- gsub("\t", "\\t", s, fixed = TRUE)
+  # RFC 8259 §7 requires that ALL U+0000..U+001F appear as escape
+  # sequences inside JSON strings. Without this pass, a value-label or
+  # variable-label byte like \x01 (real automated-export datasets do
+  # ship these) reaches the wire as a raw control character — which
+  # Python's `json.loads` rejects with "Invalid control character",
+  # and the executor's JSONL parser drops every line of the payload
+  # silently. Stata's helpers have the same gap; matching changes
+  # land in the .ado files.
+  # Codepoints 9 (\t), 10 (\n), 13 (\r) are already escaped via the
+  # named-escape gsubs above. NUL (codepoint 0) cannot occur in an R
+  # character vector at all -- R rejects strings with embedded nulls
+  # at every ingestion boundary -- so 1..31 minus the three handled
+  # is the full range we need to walk here.
+  for (cp in setdiff(1:31, c(9L, 10L, 13L))) {
+    s <- gsub(intToUtf8(cp), sprintf("\\u%04x", cp), s, fixed = TRUE)
+  }
   paste0('"', s, '"')
 }
 
 nora$.to_json <- function(x) {
   if (is.null(x)) return("null")
+
+  # Coerce factors to their character labels BEFORE any of the scalar
+  # / vector branches. A factor is `is.atomic` and `length(x) == 1`
+  # for length-1 cases, but is neither `is.numeric` nor
+  # `is.character`, so it falls through every scalar guard into the
+  # atomic-vector branch. That branch recurses on `x[[1]]`, and for a
+  # factor `x[[1]]` is *another factor* equal to `x` itself —
+  # infinite recursion → node stack overflow. Concretely: any
+  # `factor(...)` value (very common with `read.csv` defaults pre-
+  # R 4.0, and with `stringsAsFactors = TRUE`) crashes the script
+  # before any payload reaches disk. Convert to character early so
+  # the rest of the serializer treats labels like ordinary strings.
+  if (is.factor(x)) x <- as.character(x)
+
+  # NA-of-any-flavor is JSON null. Catch this BEFORE the atomic-vector
+  # branch below: a length-1 NA passes `is.atomic`, and `x[[1]]` for an
+  # NA is identical to NA itself, so without this guard the recursion
+  # never terminates and the script crashes with a node stack overflow.
+  # Concretely: any helper field that ends up NA upstream (e.g.
+  # `attr(x, "label")` returning NA, an upstream `mean(x)` over an
+  # all-NA vector) would crash the whole script before any payload
+  # reached disk.
+  if (length(x) == 1 && is.atomic(x) && is.na(x)) return("null")
 
   # Scalars first — auto-unbox for length-1 atomics.
   if (is.logical(x) && length(x) == 1 && !is.na(x)) {
@@ -79,7 +118,13 @@ nora$.to_json <- function(x) {
     # runtime emits as-is. Allow scientific notation (the default) so
     # extremely small / large numbers get compact valid-JSON literals
     # like `1.7858e-41` instead of ugly long decimals.
-    return(format(x, digits = 17, trim = TRUE))
+    # `decimal.mark = "."` is required: `format()` honors the
+    # locale-dependent OutDec option, so a researcher script that ran
+    # `options(OutDec = ",")` (German/French/Spanish locales) would
+    # otherwise emit `3,14...` and break JSON parsing for every line
+    # that follows. Stata's helper uses `strofreal(..., "%21.17e")`
+    # which is locale-independent — match that guarantee here.
+    return(format(x, digits = 17, trim = TRUE, decimal.mark = "."))
   }
   if (is.character(x) && length(x) == 1 && !is.na(x)) {
     return(nora$.json_escape_str(x))
@@ -95,9 +140,21 @@ nora$.to_json <- function(x) {
   # Lists.
   if (is.list(x)) {
     nms <- names(x)
-    if (is.null(nms) || any(!nzchar(nms))) {
+    # Mixed naming (some named, some positional) — `list(a = 1, 2)` —
+    # used to silently fall back to array-mode and DROP the named
+    # entries. That's a quiet data loss: a researcher passing
+    # mixed args (e.g. via `do.call`) gets a payload whose shape no
+    # longer matches schema validation, but no error is raised.
+    # Keep array-mode only for the *fully-positional* case (no names
+    # at all). Any partial naming becomes object-mode, with empty
+    # names auto-numbered so the JSON is still well-formed.
+    if (is.null(nms)) {
       parts <- vapply(x, nora$.to_json, character(1))
       return(paste0("[", paste(parts, collapse = ","), "]"))
+    }
+    if (any(!nzchar(nms))) {
+      idx <- which(!nzchar(nms))
+      nms[idx] <- paste0("_", idx)
     }
     parts <- vapply(seq_along(x), function(i) {
       paste0(nora$.json_escape_str(nms[i]), ":",
@@ -155,17 +212,39 @@ nora$result <- function(type, ...) {
 #' anything returns to the sanitizer), so printing here is only for
 #' the researcher's benefit.
 nora$from_lm <- function(model, ...) {
-  print(summary(model))
+  # Compute `summary` once — it's not free on large fits (it
+  # re-derives vcov, t/z stats, p-values), and the previous version
+  # called it twice (once for `print`, once to feed the helper). Pass
+  # the same object to `print` for the researcher's TUI panel.
   s <- summary(model)
+  print(s)
   ce <- as.data.frame(s$coefficients)
   coefs <- as.list(ce[, "Estimate"])
   names(coefs) <- rownames(ce)
   ses <- as.list(ce[, "Std. Error"])
   names(ses) <- rownames(ce)
-  tvals <- as.list(ce[, "t value"])
-  names(tvals) <- rownames(ce)
-  pvals <- as.list(ce[, "Pr(>|t|)"])
-  names(pvals) <- rownames(ce)
+  # `lm` summaries name the test-stat columns "t value" / "Pr(>|t|)";
+  # `glm` summaries (logit, poisson, etc.) use "z value" / "Pr(>|z|)".
+  # Researchers naturally pass `glm(y ~ x, family = binomial)` to
+  # `from_lm` because `glm` extends `lm`, and the previous hardcoded
+  # column lookup failed with `Error: undefined columns selected`,
+  # aborting the script before the payload was written. Probe both
+  # naming conventions and fall back to positional access (col 3 is
+  # the test stat, col 4 the p-value) so other glm-like fits with
+  # exotic naming still emit a payload.
+  ce_cols <- colnames(ce)
+  stat_col <- if ("t value" %in% ce_cols) "t value" else
+              if ("z value" %in% ce_cols) "z value" else
+              if (ncol(ce) >= 3) ce_cols[3] else NA_character_
+  p_col <- if ("Pr(>|t|)" %in% ce_cols) "Pr(>|t|)" else
+           if ("Pr(>|z|)" %in% ce_cols) "Pr(>|z|)" else
+           if (ncol(ce) >= 4) ce_cols[4] else NA_character_
+  tvals <- if (!is.na(stat_col)) {
+    v <- as.list(ce[, stat_col]); names(v) <- rownames(ce); v
+  } else NULL
+  pvals <- if (!is.na(p_col)) {
+    v <- as.list(ce[, p_col]); names(v) <- rownames(ce); v
+  } else NULL
 
   response <- as.character(attr(model$terms, "variables")[[2]])
   # Wrap in `as.list(...)` so a single-predictor model serializes as the
@@ -662,6 +741,26 @@ nora$.plots_dir <- function() {
   d
 }
 
+# Return `base` if no file by that name exists in `d`; otherwise
+# append _2, _3, ... before the extension. Without this, calling
+# `plot_coefficients(fit1)` then `plot_coefficients(fit2)` in one
+# script would (a) overwrite `coefficients.png` with fit2's image
+# and (b) append a second manifest row pointing at the SAME file,
+# so the model sees two "different" plots that are both fit2.
+# `plot_interaction` already side-steps this by suffixing the
+# variable name into the filename; the others need a counter.
+nora$.unique_plot_name <- function(d, base) {
+  if (!file.exists(file.path(d, base))) return(base)
+  parts <- tools::file_path_sans_ext(base)
+  ext <- tools::file_ext(base)
+  i <- 2L
+  repeat {
+    candidate <- if (nzchar(ext)) paste0(parts, "_", i, ".", ext) else paste0(parts, "_", i)
+    if (!file.exists(file.path(d, candidate))) return(candidate)
+    i <- i + 1L
+  }
+}
+
 nora$.append_plot_manifest <- function(file, kind, label) {
   d <- nora$.plots_dir()
   if (is.null(d)) return(invisible(NULL))
@@ -717,7 +816,7 @@ nora$.append_plot_helper_error <- function(helper, message) {
 nora$plot_residuals <- function(model, label = NULL) {
   d <- nora$.plots_dir()
   if (is.null(d)) return(invisible(NULL))
-  fname <- "residuals.png"
+  fname <- nora$.unique_plot_name(d, "residuals.png")
   res <- tryCatch({
     grDevices::png(file.path(d, fname),
                    width = 900, height = 700, res = 110)
@@ -917,7 +1016,7 @@ nora$plot_interaction <- function(model, var, label = NULL,
 nora$plot_coefficients <- function(model, label = NULL) {
   d <- nora$.plots_dir()
   if (is.null(d)) return(invisible(NULL))
-  fname <- "coefficients.png"
+  fname <- nora$.unique_plot_name(d, "coefficients.png")
   res <- tryCatch({
     cf <- coef(model)
     ci <- stats::confint(model)
@@ -983,7 +1082,7 @@ nora$plot_coefficients <- function(model, label = NULL) {
 nora$plot_estimate_comparison <- function(models, coef, label = NULL) {
   d <- nora$.plots_dir()
   if (is.null(d)) return(invisible(NULL))
-  fname <- "estimate_comparison.png"
+  fname <- nora$.unique_plot_name(d, "estimate_comparison.png")
   res <- tryCatch({
     if (!is.list(models) || length(models) < 2) {
       stop("`models` must be a list of at least 2 model fits")
@@ -1041,7 +1140,7 @@ nora$plot_estimate_comparison <- function(models, coef, label = NULL) {
   })
   if (isTRUE(res)) {
     nora$.append_plot_manifest(
-      fname, "coefficients",
+      fname, "estimate_comparison",
       if (is.null(label)) paste0("Estimate comparison: ", coef) else label
     )
   }

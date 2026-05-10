@@ -131,7 +131,7 @@ _count_dict = st.dictionaries(
 )
 
 
-@given(counts=_count_dict, threshold=st.integers(min_value=0, max_value=100))
+@given(counts=_count_dict, threshold=st.integers(min_value=1, max_value=100))
 def test_suppression_removes_all_below_threshold(counts, threshold):
     """No integer cell below threshold survives suppression."""
     result = suppress_cells_below(counts, threshold)
@@ -142,14 +142,14 @@ def test_suppression_removes_all_below_threshold(counts, threshold):
         )
 
 
-@given(counts=_count_dict, threshold=st.integers(min_value=0, max_value=100))
+@given(counts=_count_dict, threshold=st.integers(min_value=1, max_value=100))
 def test_suppression_preserves_keys(counts, threshold):
     """Suppression never adds or removes keys — only replaces values."""
     result = suppress_cells_below(counts, threshold)
     assert set(result.counts.keys()) == set(counts.keys())
 
 
-@given(counts=_count_dict, threshold=st.integers(min_value=0, max_value=100))
+@given(counts=_count_dict, threshold=st.integers(min_value=1, max_value=100))
 def test_suppression_total_unchanged(counts, threshold):
     """The reported `total_original` matches the sum of all input counts."""
     result = suppress_cells_below(counts, threshold)
@@ -159,6 +159,14 @@ def test_suppression_total_unchanged(counts, threshold):
 def test_suppression_rejects_negatives():
     with pytest.raises(ValueError):
         suppress_cells_below({"A": -1}, threshold=5)
+
+
+def test_suppression_rejects_zero_threshold():
+    """``threshold = 0`` would silently disable suppression — no
+    non-negative count is < 0 — so it surfaces as a hard error
+    instead of slipping through as a no-op."""
+    with pytest.raises(ValueError, match="at least 1"):
+        suppress_cells_below({"A": 1}, threshold=0)
 
 
 def test_suppression_rejects_nonint():

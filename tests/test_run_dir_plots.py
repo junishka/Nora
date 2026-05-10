@@ -735,9 +735,11 @@ def test_plot_estimate_comparison_helpers_exist_for_all_languages() -> None:
     assert "estimates restore" in stata_ado
     # Writes under run_dir, not session cwd.
     assert "`rundir'/_nora_plots" in stata_ado
-    # Manifest entry uses the allowlisted ``coefficients`` kind so
-    # the runner accepts it.
-    assert '"kind":"coefficients"' in stata_ado
+    # Manifest entry uses the dedicated ``estimate_comparison`` kind
+    # so the model can distinguish a model-comparison forest plot
+    # from a single-model coefficient plot. The runner allowlist
+    # accepts both kinds.
+    assert '"kind":"estimate_comparison"' in stata_ado
 
     # R + Python: live inside the runtime modules.
     r_src = runtime.joinpath("nora.R").read_text(encoding="utf-8")

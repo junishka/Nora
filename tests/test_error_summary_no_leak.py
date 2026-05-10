@@ -384,6 +384,125 @@ def test_bare_absolute_path_in_message_is_redacted() -> None:
     assert "Error :" in excerpt
 
 
+def test_path_with_space_in_username_is_fully_scrubbed() -> None:
+    """macOS / Windows users with names containing spaces are common
+    (``John Smith``, ``Mary O'Brien Lopez``). The bare-path regex
+    used to stop at the first space and only basename ``/Users/John``,
+    leaving ``Smith/research/wages.csv`` in the excerpt — leaking the
+    surname AND the substantive path. With the wholesale exception-body
+    redaction the leak is closed at a different layer (the body is
+    gone entirely), but the regex fix in ``_scrub_and_cap`` still
+    matters as defense-in-depth for any surface that survives the
+    redaction (R ``Calls:`` chain, residual frame lines)."""
+    stderr = (
+        "FileNotFoundError: [Errno 2] No such file or directory: "
+        "/Users/John Smith/research/wages.csv\n"
+    )
+    # Wrap so the Python extractor anchors on a real traceback.
+    stderr = (
+        "Traceback (most recent call last):\n"
+        '  File "/abs/x.py", line 1, in <module>\n'
+        "    pd.read_csv(path)\n"
+        + stderr
+    )
+    excerpt = extract_debug_excerpt("", stderr, 1, "Python")
+    assert excerpt is not None
+    # No part of the user-controlled path may survive — both the
+    # surname-as-directory-component AND the substantive path body.
+    assert "/Users/John" not in excerpt
+    assert "Smith" not in excerpt
+    assert "research" not in excerpt
+    assert "wages.csv" not in excerpt
+    # The exception type still surfaces so the model knows what
+    # happened; only the body (which carried the path) is redacted.
+    assert "FileNotFoundError" in excerpt
+
+
+def test_github_personal_access_token_redacted() -> None:
+    """A GitHub PAT in stderr (e.g., a request library printed the
+    auth header on a 401) must be redacted. The classic ``ghp_``
+    prefix slipped past the original credential pattern set, which
+    only covered ``sk-...``, ``AKIA``, and JWTs.
+
+    Two layers protect now: (1) the wholesale exception-body
+    redaction drops the body entirely (so the PAT goes with it),
+    and (2) ``_CRED_PATTERNS`` still applies to any surface that
+    survives — Stata logs, R ``Calls:`` chains. Either layer alone
+    is enough; both together is defense in depth."""
+    pat = "ghp_" + "A" * 36
+    stderr = (
+        "Traceback (most recent call last):\n"
+        '  File "/x.py", line 1, in <module>\n'
+        '    raise RuntimeError(headers["Authorization"])\n'
+        f"RuntimeError: token {pat}\n"
+    )
+    excerpt = extract_debug_excerpt("", stderr, 1, "Python")
+    assert excerpt is not None
+    assert pat not in excerpt
+
+
+def test_slack_token_redacted() -> None:
+    token = "xoxb-1234567890-1234567890-AbCdEfGhIjKlMnOpQrStUv"
+    stderr = (
+        "Traceback (most recent call last):\n"
+        '  File "/x.py", line 1, in <module>\n'
+        '    raise RuntimeError("posted")\n'
+        f"RuntimeError: webhook {token}\n"
+    )
+    excerpt = extract_debug_excerpt("", stderr, 1, "Python")
+    assert excerpt is not None
+    assert token not in excerpt
+
+
+def test_huggingface_token_redacted() -> None:
+    token = "hf_" + "A" * 30
+    stderr = (
+        "Traceback (most recent call last):\n"
+        '  File "/x.py", line 1, in <module>\n'
+        '    raise RuntimeError("hf")\n'
+        f"RuntimeError: token={token}\n"
+    )
+    excerpt = extract_debug_excerpt("", stderr, 1, "Python")
+    assert excerpt is not None
+    assert token not in excerpt
+
+
+def test_stripe_underscore_key_redacted() -> None:
+    """The original ``sk-`` regex requires a hyphen; Stripe uses
+    underscores (``sk_live_...`` / ``sk_test_...``). Pin the
+    underscore variant so a researcher's STRIPE_KEY env var
+    leaking via a printed header doesn't slip through."""
+    key = "sk_live_" + "A" * 24
+    stderr = (
+        "Traceback (most recent call last):\n"
+        '  File "/x.py", line 1, in <module>\n'
+        '    raise RuntimeError("billing")\n'
+        f"RuntimeError: STRIPE_KEY={key}\n"
+    )
+    excerpt = extract_debug_excerpt("", stderr, 1, "Python")
+    assert excerpt is not None
+    assert key not in excerpt
+
+
+def test_r_call_argument_credential_is_redacted() -> None:
+    """R errors of the form ``Error in some_func("user-supplied") : ...``
+    interpolate the call argument verbatim. Earlier extractor versions
+    forwarded the call group raw, leaking short data values that sit
+    under the long-quoted-arg threshold (SSNs, IDs, GH PATs from
+    header dumps). The current extractor drops the whole body
+    wholesale ("Error : [message body redacted]"), so the call group
+    — and any credential it carried — never reaches the excerpt."""
+    pat = "ghp_" + "B" * 36
+    r_stderr = f'Error in httr::GET("api", token = "{pat}") : 401 Unauthorized\n'
+    excerpt = extract_debug_excerpt("", r_stderr, 1, "R")
+    assert excerpt is not None
+    assert pat not in excerpt
+    # The whole body (including the call group's argument) is
+    # redacted; the parser-owned anchor still surfaces.
+    assert "[message body redacted]" in excerpt
+    assert "Error" in excerpt
+
+
 # ---------------------------------------------------------------------------
 # stdout NEVER read for R / Python
 # ---------------------------------------------------------------------------

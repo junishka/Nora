@@ -9,7 +9,7 @@ field and weaken the guarantee.
 
 from __future__ import annotations
 
-from hypothesis import given, settings
+from hypothesis import assume, given, settings
 from hypothesis import strategies as st
 
 from nora.sanitizer import DEFAULT_CONFIG, sanitize, supported_types
@@ -66,8 +66,14 @@ def test_crosstab_is_supported():
 def test_crosstab_never_emits_margins(raw):
     """The load-bearing invariant: no margin field ever appears in output."""
     result = sanitize(raw)
-    if not result.ok:
-        return
+    # ``assume`` instead of silent ``return``: if a sanitizer bug
+    # causes EVERY generated input to be rejected, ``return`` would
+    # leave every example vacuously passing and Hypothesis would
+    # report "100 passing" while the assertions below never ran.
+    # ``assume`` tells Hypothesis to discard the example and seek a
+    # valid one, so a coverage collapse surfaces as a "could not
+    # find enough valid examples" error.
+    assume(result.ok)
     for forbidden in _MARGIN_FIELDS:
         assert forbidden not in result.sanitized, (
             f"margin field {forbidden!r} leaked through — "
@@ -79,8 +85,14 @@ def test_crosstab_never_emits_margins(raw):
 def test_crosstab_cells_below_threshold_always_suppressed(raw):
     """No cell below threshold survives as a raw integer."""
     result = sanitize(raw)
-    if not result.ok:
-        return
+    # ``assume`` instead of silent ``return``: if a sanitizer bug
+    # causes EVERY generated input to be rejected, ``return`` would
+    # leave every example vacuously passing and Hypothesis would
+    # report "100 passing" while the assertions below never ran.
+    # ``assume`` tells Hypothesis to discard the example and seek a
+    # valid one, so a coverage collapse surfaces as a "could not
+    # find enough valid examples" error.
+    assume(result.ok)
     threshold = DEFAULT_CONFIG.cell_suppression_threshold
     marker = suppression_marker(threshold)
     nested = result.sanitized["counts"]
@@ -108,8 +120,14 @@ def test_crosstab_output_keys_are_visible_or_suppressed_bucket(raw):
     single ``[suppressed]`` bucket."""
     from nora.text_safety import safe_key
     result = sanitize(raw)
-    if not result.ok:
-        return
+    # ``assume`` instead of silent ``return``: if a sanitizer bug
+    # causes EVERY generated input to be rejected, ``return`` would
+    # leave every example vacuously passing and Hypothesis would
+    # report "100 passing" while the assertions below never ran.
+    # ``assume`` tells Hypothesis to discard the example and seek a
+    # valid one, so a coverage collapse surfaces as a "could not
+    # find enough valid examples" error.
+    assume(result.ok)
     threshold = DEFAULT_CONFIG.cell_suppression_threshold
     out_counts = result.sanitized["counts"]
     in_counts = raw["counts"]
@@ -134,8 +152,14 @@ def test_crosstab_output_keys_are_visible_or_suppressed_bucket(raw):
 def test_crosstab_logs_margin_drops_loudly(raw):
     """If the script smuggled a margin in, the transformation log names it."""
     result = sanitize(raw)
-    if not result.ok:
-        return
+    # ``assume`` instead of silent ``return``: if a sanitizer bug
+    # causes EVERY generated input to be rejected, ``return`` would
+    # leave every example vacuously passing and Hypothesis would
+    # report "100 passing" while the assertions below never ran.
+    # ``assume`` tells Hypothesis to discard the example and seek a
+    # valid one, so a coverage collapse surfaces as a "could not
+    # find enough valid examples" error.
+    assume(result.ok)
     smuggled = [f for f in _MARGIN_FIELDS if f in raw]
     for f in smuggled:
         assert any(f"dropped margin field {f!r}" in t for t in result.transformations), (

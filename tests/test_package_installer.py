@@ -92,6 +92,27 @@ def test_validate_names_rejects_overlong() -> None:
     assert len(rejected) == 1
 
 
+def test_install_packages_caps_list_length() -> None:
+    """A massive package list shouldn't launch a single multi-hour
+    invocation the researcher can't easily interrupt. The per-call
+    cap rejects oversized batches before any subprocess fires.
+    """
+    import asyncio
+
+    from nora.package_installer import install_packages as _do_install
+
+    # 60 names — over the 50-package cap, all individually well-formed.
+    names = [f"pkg{i:03d}" for i in range(60)]
+    result = asyncio.run(_do_install("Python", names, "install"))
+
+    assert result.error is not None
+    assert "too many" in result.error.lower() or "cap" in result.error.lower()
+    # No subprocess fired, so no statuses, no stdout, no stderr.
+    assert result.statuses == ()
+    assert result.raw_stdout == ""
+    assert result.raw_stderr == ""
+
+
 # ---------------------------------------------------------------------------
 # 1. Python install command shape
 # ---------------------------------------------------------------------------

@@ -11,7 +11,7 @@ Phrased as a property: if the output has N present, then either
 
 from __future__ import annotations
 
-from hypothesis import given, settings
+from hypothesis import assume, given, settings
 from hypothesis import strategies as st
 
 from nora.sanitizer import DEFAULT_CONFIG, sanitize
@@ -50,8 +50,10 @@ def test_never_exactly_one_suppressed_when_n_present(raw):
     ``[suppressed]`` key in the output, so the count of distinct
     suppressed cells lives in the ``suppressed_cell_count`` field."""
     result = sanitize(raw)
-    if not result.ok:
-        return
+    # ``assume`` instead of silent ``return``: a sanitizer regression
+    # that rejected every generated input would otherwise leave this
+    # test passing vacuously.
+    assume(result.ok)
     sanitized = result.sanitized
     if "n" not in sanitized:
         return  # if N isn't published, back-calc isn't a concern
@@ -67,8 +69,10 @@ def test_never_exactly_one_suppressed_when_n_present(raw):
 def test_secondary_only_adds_when_necessary(raw):
     """If >=2 cells are already primary-suppressed, the log shouldn't mention secondary."""
     result = sanitize(raw)
-    if not result.ok:
-        return
+    # ``assume`` instead of silent ``return``: a sanitizer regression
+    # that rejected every generated input would otherwise leave this
+    # test passing vacuously.
+    assume(result.ok)
     distinct_suppressed = result.sanitized.get("suppressed_cell_count", 0)
     secondary_logged = any(
         "secondary suppression" in t for t in result.transformations
@@ -99,8 +103,10 @@ def test_all_suppressed_cells_use_marker(raw):
     """Visible cells are ints; the single ``[suppressed]`` bucket
     carries the marker. No other shapes."""
     result = sanitize(raw)
-    if not result.ok:
-        return
+    # ``assume`` instead of silent ``return``: a sanitizer regression
+    # that rejected every generated input would otherwise leave this
+    # test passing vacuously.
+    assume(result.ok)
     marker = suppression_marker(DEFAULT_CONFIG.cell_suppression_threshold)
     for k, v in result.sanitized["counts"].items():
         if k == "[suppressed]":

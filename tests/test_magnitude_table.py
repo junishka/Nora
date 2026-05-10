@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import math
 
-from hypothesis import given
+from hypothesis import assume, given
 from hypothesis import strategies as st
 
 from nora.sanitizer import DEFAULT_CONFIG, SDCConfig, sanitize, supported_types
@@ -102,8 +102,10 @@ def test_magnitude_table_is_supported():
 def test_max_share_never_emitted(raw):
     """The load-bearing privacy property."""
     r = sanitize(raw)
-    if not r.ok:
-        return
+    # ``assume`` instead of silent ``return``: a sanitizer regression
+    # that rejected every generated input would otherwise leave this
+    # test passing vacuously.
+    assume(r.ok)
     for cell in r.sanitized["cells"].values():
         assert "max_share" not in cell, (
             "max_share leaked through — dominance-metric-only invariant "
@@ -115,8 +117,10 @@ def test_max_share_never_emitted(raw):
 def test_suppressed_cells_have_both_markers(raw):
     """Suppression is atomic: if value is suppressed, n is too, and vice versa."""
     r = sanitize(raw)
-    if not r.ok:
-        return
+    # ``assume`` instead of silent ``return``: a sanitizer regression
+    # that rejected every generated input would otherwise leave this
+    # test passing vacuously.
+    assume(r.ok)
     marker = suppression_marker(DEFAULT_CONFIG.cell_suppression_threshold)
     for cell in r.sanitized["cells"].values():
         v_is_mark = cell.get("value") == marker
@@ -134,8 +138,10 @@ def test_small_n_cells_always_suppressed(raw):
     at small N (knowing a rare industry exists with these
     dominance characteristics identifies its members)."""
     r = sanitize(raw)
-    if not r.ok:
-        return
+    # ``assume`` instead of silent ``return``: a sanitizer regression
+    # that rejected every generated input would otherwise leave this
+    # test passing vacuously.
+    assume(r.ok)
     threshold = DEFAULT_CONFIG.cell_suppression_threshold
     for raw_key, raw_cell in raw["cells"].items():
         if raw_cell["n"] < threshold:
@@ -157,8 +163,10 @@ def test_dominant_cells_always_suppressed(raw):
     """Any raw cell that fails dominance must NOT appear under its
     own group label in the output (bucketed under [suppressed])."""
     r = sanitize(raw)
-    if not r.ok:
-        return
+    # ``assume`` instead of silent ``return``: a sanitizer regression
+    # that rejected every generated input would otherwise leave this
+    # test passing vacuously.
+    assume(r.ok)
     threshold_dom = DEFAULT_CONFIG.dominance_threshold
     threshold_n = DEFAULT_CONFIG.cell_suppression_threshold
     for raw_key, raw_cell in raw["cells"].items():

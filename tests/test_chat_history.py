@@ -579,15 +579,22 @@ def test_build_prefix_strips_control_chars_in_tool_label(tmp_path: Path):
 def test_build_prefix_per_field_caps_truncate_long_text(tmp_path: Path):
     """A single enormous user message should be capped at the
     per-field limit with a truncation marker, but the turn itself
-    still appears in the prefix."""
-    long_text = "x" * 3000  # exceeds the 1500-char per-field cap
+    still appears in the prefix.
+
+    The text-safety chokepoint emits ``[TRUNCATED]`` as its marker;
+    upstream callers used to emit ``…[truncated]`` but routing the
+    cap through ``safe_text`` (so prior-turn prose can't carry bidi
+    overrides or fake "System:" headers into the new turn) unifies
+    the marker. Either is acceptable evidence that capping happened.
+    """
+    long_text = "x" * 3000  # exceeds the per-field cap
     cwd = _write_jsonl(tmp_path, [
         {"type": "user_message", "text": long_text},
         {"type": "assistant_text", "text": "noted"},
     ])
     prefix = build_context_prefix(cwd, results=[])
     assert "[turn 0]" in prefix
-    assert "…[truncated]" in prefix
+    assert "[TRUNCATED]" in prefix or "…[truncated]" in prefix
     assert long_text not in prefix  # full text must not be present
     assert "assistant: noted" in prefix
 

@@ -482,7 +482,13 @@ def _render_descriptive(p: dict[str, Any]) -> str | None:
         row.append(_fmt_num(p["min_value"]))
     if has_max:
         row.append(_fmt_num(p["max_value"]))
-    row.append(_fmt_int(p.get("missing_count", 0)))
+    # ``p.get("missing_count")`` (no default) — when the sanitizer
+    # has DROPPED the field entirely (cross-query back-calc case in
+    # ``_render_crosstab`` analogues, single-suppressed-cell paths,
+    # etc.), defaulting to 0 would render "missing = 0" and claim no
+    # missingness — actively misleading. ``_fmt_int(None)`` returns
+    # "" so the column renders blank instead.
+    row.append(_fmt_int(p.get("missing_count")))
     return _markdown_table(header, [row])
 
 

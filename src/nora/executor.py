@@ -734,6 +734,18 @@ def run_script(
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
+            # New process group: ``proc.kill()`` only SIGKILLs the
+            # direct child (the ``sandbox-exec`` wrapper, which
+            # ``exec``s into the interpreter). Any subprocess the
+            # user's script spawns — ``parallel::makeCluster`` /
+            # ``mclapply`` workers in R, ``multiprocessing.Pool`` /
+            # ``subprocess.Popen`` in Python, ``parallel ...`` blocks
+            # in Stata — would be re-parented to init when the wrapper
+            # dies and keep running, still able to append to
+            # ``result.json``. ``start_new_session=True`` puts the
+            # whole subtree in its own session+process group so
+            # ``cancel_turn`` can `killpg` the lot.
+            start_new_session=True,
         )
     except FileNotFoundError as e:
         return ExecutionResult(
@@ -756,7 +768,19 @@ def run_script(
         # the .stdout/.stderr buffers stay attached to the killed
         # proc and the file descriptors leak into the run dir's
         # parent process.
-        proc.kill()
+        # Whole-process-group kill — ``start_new_session=True`` above
+        # detaches the subprocess into its own session, so any
+        # parallel/multiprocessing workers the user's script
+        # spawned are reachable via ``killpg``. Otherwise they'd
+        # outlive the timeout and keep writing to ``result.json``.
+        import signal as _signal
+        try:
+            os.killpg(os.getpgid(proc.pid), _signal.SIGKILL)
+        except (ProcessLookupError, PermissionError, OSError):
+            try:
+                proc.kill()
+            except Exception:  # noqa: BLE001
+                pass
         try:
             stdout, stderr = proc.communicate(timeout=2)
         except subprocess.TimeoutExpired:

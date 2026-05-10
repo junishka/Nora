@@ -147,8 +147,16 @@ def suppress_cells_below(
     Returns a `SuppressionResult` so callers can report which cells were
     suppressed (useful for transformation logs the researcher sees).
     """
-    if threshold < 0:
-        raise ValueError(f"threshold must be non-negative, got {threshold}")
+    if threshold < 1:
+        # `threshold = 0` would silently disable suppression (no count
+        # `v >= 0` ever satisfies `v < 0`), defeating the purpose of
+        # the routine. Require >= 1 so a misconfigured `SDCConfig`
+        # surfaces as a hard error rather than a silent zero-cell-
+        # suppressed result.
+        raise ValueError(
+            f"threshold must be at least 1, got {threshold}; a value "
+            f"of 0 would silently disable suppression"
+        )
     marker = suppression_marker(threshold)
     out: dict[str, int | str] = {}
     suppressed: list[str] = []

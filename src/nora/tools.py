@@ -4068,13 +4068,22 @@ async def install_packages(args: dict[str, Any]) -> dict[str, Any]:
             "raw_stdout_excerpt": (result.raw_stdout or "")[-1500:],
             "raw_stderr_excerpt": (result.raw_stderr or "")[-3000:],
         })
+    # No ``raw_stdout_excerpt`` on success. pip's progress output
+    # echoes the full index URL — including any token-bearing
+    # ``index-url = https://USER:TOKEN@private-pypi.acme.com/simple``
+    # the researcher configured in pip.conf or PIP_INDEX_URL — and
+    # that excerpt was being forwarded into the model's transcript on
+    # every successful install. The ``statuses`` list already tells
+    # the model which packages were touched and at what version;
+    # pip's chatty output adds no information beyond that. Errors
+    # still get the excerpt (above) because diagnosing a failed
+    # install genuinely needs it.
     return _as_mcp_text({
         "status": "ok",
         "language": result.language,
         "action": result.action,
         "statuses": statuses,
         "duration_seconds": round(result.duration_seconds, 2),
-        "raw_stdout_excerpt": (result.raw_stdout or "")[-1500:],
     })
 
 

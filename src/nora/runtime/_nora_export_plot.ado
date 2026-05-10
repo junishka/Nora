@@ -37,6 +37,31 @@ program define _nora_export_plot, rclass
     * can write into the dir.
     capture mkdir "`using'"
 
+    * Disambiguate basename if a prior helper call in this same run
+    * already produced ``basename.{pdf,png,eps,gph}``. Without this,
+    * a script that calls e.g. ``nora_plot_coefficients`` twice would
+    * overwrite the first plot AND append a second manifest row
+    * pointing at the same on-disk file — the model would see two
+    * "different" plots that are in fact both the second fit. We
+    * check all four output extensions, not just the one we're
+    * about to write, so the disambiguation is stable regardless of
+    * which translator path won the previous call.
+    local _basename "`basename'"
+    local _i = 2
+    forvalues _try = 1/100 {
+        local _exists 0
+        foreach _ext in pdf png eps gph {
+            capture confirm file "`using'/`_basename'.`_ext'"
+            if !_rc {
+                local _exists 1
+            }
+        }
+        if !`_exists' continue, break
+        local _basename "`basename'_`_i'"
+        local _i = `_i' + 1
+    }
+    local basename "`_basename'"
+
     local exported ""
     local fmt ""
     local last_rc 0

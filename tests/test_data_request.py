@@ -184,11 +184,29 @@ def test_na_count_basic(sample_csv: Path):
 
 
 def test_na_count_denies_when_subgroup_too_small(sample_csv: Path):
-    """If almost everything is NA, the non-NA subgroup is disclosive."""
+    """If almost everything is NA, the non-NA subgroup is disclosive.
+
+    Beyond the deny status, the denial reason must not echo the exact
+    small count back at the model — that would defeat the suppression.
+    The threshold itself is a safe constant to disclose.
+    """
+    import pandas as pd
     r = handle(sample_csv, "na_count", "mostly_missing")
     # ~97% NA → non-NA count <10 → denied.
     assert r.status == "denied"
-    assert "too small" in r.reason.lower()
+    assert "threshold" in r.reason.lower()
+    assert "10" in r.reason  # the disclosure threshold is safe to disclose
+    # Compute the actual small count from the fixture, then assert it
+    # isn't echoed in the reason. Done this way (rather than hardcoding
+    # 1-9) so a future fixture tweak that drifts the value still
+    # exercises the right check.
+    df = pd.read_csv(sample_csv)
+    actual_non_na = int(df["mostly_missing"].notna().sum())
+    assert actual_non_na < 10, "fixture invariant"
+    assert str(actual_non_na) not in r.reason, (
+        f"denial reason leaks the suppressed count "
+        f"{actual_non_na!r}: {r.reason!r}"
+    )
 
 
 # ---------------------------------------------------------------------------
