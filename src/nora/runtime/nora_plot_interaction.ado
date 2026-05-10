@@ -41,29 +41,44 @@ program define nora_plot_interaction
     }
     local rundir : subinstr local resultpath "/result.json" ""
 
+    * Per-run authenticity token. Stamped into every manifest line so
+    * the executor can drop manifest entries a hand-crafted file write
+    * could otherwise have appended (a script saving a raw-data plot
+    * under _nora_plots/ and labeling it ``interaction`` would
+    * otherwise ride the next turn through the vision channel).
+    local _nora_token : env NORA_RUN_TOKEN
+    if "`_nora_token'" == "" {
+        display as error "nora_plot_interaction: NORA_RUN_TOKEN not set"
+        exit 198
+    }
+
     local _step "init"
     capture noisily {
         local _step "summarize"
-        * Compute the variable's observed range. ``summarize`` after
-        * the regression — if the var was used in the model, it's
-        * still in memory.
+        * Compute the variable's mean and SD — NOT min/max. The
+        * rendered PNG is allowlisted for model vision, so anything
+        * the x-axis exposes crosses the SDC boundary; raw extrema
+        * are exactly the disclosure the descriptive sanitizer
+        * refuses unless the researcher has opted the variable into
+        * ``non_disclosive_variables``. Mean ± 2*SD is equivalent to
+        * the mean+SD pair the descriptive sanitizer already permits.
         quietly summarize `var'
-        if r(N) == 0 {
-            display as error "nora_plot_interaction: no observations for `var'"
+        if r(N) < 10 {
+            display as error "nora_plot_interaction: `var' has fewer than 10 non-missing observations; below disclosure threshold"
             exit 198
         }
-        local _min = r(min)
-        local _max = r(max)
-        if `_min' == `_max' {
-            display as error "nora_plot_interaction: `var' has no variation"
+        if r(sd) == 0 | missing(r(sd)) {
+            display as error "nora_plot_interaction: `var' has zero variance — interaction plot would expose the constant value"
             exit 198
         }
+        local _lower = r(mean) - 2 * r(sd)
+        local _upper = r(mean) + 2 * r(sd)
 
-        * Build a 25-point grid across the observed range. 25 is
+        * Build a 25-point grid across the disclosure-safe range. 25 is
         * smooth enough for ``marginsplot`` 's recast(line) without
         * burning compute on huge datasets.
-        local step = (`_max' - `_min') / 24
-        margins, at(`var' = (`_min'(`step')`_max')) atmeans
+        local step = (`_upper' - `_lower') / 24
+        margins, at(`var' = (`_lower'(`step')`_upper')) atmeans
 
         * Pick defaults for axis labels / title that are honest if
         * the caller doesn't override them. Match the R / Python
@@ -111,7 +126,7 @@ program define nora_plot_interaction
         local lab : subinstr local lab "`=char(9)'" " ", all
 
         local manifestpath "`rundir'/_nora_plots/manifest.jsonl"
-        local jsonline `"{"file":"`_file'","kind":"interaction","label":"`lab'","format":"`_fmt'"}"'
+        local jsonline `"{"file":"`_file'","kind":"interaction","label":"`lab'","format":"`_fmt'","_token":"`_nora_token'"}"'
         tempname mh
         file open `mh' using "`manifestpath'", write append text
         file write `mh' `"`jsonline'"' _n

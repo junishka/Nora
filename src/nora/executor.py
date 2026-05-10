@@ -336,6 +336,82 @@ def _format_bad_lines_summary(bad_lines: list[str], payload_count: int) -> str:
 _BAD_LINES_TAIL_CAP = 20
 
 
+def _filter_plot_manifest(run_dir: Path, run_token: str) -> int:
+    """Drop manifest entries whose ``_token`` is missing or wrong, and
+    strip the field from the rest. Returns the number of entries
+    dropped.
+
+    The plot manifest at ``<run_dir>/_nora_plots/manifest.jsonl`` is
+    the disclosure-control allowlist for vision attachment: anything
+    listed there with a ``kind`` in ``_PLOT_KIND_ALLOWLIST`` rides
+    the next turn as an image. The manifest file itself sits inside
+    the per-run directory, which the analysis script can write —
+    nothing structural prevents a script from saving a raw-data plot
+    under ``_nora_plots/`` and appending a hand-crafted manifest line
+    that labels it ``coefficients``. That would slip a row-level
+    plot past the JSON sanitizer through the vision side channel.
+    Same posture as ``_parse_result_jsonl``: helpers stamp every
+    entry with the per-run token, the executor validates and strips
+    it before any consumer sees the file. A determined script can
+    still introspect the runtime library's loaded module state to
+    recover the token, but doing so requires explicit code in the
+    script the researcher reviews — same trust model as the
+    result-payload validation.
+    """
+    import json
+
+    manifest_path = run_dir / "_nora_plots" / "manifest.jsonl"
+    if not manifest_path.is_file():
+        return 0
+    try:
+        text = manifest_path.read_text(encoding="utf-8")
+    except OSError:
+        return 0
+    kept: list[dict[str, Any]] = []
+    dropped = 0
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        try:
+            entry = json.loads(line)
+        except json.JSONDecodeError:
+            dropped += 1
+            continue
+        if not isinstance(entry, dict):
+            dropped += 1
+            continue
+        got = entry.get(RESULT_TOKEN_FIELD)
+        if not isinstance(got, str) or not secrets.compare_digest(
+            got, run_token
+        ):
+            dropped += 1
+            continue
+        cleaned = {k: v for k, v in entry.items() if k != RESULT_TOKEN_FIELD}
+        kept.append(cleaned)
+    if dropped == 0:
+        # Every line validated; manifest content is unchanged except
+        # for the ``_token`` field, which downstream consumers don't
+        # otherwise care about. Rewrite anyway to strip it so the
+        # field never reaches the runner / tools / Files panel.
+        pass
+    try:
+        manifest_path.write_text(
+            "".join(
+                json.dumps(e, ensure_ascii=False) + "\n" for e in kept
+            ),
+            encoding="utf-8",
+        )
+    except OSError:
+        # Best-effort: if we can't rewrite, leave the original file
+        # in place. Consumers that read ``_token``-bearing entries
+        # treat them as opaque (they don't gate on it), so the
+        # runner's allowlist still bounds what's attached — but the
+        # forged-entry filter is bypassed in this rare case.
+        pass
+    return dropped
+
+
 def _parse_result_jsonl(
     text: str, run_token: str
 ) -> tuple[list[dict[str, Any]], list[str], bool]:
@@ -610,6 +686,17 @@ def run_script(
     # unsets the env var so user code loaded afterward can't read it
     # directly. See ``_validate_and_strip_token`` below.
     run_token = _generate_run_token()
+    # Per-run TMPDIR. Inheriting the user's session TMPDIR (typically
+    # /var/folders/<hash>/T/) re-opens reads onto every other app's
+    # scratch files for the same user — Slack, Cursor, Chrome cache,
+    # etc. The sandbox previously allowed those whole trees too, so
+    # a script could grep them for cookies, session tokens, draft
+    # documents and smuggle excerpts through any surviving channel.
+    # Pin the script to a fresh per-run dir under run_dir/tmp; the
+    # sandbox profile (built below) narrows file-read*/file-write*
+    # to that path instead of the broad system temp roots.
+    per_run_tmp = run_dir / "tmp"
+    per_run_tmp.mkdir(exist_ok=True)
     # Build the subprocess env from an explicit allowlist, not
     # ``{**os.environ}``. See _SUBPROCESS_ENV_ALLOWLIST above for
     # the rationale. Nora-specific vars are set last so a
@@ -619,6 +706,14 @@ def run_script(
         "NORA_RESULT_PATH": str(result_path),
         "NORA_LIB_DIR": str(lib_dir),
         "NORA_CWD": str(cwd),
+        # Override the inherited TMPDIR / TMP / TEMP / STATATMP so
+        # R / Stata / Python's tempfile module land scratch files
+        # under run_dir/tmp/ — covered by the run_dir allow rather
+        # than the broad system temp roots.
+        "TMPDIR": str(per_run_tmp),
+        "TMP": str(per_run_tmp),
+        "TEMP": str(per_run_tmp),
+        "STATATMP": str(per_run_tmp),
         RUN_TOKEN_ENV_VAR: run_token,
     }
 
@@ -790,6 +885,22 @@ def run_script(
     ok = (exit_code == 0) and bool(payloads) and (error is None)
     if not ok and error is None:
         error = f"interpreter exited with non-zero code {exit_code}"
+
+    # Filter the plot manifest before any consumer (the runner's
+    # ``_capture_plots``, ``submit_script``'s ``_summarize_plot_helpers``,
+    # the recall path's allowlist check) reads it. Any entry whose
+    # ``_token`` is missing or doesn't match the per-run token gets
+    # dropped — that's the script-injected entries gone. Done here
+    # rather than at every consumer so there's exactly one trust
+    # boundary.
+    dropped_manifest = _filter_plot_manifest(run_dir, run_token)
+    if dropped_manifest:
+        warnings.append(
+            f"dropped {dropped_manifest} plot manifest entr"
+            f"{'y' if dropped_manifest == 1 else 'ies'} "
+            f"with missing or invalid authenticity token — likely "
+            f"hand-crafted by the script bypassing the helper library"
+        )
 
     return ExecutionResult(
         ok=ok, language=language,
@@ -1109,9 +1220,9 @@ def _build_profile(
         return '"' + s.replace("\\", "\\\\").replace('"', '\\"') + '"'
 
     # Per-run write scope: the run's scratch dir (result file, Stata
-    # .log, staged script), the researcher's cwd (so scripts can
-    # ``save "panel.dta", replace`` / ``saveRDS`` / ``df.to_csv``),
-    # plus system temp dirs that R/Stata use.
+    # .log, staged script, and run_dir/tmp via TMPDIR override), and
+    # the researcher's cwd (so scripts can ``save "panel.dta", replace``
+    # / ``saveRDS`` / ``df.to_csv``).
     #
     # The researcher's cwd is the analysis workspace. Every session
     # gets its own dir under ``~/.nora-sessions/`` so a script writing
@@ -1120,12 +1231,19 @@ def _build_profile(
     # (so a script can't slurp ``/etc/passwd`` or POST data to a
     # remote host); writes within the user-authorized cwd are part of
     # the normal Stata / R / Python workflow.
+    #
+    # NOT in this list (deliberately): /private/tmp, /private/var/folders,
+    # /tmp. Those system temp roots hold scratch files from every
+    # other app the same user is running (Slack, Cursor, Chrome
+    # caches). Granting read+write subpath there let a script grep
+    # cross-app secrets and smuggle excerpts back through any
+    # surviving channel (helper labels, etc.). The executor instead
+    # sets TMPDIR=<run_dir>/tmp for the subprocess, so R / Stata /
+    # Python's tempfile module land scratch files inside the
+    # run-dir allow.
     write_subpaths = [
         _quote(run_dir),
         _quote(cwd),
-        _quote("/private/tmp"),
-        _quote("/private/var/folders"),
-        _quote("/tmp"),
     ]
     write_literals = [
         _quote("/dev/null"),
@@ -1184,14 +1302,20 @@ def _build_profile(
         _quote("/dev"),
         _quote("/Applications"),
         # /private — only the subtrees needed for POSIX config,
-        # user/group resolution, timezone data, and $TMPDIR scratch.
-        # Notably: /private/etc is NOT a subpath — specific config
-        # files are allowed via read_literals above. See the comment
-        # on that list for why.
-        _quote("/private/tmp"),
+        # user/group resolution, and timezone data. Notably: /private/etc
+        # is NOT a subpath — specific config files are allowed via
+        # read_literals above. See the comment on that list for why.
+        #
+        # NOT in this list (deliberately): /private/tmp,
+        # /private/var/folders. Those trees contain scratch files
+        # from every app the same user is running — granting read
+        # subpath there let a model-authored script enumerate other
+        # apps' caches / session tokens / draft documents. The
+        # executor sets TMPDIR=<run_dir>/tmp for the subprocess so
+        # R / Stata / Python's tempfile module lands inside the
+        # run_dir allow without needing the broad temp roots.
         _quote("/private/var/db/dslocal"),
         _quote("/private/var/db/timezone"),
-        _quote("/private/var/folders"),
         _quote(r_user_lib),
         _quote(stata_user_config),
         _quote(stata_user_ado),

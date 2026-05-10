@@ -82,6 +82,7 @@ to rediscover them.**
 from __future__ import annotations
 
 import math
+import re
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
@@ -600,9 +601,16 @@ def _sanitize_linear_regression(
 
     n_raw = raw.get("n")
     if not isinstance(n_raw, int) or isinstance(n_raw, bool) or n_raw < 0:
+        # Don't echo ``n_raw`` itself — a malicious script could set
+        # ``n`` to a raw cell value to smuggle it out via this
+        # rejection_reason (which submit_script forwards into both
+        # the inline result and the persisted diagnostic row). The
+        # type name leaks zero bits of payload content.
         return SanitizerResult(
             ok=False, analysis_type="linear_regression",
-            rejection_reason=f"n must be a non-negative int, got {n_raw!r}",
+            rejection_reason=(
+                f"n must be a non-negative int, got {type(n_raw).__name__}"
+            ),
         )
 
     try:
@@ -641,6 +649,56 @@ def _sanitize_linear_regression(
         list_string=_OLS_ALLOWED_LIST_STRING,
         transformations=transformations,
     )
+
+    # Disclosure-control gate: refuse formula-categorical coefficient
+    # names. statsmodels / patsy formula fits encode raw categorical
+    # levels into coefficient names using contrast markers — e.g.
+    # ``C(diagnosis)[T.diabetes]`` for treatment contrasts, with
+    # ``[Sum.`` / ``[Diff.`` / ``[Helmert.`` for other coding schemes.
+    # ``safe_key`` only enforces prompt-injection bounds (length,
+    # control chars); it doesn't recognise the level value as data,
+    # so a script can ``ols('y ~ C(secret)', data=df).fit()`` and
+    # leak each unique level of ``secret`` through the regression
+    # coefficient / SE / p-value keys (and through the predictor
+    # list itself).
+    #
+    # Force the script to expand dummies explicitly via
+    # ``pd.get_dummies(...)`` and pass them as named columns. That
+    # moves the level-naming responsibility into the script proper
+    # (where it's visible in the code the researcher reviews) and
+    # the resulting predictor names go through ``predictor_variables``
+    # like any other column name — same disclosure surface as a
+    # normal regression on already-encoded data.
+    _CATEGORICAL_CONTRAST_RE = re.compile(r"\[[A-Za-z]+\.")
+    suspicious_keys: set[str] = set()
+    for name in out.get("predictor_variables") or []:
+        if isinstance(name, str) and _CATEGORICAL_CONTRAST_RE.search(name):
+            suspicious_keys.add(name)
+    for dict_field in _OLS_ALLOWED_DICT_NUMERIC:
+        d = out.get(dict_field)
+        if not isinstance(d, dict):
+            continue
+        for k in d:
+            if isinstance(k, str) and _CATEGORICAL_CONTRAST_RE.search(k):
+                suspicious_keys.add(k)
+    if suspicious_keys:
+        return SanitizerResult(
+            ok=False, analysis_type="linear_regression",
+            rejection_reason=(
+                "regression payload contains formula-categorical "
+                "coefficient name(s) — patsy / statsmodels formula "
+                "fits embed raw categorical level values into "
+                "coefficient names (e.g. ``C(var)[T.level]``), "
+                "which would surface those level values without "
+                "going through the frequency-table cell suppression "
+                "policy. Expand categorical predictors into named "
+                "indicator columns before fitting (pandas: "
+                "``pd.get_dummies(df, columns=[...], drop_first=True)``; "
+                "R: build a model matrix with ``model.matrix`` then "
+                "fit on the resulting numeric columns) so the "
+                "predictor names you emit are plain identifiers."
+            ),
+        )
 
     # Cross-field integrity: each coefficient-dict key must name a
     # declared predictor OR the intercept. Without this, a prompt-
@@ -816,11 +874,16 @@ def _sanitize_t_test(raw: dict[str, Any], config: SDCConfig) -> SanitizerResult:
 
     subtype = raw.get("test_type")
     if subtype not in _TTEST_VALID_SUBTYPES:
+        # Same exfiltration concern as the dispatcher's unknown-type
+        # branch: a script could set ``test_type`` to a raw cell value
+        # to smuggle it through this rejection_reason. Bound the leak
+        # to the type name (or, for strings, a 40-char ``safe_key``
+        # which strips control chars and caps length).
         return SanitizerResult(
             ok=False, analysis_type="t_test",
             rejection_reason=(
                 f"test_type must be one of {sorted(_TTEST_VALID_SUBTYPES)}, "
-                f"got {subtype!r}"
+                f"got {type(subtype).__name__}"
             ),
         )
 
@@ -828,7 +891,9 @@ def _sanitize_t_test(raw: dict[str, Any], config: SDCConfig) -> SanitizerResult:
     if not isinstance(n1, int) or isinstance(n1, bool) or n1 < 0:
         return SanitizerResult(
             ok=False, analysis_type="t_test",
-            rejection_reason=f"n1 must be a non-negative int, got {n1!r}",
+            rejection_reason=(
+                f"n1 must be a non-negative int, got {type(n1).__name__}"
+            ),
         )
 
     # For two-sample / welch, n2 is required; for paired, n1 is the number
@@ -840,7 +905,8 @@ def _sanitize_t_test(raw: dict[str, Any], config: SDCConfig) -> SanitizerResult:
             return SanitizerResult(
                 ok=False, analysis_type="t_test",
                 rejection_reason=(
-                    f"{subtype} requires integer n2 >= 0, got {n2!r}"
+                    f"{subtype} requires integer n2 >= 0, got "
+                    f"{type(n2).__name__}"
                 ),
             )
 
@@ -920,7 +986,9 @@ def _sanitize_descriptive(
     if not isinstance(n_raw, int) or isinstance(n_raw, bool) or n_raw < 0:
         return SanitizerResult(
             ok=False, analysis_type="descriptive",
-            rejection_reason=f"n must be a non-negative int, got {n_raw!r}",
+            rejection_reason=(
+                f"n must be a non-negative int, got {type(n_raw).__name__}"
+            ),
         )
 
     try:
@@ -962,6 +1030,22 @@ def _sanitize_descriptive(
             f"min_value / max_value passed through (variable "
             f"{variable_name!r} is on the dataset's "
             f"non_disclosive_variables opt-in list)"
+        )
+    # Coarsen ``missing_count`` below the cell suppression threshold.
+    # An exact small missingness count is itself disclosive — the
+    # one record whose ``height`` is missing is identifiable as
+    # "the missing one," and combined with other variables it
+    # supports re-identification. Apply the same threshold the
+    # frequency-table / crosstab cell suppression uses so the
+    # disclosure rule is uniform across payload kinds. Zero is left
+    # as 0 (no missingness, nothing to suppress).
+    threshold = config.cell_suppression_threshold
+    miss_raw = out.get("missing_count")
+    if isinstance(miss_raw, int) and 0 < miss_raw < threshold:
+        out["missing_count"] = suppression_marker(threshold)
+        transformations.append(
+            f"coarsened missing_count to {suppression_marker(threshold)} "
+            f"(exact small missingness counts are themselves disclosive)"
         )
     transformations.append(
         f"clamped numeric fields to {sigfigs_for_n(n)} significant "
@@ -1026,7 +1110,7 @@ def _sanitize_frequency_table(
                 ok=False, analysis_type="frequency_table",
                 rejection_reason=(
                     f"count value for {safe_key(k)!r} must be "
-                    f"non-negative int, got {v!r}"
+                    f"non-negative int, got {type(v).__name__}"
                 ),
             )
         # safe_key neutralizes control chars / length / newline injections
@@ -1248,7 +1332,7 @@ def _sanitize_crosstab(
                     ok=False, analysis_type="crosstab",
                     rejection_reason=(
                         f"counts[{safe_row!r}][{safe_key(col_key)!r}] must "
-                        f"be a non-negative int; got {v!r}"
+                        f"be a non-negative int; got {type(v).__name__}"
                     ),
                 )
             safe_col = safe_key(col_key)
@@ -1427,7 +1511,8 @@ def _sanitize_magnitude_table(
             ok=False, analysis_type="magnitude_table",
             rejection_reason=(
                 f"aggregation must be one of "
-                f"{sorted(_MAGTAB_VALID_AGGREGATIONS)}, got {aggregation!r}"
+                f"{sorted(_MAGTAB_VALID_AGGREGATIONS)}, got "
+                f"{type(aggregation).__name__}"
             ),
         )
 
@@ -1504,7 +1589,7 @@ def _sanitize_magnitude_table(
                 ok=False, analysis_type="magnitude_table",
                 rejection_reason=(
                     f"cells[{safe_key(raw_group)!r}].value must be a finite "
-                    f"number; got {value!r}"
+                    f"number; got {type(value).__name__}"
                 ),
             )
         if not isinstance(n, int) or isinstance(n, bool) or n < 0:
@@ -1512,7 +1597,7 @@ def _sanitize_magnitude_table(
                 ok=False, analysis_type="magnitude_table",
                 rejection_reason=(
                     f"cells[{safe_key(raw_group)!r}].n must be a non-negative "
-                    f"int; got {n!r}"
+                    f"int; got {type(n).__name__}"
                 ),
             )
         if not _is_finite_number(max_share):
@@ -1520,7 +1605,7 @@ def _sanitize_magnitude_table(
                 ok=False, analysis_type="magnitude_table",
                 rejection_reason=(
                     f"cells[{safe_key(raw_group)!r}].max_share must be a "
-                    f"finite number; got {max_share!r}"
+                    f"finite number; got {type(max_share).__name__}"
                 ),
             )
 
@@ -1619,7 +1704,9 @@ def _sanitize_correlation_matrix(
     if not isinstance(n_raw, int) or isinstance(n_raw, bool) or n_raw < 0:
         return SanitizerResult(
             ok=False, analysis_type="correlation_matrix",
-            rejection_reason=f"n must be a non-negative int, got {n_raw!r}",
+            rejection_reason=(
+                f"n must be a non-negative int, got {type(n_raw).__name__}"
+            ),
         )
 
     try:
@@ -1654,7 +1741,7 @@ def _sanitize_correlation_matrix(
             ok=False, analysis_type="correlation_matrix",
             rejection_reason=(
                 f"method must be one of {sorted(_CORR_VALID_METHODS)} or "
-                f"omitted, got {method!r}"
+                f"omitted, got {type(method).__name__}"
             ),
         )
 

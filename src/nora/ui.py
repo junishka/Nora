@@ -1384,6 +1384,37 @@ class NoraBridge:
                 "ok": False,
                 "reason": "path is outside the session — refused as a precaution",
             }
+        # Defence-in-depth: only permit deletion of files the Files
+        # panel actually surfaces. Containment in cwd alone is not
+        # enough — the bridge is callable from page-rendered JS, and
+        # a compromised result that escaped sanitization could call
+        # ``delete_session_file('.nora/chat_history.jsonl')`` (or
+        # ``results.db`` / ``policy.json`` / ``session_state.json``)
+        # and corrupt audit history, the policy file, or session
+        # state. The Files panel itself never lists those, so a
+        # request to delete something outside the listing has no
+        # legitimate UI origin. We also accept the PDF/EPS sidecar
+        # raster (``*.nora.png`` next to a listed PDF) because the
+        # delete path below cleans those up implicitly.
+        from nora.session_files import enumerate_session_files
+        listing_paths: set[Path] = set()
+        for row in enumerate_session_files(
+            cwd_resolved,
+            include_data=True,
+            include_run_scripts=True,
+        ):
+            try:
+                listing_paths.add(Path(row["path"]).resolve())
+            except OSError:
+                continue
+        if target not in listing_paths:
+            return {
+                "ok": False,
+                "reason": (
+                    "this file isn't in the Files panel listing — "
+                    "refused as a precaution"
+                ),
+            }
         if not target.is_file():
             return {"ok": False, "reason": f"not found: {target.name}"}
         try:
@@ -1787,6 +1818,16 @@ class NoraBridge:
         screen (depending on whether anything else is configured)."""
         from nora import auth as _auth
         res = _auth.delete_credential(provider)
+        # Gate every side effect on the keyring delete actually
+        # succeeding. ``auth.delete_credential`` returns ``ok=False``
+        # on Keychain backend failure (locked, denied prompt, securityd
+        # error) — in that case the secret is still in the OS store
+        # and the credential is still usable, so closing idle runners
+        # or clearing the injected env would force a spurious auth
+        # screen on the next turn while reporting "delete failed" to
+        # the user. Match the success of the underlying call.
+        if not res.get("ok"):
+            return {**res, "auth": self._auth_status_payload()}
         # Close any IDLE runner that's bound to the now-unauthed
         # provider. We deliberately leave busy runners alone — their
         # turn will surface an auth_failure on the next request, but
@@ -2057,10 +2098,21 @@ class NoraBridge:
             target = Path(path).expanduser().resolve()
         except OSError as e:
             return {"ok": False, "reason": f"bad path: {e}"}
-        if not _is_within(target, SESSIONS_ROOT.resolve()):
+        sessions_root = SESSIONS_ROOT.resolve()
+        # Must be a *direct* child of SESSIONS_ROOT — not the root
+        # itself, and not a nested directory inside a session.
+        # ``_is_within`` returns True for ``target == sessions_root``
+        # (Path.relative_to returns ``'.'`` for equal paths) and for
+        # any nested path beneath a session, both of which would let
+        # rmtree wipe far more than the caller named. The narrower
+        # check below requires the parent to be exactly SESSIONS_ROOT.
+        if target == sessions_root or target.parent != sessions_root:
             return {
                 "ok": False,
-                "reason": "path is outside ~/.nora-sessions/",
+                "reason": (
+                    "must be a direct session directory under "
+                    "~/.nora-sessions/"
+                ),
             }
         if not target.exists():
             return {"ok": False, "reason": "already gone"}
@@ -2945,7 +2997,20 @@ class NoraBridge:
     def get_chat_history(self) -> dict[str, Any]:
         """Return the persisted chat log for the active session so
         the UI can replay past messages after a session switch.
-        Empty list if the session has no history yet."""
+        Empty list if the session has no history yet.
+
+        Heavy-payload fields (raw stdout/stderr from
+        ``submit_script``, full tool-call inputs, long thinking
+        blocks) are TRUNCATED before crossing to the WebView. A
+        long script-heavy session can otherwise serialise tens of
+        MB of base64'd plot thumbnails + raw R/Stata output into a
+        single ``evaluate_js`` payload, which freezes the renderer
+        on session switch / reload. The on-disk
+        ``chat_history.jsonl`` keeps the un-truncated bytes — that
+        file is the model's source of truth on warm start, NOT the
+        replay surface. The replay UI just needs enough to
+        reconstruct the visible cards.
+        """
         if self.cwd is None:
             return {"ok": True, "events": []}
         path = self.cwd / ".nora" / "chat_history.jsonl"
@@ -2959,9 +3024,10 @@ class NoraBridge:
                     if not line:
                         continue
                     try:
-                        events.append(json.loads(line))
+                        rec = json.loads(line)
                     except json.JSONDecodeError:
                         continue
+                    events.append(_trim_event_for_replay(rec))
         except OSError as e:
             return {"ok": False, "reason": str(e)}
         return {"ok": True, "events": events}
@@ -3656,6 +3722,78 @@ def _is_within(child: Path, parent: Path) -> bool:
         return True
     except (ValueError, OSError):
         return False
+
+
+# Caps on per-event payload fields the WebView replay path doesn't
+# need at full length. The on-disk chat_history.jsonl keeps the
+# un-truncated bytes — that file is the model's warm-start source.
+# These caps only bound what crosses ``evaluate_js`` for the visible
+# replay cards.
+_REPLAY_RAW_OUTPUT_CAP = 16 * 1024       # raw_stdout / raw_stderr per tool_result
+_REPLAY_THINKING_CAP = 8 * 1024          # assistant_thinking text
+_REPLAY_TOOL_INPUT_CAP = 8 * 1024        # tool_call input fields (script code)
+
+
+def _trim_str_for_replay(s: Any, cap: int) -> Any:
+    """Truncate a string to ``cap`` chars with a marker, leaving
+    non-strings untouched."""
+    if not isinstance(s, str) or len(s) <= cap:
+        return s
+    overflow = len(s) - cap
+    return s[:cap] + f"\n\n[…{overflow} chars trimmed for replay; full output preserved on disk]"
+
+
+def _trim_event_for_replay(evt: dict[str, Any]) -> dict[str, Any]:
+    """Cap heavy-payload fields on a chat-history event before it
+    rides ``evaluate_js`` to the WebView. Returns a shallow copy so
+    the original record (used elsewhere in the bridge process) is
+    unchanged.
+
+    Cards still render, scripts/output still show in the collapsed
+    panel; researchers who need the un-truncated text open the run
+    directory or expand the entry from disk on demand.
+    """
+    if not isinstance(evt, dict):
+        return evt
+    t = evt.get("type")
+    if t == "tool_result":
+        out = dict(evt)
+        for field in ("raw_stdout", "raw_stderr"):
+            if field in out:
+                out[field] = _trim_str_for_replay(
+                    out[field], _REPLAY_RAW_OUTPUT_CAP
+                )
+        # The ``text`` field is the JSON tool-result envelope —
+        # already small for sanitized payloads, but a malformed /
+        # oversize entry should still be capped so a single bad
+        # event can't drown the WebView.
+        if "text" in out:
+            out["text"] = _trim_str_for_replay(
+                out["text"], _REPLAY_RAW_OUTPUT_CAP
+            )
+        return out
+    if t == "tool_call":
+        out = dict(evt)
+        inp = out.get("input")
+        if isinstance(inp, dict):
+            new_inp = dict(inp)
+            # ``code`` (submit_script) and ``script`` are the
+            # large fields. Cap each.
+            for field in ("code", "script"):
+                if field in new_inp:
+                    new_inp[field] = _trim_str_for_replay(
+                        new_inp[field], _REPLAY_TOOL_INPUT_CAP
+                    )
+            out["input"] = new_inp
+        return out
+    if t == "assistant_thinking":
+        out = dict(evt)
+        if "text" in out:
+            out["text"] = _trim_str_for_replay(
+                out["text"], _REPLAY_THINKING_CAP
+            )
+        return out
+    return evt
 
 
 def _dir_size(path: Path) -> int:

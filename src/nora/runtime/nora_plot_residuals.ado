@@ -46,6 +46,18 @@ program define nora_plot_residuals
     }
     local rundir : subinstr local resultpath "/result.json" ""
 
+    * Per-run authenticity token. Stamped into every manifest line so
+    * the executor can drop manifest entries a hand-crafted file write
+    * could otherwise have appended. Even though ``residuals`` is
+    * researcher-only at the runner allowlist, an unauthenticated
+    * manifest line still surfaces through ``_summarize_plot_helpers``
+    * and the recall path's allowlist check, so this still matters.
+    local _nora_token : env NORA_RUN_TOKEN
+    if "`_nora_token'" == "" {
+        display as error "nora_plot_residuals: NORA_RUN_TOKEN not set"
+        exit 198
+    }
+
     local _step "init"
     capture noisily {
         * Sample for the plot if the dataset is large. The PDF / EPS
@@ -89,7 +101,7 @@ program define nora_plot_residuals
         local lab : subinstr local lab "`=char(9)'" " ", all
 
         local manifestpath "`rundir'/_nora_plots/manifest.jsonl"
-        local jsonline `"{"file":"`_file'","kind":"residuals","label":"`lab'","format":"`_fmt'"}"'
+        local jsonline `"{"file":"`_file'","kind":"residuals","label":"`lab'","format":"`_fmt'","_token":"`_nora_token'"}"'
         tempname mh
         file open `mh' using "`manifestpath'", write append text
         file write `mh' `"`jsonline'"' _n
