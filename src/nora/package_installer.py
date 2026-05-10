@@ -336,6 +336,26 @@ async def install_packages(
             statuses=(), raw_stdout="", raw_stderr="", duration_seconds=0.0,
             error="packages must be a non-empty list of names",
         )
+    # Per-call cap. Each install/remove/reinstall ships through one
+    # subprocess invocation that runs to completion before this tool
+    # returns; an unbounded list (a model that feeds the tool 10,000
+    # synthetic names, or a typo'd loop) launches a single multi-hour
+    # invocation that the researcher can't easily interrupt. 50 is
+    # well above any legitimate batch — the largest realistic
+    # research-package install (e.g. tidyverse + survival + a
+    # dozen modeling libraries) sits comfortably under this.
+    _MAX_PACKAGES_PER_CALL = 50
+    if len(packages) > _MAX_PACKAGES_PER_CALL:
+        return InstallResult(
+            language=language,  # type: ignore[arg-type]
+            action=action,  # type: ignore[arg-type]
+            statuses=(), raw_stdout="", raw_stderr="", duration_seconds=0.0,
+            error=(
+                f"too many packages in one call: got {len(packages)}, "
+                f"the per-call cap is {_MAX_PACKAGES_PER_CALL}. Split "
+                f"the list across multiple install_packages calls."
+            ),
+        )
 
     valid, rejected = _validate_names(packages)
     if not valid:

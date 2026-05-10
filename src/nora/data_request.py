@@ -446,15 +446,19 @@ def _na_count(series: Any, n_total: int, config: SDCConfig) -> RequestResult:
     # as ``schema._suppress_rare_count``.
     rare = min(na_count, non_na_count)
     if rare > 0 and rare < threshold:
+        # Don't echo ``rare`` in the reason. The denial itself already
+        # reveals ``rare < threshold``; spelling out e.g. "7 observations
+        # on the rarer side" leaks the precise small value the
+        # suppression was meant to hide and contradicts the docstring
+        # above ("the genuinely disclosive case"). The threshold is
+        # safe to disclose — it's a fixed configuration constant.
         return RequestResult(
             status="denied",
             reason=(
-                f"variable has {rare} observation(s) on the rarer side "
-                f"(missing vs. non-missing) — that subgroup is too "
-                f"small (below the disclosure threshold of "
-                f"{threshold}). The count is suppressed because "
-                f"either subgroup at small N can identify the "
-                f"observations on that side."
+                f"the rarer of (missing, non-missing) is below the "
+                f"disclosure threshold of {threshold}. The count is "
+                f"suppressed because reporting it would identify the "
+                f"observations on the small side by inverse."
             ),
         )
     return RequestResult(

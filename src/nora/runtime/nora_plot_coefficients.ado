@@ -135,6 +135,18 @@ program define nora_plot_coefficients
         if "`lab'" == "" local lab "Coefficient estimates with 95% CIs"
         local lab : subinstr local lab "\" "\\", all
         local lab : subinstr local lab `"""' `"\""', all
+        * RFC 8259 §7 forbids raw U+0000..U+001F inside JSON strings;
+        * `json.loads` rejects the line and the executor's parser drops
+        * the whole payload silently. Replace every control char with
+        * a space (same posture as the original \t/\n/\r handling) so
+        * a label byte from a Stata-imported automated-export dataset
+        * can't make the manifest line invalid.
+        forvalues _cc = 1/31 {
+            if `_cc' != 9 & `_cc' != 10 & `_cc' != 13 {
+                local lab : subinstr local lab "`=char(`_cc')'" " ", all
+            }
+        }
+        local lab : subinstr local lab "`=char(127)'" " ", all
         local lab : subinstr local lab "`=char(10)'" " ", all
         local lab : subinstr local lab "`=char(13)'" " ", all
         local lab : subinstr local lab "`=char(9)'" " ", all

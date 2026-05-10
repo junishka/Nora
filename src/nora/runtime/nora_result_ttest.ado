@@ -24,8 +24,16 @@ program define nora_result_ttest
     local label : subinstr local label "`=char(13)'" " ", all
     local label : subinstr local label "`=char(9)'" " ", all
 
-    if "`r(t)'" == "" {
-        display as error "nora_result_ttest: no t-test results in memory. Run `ttest` first."
+    * ``"`r(t)'" == ""`` catches the "no test result in memory" case,
+    * but ``ttest`` can also POPULATE ``r(t)`` with a Stata-missing
+    * scalar (``.``) when the test denominator collapses — equal
+    * values in one group, SD=0, all-NaN inputs. The string compare
+    * lets that through; ``strofreal(.)`` then writes a literal
+    * ``.`` into the JSON, which Python's ``json.loads`` rejects.
+    * Reject both shapes here so a missing test stat surfaces as a
+    * clear error rather than a corrupt payload.
+    if "`r(t)'" == "" | missing(`=r(t)') {
+        display as error "nora_result_ttest: no usable t-test result in memory (run ttest first, or check that the test denominator isn't zero)."
         exit 198
     }
 
@@ -94,11 +102,16 @@ program define nora_result_ttest
 
     * Means. Stata: r(mu_1) is always the first group / first variable;
     * r(mu_2) is the second group / constant / paired comparator.
-    if "`r(mu_1)'" != "" {
+    if "`r(mu_1)'" != "" & !missing(`=r(mu_1)') {
         local _x = strofreal(`=r(mu_1)', "%21.17e")
         file write `fh' `","mean1":`_x'"'
     }
-    if "`r(mu_2)'" != "" {
+    * The string-empty check guards against ``r(scalar)`` never being
+    * set; ``missing(`=r(scalar)')`` guards against it being set to
+    * Stata-missing ``.`` (denominator collapse). Without both,
+    * ``strofreal(.)`` would emit a literal ``.`` into JSON and break
+    * Python's ``json.loads`` for the whole line.
+    if "`r(mu_2)'" != "" & !missing(`=r(mu_2)') {
         local _x = strofreal(`=r(mu_2)', "%21.17e")
         file write `fh' `","mean2":`_x'"'
     }
@@ -107,14 +120,14 @@ program define nora_result_ttest
     local _x = strofreal(`=r(t)', "%21.17e")
     file write `fh' `","t_statistic":`_x'"'
 
-    if "`r(df_t)'" != "" {
+    if "`r(df_t)'" != "" & !missing(`=r(df_t)') {
         local _x = strofreal(`=r(df_t)', "%21.17e")
         file write `fh' `","degrees_of_freedom":`_x'"'
     }
 
     * Stata publishes three p-values: r(p_l), r(p), r(p_u) for one-sided
     * lower, two-sided, one-sided upper. Use two-sided by default.
-    if "`r(p)'" != "" {
+    if "`r(p)'" != "" & !missing(`=r(p)') {
         local _x = strofreal(`=r(p)', "%21.17e")
         file write `fh' `","p_value":`_x'"'
     }

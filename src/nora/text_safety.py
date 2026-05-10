@@ -63,15 +63,24 @@ _TRUNCATION_MARKER = "[TRUNCATED]"
 # bidi/zero-width set.
 # RTL/LTR overrides: U+202A..U+202E, U+2066..U+2069.
 # Zero-width / format: U+200B..U+200F, U+FEFF (BOM).
+# Soft Hyphen (U+00AD) and Word Joiner (U+2060): both are invisible
+#   but NOT whitespace, so the ``\s+`` normalisation pass below doesn't
+#   catch them. Soft Hyphen renders only at line breaks; Word Joiner
+#   is completely invisible. Same posture as the zero-width set.
 # Variation selectors: U+FE00..U+FE0F (basic) + U+E0100..U+E01EF
 #   (supplementary, on the astral plane — the \U escape form below).
 # Tag characters: U+E0000..U+E007F. Includes the ASCII-mirrored payload
 #   range (U+E0020..U+E007E) used to smuggle invisible instructions.
 # ASCII control: U+0000..U+001F except \t\n, plus U+007F (DEL).
+# U+2028 / U+2029 (line / paragraph separator) are NOT in this set on
+# purpose: they match Python's Unicode-aware ``\s``, so the whitespace
+# normalisation pass below already flattens them to a single space.
 _CONTROL_AND_TRICKS = re.compile(
     r"[\x00-\x08\x0B\x0C\x0E-\x1F\x7F"
+    r"\u00AD"
     r"\u202A-\u202E\u2066-\u2069"
     r"\u200B-\u200F\uFEFF"
+    r"\u2060"
     r"\uFE00-\uFE0F"
     r"\U000E0000-\U000E007F"
     r"\U000E0100-\U000E01EF"

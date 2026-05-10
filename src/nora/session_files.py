@@ -241,11 +241,18 @@ def enumerate_session_files(
         # decide what to delete after a rewind).
         try:
             for run_dir in runs_root.iterdir():
+                # ``is_dir`` follows symlinks; a symlinked
+                # ``.nora/runs/<id>`` could point at another path's
+                # plots dir and surface those plots through the
+                # listing. ``run_files.py`` already rejects symlinked
+                # run dirs at the same boundary; match that posture.
+                if not run_dir.is_dir() or run_dir.is_symlink():
+                    continue
                 if (visible_run_dirs is not None
                         and run_dir.name not in visible_run_dirs):
                     continue
                 plots_dir = run_dir / "_nora_plots"
-                if plots_dir.is_dir():
+                if plots_dir.is_dir() and not plots_dir.is_symlink():
                     try:
                         for plot in plots_dir.iterdir():
                             if plot.is_file() and not plot.is_symlink():

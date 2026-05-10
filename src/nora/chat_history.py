@@ -424,7 +424,18 @@ def build_context_prefix(
     omitted = total_turns - len(picked)
 
     def _cap(s: str) -> str:
-        return s if len(s) <= PER_FIELD_CAP else s[:PER_FIELD_CAP] + "…[truncated]"
+        # User and assistant text get re-injected verbatim into the
+        # next turn's prompt. A prior message containing a bidi
+        # override or "\n###System: ..."-shaped content (either typed
+        # by the researcher OR echoed by Claude from a tool result it
+        # didn't filter) would otherwise survive into the new turn as
+        # a fresh injection vector. Strip control/bidi characters and
+        # flatten whitespace via the same chokepoint every other
+        # data-origin string crosses, then cap to PER_FIELD_CAP. The
+        # wider cap is intentional — turn prose can run long; tool
+        # labels keep the tighter TOOL_LABEL_CAP.
+        from nora.text_safety import safe_text
+        return safe_text(s, max_len=PER_FIELD_CAP)
 
     def _cap_label(s: str) -> str:
         # Strip control chars and cap. Tool labels are derived from

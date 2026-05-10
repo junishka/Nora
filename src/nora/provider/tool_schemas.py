@@ -727,6 +727,15 @@ def build_tool_specs() -> tuple[ToolSpec, ...]:
                     "type": "array",
                     "items": {"type": "string"},
                 },
+                # Handler reads ``args.get("limit", 0)`` and clamps to
+                # ``_LIST_SESSION_FILES_HARD_CAP`` (500). Without
+                # advertising the parameter in the schema, a model
+                # holding back from a 200-file session at the 100-row
+                # default couldn't ask for the rest of the list — its
+                # only fallback was switching to search_in_session_files
+                # even though list_session_files already had a working
+                # ``limit`` path.
+                "limit": {"type": "integer"},
             },
             required=(),
         ),

@@ -76,7 +76,19 @@ program define nora_result_regress
     }
 
     * Integer fields: n, df.
-    file write `fh' `","n":`=e(N)'"'
+    * ``e(N)`` can be ``.`` (Stata missing) for some estimators
+    * (e.g., ``xtlogit, pa`` doesn't populate it). Without a
+    * ``missing()`` guard we'd write a literal ``.`` into the
+    * JSON, which Python's ``json.loads`` rejects as not a number
+    * — every line that follows in the JSONL stream then drops
+    * silently. Emit ``null`` instead and let the sanitizer
+    * decide.
+    if missing(`=e(N)') {
+        file write `fh' `","n":null"'
+    }
+    else {
+        file write `fh' `","n":`=e(N)'"'
+    }
 
     local dv = "`e(depvar)'"
     file write `fh' `","response_variable":"`dv'""'
@@ -122,7 +134,14 @@ program define nora_result_regress
     forvalues i = 1/`k' {
         local v : word `i' of `vnames'
         if !`first' file write `fh' ","
-        if missing(`Vmat'[`i', `i']) {
+        if missing(`Vmat'[`i', `i']) | `Vmat'[`i', `i'] < 0 {
+            * Negative diagonals can arise from numerical noise in
+            * robust SE computation; ``sqrt`` of a negative yields
+            * Stata-missing ``.`` and ``strofreal(.)`` emits a
+            * literal ``.`` into the JSON — invalid number, every
+            * downstream JSONL line drops silently. Guard the
+            * sign too so robust-SE artifacts produce ``null``
+            * rather than a corrupt payload.
             file write `fh' `""`v'":null"'
         }
         else {
@@ -382,14 +401,27 @@ program define nora_result_regress
             local v : word `i' of `vnames'
             if "`v'" == "_cons" continue
             if missing(`Vmat'[`i', `i']) continue
-            quietly count if e(sample) & !missing(`v')
+            * Factor-variable expansions like ``1.foreign`` or
+            * ``1.year#2.sector`` are NOT valid Stata variable
+            * references — ``count if !missing(1.foreign)`` errors,
+            * which would halt the helper before the payload is
+            * written. ``regress y i.x z`` is mainstream usage, so
+            * the helper must skip these gracefully instead of
+            * crashing. A name containing ``.`` or ``#`` is a
+            * factor expansion; numeric/letter-only names are
+            * ordinary variables that count/summarize can handle.
+            if regexm("`v'", "[.#]") continue
+            capture quietly count if e(sample) & !missing(`v')
+            if _rc continue
             local _nj = r(N)
             if `_nj' < 2 continue
-            quietly summarize `v' if e(sample)
+            capture quietly summarize `v' if e(sample)
+            if _rc continue
             local _varj = r(Var)
             if missing(`_varj') | `_varj' == 0 continue
             local _tssj = `_varj' * (`_nj' - 1)
             local _vifj = `Vmat'[`i', `i'] * `_tssj' / `_rmse2'
+            if missing(`_vifj') continue
             if !`_vfirst' file write `fh' ","
             local _x = strofreal(`_vifj', "%21.17e")
             file write `fh' `""`v'":`_x'"'

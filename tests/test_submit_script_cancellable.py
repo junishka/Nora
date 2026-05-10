@@ -25,6 +25,7 @@ from __future__ import annotations
 import asyncio
 import os
 import subprocess
+import sys
 import time
 from pathlib import Path
 
@@ -137,3 +138,83 @@ def test_no_orphaned_subprocesses_after_cancel(tmp_path: Path) -> None:
     time.sleep(0.5)
     with pytest.raises(ProcessLookupError):
         os.kill(pid, 0)
+
+
+def test_executor_starts_subprocess_in_new_session(tmp_path: Path) -> None:
+    """The executor must pass ``start_new_session=True`` to ``Popen``,
+    AND ``_kill_proc_quietly`` must use ``killpg`` on the resulting
+    process group. Without both, a user script that spawns
+    ``parallel::makeCluster`` / ``multiprocessing.Pool`` workers
+    leaves them running as orphans of init when Stop fires —
+    ``proc.kill()`` only SIGKILLs the direct child.
+
+    Verify by spawning an in-process subprocess (no sandbox-exec,
+    no submit_script plumbing) that itself spawns a grandchild, then
+    calling ``_kill_proc_quietly`` and asserting the grandchild dies.
+    """
+    import signal as _signal
+    from nora.runner import _kill_proc_quietly
+
+    pid_file = tmp_path / "grandchild.pid"
+
+    proc = subprocess.Popen(
+        [
+            sys.executable, "-c",
+            (
+                "import os, subprocess, time\n"
+                f"p = subprocess.Popen(['/bin/sleep', '60'])\n"
+                f"open({str(pid_file)!r}, 'w').write(str(p.pid))\n"
+                "time.sleep(30)\n"
+            ),
+        ],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        start_new_session=True,
+    )
+
+    # Wait for the grandchild's PID to land on disk.
+    for _ in range(80):
+        if pid_file.exists() and pid_file.read_text().strip():
+            break
+        time.sleep(0.05)
+    assert pid_file.exists() and pid_file.read_text().strip(), (
+        "script never spawned the grandchild — test setup is wrong"
+    )
+    grandchild_pid = int(pid_file.read_text().strip())
+
+    # Sanity-check: both processes are in the same process group
+    # (the one rooted at proc.pid because of ``start_new_session=True``).
+    pgid = os.getpgid(proc.pid)
+    assert pgid == proc.pid, (
+        f"parent should be its own process-group leader; got pgid={pgid}, pid={proc.pid}"
+    )
+    assert os.getpgid(grandchild_pid) == pgid, (
+        f"grandchild ({grandchild_pid}) is in a different process group "
+        f"than its parent — start_new_session inheritance is broken"
+    )
+
+    # The fix under test: ``_kill_proc_quietly`` should tear down the
+    # whole process group, not just the parent.
+    _kill_proc_quietly(proc)
+
+    # Both should be gone after the killpg. SIGKILL is synchronous so
+    # 200ms is plenty of slack for launchd to reap on macOS / init on
+    # Linux.
+    time.sleep(0.2)
+    with pytest.raises(ProcessLookupError):
+        os.kill(proc.pid, 0)
+    # If killpg didn't fire (bug), the grandchild — running as an
+    # /bin/sleep with no parent — would still be alive here.
+    try:
+        os.kill(grandchild_pid, 0)
+        # If we got here, kill it manually so we don't leak.
+        try:
+            os.kill(grandchild_pid, _signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        pytest.fail(
+            f"grandchild {grandchild_pid} survived _kill_proc_quietly — "
+            f"process-group kill did NOT reach it"
+        )
+    except ProcessLookupError:
+        pass  # expected — killpg reached the grandchild

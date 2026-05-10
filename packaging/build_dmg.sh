@@ -70,8 +70,16 @@ rm -rf "$STAGING" "$DMG_OUT"
 mkdir -p "$STAGING"
 
 # Copy the .app (don't move — we want the original to stay for
-# re-runs / manual testing).
-cp -R "$APP_BUNDLE" "$STAGING/"
+# re-runs / manual testing). ``ditto`` instead of ``cp -R``: cp on
+# macOS strips some extended attributes the codesign signature
+# relies on, and the bundle we're staging is ALREADY signed
+# (build_app.sh ran codesign before this script). A corrupted
+# signature passes spctl at the build host but fails at launch on
+# stricter machines — silent ship-it bug. ``ditto`` preserves the
+# attribute set codesign cares about. release.sh and build_app.sh
+# already use ``ditto`` for the same reason; this closes the last
+# gap.
+/usr/bin/ditto "$APP_BUNDLE" "$STAGING/$(basename "$APP_BUNDLE")"
 
 # The drag-to-Applications symlink. macOS Finder treats this specially
 # when the .dmg is opened: shows as a real Applications folder the

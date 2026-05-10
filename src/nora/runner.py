@@ -90,6 +90,7 @@ _CANCELLED_TURN_ID_HISTORY = 256
 _PLOT_KIND_ALLOWLIST: frozenset[str] = frozenset({
     "interaction",
     "coefficients",
+    "estimate_comparison",
     "marginal_effects",
 })
 # Kinds we explicitly know about but deliberately keep researcher-
@@ -885,13 +886,42 @@ class SessionRunner:
                     carried_dataset_diff = new_datasets
                 self.known_datasets = current_datasets
 
+                # @-mention pull-in, mid-chat script attachments, and
+                # plot/image carries are populated from the BRIDGE
+                # thread (researcher drops a file, @-mentions a name,
+                # adds an image). The worker thread reads + clears
+                # below. Without coordination, the previous pattern
+                # had a race:
+                #
+                #   1. worker reads / iterates `self.pending_X`
+                #   2. bridge appends a new entry to the SAME list
+                #   3. worker assigns `self.pending_X = []`
+                #
+                # Anything appended between steps 1 and 3 was processed
+                # AFTER the worker built its prefix block but BEFORE the
+                # reset — so it landed in NEITHER the prompt nor the
+                # next-turn queue. Atomic-swap closes the race: capture
+                # the list reference and IMMEDIATELY rebind the
+                # attribute to a fresh empty list. Any bridge append
+                # racing the swap either lands in the OLD list (which
+                # we still hold via the local) or in the NEW empty list
+                # (where it gets picked up next turn). No item is lost.
+                pending_mentions = self.pending_mentioned_files
+                self.pending_mentioned_files = []
+                pending_scripts = self.pending_script_attachments
+                self.pending_script_attachments = []
+                pending_mentioned_imgs = self.pending_mentioned_images
+                self.pending_mentioned_images = []
+                pending_plots = self.pending_plot_images
+                self.pending_plot_images = []
+
                 # @-mention pull-in: the researcher pointed at one or
                 # more session-resident files by name. The files are
                 # already on disk; surface a short notice so the model
                 # treats them as the focus of THIS message rather than
                 # generic ambient context.
                 carried_mentioned_files: list[str] = []
-                if self.pending_mentioned_files:
+                if pending_mentions:
                     # Same boundary check as the dataset diff above —
                     # @-mentioned filenames cross from the researcher's
                     # filesystem into the model's prompt and would
@@ -899,7 +929,7 @@ class SessionRunner:
                     # bracketed notice.
                     safe_mentions = [
                         s for s in (
-                            safe_text(n) for n in self.pending_mentioned_files
+                            safe_text(n) for n in pending_mentions
                         ) if s
                     ]
                     if safe_mentions:
@@ -913,10 +943,7 @@ class SessionRunner:
                             f"{mentioned_lines}\n]\n\n"
                         )
                         prompt = mention_notice + prompt
-                    carried_mentioned_files = list(
-                        self.pending_mentioned_files
-                    )
-                    self.pending_mentioned_files = []
+                    carried_mentioned_files = list(pending_mentions)
 
                 # Mid-chat script attachments. Consumed unconditionally
                 # — failure of the turn does NOT carry these forward.
@@ -927,13 +954,12 @@ class SessionRunner:
                 # attached" for files no chip showed. Simpler model:
                 # if the send fails, the researcher re-attaches and
                 # tries again.
-                if self.pending_script_attachments:
+                if pending_scripts:
                     attach_block = build_script_prefix(
-                        self.pending_script_attachments, cwd,
+                        pending_scripts, cwd,
                     )
                     if attach_block:
                         prompt = attach_block + prompt
-                    self.pending_script_attachments = []
 
                 # Plot vision: prepend any plots captured from a
                 # previous turn's submit_script. Cleared after the
@@ -941,21 +967,18 @@ class SessionRunner:
                 merged_images: list[dict[str, Any]] = []
                 attached_plots: list[dict[str, Any]] = []
                 attached_mentioned_images: list[dict[str, Any]] = []
-                if self.pending_mentioned_images:
-                    merged_images.extend(self.pending_mentioned_images)
-                    attached_mentioned_images = list(
-                        self.pending_mentioned_images
-                    )
-                    self.pending_mentioned_images = []
-                if self.pending_plot_images:
-                    merged_images.extend(self.pending_plot_images)
-                    attached_plots = list(self.pending_plot_images)
+                if pending_mentioned_imgs:
+                    merged_images.extend(pending_mentioned_imgs)
+                    attached_mentioned_images = list(pending_mentioned_imgs)
+                if pending_plots:
+                    merged_images.extend(pending_plots)
+                    attached_plots = list(pending_plots)
                     # Surface a short attachment notice so the model
                     # knows what it's looking at without having to
                     # guess from filenames alone.
                     notice_lines = [
                         f"  - {img.get('name', '?')} ({img.get('label', img.get('kind', 'plot'))})"
-                        for img in self.pending_plot_images
+                        for img in pending_plots
                     ]
                     plot_notice = (
                         "[Result plots from your previous script are "
@@ -966,7 +989,6 @@ class SessionRunner:
                         "visualizations are not surfaced.]\n\n"
                     )
                     prompt = plot_notice + prompt
-                    self.pending_plot_images = []
                 if images:
                     merged_images.extend(images)
 
@@ -1119,10 +1141,31 @@ def _kill_proc_quietly(proc: subprocess.Popen[Any]) -> None:
     its own); raising would propagate to the bridge thread and could
     wedge other sessions' turns. Bounded ``wait`` so a stuck process
     doesn't hold the cancellation thread indefinitely.
+
+    Tears down the whole process group (executor starts subprocess
+    with ``start_new_session=True``): a plain ``proc.kill()`` only
+    SIGKILLs the direct child, leaving any
+    ``parallel::makeCluster`` / ``multiprocessing.Pool`` workers as
+    orphans of init, still able to append result lines to disk.
+    ``os.killpg(pgid, SIGKILL)`` reaches every descendant in the
+    session. Fall back to ``proc.kill()`` if the process group lookup
+    fails (race between Stop and process exit).
     """
+    import os
+    import signal
     try:
         if proc.poll() is None:
-            proc.kill()
+            try:
+                pgid = os.getpgid(proc.pid)
+                os.killpg(pgid, signal.SIGKILL)
+            except (ProcessLookupError, PermissionError, OSError):
+                # Process already gone, or no PG (the subprocess never
+                # detached into its own session — older code paths or
+                # non-POSIX). Fall back to the per-process kill.
+                try:
+                    proc.kill()
+                except Exception:  # noqa: BLE001
+                    pass
     except Exception:  # noqa: BLE001
         return
     try:

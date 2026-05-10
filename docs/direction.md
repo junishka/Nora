@@ -73,9 +73,12 @@ researcher use case demands it.
 
 As of 2026-04-25, the implementation covers:
 
-- Spine + full SDK lockdown (6 MCP tools — get_schema, request_data,
-  submit_script, expand_result, list_results, recall_conversation —
-  every built-in disabled, four defense layers).
+- Spine + full SDK lockdown (14 MCP tools — get_schema, search_schema,
+  request_data, submit_script, submit_script_file, expand_result,
+  compose_results, list_results, list_results_global,
+  recall_conversation, read_attached_file, list_session_files,
+  search_in_session_files, install_packages — every built-in disabled,
+  four defense layers).
 - Schema extractor for `.csv` / `.dta` / `.rds` with four depth
   tiers; default is `names_types_labels_summary`.
 - Executor with `(deny default)` subpath-allowlist sandbox AND an
@@ -369,9 +372,12 @@ datasets. Not urgent for pilot-scale public-ish research.
 
 - Claude has no general-purpose tools. SDK built-ins stay
   disabled.
-- Claude's only interface to the machine is the 6 MCP tools
-  (`get_schema`, `request_data`, `submit_script`, `expand_result`,
-  `list_results`, `recall_conversation`).
+- Claude's only interface to the machine is the MCP tools registered
+  in `ALLOWED_TOOL_NAMES` (the source of truth — currently 14: the
+  six original plus `search_schema`, `submit_script_file`,
+  `compose_results`, `list_results_global`, `read_attached_file`,
+  `list_session_files`, `search_in_session_files`, and
+  `install_packages`).
 - Every `submit_script` call runs under the sandbox.
 - Every executor output passes through the sanitizer before
   reaching the model.

@@ -155,9 +155,24 @@ def frequency_table_payloads(draw, max_cells: int = 10):
     st.integers(), st.text(), st.none(), st.floats(), st.lists(st.integers()),
 ))
 def test_sanitize_never_raises(raw):
-    """No matter how broken the input, `sanitize()` returns a result, not an exception."""
+    """No matter how broken the input, ``sanitize()`` returns a
+    ``SanitizerResult`` (never raises an exception).
+
+    The previous assertion ``result.ok in (True, False)`` was a
+    tautology because ``result.ok`` is typed bool — it passed
+    regardless of what sanitize did. Hypothesis would silently
+    confirm the "no exception" promise but never verify the result
+    SHAPE. If sanitize started returning ``None`` on broken inputs
+    instead of raising, the old assertion would catch the type
+    error eventually but the test name would lie about what it
+    pinned. Replace with a structural check.
+    """
     result = sanitize(raw)  # should not raise
-    assert result.ok in (True, False)
+    # Must be a SanitizerResult with the expected fields populated.
+    assert hasattr(result, "ok")
+    assert hasattr(result, "sanitized")
+    assert hasattr(result, "transformations")
+    assert isinstance(result.ok, bool)
 
 
 @given(raw=ols_payloads() | ttest_payloads() | descriptive_payloads() | frequency_table_payloads())

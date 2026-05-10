@@ -121,15 +121,41 @@ class _NoraJSONEncoder(json.JSONEncoder):
         return super().default(obj)
 
 
+def _scrub_non_finite(obj: Any) -> Any:
+    """Replace non-finite *plain* Python floats with ``None``.
+
+    The encoder's ``default()`` only fires for objects ``json.dumps``
+    doesn't know how to serialise natively; ``float('nan')`` /
+    ``float('inf')`` ARE natively serialisable, so the encoder's
+    non-finite branch never sees them and ``allow_nan=True`` would
+    emit RFC-8259-invalid ``NaN`` / ``Infinity`` tokens. Walk the
+    payload first and substitute ``None`` so the wire stays
+    strict-JSON, matching the R library's "non-finite -> null"
+    contract.
+    """
+    if isinstance(obj, float):
+        return None if not math.isfinite(obj) else obj
+    if isinstance(obj, dict):
+        return {k: _scrub_non_finite(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_scrub_non_finite(v) for v in obj]
+    return obj
+
+
 def _to_json(payload: dict[str, Any]) -> str:
     """Serialise ``payload`` with the numpy/pandas-aware encoder.
 
-    ``allow_nan=False`` would catch any float Inf/NaN we forgot to
-    map, but we let the encoder's ``default`` handle them and emit
-    ``null`` instead so a NaN coefficient (e.g. perfect collinearity)
-    serialises as null rather than crashing the script post-fit.
+    ``allow_nan=False`` ensures any float Inf/NaN the pre-pass missed
+    raises a ``ValueError`` rather than silently emitting RFC-8259-
+    invalid tokens. Plain Python non-finite floats are scrubbed to
+    ``None`` up front so a NaN coefficient (e.g. perfect collinearity)
+    serialises as null rather than crashing the script post-fit;
+    numpy non-finite floats still go through the encoder's
+    ``default()``.
     """
-    return json.dumps(payload, cls=_NoraJSONEncoder, allow_nan=True)
+    return json.dumps(
+        _scrub_non_finite(payload), cls=_NoraJSONEncoder, allow_nan=False,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -440,16 +466,23 @@ def from_t_test(res: Any, *, n1: int, n2: int | None = None,
     if test_type is None:
         test_type = "one_sample" if n2 is None else "two_sample"
 
+    # ``_safe_int`` instead of bare ``int(...)``: ``int(float('nan'))``
+    # raises ``ValueError`` and crashes the helper before any payload
+    # reaches disk. NaN sample sizes are unusual (you don't usually
+    # have NaN counts of observations) but a careless caller passing
+    # ``len(df_with_nans_in_index)`` or similar shouldn't lose the
+    # entire result. Coerce to None and let the sanitizer reject the
+    # field with a clear reason instead.
     fields: dict[str, Any] = {
         "test_type": test_type,
         "t_statistic": statistic,
         "p_value": pvalue,
         "degrees_of_freedom": df,
-        "n1": int(n1),
+        "n1": _safe_int(n1),
         "mean1": mean1,
     }
     if n2 is not None:
-        fields["n2"] = int(n2)
+        fields["n2"] = _safe_int(n2)
     if mean2 is not None:
         fields["mean2"] = mean2
     fields.update(extra)
@@ -473,12 +506,17 @@ def from_summarize(variable: str, *, n: int, mean: float, sd: float,
     they cost nothing and surface automatically if the researcher
     has opted the variable in.
     """
+    # ``_safe_int`` instead of bare ``int(...)``: avoid crashing the
+    # whole helper on a NaN count that a careless caller forwarded
+    # from a partial aggregation. The sanitizer will reject ``None``
+    # integer fields with a clear reason; that's strictly better than
+    # losing the entire result to a ``ValueError``.
     fields: dict[str, Any] = {
         "variable": variable,
-        "n": int(n),
+        "n": _safe_int(n),
         "mean": _safe_float(mean),
         "sd": _safe_float(sd),
-        "missing_count": int(missing_count),
+        "missing_count": _safe_int(missing_count),
     }
     if min_value is not None:
         fields["min_value"] = _safe_float(min_value)
@@ -499,13 +537,25 @@ def from_table(variable: str, counts: Any, *, n: int | None = None,
         counts_dict = counts.to_dict()
     else:
         counts_dict = dict(counts)
+    # Filter out non-finite values up front. ``int(float('nan'))``
+    # raises ``ValueError`` and would crash the helper before the
+    # payload reaches disk — pandas value_counts() doesn't usually
+    # produce NaN cells, but a hand-built counts dict or a
+    # ``pd.crosstab`` with all-missing combinations can. Drop the
+    # NaN levels rather than coercing to 0 (which would lie about
+    # observed-zero vs. unobserved).
+    clean_counts: dict[str, int] = {}
+    for k, v in counts_dict.items():
+        iv = _safe_int(v)
+        if iv is not None:
+            clean_counts[str(k)] = iv
     if n is None:
-        n = sum(int(v) for v in counts_dict.values())
+        n = sum(clean_counts.values())
     fields = {
         "variable": variable,
-        "counts": {str(k): int(v) for k, v in counts_dict.items()},
-        "n": int(n),
-        "missing_count": int(missing_count),
+        "counts": clean_counts,
+        "n": _safe_int(n) or 0,
+        "missing_count": _safe_int(missing_count) or 0,
     }
     fields.update(extra)
     result(type="frequency_table", **fields)
@@ -521,22 +571,39 @@ def from_crosstab(table: Any, *, row_variable: str | None = None,
     except ImportError:
         pd = None  # type: ignore[assignment]
 
+    # NaN-tolerant cell coercion. ``pd.crosstab`` can produce NaN
+    # cells when ``dropna=False`` leaves un-observed row/col
+    # combinations, and bare ``int(float('nan'))`` raises
+    # ``ValueError`` and crashes the helper before any payload
+    # reaches disk. Drop NaN cells silently — "the cell was never
+    # observed" is structurally different from "the cell has 0
+    # observations" and conflating them via ``or 0`` would lie.
+    def _cell(v: Any) -> int | None:
+        return _safe_int(v)
+
     if pd is not None and isinstance(table, pd.DataFrame):
         counts: dict[str, dict[str, int]] = {}
         for row_label, row in table.iterrows():
-            counts[str(row_label)] = {
-                str(col): int(row[col]) for col in table.columns
-            }
+            row_dict: dict[str, int] = {}
+            for col in table.columns:
+                iv = _cell(row[col])
+                if iv is not None:
+                    row_dict[str(col)] = iv
+            counts[str(row_label)] = row_dict
         if row_variable is None:
             row_variable = str(table.index.name or "row")
         if col_variable is None:
             col_variable = str(table.columns.name or "column")
     else:
         # Caller passed a pre-built nested dict.
-        counts = {
-            str(rk): {str(ck): int(cv) for ck, cv in (rv or {}).items()}
-            for rk, rv in dict(table).items()
-        }
+        counts = {}
+        for rk, rv in dict(table).items():
+            row_dict = {}
+            for ck, cv in (rv or {}).items():
+                iv = _cell(cv)
+                if iv is not None:
+                    row_dict[str(ck)] = iv
+            counts[str(rk)] = row_dict
         row_variable = row_variable or "row"
         col_variable = col_variable or "column"
 
@@ -544,7 +611,7 @@ def from_crosstab(table: Any, *, row_variable: str | None = None,
         "row_variable": row_variable,
         "col_variable": col_variable,
         "counts": counts,
-        "missing_count": int(missing_count),
+        "missing_count": _safe_int(missing_count) or 0,
     }
     fields.update(extra)
     result(type="crosstab", **fields)
@@ -760,6 +827,32 @@ def _plots_dir() -> Any:
     return d
 
 
+def _unique_plot_name(d: Any, base: str) -> str:
+    """Return ``base`` if no file by that name exists in ``d``;
+    otherwise append ``_2``, ``_3``, ... before the extension.
+
+    Without this, calling ``plot_coefficients(fit1)`` then
+    ``plot_coefficients(fit2)`` in one script would:
+      1. write ``coefficients.png`` (fit1) + manifest entry
+      2. *overwrite* ``coefficients.png`` (now fit2) + a SECOND
+         manifest entry pointing at the same path
+    The bridge would read two manifest rows that point to the same
+    image and the model would see two "different" plots that are
+    in fact fit2 twice. ``plot_interaction`` already side-steps
+    this by suffixing the variable name into the filename; the
+    other helpers need a counter.
+    """
+    from pathlib import Path
+    p = Path(base)
+    stem, ext = p.stem, p.suffix
+    candidate = base
+    i = 2
+    while (d / candidate).exists():
+        candidate = f"{stem}_{i}{ext}"
+        i += 1
+    return candidate
+
+
 def _append_plot_manifest(file: str, kind: str, label: str | None) -> None:
     d = _plots_dir()
     if d is None:
@@ -911,7 +1004,7 @@ def plot_residuals(fitted: Any, label: str | None = None) -> None:
         axes[1, 1].set_title("Residual distribution")
         fig.tight_layout()
 
-        fname = "residuals.png"
+        fname = _unique_plot_name(d, "residuals.png")
         fig.savefig(d / fname, dpi=110)
         plt.close(fig)
         _append_plot_manifest(
@@ -1004,7 +1097,7 @@ def plot_coefficients(fitted: Any, label: str | None = None) -> None:
         ax.set_title("Coefficients")
         fig.tight_layout()
 
-        fname = "coefficients.png"
+        fname = _unique_plot_name(d, "coefficients.png")
         fig.savefig(d / fname, dpi=110)
         plt.close(fig)
         _append_plot_manifest(
@@ -1107,11 +1200,11 @@ def plot_estimate_comparison(
         ax.set_title(f"Estimate comparison: {coef}")
         fig.tight_layout()
 
-        fname = "estimate_comparison.png"
+        fname = _unique_plot_name(d, "estimate_comparison.png")
         fig.savefig(d / fname, dpi=110)
         plt.close(fig)
         _append_plot_manifest(
-            fname, "coefficients",
+            fname, "estimate_comparison",
             label or f"Estimate comparison: {coef}",
         )
     except Exception as e:  # noqa: BLE001

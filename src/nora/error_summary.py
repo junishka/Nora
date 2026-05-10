@@ -293,6 +293,16 @@ def _extract_r(stderr: str) -> Optional[str]:
     if not matches:
         return None
     last = matches[-1]
+    # Drop both the `call` deparse AND the message body — both are
+    # script-controlled in the limit, so the cleanest privacy
+    # posture is to keep only the parser-owned anchor and the
+    # ``Calls:`` chain (function names the model already knows
+    # because it wrote the script). Earlier iterations scrubbed
+    # the body via credential regexes / data-shape detection, but
+    # the upstream "redact wholesale" approach is strictly safer:
+    # no SSN / ID / short data value sits under any per-pattern
+    # threshold the way it can in a body-included form. The
+    # researcher still has the un-scrubbed message on disk.
     block = "Error : [message body redacted]"
 
     # Look for a Calls: line in the slice immediately after the
@@ -437,23 +447,57 @@ _REDACTED_BODY = "[message body redacted]"
 
 # Reduce absolute paths in messages / tracebacks to their basename.
 # We keep "line N" markers because line numbers are exactly what
-# the model needs. Two patterns: quoted Python-traceback paths and
-# bare absolute paths in error messages.
+# the model needs. Three patterns, applied in order:
+#
+#   1. Quoted Python-traceback paths (`"/path/to/file.py"`).
+#   2. Paths with spaces that end at a known data/script extension —
+#      `"FileNotFoundError: ... /Users/John Smith/wages.csv"` would
+#      otherwise leak `Smith/research/wages.csv` because the strict
+#      bare-path regex stops at the first space. Anchoring on the
+#      extension lets us absorb the username space without over-
+#      matching into trailing prose.
+#   3. Bare absolute paths in free-form messages with NO space
+#      anywhere in the path (the strict legacy pattern, used as a
+#      catch-all after the extension-anchored sweep).
 _QUOTED_ABS_PATH_RE = re.compile(r'"((?:/[^"\n]+))"')
+_PATH_WITH_EXT_RE = re.compile(
+    r"(?<![\w/])"                      # not preceded by a word char or slash
+    r"/[A-Za-z0-9_.\- /]+?"            # path body, allowing single spaces
+    r"\.(?:csv|tsv|dta|rds|RData|rdata|parquet|jsonl|ndjson|"
+    r"R|do|py|ipynb|sql|sas|sav|"
+    r"xlsx|xls|txt|json|md|log|"
+    r"png|pdf|svg|jpg|jpeg|html|"
+    r"yaml|yml|toml)\b"                # known data / script / output extension
+)
 _BARE_ABS_PATH_RE = re.compile(r"(?<![\w/])/[A-Za-z0-9_.\-/]{4,}")
 
 # Credential patterns we always strip. Scoped tight enough that
-# they don't false-positive on column names or numeric IDs:
-#   - Anthropic-style:  sk-ant-...   (>=20 alphanum/dash after sk-)
-#   - OpenAI-style:     sk-...       (>=20 alphanum after sk-)
-#   - AWS access keys:  AKIA + 16 alnum
-#   - JWTs: three base64url segments separated by dots
+# they don't false-positive on column names or numeric IDs.
+# Coverage roughly matches the secret types most likely to land in
+# a researcher's `Sys.getenv(...)` / `os.environ[...]` and ride
+# through into an error message (header dumps, library prints).
+#   - Anthropic-style:    sk-ant-...     (>=20 alphanum/dash after sk-)
+#   - OpenAI-style:       sk-...         (>=20 alphanum after sk-)
+#   - Stripe / similar:   sk_live_..., sk_test_... (underscore variant
+#                         that the hyphen-anchored OpenAI regex misses)
+#   - AWS access keys:    AKIA + 16 alnum
+#   - JWTs:               three base64url segments separated by dots
+#   - GitHub PATs / OAuth / server tokens / fine-grained PATs:
+#                         ghp_/gho_/ghs_/ghu_/ghr_ + 36+ alnum, plus
+#                         the longer github_pat_ prefix
+#   - Slack tokens:       xoxb-/xoxp-/xoxa-/xoxr-/xoxs- + numeric + alnum
+#   - HuggingFace:        hf_ + 30+ alnum
 _CRED_PATTERNS: tuple[re.Pattern[str], ...] = (
     re.compile(r"sk-(?:ant-)?[A-Za-z0-9_\-]{20,}"),
+    re.compile(r"\bsk_(?:live|test)_[A-Za-z0-9]{20,}\b"),
     re.compile(r"AKIA[A-Z0-9]{16}"),
     re.compile(
         r"\beyJ[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+\b"
     ),
+    re.compile(r"\bgh[pousr]_[A-Za-z0-9]{36,}\b"),
+    re.compile(r"\bgithub_pat_[A-Za-z0-9_]{60,}\b"),
+    re.compile(r"\bxox[abprs]-[A-Za-z0-9\-]{10,}\b"),
+    re.compile(r"\bhf_[A-Za-z0-9]{30,}\b"),
 )
 _CRED_REDACTED = "[redacted-credential]"
 
@@ -476,10 +520,17 @@ def _scrub_and_cap(text: str) -> str:
         return f'"{Path(m.group(1)).name}"'
     out = _QUOTED_ABS_PATH_RE.sub(_quoted_basename, out)
 
-    # Path normalisation - bare absolute paths in free-form
-    # messages (R / Stata sometimes emit these).
+    # Path normalisation - extension-anchored sweep first so paths
+    # with spaces (a username like "/Users/John Smith/research/x.csv")
+    # collapse to the basename even though the strict regex below
+    # would stop at the first space.
     def _bare_basename(m: re.Match[str]) -> str:
         return Path(m.group(0)).name
+    out = _PATH_WITH_EXT_RE.sub(_bare_basename, out)
+    # Path normalisation - bare absolute paths in free-form
+    # messages (R / Stata sometimes emit these). Strict charset
+    # (no spaces) catches paths the extension-anchored sweep
+    # missed but leaves space-bearing ones to the sweep above.
     out = _BARE_ABS_PATH_RE.sub(_bare_basename, out)
 
     # Credential scrub. Order matters less than completeness - each

@@ -539,7 +539,7 @@ newest-first rows tagged with `session_path`; feed that into \
 requires `NORA_ALLOW_CROSS_SESSION_RECALL=1`. Stored payloads are \
 pre-sanitized — the gate exists for project separation, not privacy.
 
-10. `recall_conversation(query?, tail?, max_chars?)`. Search older \
+10. `recall_conversation(query?, tail?, context?, max_chars?)`. Search older \
 archived turns. The most recent ~20 turns auto-load on session \
 open (see "Resuming a session" below); use this only for DEEPER \
 lookups (older turns that fell out of the auto-loaded window, or \
@@ -891,16 +891,32 @@ def runtime_environment_listing() -> str:
         return f" ({', '.join(parts)})"
 
     from nora.env_detect import _PYTHON_OPTIONAL_PACKAGES, _R_OPTIONAL_PACKAGES
+    from nora.text_safety import safe_text
+
+    # Versions get newlines stripped already, but still sanitize: stray
+    # bidi / zero-width / control chars in upstream version strings would
+    # otherwise reach the prompt verbatim. Binary paths come from the env
+    # — on macOS/Linux a directory name CAN technically contain newlines
+    # (`/Users/me/My\nDir/Rscript`), which would inject a fake heading
+    # into the runtime listing. Same chokepoint as dataset names two
+    # functions above. The 256-char cap is comfortably above the
+    # filesystem PATH_MAX practical norm without inviting truly
+    # adversarial payloads.
+    def _safe_path(p: str | None) -> str:
+        return safe_text(str(p), max_len=256) if p is not None else ""
+
+    def _safe_version(v: str | None) -> str:
+        return safe_text(str(v), max_len=120) if v is not None else ""
 
     lines: list[str] = []
     if env.r is not None:
-        version = env.r.version or "Rscript"
+        version = _safe_version(env.r.version) or "Rscript"
         pkgs = _pkg_listing(env.r.optional_missing_packages, _R_OPTIONAL_PACKAGES)
-        lines.append(f"  - R: {version} at {env.r.binary}{pkgs}")
+        lines.append(f"  - R: {version} at {_safe_path(env.r.binary)}{pkgs}")
     else:
         lines.append("  - R: not installed")
     if env.python is not None:
-        version = env.python.version or "Python"
+        version = _safe_version(env.python.version) or "Python"
         pkgs = _pkg_listing(
             env.python.optional_missing_packages, _PYTHON_OPTIONAL_PACKAGES,
         )
@@ -913,11 +929,13 @@ def runtime_environment_listing() -> str:
             f" REQUIRED MISSING: {', '.join(hard_missing)}"
             if hard_missing else ""
         )
-        lines.append(f"  - {version} at {env.python.binary}{pkgs}{hard}")
+        lines.append(
+            f"  - {version} at {_safe_path(env.python.binary)}{pkgs}{hard}"
+        )
     else:
         lines.append("  - Python: not installed")
     if env.stata is not None:
-        lines.append(f"  - Stata: at {env.stata.binary}")
+        lines.append(f"  - Stata: at {_safe_path(env.stata.binary)}")
     else:
         lines.append("  - Stata: not installed")
     return "\n".join(lines)
@@ -950,10 +968,20 @@ def build_system_prompt(
     # module top) keeps the system_prompt → tools dependency
     # one-directional: tools.py builds its registry, then any
     # caller can ask for the rendered prompt.
+    from nora.text_safety import safe_text
     from nora.tools import ALLOWED_TOOL_NAMES
 
+    # cwd lands verbatim in the prompt body. A directory named with
+    # embedded newlines / bidi overrides / fake "System:" markers
+    # would otherwise inject straight into context — same
+    # prompt-injection vector the team already neutralizes for
+    # dataset filenames in dataset_listing(). 512 chars covers any
+    # legitimate filesystem path with comfortable headroom; truly
+    # absurd lengths (10× the cap) hard-reject and the prompt
+    # falls back to an empty cwd rendering rather than carrying a
+    # payload.
     rendered = SYSTEM_PROMPT_TEMPLATE.format(
-        cwd=cwd,
+        cwd=safe_text(str(cwd), max_len=512),
         SERVER_NAME=server_name,
         datasets_list=dataset_listing(cwd),
         runtime_environment=runtime_environment_listing(),
