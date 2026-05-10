@@ -3862,13 +3862,23 @@ async def search_in_session_files(args: dict[str, Any]) -> dict[str, Any]:
         search_entries.append((name, child, kind))
     if "script" in keep_kinds:
         from nora.run_files import enumerate_run_dir_scripts
+        from nora.session_files import visible_run_dir_names
+        # Rewind-aware: a discarded chat branch leaves its run dirs
+        # on disk but its results are hidden, and ``list_session_files``
+        # /``read_attached_file`` already filter on ``visible_run_dirs``
+        # so a hidden-branch script is invisible to the model. Without
+        # the same filter here, ``search_in_session_files`` would still
+        # return excerpts from those scripts — a sibling discovery
+        # path that bypasses the rewind visibility contract.
+        visible_runs = visible_run_dir_names(cwd)
         # Same disambiguation contract as list_session_files: pass
         # the already-emitted top-level names as reserved so a
         # colliding run-dir script gets a ``(short_id)`` suffix
         # rather than being silently dropped here.
         reserved_names = frozenset(seen_names)
         for entry in enumerate_run_dir_scripts(
-            cwd, reserved_names=reserved_names,
+            cwd, visible_run_dirs=visible_runs,
+            reserved_names=reserved_names,
         ):
             name = safe_text(entry.display_name)
             if not name or name in seen_names:

@@ -18,10 +18,12 @@ from nora.error_summary import (
 # Python
 # ---------------------------------------------------------------------------
 
-def test_python_keyerror_keeps_column_name() -> None:
-    """The whole point of forwarding the message - a researcher
-    typo'd a column name, and Nora needs to know which one to
-    propose the fix."""
+def test_python_keyerror_keeps_type_redacts_body() -> None:
+    """The exception type and user-code frame survive; the body
+    (here ``'typo'``) is redacted to close the script-controlled
+    body channel. The model already wrote the script so it knows
+    which ``df[X]`` line referenced the missing key — surfacing
+    the actual key value is unnecessary and exfiltratable."""
     stderr = (
         'Traceback (most recent call last):\n'
         '  File "/abs/path/script.py", line 17, in <module>\n'
@@ -32,7 +34,16 @@ def test_python_keyerror_keeps_column_name() -> None:
     )
     excerpt = extract_debug_excerpt("", stderr, 1, "Python")
     assert excerpt is not None
-    assert "KeyError: 'typo'" in excerpt
+    # Type preserved.
+    assert "KeyError" in excerpt
+    # The exception body is redacted on the exception line. The
+    # source-line preview ``df['typo']`` IS the model's own script
+    # source (Python's traceback formatter echoes the source line),
+    # so the literal substring may also appear there — that's safe
+    # (the model wrote that code). The leak channel is the body.
+    last_line = excerpt.strip().splitlines()[-1]
+    assert last_line.startswith("KeyError")
+    assert "[message body redacted]" in last_line
     # The user-code frame survives; the pandas internals frame is dropped.
     assert 'line 17' in excerpt
     assert 'pandas' not in excerpt
@@ -57,8 +68,9 @@ def test_python_traceback_path_is_basenamed() -> None:
 
 def test_python_includes_source_line() -> None:
     """The traceback's source-line preview (the indented line under
-    the frame) is the most actionable thing in the excerpt - keep
-    it."""
+    the frame) is parser-emitted from the model's own script source,
+    so it's safe to forward — the model already wrote that code.
+    Only the exception body is data-controlled and redacted."""
     stderr = (
         'Traceback (most recent call last):\n'
         '  File "/abs/run.py", line 9, in <module>\n'
@@ -67,14 +79,18 @@ def test_python_includes_source_line() -> None:
     )
     excerpt = extract_debug_excerpt("", stderr, 1, "Python")
     assert excerpt is not None
+    # Source-line preview preserved (it's the model's own code).
     assert "result = compute_things(df)" in excerpt
-    assert "NameError: name 'compute_things' is not defined" in excerpt
+    # Type preserved, body redacted.
+    assert "NameError" in excerpt
+    assert "[message body redacted]" in excerpt
+    assert "'compute_things' is not defined" not in excerpt
 
 
 def test_python_chained_exceptions_keeps_last_one() -> None:
     """When Python raises during except-handling, both exceptions
-    appear. The LAST one is the propagating one - that's what the
-    model should see."""
+    appear. The LAST one is the propagating one — that's the type
+    that surfaces. Body still redacted."""
     stderr = (
         'Traceback (most recent call last):\n'
         '  File "/x.py", line 1, in <module>\n'
@@ -90,7 +106,14 @@ def test_python_chained_exceptions_keeps_last_one() -> None:
     )
     excerpt = extract_debug_excerpt("", stderr, 1, "Python")
     assert excerpt is not None
-    assert 'RuntimeError: retry failed' in excerpt
+    # The propagating type is RuntimeError; the body is redacted on
+    # the final exception line. The literal ``"retry failed"`` is
+    # in the model's own ``raise RuntimeError("retry failed")``
+    # source line, which the traceback formatter echoes — that's
+    # not a leak (it's the script source, which the model wrote).
+    last_line = excerpt.strip().splitlines()[-1]
+    assert last_line.startswith("RuntimeError")
+    assert "[message body redacted]" in last_line
 
 
 # ---------------------------------------------------------------------------
@@ -98,8 +121,9 @@ def test_python_chained_exceptions_keeps_last_one() -> None:
 # ---------------------------------------------------------------------------
 
 def test_r_error_block_with_calls_chain() -> None:
-    """R's ``Error in ... :`` block + the ``Calls:`` trailer is
-    exactly what shows on a researcher's R console. Keep both."""
+    """R's ``Error`` anchor + the ``Calls:`` trailer survive. The
+    call deparse (``in eval(predvars, data, env)``) and message
+    body are both script-controlled and now redacted."""
     stderr = (
         "Loading required package: stats\n"
         "Error in eval(predvars, data, env) : object 'wage' not found\n"
@@ -108,16 +132,20 @@ def test_r_error_block_with_calls_chain() -> None:
     )
     excerpt = extract_debug_excerpt("", stderr, 1, "R")
     assert excerpt is not None
-    assert "Error in eval(predvars, data, env)" in excerpt
-    assert "object 'wage' not found" in excerpt
+    # The "Error :" anchor and "Calls:" trailer are parser-owned.
+    assert "Error :" in excerpt
     assert "Calls: lm -> eval -> eval" in excerpt
-    # "Execution halted" trailer is noise - drop it.
+    # Call deparse and body redacted.
+    assert "eval(predvars" not in excerpt
+    assert "object 'wage' not found" not in excerpt
+    assert "[message body redacted]" in excerpt
+    # "Execution halted" trailer is noise — still dropped.
     assert "Execution halted" not in excerpt
 
 
-def test_r_multiline_error_message_preserved() -> None:
-    """Some R errors wrap onto a second line. The extractor must
-    pick up the whole logical block."""
+def test_r_multiline_error_message_redacted() -> None:
+    """Multi-line error message bodies are redacted regardless of
+    their wrap. The Calls: trailer remains as parser-owned framing."""
     stderr = (
         "Error in lm.fit(x, y, offset = offset, singular.ok = singular.ok, ...) : \n"
         "  NA/NaN/Inf in 'x'\n"
@@ -125,14 +153,16 @@ def test_r_multiline_error_message_preserved() -> None:
     )
     excerpt = extract_debug_excerpt("", stderr, 1, "R")
     assert excerpt is not None
-    assert "NA/NaN/Inf in 'x'" in excerpt
+    assert "NA/NaN/Inf in 'x'" not in excerpt
+    assert "lm.fit(x, y" not in excerpt
     assert "Calls: lm -> lm.fit" in excerpt
+    assert "Error :" in excerpt
 
 
 def test_r_only_last_error_is_returned() -> None:
     """If a script logs multiple errors (e.g., recovered errors
-    inside ``tryCatch``), only the LAST top-level one matters -
-    that's what propagated."""
+    inside ``tryCatch``), only the LAST top-level one's Calls
+    trailer remains. Both error bodies are redacted."""
     stderr = (
         "Error in foo() : early problem\n"
         "Error in bar() : the actual cause\n"
@@ -140,9 +170,11 @@ def test_r_only_last_error_is_returned() -> None:
     )
     excerpt = extract_debug_excerpt("", stderr, 1, "R")
     assert excerpt is not None
-    assert "the actual cause" in excerpt
-    # The earlier "early problem" shouldn't be in the excerpt.
+    # Both bodies redacted.
+    assert "the actual cause" not in excerpt
     assert "early problem" not in excerpt
+    # The Calls trailer of the LAST error survives.
+    assert "Calls: bar -> baz" in excerpt
 
 
 # ---------------------------------------------------------------------------
@@ -167,11 +199,23 @@ r(111);
 """
 
 
-def test_stata_extract_anchors_on_rc_and_command_echo() -> None:
+def test_stata_extract_anchors_on_rc_and_command_verb() -> None:
+    """The failing command's verb (``regress``) and the rc line are
+    parser-owned framing and pass through. The command's arguments
+    (``y x_missing``) and the error message body (``variable
+    x_missing not found``) are script-controlled and redacted —
+    a macro-expanded raw value in the args used to ride that
+    channel directly to the model."""
     excerpt = extract_debug_excerpt(_STATA_LOG_TYPICAL, "", 111, "Stata")
     assert excerpt is not None
-    assert ". regress y x_missing" in excerpt
-    assert "variable x_missing not found" in excerpt
+    # Verb survives.
+    assert ". regress" in excerpt
+    # Args dropped.
+    assert "x_missing" not in excerpt
+    # Error body dropped.
+    assert "variable x_missing not found" not in excerpt
+    assert "[message body redacted]" in excerpt
+    # rc line preserved.
     assert "r(111);" in excerpt
     # The unrelated `set more off` / `use ...` echos must NOT be
     # in the excerpt - they're not the failing command.
@@ -190,17 +234,19 @@ def test_stata_excludes_end_of_dofile_trailer_rc() -> None:
     assert "end of do-file" not in excerpt
 
 
-def test_stata_no_command_echo_falls_back_to_message_lines() -> None:
+def test_stata_no_command_echo_returns_rc_only() -> None:
     """If the executor truncated the log such that the failing
-    command isn't present, still surface the error message + rc
-    so the model has something to work with."""
+    command isn't present, return the rc line only. The error
+    message body (``syntax error``) is data-controlled too and
+    is no longer forwarded — the rc code carries enough framing
+    for the model to know the failure class."""
     log = (
         "syntax error\n"
         "r(198);\n"
     )
     excerpt = extract_debug_excerpt(log, "", 198, "Stata")
     assert excerpt is not None
-    assert "syntax error" in excerpt
+    assert "syntax error" not in excerpt
     assert "r(198);" in excerpt
 
 

@@ -455,6 +455,40 @@ def _require_fields(
     return None
 
 
+def _require_after_filter(
+    out: dict[str, Any],
+    required: frozenset[str],
+    analysis_type: str,
+    *,
+    pre_validated: frozenset[str] = frozenset(),
+) -> str | None:
+    """Re-check required fields after ``_collect_allowed`` runs.
+
+    ``_require_fields`` only checks that required keys are present in
+    the raw payload; ``_collect_allowed`` then DROPS any field whose
+    type doesn't match the schema (e.g. ``coefficients`` shipped as a
+    string). The result is an ``ok=True`` payload missing structural
+    fields — the model thinks the analysis succeeded with garbage. So
+    callers re-check required fields against ``out`` after collection.
+
+    ``pre_validated`` lists fields the caller already gates explicitly
+    BEFORE ``_collect_allowed`` (e.g. ``n`` for OLS, ``cells`` for
+    magnitude_table) — those are never inserted into ``out`` by
+    ``_collect_allowed`` itself, so excluding them avoids spurious
+    rejection. The handler is expected to assemble those fields
+    elsewhere in ``out`` if they survive their pre-validation.
+    """
+    needs_check = required - pre_validated - {"type"}
+    missing = needs_check - out.keys()
+    if missing:
+        return (
+            f"{analysis_type} payload required field(s) had wrong "
+            f"type and were dropped during sanitization: "
+            f"{sorted(missing)}"
+        )
+    return None
+
+
 def _is_finite_number(x: Any) -> bool:
     return isinstance(x, (int, float)) and not isinstance(x, bool) and math.isfinite(x)
 
@@ -524,10 +558,23 @@ def _collect_allowed(
         else:
             surplus += 1
 
+    # Count rather than name unknown fields. Field names in ``raw``
+    # but outside ``allowed`` are data-derived (an attacker-authored
+    # script can encode raw row values as JSON field names and read
+    # them back through ``transformations``). The single summary line
+    # below emits the count only — the per-row store keeps the raw
+    # payload for researcher audit, so naming the fields here was
+    # exfil-without-benefit.
+    unknown_field_count = 0
+    # Same pattern for dict_numeric inner keys: non-string keys and
+    # non-finite values inside an allowed dict-of-numeric field both
+    # carry caller-controlled bytes if echoed. We collapse them into
+    # one summary line per parent field.
+    dict_drops: dict[str, int] = {}
+
     for k, v in raw.items():
         if k not in allowed:
-            # safe_key on the field name before it's echoed back to Claude.
-            _log(f"dropped unknown/forbidden field {safe_key(str(k))!r}")
+            unknown_field_count += 1
             continue
         if k in integer:
             if not isinstance(v, int) or isinstance(v, bool):
@@ -552,16 +599,42 @@ def _collect_allowed(
                 _log(f"dropped {k!r}: expected dict, got {type(v).__name__}")
                 continue
             clean: dict[str, float] = {}
+            inner_drops = 0
+            inner_collisions = 0
             for kk, vv in v.items():
                 if not isinstance(kk, str):
-                    _log(f"dropped {k!r}[{safe_key(str(kk))!r}]: key not a string")
+                    inner_drops += 1
                     continue
                 if not _is_finite_number(vv):
-                    _log(f"dropped {k!r}[{safe_key(kk)!r}]: not a finite number")
+                    inner_drops += 1
                     continue
                 # safe_key on the key — e.g. coefficient names, which
-                # originate in the data's variable names, cross to Claude.
-                clean[safe_key(kk)] = float(vv)
+                # originate in the data's variable names, cross to
+                # Claude. Two raw keys that ``safe_key`` collapses to
+                # the same form (newline → space, 40-char prefix
+                # share) MUST NOT silently overwrite — the second
+                # value would replace the first and the model would
+                # see one value labelled by an ambiguous key. Drop
+                # the duplicate; track a count for the transformation
+                # log so the researcher can audit. The vcov path in
+                # _sanitize_linear_regression detects collisions in
+                # the same shape.
+                safe_kk = safe_key(kk)
+                if safe_kk in clean:
+                    inner_collisions += 1
+                    continue
+                clean[safe_kk] = float(vv)
+            if inner_drops:
+                dict_drops[k] = inner_drops
+            if inner_collisions:
+                # Separate counter so the cause is auditable. Names
+                # withheld — collisions identify pairs of data-derived
+                # raw keys.
+                _log(
+                    f"dropped {inner_collisions} duplicate inner "
+                    f"key(s) from {k!r} after sanitization "
+                    f"(colliding names withheld)"
+                )
             out[k] = clean
         elif k in list_string:
             if not isinstance(v, list) or not all(isinstance(x, str) for x in v):
@@ -575,6 +648,26 @@ def _collect_allowed(
                 continue
             out[k] = [float(x) for x in v]
 
+    if unknown_field_count:
+        # Aggregate count only — the field names themselves were
+        # data-derived and are deliberately not echoed. Researchers
+        # who need to audit the dropped names can read the raw payload
+        # from the per-row store; the model only sees the count.
+        _log(
+            f"dropped {unknown_field_count} unknown/forbidden "
+            f"top-level field(s) (names withheld)"
+        )
+    if dict_drops:
+        # Per-parent count for malformed dict-of-numeric inner entries.
+        # Both non-string keys and non-finite values are collapsed —
+        # the inner key is data-derived (a coefficient / VIF / vcov
+        # row name) and a non-string key would otherwise be coerced to
+        # str and echoed back.
+        for parent, n_dropped in sorted(dict_drops.items()):
+            _log(
+                f"dropped {n_dropped} malformed entry(ies) from "
+                f"{parent!r} (inner keys/values withheld)"
+            )
     if surplus:
         # Single line that bounds the total log size at
         # ``_COLLECT_ALLOWED_LOG_CAP + 1`` regardless of payload size.
@@ -649,6 +742,23 @@ def _sanitize_linear_regression(
         list_string=_OLS_ALLOWED_LIST_STRING,
         transformations=transformations,
     )
+
+    # Re-check required fields after type filtering. ``_require_fields``
+    # only verifies key presence in ``raw``; ``_collect_allowed`` then
+    # silently drops any required field whose type doesn't match
+    # (e.g. ``coefficients`` shipped as a string). Without this gate,
+    # a wrong-typed ``coefficients`` / ``standard_errors`` /
+    # ``response_variable`` survives to ``ok=True`` with the field
+    # absent. ``n`` is already pre-validated above.
+    missing_after_filter = _require_after_filter(
+        out, _OLS_REQUIRED, "linear_regression",
+        pre_validated=frozenset(("n",)),
+    )
+    if missing_after_filter:
+        return SanitizerResult(
+            ok=False, analysis_type="linear_regression",
+            rejection_reason=missing_after_filter,
+        )
 
     # Disclosure-control gate: refuse formula-categorical coefficient
     # names. statsmodels / patsy formula fits encode raw categorical
@@ -929,6 +1039,20 @@ def _sanitize_t_test(raw: dict[str, Any], config: SDCConfig) -> SanitizerResult:
         transformations=transformations,
     )
 
+    # Re-check required fields after type filtering. ``test_type`` and
+    # ``n1`` are pre-validated above; ``mean1`` / ``t_statistic`` /
+    # ``p_value`` would otherwise survive to ``ok=True`` if shipped
+    # with a non-numeric type.
+    missing_after_filter = _require_after_filter(
+        out, _TTEST_REQUIRED, "t_test",
+        pre_validated=frozenset(("n1", "test_type")),
+    )
+    if missing_after_filter:
+        return SanitizerResult(
+            ok=False, analysis_type="t_test",
+            rejection_reason=missing_after_filter,
+        )
+
     # ``confidence_interval`` must be a 2-element [lower, upper]
     # list. The generic list_numeric filter accepts any length, so
     # without this check a 3+ element list would survive and could
@@ -1021,6 +1145,20 @@ def _sanitize_descriptive(
         transformations=transformations,
     )
 
+    # Re-check required fields after type filtering — ``mean`` / ``sd``
+    # / ``missing_count`` / ``variable`` would otherwise be silently
+    # dropped on type mismatch and the response would still be
+    # ``ok=True``.
+    missing_after_filter = _require_after_filter(
+        out, _DESC_REQUIRED, "descriptive",
+        pre_validated=frozenset(("n",)),
+    )
+    if missing_after_filter:
+        return SanitizerResult(
+            ok=False, analysis_type="descriptive",
+            rejection_reason=missing_after_filter,
+        )
+
     n = out["n"]
     for key in numeric_allowlist:
         if key in out:
@@ -1106,11 +1244,15 @@ def _sanitize_frequency_table(
                 ),
             )
         if not isinstance(v, int) or isinstance(v, bool) or v < 0:
+            # Don't echo the level name (it's data-derived; even after
+            # ``safe_key`` it carries up to 40 chars of attacker-
+            # controlled bytes through ``rejection_reason``, which
+            # ``submit_script`` forwards back to the model).
             return SanitizerResult(
                 ok=False, analysis_type="frequency_table",
                 rejection_reason=(
-                    f"count value for {safe_key(k)!r} must be "
-                    f"non-negative int, got {type(v).__name__}"
+                    f"a count value is not a non-negative int "
+                    f"(got {type(v).__name__}); level name withheld"
                 ),
             )
         # safe_key neutralizes control chars / length / newline injections
@@ -1126,15 +1268,19 @@ def _sanitize_frequency_table(
         # before crossing the boundary.
         clean_key = safe_key(k)
         if clean_key in clean_counts:
+            # The colliding key is data-derived; don't echo it back to
+            # the model (each rejection would ship 40 chars of attacker-
+            # controlled bytes through ``rejection_reason``).
             return SanitizerResult(
                 ok=False, analysis_type="frequency_table",
                 rejection_reason=(
-                    f"two distinct level names sanitize to the same "
-                    f"key {clean_key!r} (e.g. embedded newlines or "
-                    f"shared 40-char prefix). Collisions are rejected "
-                    f"because aggregating the counts would defeat "
-                    f"cell suppression on the smaller component. "
-                    f"Disambiguate the levels in the source data."
+                    "two distinct level names sanitize to the same "
+                    "key (e.g. embedded newlines or shared 40-char "
+                    "prefix). Collisions are rejected because "
+                    "aggregating the counts would defeat cell "
+                    "suppression on the smaller component. "
+                    "Disambiguate the levels in the source data; "
+                    "the colliding key is withheld."
                 ),
             )
         clean_counts[clean_key] = v
@@ -1150,6 +1296,20 @@ def _sanitize_frequency_table(
         string=_FREQ_ALLOWED_STRING_FIELDS,
         transformations=transformations,
     )
+
+    # Re-check required fields after type filtering. ``counts`` is
+    # validated above and routed in separately, so it sits in
+    # ``pre_validated``. ``variable`` / ``n`` / ``missing_count``
+    # would otherwise survive a type mismatch with ``ok=True``.
+    missing_after_filter = _require_after_filter(
+        out, _FREQ_REQUIRED, "frequency_table",
+        pre_validated=frozenset(("counts",)),
+    )
+    if missing_after_filter:
+        return SanitizerResult(
+            ok=False, analysis_type="frequency_table",
+            rejection_reason=missing_after_filter,
+        )
 
     # Primary cell suppression.
     primary = suppress_cells_below(
@@ -1310,11 +1470,15 @@ def _sanitize_crosstab(
                 ),
             )
         if not isinstance(inner, dict):
+            # Row labels are data-derived; redact them from rejection
+            # messages so the model can't trigger this branch with a
+            # crafted label and read it back via ``rejection_reason``.
             return SanitizerResult(
                 ok=False, analysis_type="crosstab",
                 rejection_reason=(
-                    f"counts[{safe_key(row_key)!r}] must be a dict "
-                    f"(col_level → int); got {type(inner).__name__}"
+                    f"a counts row is not a dict "
+                    f"(col_level → int); got {type(inner).__name__}; "
+                    f"row label withheld"
                 ),
             )
         safe_row = safe_key(row_key)
@@ -1328,26 +1492,30 @@ def _sanitize_crosstab(
                     ),
                 )
             if not isinstance(v, int) or isinstance(v, bool) or v < 0:
+                # Don't echo row/col labels — they are data-derived.
                 return SanitizerResult(
                     ok=False, analysis_type="crosstab",
                     rejection_reason=(
-                        f"counts[{safe_row!r}][{safe_key(col_key)!r}] must "
-                        f"be a non-negative int; got {type(v).__name__}"
+                        f"a counts cell is not a non-negative int "
+                        f"(got {type(v).__name__}); row/col labels "
+                        f"withheld"
                     ),
                 )
             safe_col = safe_key(col_key)
             if (safe_row, safe_col) in clean_counts:
+                # The colliding labels are data-derived; redact.
                 return SanitizerResult(
                     ok=False, analysis_type="crosstab",
                     rejection_reason=(
-                        f"label collision after sanitization at cell "
-                        f"({safe_row!r}, {safe_col!r}): two distinct raw "
-                        f"row/col labels in this crosstab sanitize to the "
-                        f"same safe_key, which would silently overwrite "
-                        f"counts (and break suppression accounting). "
-                        f"Rename the colliding levels in the source script "
-                        f"— e.g. strip embedded whitespace / control "
-                        f"characters before the crosstab — and re-run."
+                        "label collision after sanitization in "
+                        "crosstab: two distinct raw row/col labels "
+                        "sanitize to the same safe_key, which would "
+                        "silently overwrite counts (and break "
+                        "suppression accounting). Rename the "
+                        "colliding levels in the source script — e.g. "
+                        "strip embedded whitespace / control "
+                        "characters before the crosstab — and re-run. "
+                        "The colliding labels are withheld."
                     ),
                 )
             clean_counts[(safe_row, safe_col)] = v
@@ -1374,6 +1542,18 @@ def _sanitize_crosstab(
         string=_XTAB_ALLOWED_STRING_FIELDS,
         transformations=transformations,
     )
+
+    # Re-check required fields after type filtering. ``counts`` is
+    # validated above and reattached separately.
+    missing_after_filter = _require_after_filter(
+        out, _XTAB_REQUIRED, "crosstab",
+        pre_validated=frozenset(("counts",)),
+    )
+    if missing_after_filter:
+        return SanitizerResult(
+            ok=False, analysis_type="crosstab",
+            rejection_reason=missing_after_filter,
+        )
 
     # Primary suppression on the flat view, then reshape back to
     # nested with bucketing. Suppressed (row, col) labels themselves
@@ -1548,6 +1728,18 @@ def _sanitize_magnitude_table(
         transformations=transformations,
     )
 
+    # Re-check required fields after type filtering. ``cells`` and
+    # ``aggregation`` are pre-validated above.
+    missing_after_filter = _require_after_filter(
+        out, _MAGTAB_REQUIRED, "magnitude_table",
+        pre_validated=frozenset(("cells", "aggregation")),
+    )
+    if missing_after_filter:
+        return SanitizerResult(
+            ok=False, analysis_type="magnitude_table",
+            rejection_reason=missing_after_filter,
+        )
+
     threshold_n = config.cell_suppression_threshold
     dom_threshold = config.dominance_threshold
     marker_n = suppression_marker(threshold_n)
@@ -1573,11 +1765,18 @@ def _sanitize_magnitude_table(
                 ),
             )
         if not isinstance(cell, dict):
+            # Group labels are data-derived; redact from
+            # ``rejection_reason`` (which crosses to the model via
+            # ``submit_script``). ``cell`` here is the offending
+            # dict-or-not from the raw payload, distinct from
+            # ``cells`` (the parent dict) — no collision with the
+            # parent name in the sanitizer itself.
             return SanitizerResult(
                 ok=False, analysis_type="magnitude_table",
                 rejection_reason=(
-                    f"cells[{safe_key(raw_group)!r}] must be a dict with "
-                    f"keys value, n, max_share; got {type(cell).__name__}"
+                    f"a cells entry is not a dict with keys "
+                    f"value, n, max_share; got {type(cell).__name__}; "
+                    f"group label withheld"
                 ),
             )
         value = cell.get("value")
@@ -1588,24 +1787,27 @@ def _sanitize_magnitude_table(
             return SanitizerResult(
                 ok=False, analysis_type="magnitude_table",
                 rejection_reason=(
-                    f"cells[{safe_key(raw_group)!r}].value must be a finite "
-                    f"number; got {type(value).__name__}"
+                    f"a cells entry's 'value' is not a finite "
+                    f"number; got {type(value).__name__}; "
+                    f"group label withheld"
                 ),
             )
         if not isinstance(n, int) or isinstance(n, bool) or n < 0:
             return SanitizerResult(
                 ok=False, analysis_type="magnitude_table",
                 rejection_reason=(
-                    f"cells[{safe_key(raw_group)!r}].n must be a non-negative "
-                    f"int; got {type(n).__name__}"
+                    f"a cells entry's 'n' is not a non-negative "
+                    f"int; got {type(n).__name__}; "
+                    f"group label withheld"
                 ),
             )
         if not _is_finite_number(max_share):
             return SanitizerResult(
                 ok=False, analysis_type="magnitude_table",
                 rejection_reason=(
-                    f"cells[{safe_key(raw_group)!r}].max_share must be a "
-                    f"finite number; got {type(max_share).__name__}"
+                    f"a cells entry's 'max_share' is not a "
+                    f"finite number; got {type(max_share).__name__}; "
+                    f"group label withheld"
                 ),
             )
 
@@ -1625,6 +1827,28 @@ def _sanitize_magnitude_table(
             if fails_dominance:
                 n_suppressed_by_dominance += 1
             continue
+        # Reject ``safe_key`` collisions outright (mirrors crosstab /
+        # frequency_table). Two raw group labels that sanitize to the
+        # same form would silently overwrite — a small (suppressible)
+        # cell could be replaced by a visible cell, or vice versa,
+        # and the suppression accounting would never see the dropped
+        # entry. Group labels are data-derived; rejection_reason
+        # withholds them.
+        if safe_group in cleaned_cells:
+            return SanitizerResult(
+                ok=False, analysis_type="magnitude_table",
+                rejection_reason=(
+                    "label collision after sanitization in "
+                    "magnitude_table cells: two distinct raw group "
+                    "labels sanitize to the same safe_key, which "
+                    "would silently overwrite values (and break "
+                    "dominance / primary suppression accounting). "
+                    "Disambiguate the group labels in the source "
+                    "script — e.g. strip embedded whitespace / "
+                    "control characters before grouping — and "
+                    "re-run. The colliding labels are withheld."
+                ),
+            )
         # Precision-clamp the value at sigfigs appropriate for n.
         cleaned_cells[safe_group] = {
             "value": clamp_precision(float(value), n),
@@ -1761,6 +1985,19 @@ def _sanitize_correlation_matrix(
         transformations=transformations,
     )
 
+    # Re-check required fields after type filtering. ``n``,
+    # ``variables``, and ``correlations`` are pre-validated above
+    # (``correlations`` is reattached after sanitization further down).
+    missing_after_filter = _require_after_filter(
+        out, _CORR_REQUIRED, "correlation_matrix",
+        pre_validated=frozenset(("n", "variables", "correlations")),
+    )
+    if missing_after_filter:
+        return SanitizerResult(
+            ok=False, analysis_type="correlation_matrix",
+            rejection_reason=missing_after_filter,
+        )
+
     # ``out["variables"]`` is the safe_key-transformed list (each
     # element passed through safe_key in _collect_allowed). The raw
     # ``correlations`` dict keys are not yet transformed. Compare on
@@ -1772,29 +2009,48 @@ def _sanitize_correlation_matrix(
     declared = set(out.get("variables") or [])
 
     sanitized_corr: dict[str, dict[str, float]] = {}
-    dropped: list[str] = []
+    # Counters only — row/col keys are data-derived (variable names),
+    # so the per-key sample previously emitted in this transformation
+    # leaked names back to the model. The per-row store keeps the raw
+    # payload for researcher audit; the model sees totals.
+    dropped_row_count = 0
+    dropped_col_count = 0
+    collision_row_count = 0
+    collision_col_count = 0
     n = out["n"]
     for raw_row_key, row_value in correlations.items():
         if not isinstance(raw_row_key, str):
-            dropped.append(f"row {raw_row_key!r} (non-string)")
+            dropped_row_count += 1
             continue
         row_key = safe_key(raw_row_key)
         if row_key not in declared:
-            dropped.append(f"row {safe_key(raw_row_key)!r}")
+            dropped_row_count += 1
             continue
         if not isinstance(row_value, dict):
-            dropped.append(f"row {row_key!r} (non-dict)")
+            dropped_row_count += 1
+            continue
+        # Reject row-key collisions outright — two raw row keys that
+        # ``safe_key`` collapses to the same form would silently
+        # overwrite, replacing an earlier correlation row with a
+        # later one and reporting it under an ambiguous label.
+        if row_key in sanitized_corr:
+            collision_row_count += 1
             continue
         kept_row: dict[str, float] = {}
         for raw_col_key, val in row_value.items():
             if not isinstance(raw_col_key, str):
-                dropped.append(f"{row_key}.{raw_col_key!r} (non-string)")
+                dropped_col_count += 1
                 continue
             col_key = safe_key(raw_col_key)
             if col_key not in declared:
-                dropped.append(f"{row_key}.{col_key}")
+                dropped_col_count += 1
                 continue
             if not _is_finite_number(val):
+                continue
+            # Same collision check on the column axis: skip duplicates
+            # rather than overwrite. Counter only, no name echo.
+            if col_key in kept_row:
+                collision_col_count += 1
                 continue
             clamped = clamp_precision(float(val), n)
             # Clip to [-1, 1] in case precision-clamping nudged a near-
@@ -1803,11 +2059,18 @@ def _sanitize_correlation_matrix(
             kept_row[col_key] = clamped
         if kept_row:
             sanitized_corr[row_key] = kept_row
-    if dropped:
+    if dropped_row_count or dropped_col_count:
         transformations.append(
-            f"dropped {len(dropped)} undeclared key(s) from "
-            f"correlations: {sorted(dropped)[:5]}"
-            + (" …" if len(dropped) > 5 else "")
+            f"dropped {dropped_row_count} undeclared row(s) and "
+            f"{dropped_col_count} undeclared column entry(ies) from "
+            f"correlations (names withheld)"
+        )
+    if collision_row_count or collision_col_count:
+        transformations.append(
+            f"dropped {collision_row_count} duplicate row key(s) and "
+            f"{collision_col_count} duplicate column key(s) from "
+            f"correlations after sanitization (colliding names "
+            f"withheld)"
         )
     if not sanitized_corr:
         # Every entry got dropped. Returning ok=True with an empty
