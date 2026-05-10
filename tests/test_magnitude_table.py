@@ -91,6 +91,10 @@ def magnitude_payloads(draw, max_groups: int = 6):
         "value_variable": draw(_name),
         "aggregation": draw(st.sampled_from(["sum", "mean"])),
         "cells": cells,
+        # Helper-provenance marker — the sanitizer requires this for
+        # magnitude_table. The hypothesis strategy is exercising the
+        # post-helper payload shape, so include the marker by default.
+        "_via_helper": "from_magnitude_table",
     }
 
 
@@ -193,6 +197,7 @@ def test_happy_path_well_distributed():
             "CA": {"value": 12500000, "n": 125, "max_share": 0.03},
             "NY": {"value": 9800000, "n": 98, "max_share": 0.04},
         },
+        "_via_helper": "from_magnitude_table",
     })
     assert r.ok
     # Both cells published, max_share absent.
@@ -215,6 +220,7 @@ def test_dominance_fires_exactly_over_threshold():
             "edge":  {"value": 1000, "n": 50, "max_share": 0.85},
             "over":  {"value": 1000, "n": 50, "max_share": 0.851},
         },
+        "_via_helper": "from_magnitude_table",
     })
     assert r.ok
     marker = suppression_marker(DEFAULT_CONFIG.cell_suppression_threshold)
@@ -231,6 +237,7 @@ def test_custom_dominance_threshold():
         "value_variable": "v",
         "aggregation": "sum",
         "cells": {"A": {"value": 1000, "n": 50, "max_share": 0.6}},
+        "_via_helper": "from_magnitude_table",
     }, config=strict)
     assert r.ok
     marker = suppression_marker(10)
@@ -245,6 +252,7 @@ def test_rejects_non_sum_mean_aggregation():
         "value_variable": "v",
         "aggregation": "median",
         "cells": {"A": {"value": 1, "n": 1, "max_share": 0.0}},
+        "_via_helper": "from_magnitude_table",
     })
     assert not r.ok
     assert "aggregation" in (r.rejection_reason or "")
@@ -257,8 +265,67 @@ def test_rejects_cell_missing_max_share():
         "value_variable": "v",
         "aggregation": "sum",
         "cells": {"A": {"value": 1000, "n": 50}},  # no max_share
+        "_via_helper": "from_magnitude_table",
     })
     assert not r.ok
+
+
+def test_rejects_payload_without_helper_provenance():
+    """A magnitude_table that didn't come through the typed helper
+    is rejected: max_share is caller-supplied and consulted-only,
+    so a script bypassing the typed helper could publish a
+    dominance-violating value with max_share=0 and skip the gate.
+    The marker is the cheapest gate that blocks the trivial
+    nora.result(type="magnitude_table", ...) attack — this test
+    pins it."""
+    base = {
+        "type": "magnitude_table",
+        "row_variable": "industry",
+        "value_variable": "revenue",
+        "aggregation": "sum",
+        "cells": {
+            # Looks innocent: max_share=0 says "no contributor
+            # dominates", but a script could lie. Without the helper
+            # marker this payload would publish $1B as a 50-row sum
+            # even if 99% came from one company.
+            "tech": {"value": 1e9, "n": 50, "max_share": 0.0},
+        },
+    }
+    # No marker → reject.
+    r = sanitize(dict(base))
+    assert not r.ok
+    assert "typed runtime helper" in (r.rejection_reason or "")
+    # Wrong marker value → reject (defends against a script setting
+    # ``_via_helper="from_summarize"`` or an empty string).
+    r = sanitize({**base, "_via_helper": "from_summarize"})
+    assert not r.ok
+    r = sanitize({**base, "_via_helper": ""})
+    assert not r.ok
+    # Correct marker → accept.
+    r = sanitize({**base, "_via_helper": "from_magnitude_table"})
+    assert r.ok
+
+
+def test_helper_marker_never_emitted_to_model():
+    """The marker is internal to the runtime/sanitizer boundary —
+    the model has no business seeing the field name or value, and
+    it must NOT show up in the transformation log either (the
+    log path is otherwise model-visible)."""
+    r = sanitize({
+        "type": "magnitude_table",
+        "row_variable": "industry",
+        "value_variable": "revenue",
+        "aggregation": "sum",
+        "cells": {
+            "tech": {"value": 1e9, "n": 50, "max_share": 0.05},
+        },
+        "_via_helper": "from_magnitude_table",
+    })
+    assert r.ok
+    assert "_via_helper" not in r.sanitized
+    logged = " ".join(r.transformations)
+    assert "_via_helper" not in logged
+    assert "from_magnitude_table" not in logged
 
 
 def test_transformations_name_suppression_reasons():
@@ -276,6 +343,7 @@ def test_transformations_name_suppression_reasons():
             "dom":  {"value": 1000, "n": 50, "max_share": 0.95},  # dominance
             "ok":   {"value": 500, "n": 50, "max_share": 0.1},
         },
+        "_via_helper": "from_magnitude_table",
     })
     assert r.ok
     logged = " ".join(r.transformations)

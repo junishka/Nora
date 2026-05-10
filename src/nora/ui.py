@@ -2205,14 +2205,18 @@ class NoraBridge:
             return {"ok": False, "reason": f"bad path: {e}"}
         if not target.is_dir():
             return {"ok": False, "reason": f"not a directory: {target}"}
-        # Only allow switching into paths we manage — prevents a
-        # page-side exploit from pointing cwd at an arbitrary folder.
-        # Must be a direct child of SESSIONS_ROOT, not the root
-        # itself: ``_is_within`` returns True for ``target ==
-        # sessions_root`` (relative_to of equal paths is ``Path('.')``),
-        # and a cwd anchored at the sessions root would let path
-        # resolution in downstream tools traverse every session.
-        # Matches the narrower check ``delete_session`` already uses.
+        # Only allow switching into paths we manage AND require a
+        # *direct* child of SESSIONS_ROOT — not the root itself, and
+        # not a nested directory inside a session. ``_is_within`` is
+        # too loose: it returns True for ``target == sessions_root``
+        # (relative_to of equal paths is ``Path('.')``) — cwd would
+        # then become the directory containing every session, which
+        # makes every other session a child of the active cwd and
+        # breaks the cross-session isolation gate. It also accepts
+        # any subdirectory beneath a session, which would spawn a
+        # runner whose cwd doesn't see the session's ``.nora/``
+        # state. ``parent == sessions_root`` is the narrow gate
+        # matching the check ``delete_session`` already uses.
         sessions_root = SESSIONS_ROOT.resolve()
         if target == sessions_root or target.parent != sessions_root:
             return {

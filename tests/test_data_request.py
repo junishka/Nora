@@ -209,6 +209,40 @@ def test_na_count_denies_when_subgroup_too_small(sample_csv: Path):
     )
 
 
+def test_na_count_denies_when_na_subgroup_is_rare(tmp_path: Path):
+    """The dual case: when only a handful of observations are missing,
+    the na_count itself is the disclosive cell — missingness can
+    identify a sensitive subgroup (e.g. the one respondent who
+    declined to answer). The previous code only suppressed when the
+    *non-NA* count was small; this test pins the symmetric gate."""
+    # 999 non-missing, 1 missing. Pre-fix this returned na_count=1
+    # exactly — directly identifying the one observation with a
+    # missing value on this variable.
+    df = pd.DataFrame({"sensitive": [1.0] * 999 + [np.nan]})
+    p = tmp_path / "rare_missing.csv"
+    df.to_csv(p, index=False)
+    r = handle(p, "na_count", "sensitive")
+    assert r.status == "denied"
+    # Must NOT echo the exact count back in the reason — the
+    # threshold itself bounds what the model can infer, but a reason
+    # like "only 1 missing observation" would re-leak the value.
+    assert "1 missing" not in (r.reason or "").lower()
+    assert "below the disclosure threshold" in (r.reason or "").lower()
+
+
+def test_na_count_grants_when_no_missingness(tmp_path: Path):
+    """A count of zero on either side is fine — '0 missing' doesn't
+    pick out any individual. The suppression rule must be '0 or
+    >=threshold', not '>=threshold'."""
+    df = pd.DataFrame({"v": list(range(50))})
+    p = tmp_path / "no_missing.csv"
+    df.to_csv(p, index=False)
+    r = handle(p, "na_count", "v")
+    assert r.status == "granted", r.reason
+    assert r.answer["na_count"] == 0
+    assert r.answer["non_na_count"] == 50
+
+
 # ---------------------------------------------------------------------------
 # Top-level dispatch + error paths
 # ---------------------------------------------------------------------------
@@ -404,14 +438,42 @@ def test_quartiles_rejects_non_numeric(sample_csv: Path):
 
 
 def test_quartiles_denies_small_sample(sample_csv: Path, tmp_path: Path):
-    """Same minimum-N gate as numeric_bounds — fewer than 10
-    observations risks identifying individuals at the quartiles."""
+    """Same minimum-N gate as numeric_bounds (N>=30). Quartiles are
+    interpolations between adjacent sorted observations, so at small
+    N they're weighted blends of 2-3 specific individuals — 2-sigfig
+    rounding doesn't reliably hide them."""
     df = pd.DataFrame({"v": [1.0, 2.0, 3.0, 4.0, np.nan, np.nan]})
     p = tmp_path / "tiny.csv"
     df.to_csv(p, index=False)
     r = handle(p, "quartiles", "v")
     assert r.status == "denied"
     assert "too few" in r.reason.lower()
+
+
+def test_quartiles_denies_just_below_threshold(tmp_path: Path):
+    """Pin the N=30 floor specifically — N=10 used to clear the gate
+    even though q25 and q75 at that size are weighted blends of two
+    sorted observations each. The previous threshold matched the
+    cell-suppression threshold (10), but order-statistic
+    interpolation needs more breadth than cell-count suppression."""
+    # N=20 — comfortably above the previous floor (10) and below the
+    # new one (30). Without the bump, this would have been granted.
+    df = pd.DataFrame({"v": list(range(1, 21))})
+    p = tmp_path / "twenty.csv"
+    df.to_csv(p, index=False)
+    r = handle(p, "quartiles", "v")
+    assert r.status == "denied"
+    assert "too few" in r.reason.lower()
+    assert "30" in r.reason  # surface the new floor
+
+
+def test_quartiles_grants_at_threshold(tmp_path: Path):
+    """N=30 must clear — the bump is to 30 (inclusive), not above."""
+    df = pd.DataFrame({"v": list(range(1, 31))})
+    p = tmp_path / "thirty.csv"
+    df.to_csv(p, index=False)
+    r = handle(p, "quartiles", "v")
+    assert r.status == "granted", r.reason
 
 
 # ---------------------------------------------------------------------------
@@ -432,6 +494,47 @@ def test_correlation_pair_returns_pearson_r(sample_csv: Path):
     assert -1.0 <= a["correlation"] <= 1.0
     assert a["method"] == "pearson"
     assert a["n_complete"] >= 10
+
+
+def test_correlation_pair_coarsens_rare_missingness(tmp_path: Path):
+    """``request_data(correlation_pair)`` returns
+    ``missing_count = len(s1) - n_complete``. If 999 rows are
+    complete and 1 is incomplete, the previous code published
+    ``missing_count=1`` — directly identifying that one
+    observation. Same gate the schema-side ``na_count`` and the
+    stored-result sanitizers apply: coarsen ``0 < missing_count <
+    threshold``."""
+    n = 1000
+    income = np.arange(n, dtype=float)
+    age = np.arange(n, dtype=float) + 5.0
+    # One row incomplete on age.
+    age[42] = np.nan
+    df = pd.DataFrame({"income": income, "age": age})
+    p = tmp_path / "rare_missing_pair.csv"
+    df.to_csv(p, index=False)
+    r = handle(p, "correlation_pair", "income", variable2="age")
+    assert r.status == "granted", r.reason
+    # The exact "1" must NOT be in the answer — coarsened to the marker.
+    assert r.answer["missing_count"] == "<10"
+    assert r.answer["n_complete"] == n - 1
+
+
+def test_correlation_pair_keeps_large_missing_count(tmp_path: Path):
+    """Above-threshold missingness is aggregate enough to publish.
+    The gate is symmetric to ``na_count``: zero on either side is
+    fine, between 1 and threshold-1 is coarsened, threshold+ is
+    forwarded."""
+    n = 200
+    income = np.arange(n, dtype=float)
+    age = np.arange(n, dtype=float)
+    # 50 incomplete rows on age — far above threshold.
+    age[:50] = np.nan
+    df = pd.DataFrame({"income": income, "age": age})
+    p = tmp_path / "many_missing_pair.csv"
+    df.to_csv(p, index=False)
+    r = handle(p, "correlation_pair", "income", variable2="age")
+    assert r.status == "granted", r.reason
+    assert r.answer["missing_count"] == 50
 
 
 def test_correlation_pair_requires_variable2(sample_csv: Path):

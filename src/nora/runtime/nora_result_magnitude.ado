@@ -94,6 +94,16 @@ program define nora_result_magnitude
 
     file write `fh' `"{"type":"magnitude_table""'
     file write `fh' `","_token":"`_nora_token'""'
+    * Helper-provenance marker. The sanitizer requires this for
+    * magnitude_table because cell-level max_share is consulted-only
+    * and stripped — without proof the metric came from raw-data
+    * computation, a script could publish a dominance-violating value
+    * with max_share=0 and skip the gate. Stata can't strip the field
+    * from a hand-crafted JSON line on the way out (no `nora$result`
+    * gateway), so the defense raises cost the same way `_token` does:
+    * a forging script must know the marker name, not just bypass a
+    * helper call. See sanitizer._sanitize_magnitude_table.
+    file write `fh' `","_via_helper":"from_magnitude_table""'
     if `"`label'"' != "" {
         file write `fh' `","label":"`label'""'
     }

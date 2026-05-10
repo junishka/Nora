@@ -603,9 +603,39 @@ class OpenAISession:
                         out_text = _mcp_payload_to_text(result)
                         is_error = False
                     except Exception as e:  # noqa: BLE001
+                        # Catch-all fallback: a per-tool handler raised
+                        # an unexpected exception. The exception
+                        # message itself may include parser excerpts,
+                        # file paths, or raw data values the tool's
+                        # curated error-handling would have redacted —
+                        # interpolating ``str(e)`` into the model-
+                        # visible reason bypasses the per-tool
+                        # disclosure contract. Log the full details
+                        # locally for debugging and return only the
+                        # exception CLASS (a bounded identifier) plus
+                        # a generic recovery hint.
+                        import traceback
+                        diag = (
+                            f"[nora.openai] tool {name!r} handler "
+                            f"raised {e.__class__.__name__}: {e}\n"
+                            + traceback.format_exc()
+                        )
+                        print(diag, file=sys.stderr, flush=True)
+                        try:
+                            from nora.provider.usage_log import (
+                                append_usage_line,
+                            )
+                            append_usage_line(self.cwd, diag.rstrip())
+                        except Exception:  # noqa: BLE001 — logging must not block
+                            pass
                         out_text = json.dumps({
                             "status": "error",
-                            "reason": f"handler raised: {e.__class__.__name__}: {e}",
+                            "reason": (
+                                f"tool handler failed with "
+                                f"{e.__class__.__name__}. Retry with "
+                                f"different arguments or fall back to "
+                                f"another tool."
+                            ),
                         })
                         is_error = True
                     run_dir, language = _extract_hints(out_text)

@@ -191,7 +191,14 @@ nora$.write_result <- function(payload) {
 }
 
 nora$result <- function(type, ...) {
+  # Strip the sanitizer-side helper-provenance marker. Typed
+  # helpers (e.g. nora$from_magnitude_table) write directly via
+  # .write_result with `_via_helper` set, proving they computed
+  # disclosure metrics from raw data. Allowing it through here
+  # would let a script forge the marker through the generic API
+  # and bypass the dominance gate on magnitude_table.
   payload <- c(list(type = type), list(...))
+  payload[["_via_helper"]] <- NULL
   nora$.write_result(payload)
 }
 
@@ -535,14 +542,26 @@ nora$from_magnitude_table <- function(df, group_var, value_var,
     )
   }
 
-  nora$result(
-    type = "magnitude_table",
-    row_variable = as.character(group_var),
-    value_variable = as.character(value_var),
-    aggregation = aggregation,
-    cells = cells,
-    ...
+  # Bypass nora$result and write directly so the helper-provenance
+  # marker (`_via_helper`) survives. The generic nora$result strips
+  # `_via_helper` from caller-passed kwargs so a script can't forge
+  # this marker through the public API. The sanitizer requires the
+  # marker for magnitude_table because cell-level `max_share` is
+  # consulted-only and stripped — without proof that max_share came
+  # from raw-data computation a malicious script could publish a
+  # dominance-violating value with `max_share=0` and skip the gate.
+  payload <- c(
+    list(
+      type = "magnitude_table",
+      row_variable = as.character(group_var),
+      value_variable = as.character(value_var),
+      aggregation = aggregation,
+      cells = cells
+    ),
+    list(...)
   )
+  payload[["_via_helper"]] <- "from_magnitude_table"
+  nora$.write_result(payload)
 }
 
 

@@ -555,6 +555,7 @@ def test_magnitude_table_variables_sanitized():
             "grp1": {"value": 1000.0, "n": 50, "max_share": 0.1},
             "grp2": {"value": 2000.0, "n": 50, "max_share": 0.1},
         },
+        "_via_helper": "from_magnitude_table",
     })
     assert result.ok
     assert "\n" not in result.sanitized["row_variable"]
@@ -1374,14 +1375,16 @@ def test_crosstab_strips_missing_count_when_single_cell_suppressed() -> None:
 
 
 def test_crosstab_keeps_missing_count_when_no_suppression() -> None:
-    """The strip is targeted: a clean crosstab with no suppressed
-    cells leaves ``missing_count`` intact so the model still gets
-    completeness signal on uncomplicated tables."""
+    """The back-calc strip is targeted: a clean crosstab with no
+    suppressed cells leaves ``missing_count`` intact so the model
+    still gets completeness signal on uncomplicated tables. (Use
+    an above-threshold value so the small-missingness coarsen gate
+    doesn't fire here — that's its own test below.)"""
     result = sanitize({
         "type": "crosstab",
         "row_variable": "region",
         "col_variable": "outcome",
-        "missing_count": 7,
+        "missing_count": 70,
         "counts": {
             "north": {"recovered": 200, "died": 150},
             "south": {"recovered": 180, "died": 120},
@@ -1389,20 +1392,22 @@ def test_crosstab_keeps_missing_count_when_no_suppression() -> None:
     })
     assert result.ok
     assert result.sanitized.get("suppressed_cell_count", 0) == 0
-    assert result.sanitized.get("missing_count") == 7
+    assert result.sanitized.get("missing_count") == 70
 
 
 def test_crosstab_keeps_missing_count_when_multi_cell_suppressed_in_one_row() -> None:
     """When a row's ``[suppressed]`` bucket aggregates two or more
     suppressed cells, the bucket is no longer a single value —
     ``missing_count + N`` only constrains the bucket SUM, leaving
-    individual cells underdetermined. Stripping ``missing_count``
-    here would over-protect; keep it for utility."""
+    individual cells underdetermined. The back-calc strip stays
+    off; ``missing_count`` is kept for utility. (Above-threshold
+    value used so the orthogonal small-missingness coarsen gate
+    doesn't shadow what we're testing here.)"""
     result = sanitize({
         "type": "crosstab",
         "row_variable": "diagnosis",
         "col_variable": "outcome",
-        "missing_count": 4,
+        "missing_count": 40,
         "counts": {
             # Two cells in one row are below threshold (bucketed
             # together), one cell visible.
@@ -1413,7 +1418,76 @@ def test_crosstab_keeps_missing_count_when_multi_cell_suppressed_in_one_row() ->
     assert result.ok
     assert result.sanitized["suppressed_cell_count"] == 2
     # Multi-cell bucket, missing_count safe to expose.
-    assert result.sanitized.get("missing_count") == 4
+    assert result.sanitized.get("missing_count") == 40
+
+
+def test_crosstab_coarsens_small_missing_count() -> None:
+    """Rare ``missing_count`` is itself disclosive — it identifies
+    the few rows that were dropped from the crosstab for
+    missingness on either dimension. Apply the same suppression
+    threshold the schema-side na_count gate already uses."""
+    result = sanitize({
+        "type": "crosstab",
+        "row_variable": "region",
+        "col_variable": "outcome",
+        # 3 < 10 (threshold), > 0 → coarsen.
+        "missing_count": 3,
+        "counts": {
+            "north": {"recovered": 200, "died": 150},
+            "south": {"recovered": 180, "died": 120},
+        },
+    })
+    assert result.ok
+    # Marker, not the exact 3.
+    assert result.sanitized.get("missing_count") == "<10"
+
+
+def test_frequency_table_coarsens_small_missing_count() -> None:
+    """Same gate on the 1D side. ``submit_script`` could publish a
+    frequency_table with ``missing_count=1`` and previously have it
+    forwarded verbatim — closing the gap."""
+    result = sanitize({
+        "type": "frequency_table",
+        "variable": "treatment_arm",
+        "n": 400,
+        "missing_count": 1,
+        "counts": {"A": 200, "B": 200},
+    })
+    assert result.ok
+    assert result.sanitized.get("missing_count") == "<10"
+
+
+def test_correlation_matrix_coarsens_small_missing_count() -> None:
+    """Closes the same gap for the multi-variable correlation
+    path. A single incomplete row across the matrix is identifying."""
+    result = sanitize({
+        "type": "correlation_matrix",
+        "variables": ["age", "income"],
+        "method": "pearson",
+        "n": 500,
+        "missing_count": 1,
+        "correlations": {
+            "age":    {"age": 1.0, "income": 0.4},
+            "income": {"age": 0.4, "income": 1.0},
+        },
+    })
+    assert result.ok
+    assert result.sanitized.get("missing_count") == "<10"
+
+
+def test_missing_count_zero_left_intact() -> None:
+    """Zero missingness ('no missing values on this variable') is
+    not disclosive — there's no individual to identify. The gate
+    must be ``0 < n < threshold``, not ``n < threshold``."""
+    result = sanitize({
+        "type": "frequency_table",
+        "variable": "group",
+        "n": 400,
+        "missing_count": 0,
+        "counts": {"A": 200, "B": 200},
+    })
+    assert result.ok
+    assert result.sanitized.get("missing_count") == 0
 
 
 def test_magnitude_table_suppressed_group_labels_bucketed() -> None:
@@ -1435,6 +1509,7 @@ def test_magnitude_table_suppressed_group_labels_bucketed() -> None:
                 "value": 1e6, "n": 2, "max_share": 0.5,
             },
         },
+        "_via_helper": "from_magnitude_table",
     })
     assert result.ok
     cells = result.sanitized["cells"]
@@ -1583,6 +1658,7 @@ def test_magnitude_table_rejects_over_cell_cap():
         "value_variable": "v",
         "aggregation": "sum",
         "cells": cells,
+        "_via_helper": "from_magnitude_table",
     })
     assert not r.ok
     assert "structural cap" in (r.rejection_reason or "")

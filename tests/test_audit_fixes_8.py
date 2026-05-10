@@ -200,6 +200,10 @@ def test_magnitude_table_label_collision_rejects() -> None:
     raw_a = "x" * 40 + "_one"
     raw_b = "x" * 40 + "_two"
     assert safe_key(raw_a) == safe_key(raw_b)
+    # Include the helper-provenance marker so the sanitizer's
+    # earlier helper-required gate doesn't preempt the collision
+    # check we're actually trying to test here. ``from_magnitude_table``
+    # would stamp this in production.
     r = sanitize({
         "type": "magnitude_table",
         "row_variable": "g",
@@ -209,6 +213,7 @@ def test_magnitude_table_label_collision_rejects() -> None:
             raw_a: {"value": 100.0, "n": 50, "max_share": 0.1},
             raw_b: {"value": 200.0, "n": 50, "max_share": 0.1},
         },
+        "_via_helper": "from_magnitude_table",
     })
     assert not r.ok
     assert "collision" in (r.rejection_reason or "").lower()
