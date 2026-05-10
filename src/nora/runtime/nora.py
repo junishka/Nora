@@ -764,7 +764,17 @@ def _append_plot_manifest(file: str, kind: str, label: str | None) -> None:
     d = _plots_dir()
     if d is None:
         return
-    entry: dict[str, Any] = {"file": file, "kind": kind}
+    # Stamp every entry with the per-run token. The executor validates
+    # this field after the script finishes and drops any entry whose
+    # token is missing or wrong; that strips manifest rows a script
+    # could otherwise have appended directly (saving a raw-data plot
+    # under ``_nora_plots/`` and labeling it ``coefficients`` to slip
+    # past the disclosure-control allowlist for vision attachment).
+    # Same posture as the result-payload ``_token`` field — a
+    # determined script can still reach into ``nora._RUN_TOKEN`` to
+    # forge the value, but doing so requires obvious code in the
+    # script the researcher reviews.
+    entry: dict[str, Any] = {"file": file, "kind": kind, "_token": _RUN_TOKEN}
     if label:
         entry["label"] = label
     try:
@@ -1154,12 +1164,81 @@ def plot_interaction(
             return
 
         # Build the prediction grid and the held-at-means template.
+        # Disclosure-control note: the rendered PNG is allowlisted for
+        # model vision (kind="interaction"), so anything legible on
+        # the x-axis crosses the SDC boundary. The previous version
+        # used col.min()/col.max() (numeric) and col.unique()
+        # (categorical), which surfaced raw extrema and rare-level
+        # identities the JSON sanitizer would have refused. We now
+        # build a disclosure-safe grid:
+        #   - numeric: mean ± 2*sd, which discloses no more than
+        #     the descriptive sanitizer's already-allowed mean+sd
+        #     pair. Tick labels are stripped so the model only sees
+        #     curve SHAPE, not absolute x values.
+        #   - categorical: drop levels whose observed count is
+        #     below the SDC cell_suppression_threshold (matches
+        #     frequency_table policy: rare-level identities are
+        #     themselves disclosive). If that leaves nothing, refuse
+        #     the plot rather than silently dropping back to all
+        #     levels.
         col = data[var]
         is_numeric = _pd.api.types.is_numeric_dtype(col)
+        # Mirror SDCConfig.cell_suppression_threshold default; the
+        # runtime library has no direct access to the runner-side
+        # config object.
+        _CELL_SUPPRESSION_THRESHOLD = 10
+        # Cap how many categorical bars can land on the plot — a
+        # 200-level bar chart isn't readable AND multiplies the
+        # data-channel surface through tick labels.
+        _CATEGORICAL_LEVEL_CAP = 20
+        suppression_note: str | None = None
         if is_numeric:
-            grid = _np.linspace(float(col.min()), float(col.max()), 100)
+            cleaned = col.dropna()
+            if len(cleaned) < _CELL_SUPPRESSION_THRESHOLD:
+                _helper_failed(
+                    "plot_interaction",
+                    f"variable {var!r} has fewer than "
+                    f"{_CELL_SUPPRESSION_THRESHOLD} non-missing "
+                    f"observations; below the disclosure threshold",
+                )
+                return
+            mu = float(cleaned.mean())
+            sd = float(cleaned.std(ddof=1)) if len(cleaned) > 1 else 0.0
+            if not _np.isfinite(sd) or sd <= 0:
+                # Constant variable or single observation — nothing
+                # meaningful to plot, and reading min would expose
+                # the constant value.
+                _helper_failed(
+                    "plot_interaction",
+                    f"variable {var!r} has zero variance — interaction "
+                    f"plot would expose the constant value",
+                )
+                return
+            grid = _np.linspace(mu - 2.0 * sd, mu + 2.0 * sd, 100)
         else:
-            grid = list(col.dropna().unique())
+            cleaned = col.dropna()
+            counts = cleaned.value_counts()
+            # Drop rare levels (below threshold). Their identities are
+            # disclosive even if the bar height is masked, same as the
+            # frequency_table primary suppression rule.
+            visible = counts[counts >= _CELL_SUPPRESSION_THRESHOLD]
+            if visible.empty:
+                _helper_failed(
+                    "plot_interaction",
+                    f"variable {var!r}: no level meets the disclosure "
+                    f"threshold (n >= {_CELL_SUPPRESSION_THRESHOLD}); "
+                    f"refusing to plot",
+                )
+                return
+            # Keep top-K most frequent levels for readability.
+            visible = visible.head(_CATEGORICAL_LEVEL_CAP)
+            grid = list(visible.index)
+            dropped = int((counts < _CELL_SUPPRESSION_THRESHOLD).sum())
+            if dropped > 0:
+                suppression_note = (
+                    f"{dropped} rare level(s) with count < "
+                    f"{_CELL_SUPPRESSION_THRESHOLD} suppressed"
+                )
 
         template = {}
         for c in data.columns:
@@ -1200,16 +1279,43 @@ def plot_interaction(
             # the user called out as a "really shitty" rendering.
             ax.fill_between(grid, lo, hi, color="#4C78A8", alpha=0.20)
             ax.plot(grid, mean, lw=2, color="#1F4E79")
+            # Strip numeric x-axis tick labels: the absolute values
+            # ARE data (mean ± 2σ for var). The disclosure-safe pair
+            # is mean+sd, which goes through the descriptive
+            # sanitizer with its own gates. Show only relative
+            # anchors so the model can read the curve's shape
+            # without reading the raw mean / sd off the axis.
+            ax.set_xticks([
+                grid[0], (grid[0] + grid[-1]) / 2.0, grid[-1]
+            ])
+            ax.set_xticklabels(["−2σ", "mean", "+2σ"])
         else:
             xs = _np.arange(len(grid))
             ax.bar(xs, mean, yerr=[mean - lo, hi - mean],
                    color="#4C78A8", edgecolor="#1F4E79",
                    capsize=4)
             ax.set_xticks(xs)
-            ax.set_xticklabels([str(g) for g in grid])
+            # Cap label length per tick. A category's name IS data
+            # (e.g. "engineering", "diabetes"); below-threshold
+            # rare levels are already filtered above, but apply a
+            # length cap as defence-in-depth so a long sensitive
+            # string at a frequent-level position can't ride
+            # through unbounded.
+            def _trim(s: str, lim: int = 24) -> str:
+                t = str(s)
+                return t if len(t) <= lim else (t[:lim - 1] + "…")
+            ax.set_xticklabels([_trim(g) for g in grid], rotation=30, ha="right")
         ax.set_xlabel(xtitle)
         ax.set_ylabel(ytitle)
         ax.set_title(ptitle, fontweight="bold")
+        if suppression_note:
+            # Caption-style note so the model sees that some levels
+            # were suppressed without seeing which ones.
+            fig.text(
+                0.99, 0.01, suppression_note,
+                ha="right", va="bottom",
+                fontsize=8, color="#666666",
+            )
         ax.spines["top"].set_visible(False)
         ax.spines["right"].set_visible(False)
         ax.grid(axis="y", alpha=0.25)

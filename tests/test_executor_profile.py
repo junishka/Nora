@@ -60,8 +60,8 @@ def test_no_broad_private_read_subpath(example_profile: str):
 
 def test_narrow_private_subpaths_present(example_profile: str):
     """The specific /private subtrees R/Stata actually need must be
-    allowed — otherwise the interpreter can't resolve user/group IDs,
-    load timezone data, or stage $TMPDIR scratch files.
+    allowed — otherwise the interpreter can't resolve user/group IDs
+    and load timezone data.
 
     NB: `/private/etc` is NOT a subpath here — specific config files
     are allowed via `read_literals` instead (see
@@ -70,13 +70,31 @@ def test_narrow_private_subpaths_present(example_profile: str):
     R/Stata startup.
     """
     required = [
-        '(subpath "/private/tmp")',
         '(subpath "/private/var/db/dslocal")',
         '(subpath "/private/var/db/timezone")',
-        '(subpath "/private/var/folders")',
     ]
     for entry in required:
         assert entry in example_profile, f"missing required allow: {entry}"
+
+
+def test_broad_temp_subpaths_absent(example_profile: str):
+    """`/private/tmp` and `/private/var/folders` must NOT be in the
+    read or write allowlist as broad subpaths. Those trees hold
+    scratch files from every other app the same user is running
+    (Slack, Cursor, Chrome cache); granting subpath read there let
+    a model-authored script grep cross-app secrets and smuggle
+    excerpts through any surviving channel. The executor sets
+    TMPDIR=<run_dir>/tmp for the subprocess so R/Stata/Python's
+    tempfile module lands inside the run-dir allow without needing
+    the broad temp roots.
+    """
+    forbidden = [
+        '(subpath "/private/tmp")',
+        '(subpath "/private/var/folders")',
+        '(subpath "/tmp")',
+    ]
+    for entry in forbidden:
+        assert entry not in example_profile, f"forbidden broad temp allow: {entry}"
 
 
 def test_no_broad_private_etc_subpath(example_profile: str):

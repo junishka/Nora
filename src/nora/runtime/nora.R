@@ -665,8 +665,16 @@ nora$.plots_dir <- function() {
 nora$.append_plot_manifest <- function(file, kind, label) {
   d <- nora$.plots_dir()
   if (is.null(d)) return(invisible(NULL))
+  # Stamp every entry with the per-run token. The executor validates
+  # this field after the script finishes and drops any entry whose
+  # token is missing or wrong; that strips manifest rows a script
+  # could otherwise have appended directly (saving a raw-data plot
+  # under _nora_plots/ and labeling it "coefficients" to slip past
+  # the disclosure-control allowlist for vision attachment). Same
+  # posture as the result-payload _token field.
   entry <- list(file = file, kind = kind)
   if (!is.null(label) && nzchar(label)) entry$label <- label
+  entry[["_token"]] <- nora$.run_token
   line <- nora$.to_json(entry)
   con <- file(file.path(d, "manifest.jsonl"), open = "a", encoding = "UTF-8")
   on.exit(close(con), add = TRUE)
@@ -770,12 +778,62 @@ nora$plot_interaction <- function(model, var, label = NULL,
       else                    template[[col]] <- v[1]
     }
     xs <- md[[var]]
+    # Disclosure-control: the rendered PNG is allowlisted for model
+    # vision (kind="interaction"), so anything legible on the x-axis
+    # crosses the SDC boundary. The previous version used min/max
+    # (numeric) and full level lists (factor/categorical), which
+    # surfaced raw extrema and rare-level identities the JSON
+    # sanitizer would have refused. Match the Python helper's
+    # disclosure-safe grid:
+    #   - numeric: mean ± 2*sd; equivalent to the descriptive
+    #     sanitizer's already-allowed mean+sd disclosure. Refuse
+    #     when N is below threshold or variance is zero.
+    #   - factor / categorical: drop levels with count below
+    #     threshold; refuse when none remain.
+    .CELL_SUPP_THRESH <- 10L
+    .CAT_LEVEL_CAP <- 20L
+    .suppression_note <- NULL
     if (is.numeric(xs)) {
-      grid <- seq(min(xs, na.rm = TRUE), max(xs, na.rm = TRUE), length.out = 100)
-    } else if (is.factor(xs)) {
-      grid <- factor(levels(xs), levels = levels(xs))
+      .clean <- xs[!is.na(xs)]
+      if (length(.clean) < .CELL_SUPP_THRESH) {
+        stop("variable '", var, "' has fewer than ", .CELL_SUPP_THRESH,
+             " non-missing observations; below the disclosure threshold")
+      }
+      .mu <- mean(.clean)
+      .sd <- stats::sd(.clean)
+      if (!is.finite(.sd) || .sd <= 0) {
+        stop("variable '", var,
+             "' has zero variance — interaction plot would expose ",
+             "the constant value")
+      }
+      grid <- seq(.mu - 2 * .sd, .mu + 2 * .sd, length.out = 100)
     } else {
-      grid <- unique(xs)
+      .clean <- xs[!is.na(xs)]
+      .counts <- table(.clean)
+      .visible <- .counts[.counts >= .CELL_SUPP_THRESH]
+      if (length(.visible) == 0) {
+        stop("variable '", var,
+             "': no level meets the disclosure threshold (n >= ",
+             .CELL_SUPP_THRESH, "); refusing to plot")
+      }
+      # Sort by frequency desc, keep top-K for readability.
+      .visible <- sort(.visible, decreasing = TRUE)
+      if (length(.visible) > .CAT_LEVEL_CAP) {
+        .visible <- .visible[seq_len(.CAT_LEVEL_CAP)]
+      }
+      .keep_levels <- names(.visible)
+      .dropped <- as.integer(sum(.counts < .CELL_SUPP_THRESH))
+      if (.dropped > 0) {
+        .suppression_note <- paste0(
+          .dropped, " rare level(s) with count < ",
+          .CELL_SUPP_THRESH, " suppressed"
+        )
+      }
+      if (is.factor(xs)) {
+        grid <- factor(.keep_levels, levels = levels(xs))
+      } else {
+        grid <- .keep_levels
+      }
     }
     new <- template[rep(1, length(grid)), , drop = FALSE]
     new[[var]] <- grid
