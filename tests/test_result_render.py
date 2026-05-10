@@ -1118,14 +1118,22 @@ def test_compose_results_tool_cross_session_lookup(
         reset_store_for_tests()
 
 
-def test_compose_results_tool_flags_cross_session_rid_collision(
+def test_compose_results_tool_rejects_cross_session_rid_collision(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """When two rows reference the same ``result_id`` in different
     sessions, the layout's payload dict is keyed by rid alone — one
-    payload silently overwrites the other. The tool flags this in
-    ``rid_collisions_across_sessions`` so the model can rename one
-    of them and re-emit instead of trusting a confused render."""
+    payload would silently overwrite the other and the rendered
+    table would show the wrong numbers under that row's label.
+
+    Earlier behavior surfaced a ``rid_collisions_across_sessions``
+    hint alongside ``status: ok`` and a wrong-data render; the model
+    only learned about the collision after the bad markdown had
+    already crossed. The tool now hard-rejects with ``status:
+    error`` BEFORE rendering — the model has to disambiguate (use
+    ``session_path`` on one of the rows, or rename one of the
+    source results) before any wrong numbers cross.
+    """
     sessions_root = tmp_path / ".nora-sessions"
     sessions_root.mkdir()
     sess_a = sessions_root / "20260101T000000Z_aaa"
@@ -1176,9 +1184,11 @@ def test_compose_results_tool_flags_cross_session_rid_collision(
                 },
             }))
         body = _mcp_text(res)
-        assert body["status"] == "ok"
+        assert body["status"] == "error"
         assert m_a.id in body["rid_collisions_across_sessions"]
-        assert "distinct" in body["hint"] or "split" in body["hint"]
+        # No markdown was rendered — the model never sees confused
+        # cells under this id.
+        assert "markdown" not in body
     finally:
         reset_store_for_tests()
 

@@ -492,10 +492,28 @@ def build_context_prefix(
     # model can match a question ("that OLS we ran") to an id and
     # call expand_result for the numbers.
     results_lines: list[str] = []
+    # Re-sanitize ``label`` and ``analysis_type`` at READ time as
+    # well as at insert time. Insert-time sanitization handles new
+    # rows, but the warm-start prefix re-renders rows that may have
+    # been written by an older Nora binary (pre-sanitization), or by
+    # a partially-corrupted DB write. Without a read-time pass, a
+    # legacy row carrying raw newlines / "[system] override:" /
+    # bidi-overrides in its ``label`` would land verbatim in the
+    # next-turn prompt prefix and either inject instructions or
+    # smuggle data the model otherwise wouldn't see. Trust-on-read
+    # symmetry with the in-memory tool-label path (``_cap_label``
+    # above) keeps the prompt boundary consistent regardless of how
+    # old the underlying row is.
+    from nora.text_safety import safe_text, safe_key
     for r in rows_with_ts[:MAX_RESULTS]:
         rid = str(getattr(r, "id", "") or "")
-        label = str(getattr(r, "label", "") or "")
-        atype = str(getattr(r, "analysis_type", "") or "")
+        raw_label = str(getattr(r, "label", "") or "")
+        raw_atype = str(getattr(r, "analysis_type", "") or "")
+        label = safe_text(raw_label, max_len=TOOL_LABEL_CAP)
+        # ``analysis_type`` is a parser-controlled identifier
+        # (linear_regression, frequency_table, …) — narrow
+        # ``safe_key`` cap is correct here.
+        atype = safe_key(raw_atype) if raw_atype else ""
         atype_tag = f" [{atype}]" if atype else ""
         results_lines.append(f"  - {rid}: {label}{atype_tag}")
     if len(rows_with_ts) > MAX_RESULTS:

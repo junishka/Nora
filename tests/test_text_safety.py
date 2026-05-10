@@ -122,6 +122,41 @@ def test_neutralizes_zero_width():
     assert out == "legitname"
 
 
+def test_neutralizes_variation_selector():
+    # U+FE0F is the visible-style variation selector. Invisible to a
+    # human reading the cell label but survives length truncation and
+    # round-trips through JSON, so a label like ``salary\uFE0F`` looks
+    # benign to a researcher and feeds an extra byte into a covert
+    # channel. Strip it so the label the model sees is the same one
+    # the researcher sees.
+    payload = "salary\uFE0F"
+    out = safe_text(payload)
+    assert "\uFE0F" not in out
+    assert out == "salary"
+
+
+def test_neutralizes_supplementary_variation_selector():
+    # U+E0100 (VS17) lives on the astral plane and would slip past a
+    # naive BMP-only strip. Verify the regex's \U escape catches it.
+    payload = "x\U000E0100y"
+    out = safe_text(payload)
+    assert "\U000E0100" not in out
+    assert out == "xy"
+
+
+def test_neutralizes_tag_characters():
+    # Tag characters U+E0020..U+E007E mirror printable ASCII as
+    # invisible glyphs \u2014 the canonical "smuggle a prompt-injection
+    # payload alongside a benign label" vector. ``label`` plus three
+    # ASCII-tag bytes (E0048 'H', E0049 'I', E0021 '!') should reduce
+    # back to ``label``.
+    payload = "label\U000E0048\U000E0049\U000E0021"
+    out = safe_text(payload)
+    for cp in (0xE0048, 0xE0049, 0xE0021):
+        assert chr(cp) not in out
+    assert out == "label"
+
+
 def test_truncation_marker_visible():
     out = safe_text("a" * 200)
     assert "[TRUNCATED]" in out

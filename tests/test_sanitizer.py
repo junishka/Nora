@@ -1315,6 +1315,92 @@ def test_crosstab_suppressed_cell_labels_bucketed() -> None:
     assert result.sanitized["suppressed_row_count"] == 1
 
 
+def test_crosstab_strips_missing_count_when_single_cell_suppressed() -> None:
+    """Cross-query back-calc closure: when exactly one cell is
+    suppressed and no row was fully dropped, the surviving row's
+    ``[suppressed]`` bucket carries that single cell's count alone.
+    The model can ask a separate ``descriptive`` query for ``N``,
+    then compute ``bucket = (N - missing_count) - sum(visible)`` and
+    recover the suppressed cell exactly. ``missing_count`` is the
+    only handle the model has into the crosstab's grand total (``n``
+    is already in ``_XTAB_FORBIDDEN_MARGIN_FIELDS``), so the fix is
+    to drop ``missing_count`` in this configuration. Mirrors the
+    freq-table guard that strips ``n`` and ``missing_count`` for the
+    in-payload version of the same trivial back-calc.
+    """
+    result = sanitize({
+        "type": "crosstab",
+        "row_variable": "diagnosis",
+        "col_variable": "outcome",
+        "missing_count": 12,
+        "counts": {
+            # Exactly one cell below threshold; row is otherwise
+            # fully visible, so the row label and column structure
+            # are published intact.
+            "common_condition": {
+                "recovered": 200, "died": 150, "rare_outcome": 3,
+            },
+            "another_condition": {
+                "recovered": 50, "died": 30, "rare_outcome": 25,
+            },
+        },
+    })
+    assert result.ok
+    assert result.sanitized["suppressed_cell_count"] == 1
+    # No row was fully suppressed — the unsafe configuration.
+    assert result.sanitized.get("suppressed_row_count", 0) == 0
+    # missing_count must be gone from the published payload.
+    assert "missing_count" not in result.sanitized
+    # And the transformation log must explain why so the researcher
+    # can audit the SDC step in the run summary.
+    log_text = " ".join(result.transformations)
+    assert "missing_count" in log_text
+    assert "back-calculable" in log_text or "back-calc" in log_text
+
+
+def test_crosstab_keeps_missing_count_when_no_suppression() -> None:
+    """The strip is targeted: a clean crosstab with no suppressed
+    cells leaves ``missing_count`` intact so the model still gets
+    completeness signal on uncomplicated tables."""
+    result = sanitize({
+        "type": "crosstab",
+        "row_variable": "region",
+        "col_variable": "outcome",
+        "missing_count": 7,
+        "counts": {
+            "north": {"recovered": 200, "died": 150},
+            "south": {"recovered": 180, "died": 120},
+        },
+    })
+    assert result.ok
+    assert result.sanitized.get("suppressed_cell_count", 0) == 0
+    assert result.sanitized.get("missing_count") == 7
+
+
+def test_crosstab_keeps_missing_count_when_multi_cell_suppressed_in_one_row() -> None:
+    """When a row's ``[suppressed]`` bucket aggregates two or more
+    suppressed cells, the bucket is no longer a single value —
+    ``missing_count + N`` only constrains the bucket SUM, leaving
+    individual cells underdetermined. Stripping ``missing_count``
+    here would over-protect; keep it for utility."""
+    result = sanitize({
+        "type": "crosstab",
+        "row_variable": "diagnosis",
+        "col_variable": "outcome",
+        "missing_count": 4,
+        "counts": {
+            # Two cells in one row are below threshold (bucketed
+            # together), one cell visible.
+            "common_condition": {"a": 200, "rare_x": 2, "rare_y": 3},
+            "another_condition": {"a": 50, "rare_x": 25, "rare_y": 30},
+        },
+    })
+    assert result.ok
+    assert result.sanitized["suppressed_cell_count"] == 2
+    # Multi-cell bucket, missing_count safe to expose.
+    assert result.sanitized.get("missing_count") == 4
+
+
 def test_magnitude_table_suppressed_group_labels_bucketed() -> None:
     """Magnitude table: groups with n < threshold or dominance
     failure are bucketed under ``[suppressed]`` so the group label

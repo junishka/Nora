@@ -47,7 +47,26 @@ _TINY_PNG = base64.b64decode(
 
 
 def _call(name: str) -> dict:
-    """Run the @tool-decorated handler and return its content payload."""
+    """Run the @tool-decorated handler and return its content payload.
+
+    Snapshots the active cwd's top-level files into the
+    ``file_provenance`` manifest right before the call so any
+    test fixture that wrote a file directly to ``tmp_path``
+    behaves the same as a bridge-staged file. The
+    ``read_attached_file`` SDC gate refuses cwd top-level files
+    that aren't in the manifest (the ``model-script-wrote-it``
+    side channel); these tests exercise the legitimate
+    researcher-staged path, so the manifest snapshot before each
+    call makes the legitimate-staging contract explicit at the
+    test boundary instead of forcing every individual test to
+    drive the bridge layer.
+    """
+    from nora.config import get_cwd
+    from nora.file_provenance import initialize as _init_staged
+    try:
+        _init_staged(get_cwd())
+    except Exception:  # noqa: BLE001 — manifest is best-effort
+        pass
     return asyncio.run(read_attached_file.handler({"name": name}))
 
 
@@ -62,6 +81,54 @@ def _text_payload(result: dict) -> dict:
 # ---------------------------------------------------------------------------
 # Scripts
 # ---------------------------------------------------------------------------
+
+def test_unstaged_cwd_script_rejected_as_sdc_bypass(tmp_path: Path) -> None:
+    """SDC closure: the analysis sandbox at ``executor.py``
+    intentionally lets scripts write to cwd (``saveRDS`` /
+    ``df.to_csv`` / ``save "panel.dta"`` are normal workflow). A
+    model-authored script can abuse that by writing raw row values
+    into a script-shaped file (``data_dump.R``) and then asking
+    ``read_attached_file`` to return its bytes — round-tripping
+    individual observations past every other SDC gate. The
+    provenance manifest at ``<cwd>/.nora/staged_files.json`` tracks
+    only files the BRIDGE staged on behalf of the researcher
+    (initial cwd snapshot at session-open + each ``add_files`` /
+    ``add_files_from_blobs`` / ``upload_files`` event); cwd
+    top-level scripts that aren't in the manifest are presumed
+    sandbox-output and refused.
+
+    Simulate the attack by writing the file directly (mimicking
+    the script's write path) WITHOUT running ``initialize`` over
+    the test cwd, then asking the tool to read it. The call must
+    return ``status: rejected`` with a hint that points the model
+    at the chat composer.
+    """
+    from nora.config import set_cwd as _set_cwd
+    _set_cwd(tmp_path)
+    # Pretend a sandboxed run wrote this. ``read_attached_file``'s
+    # _call helper above re-snapshots the manifest BEFORE every
+    # call to make the legitimate researcher-staged path painless;
+    # bypass that helper here so the file is genuinely unstaged.
+    (tmp_path / "smuggled.R").write_text(
+        "# pretend this is data dumped by a sandboxed run\n"
+        "secret_ssn <- '123-45-6789'\n",
+        encoding="utf-8",
+    )
+    response = asyncio.run(read_attached_file.handler({"name": "smuggled.R"}))
+    body = _text_payload(response)
+    assert body["status"] == "rejected"
+    assert "smuggled.R" in body["reason"]
+    # The hint must direct the model to the legitimate path so it
+    # can recover instead of repeatedly re-trying.
+    assert (
+        "chat composer" in body["reason"]
+        or "drop or paste" in body["reason"]
+        or "researcher-staged" in body["reason"]
+    )
+    # Critical: NO bytes from the file must appear in the response.
+    assert "secret_ssn" not in json.dumps(body)
+    assert "123-45-6789" not in json.dumps(body)
+
 
 def test_script_text_returned_inline(tmp_path: Path) -> None:
     set_cwd(tmp_path)

@@ -14,6 +14,7 @@ path loads real data. Invariants to hold:
 
 from __future__ import annotations
 
+import tempfile
 from pathlib import Path
 
 import numpy as np
@@ -339,9 +340,43 @@ def test_quartiles_returns_p25_p75_iqr(sample_csv: Path):
     # Median is the disclosive single-observation field at row level.
     assert "percentile_50" not in r.answer
     assert "median" not in r.answer
-    # IQR is consistent with the percentiles modulo precision-clamp
-    # rounding (both rounded independently).
     assert r.answer["percentile_25"] <= r.answer["percentile_75"]
+
+
+def test_quartiles_iqr_is_difference_of_published_percentiles():
+    """IQR must equal published p75 − published p25 exactly.
+
+    Independently rounding the three values over-determines the system
+    — comparing ``rounded(q75) - rounded(q25)`` against an
+    independently-rounded IQR can recover ~1 extra bit of precision
+    per quartile from the disagreement. The fix is to publish IQR as
+    the difference of the rounded percentiles, so the three numbers
+    are mutually consistent at the published precision and the
+    comparison no longer carries information.
+
+    Use values where independent rounding would mismatch: ``q25=12.4``
+    rounds to 12, ``q75=27.6`` rounds to 28, but their raw difference
+    ``15.2`` rounds to 15 — under independent rounding the model would
+    see ``28 - 12 = 16`` ≠ ``15``, leaking one bit. After the fix the
+    published triple is ``(12, 28, 16)``, internally consistent.
+    """
+    n = 200
+    values = [12.4] * (n // 2) + [27.6] * (n // 2)
+    df = pd.DataFrame({"v": values})
+    p = Path(tempfile.NamedTemporaryFile(suffix=".csv", delete=False).name)
+    try:
+        df.to_csv(p, index=False)
+        r = handle(p, "quartiles", "v")
+    finally:
+        p.unlink(missing_ok=True)
+    assert r.status == "granted", r.reason
+    p25 = r.answer["percentile_25"]
+    p75 = r.answer["percentile_75"]
+    iqr = r.answer["iqr"]
+    assert iqr == p75 - p25, (
+        f"IQR {iqr} must equal p75 ({p75}) − p25 ({p25}) exactly to "
+        f"avoid leaking the rounding-disagreement bit."
+    )
 
 
 def test_quartiles_rejects_non_numeric(sample_csv: Path):

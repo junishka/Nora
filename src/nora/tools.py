@@ -1905,6 +1905,52 @@ async def submit_script_file(args: dict[str, Any]) -> dict[str, Any]:
             "reason": f"no script named {safe_name!r} in this session",
         }))
 
+    # SDC provenance gate. Same rationale as ``read_attached_file``:
+    # the script sandbox lets a run write to cwd, and a script that
+    # wrote raw rows into a ``.R`` / ``.do`` / ``.py`` file would
+    # otherwise be re-runnable through here, with the file's bytes
+    # crossing into the executor's run-dir staging copy AND the
+    # store's ``script_code`` column verbatim. ``<cwd>/.nora/runs/``
+    # is exempt — Nora-written wrapper scripts are safe by
+    # construction (and ``find_run_dir_script_by_name`` above is the
+    # only way ``submit_script_file`` reaches them).
+    try:
+        cwd_for_check = get_cwd()
+        resolved_target = target.resolve()
+        cwd_resolved = cwd_for_check.resolve()
+    except OSError:
+        cwd_for_check = get_cwd()
+        resolved_target = target
+        cwd_resolved = cwd_for_check
+    nora_subdir = (cwd_resolved / ".nora").resolve() if cwd_resolved.exists() else cwd_resolved / ".nora"
+    is_under_nora = False
+    try:
+        is_under_nora = resolved_target.is_relative_to(nora_subdir)
+    except (ValueError, OSError):
+        is_under_nora = False
+    if not is_under_nora:
+        try:
+            from nora.file_provenance import is_known
+            staged_ok = is_known(cwd_for_check, resolved_target.name)
+        except Exception:  # noqa: BLE001 — manifest must not break runs
+            staged_ok = True
+        if not staged_ok:
+            return _as_mcp_text(_with_zero_phase_metadata({
+                "status": "rejected",
+                "reason": (
+                    f"{safe_name!r} is not in this session's staged-"
+                    f"files manifest, so I cannot run it. The "
+                    f"analysis sandbox intentionally lets scripts "
+                    f"write to your cwd; a script-shaped file that "
+                    f"appeared via that path may carry data the "
+                    f"researcher never authorised me to re-execute. "
+                    f"Re-attach it via the chat composer (drop or "
+                    f"paste it into the message box) to mark it as "
+                    f"researcher-staged, or paste its contents "
+                    f"inline with submit_script."
+                ),
+            }, language=None))
+
     ext = target.suffix.lower()
     inferred_language = _SCRIPT_FILE_LANGUAGES.get(ext)
     if inferred_language is None:
@@ -2355,11 +2401,42 @@ async def compose_results(args: dict[str, Any]) -> dict[str, Any]:
             if rid in payloads_by_id and payloads_by_id[rid] is not row_obj.sanitized_payload:
                 # Same rid resolved to different payloads from
                 # different sessions. The layout can only key cells
-                # by rid, so the second one would silently overwrite.
-                # Flag explicitly so the model can rename one of
-                # them and re-emit.
+                # by rid, so the second payload would silently
+                # overwrite the first AND the rendered table would
+                # show the wrong numbers under that row's label
+                # before the model ever saw the collision hint.
+                # Flag for the rejection check below.
                 collisions.append(rid)
-            payloads_by_id[rid] = row_obj.sanitized_payload
+            else:
+                payloads_by_id[rid] = row_obj.sanitized_payload
+
+    # Hard-reject the spec when ANY rid resolves to two different
+    # cross-session payloads. Earlier behavior assigned the second
+    # payload anyway (last-write-wins) and only emitted a hint
+    # alongside ``status: ok``, which meant the markdown the model
+    # received was already wrong by the time the hint advised it to
+    # rename. Returning ``status: error`` before rendering forces
+    # the model to disambiguate (use ``session_path`` on one of the
+    # rows, or rename one of the source results) before any wrong
+    # numbers cross.
+    if collisions:
+        unique_collisions = sorted(set(collisions))
+        return _as_mcp_text({
+            "status": "error",
+            "reason": (
+                f"{len(unique_collisions)} result_id(s) resolved to "
+                f"different payloads across sessions: "
+                f"{unique_collisions}. compose_results keys cells by "
+                f"result_id alone, so a colliding pair would render "
+                f"with the wrong numbers under whichever row "
+                f"appeared last. Disambiguate by (a) adding an "
+                f"explicit ``session_path`` to one of the rows so the "
+                f"renderer can resolve them distinctly, or (b) "
+                f"renaming one of the source results so the IDs no "
+                f"longer collide."
+            ),
+            "rid_collisions_across_sessions": unique_collisions,
+        })
 
     from nora.result_render import compose_layout
     markdown = compose_layout(spec, payloads_by_id)
@@ -2412,20 +2489,12 @@ async def compose_results(args: dict[str, Any]) -> dict[str, Any]:
             f"{response['hint']}\n{gate_msg}".strip()
             if response["hint"] else gate_msg
         )
-    if collisions:
-        response["rid_collisions_across_sessions"] = sorted(set(collisions))
-        response.setdefault("hint", "")
-        coll_msg = (
-            f"{len(set(collisions))} result_id(s) collided across "
-            f"different sessions; the layout keys cells by result_id "
-            f"alone, so one payload silently overwrote another. Pick "
-            f"distinct labels in the spec or split into two compose "
-            f"calls."
-        )
-        response["hint"] = (
-            f"{response['hint']}\n{coll_msg}".strip()
-            if response["hint"] else coll_msg
-        )
+    # ``collisions`` was previously surfaced as a post-render hint
+    # alongside ``status: ok``. The compose path now returns early
+    # with ``status: error`` on any cross-session rid collision (see
+    # the rejection block above ``compose_layout``), so by the time
+    # we reach this response builder ``collisions`` is empty by
+    # construction.
     return _as_mcp_text(response)
 
 
@@ -2458,6 +2527,14 @@ async def list_results(args: dict[str, Any]) -> dict[str, Any]:
     # Newest first: list_all returns chronological ASC, so reverse.
     newest_first = list(reversed(all_rows))[:limit]
     truncated = total > limit
+    # Re-sanitize ``label`` and ``analysis_type`` at READ time. New
+    # rows are sanitized at insert; legacy rows from older Nora
+    # binaries (pre-sanitization) or partially-corrupted writes
+    # could otherwise carry raw bidi/zero-width/control chars or
+    # ``[system] override:`` text into the listing the model sees.
+    # Mirrors the parallel guard in ``chat_history.build_context_prefix``
+    # for warm-start replay.
+    from nora.text_safety import safe_text, safe_key
     return _as_mcp_text({
         "status": "ok",
         "total": total,
@@ -2467,8 +2544,10 @@ async def list_results(args: dict[str, Any]) -> dict[str, Any]:
         "results": [
             {
                 "id": r.id,
-                "label": r.label,
-                "analysis_type": r.analysis_type,
+                "label": safe_text(r.label or ""),
+                "analysis_type": (
+                    safe_key(r.analysis_type) if r.analysis_type else ""
+                ),
                 "created_at": r.created_at,
             }
             for r in newest_first
@@ -2572,9 +2651,24 @@ async def list_results_global(args: dict[str, Any]) -> dict[str, Any]:
                     pass
             continue
         try:
+            # Re-sanitize ``label`` and ``analysis_type`` at READ
+            # time. New rows are sanitized at insert; legacy rows
+            # from older Nora binaries (pre-sanitization) or
+            # partially-corrupted writes could otherwise carry raw
+            # bidi/zero-width/control chars or ``[system] override:``
+            # text into the cross-session listing the model sees.
+            # Same guard as ``list_results`` and the warm-start
+            # prefix.
+            from nora.text_safety import safe_text, safe_key
             for r in rows:
-                label = r.label or ""
-                atype = r.analysis_type or ""
+                raw_label = r.label or ""
+                raw_atype = r.analysis_type or ""
+                # Run the query match against the sanitized values
+                # too, so a pre-sanitization legacy row can't be
+                # surfaced (or hidden) by control chars in its
+                # original label.
+                label = safe_text(raw_label)
+                atype = safe_key(raw_atype) if raw_atype else ""
                 if (
                     query
                     and query not in label.lower()
@@ -3101,6 +3195,58 @@ async def read_attached_file(args: dict[str, Any]) -> dict[str, Any]:
             "status": "not_found",
             "reason": f"no file named {safe_name!r} in this session",
         })
+
+    # SDC provenance gate for cwd top-level files. The script
+    # sandbox at ``executor.py`` allows writes to cwd by design
+    # (``saveRDS``, ``df.to_csv``, ``save "panel.dta"`` are part of
+    # the normal workflow), but a model-authored script can also
+    # write raw row values into a script- or notebook-shaped file
+    # and recall it through this tool — bypassing every other SDC
+    # gate. The ``file_provenance`` manifest tracks every cwd
+    # top-level file the BRIDGE knows the researcher staged
+    # (initial cwd snapshot at session-open + each ``add_files`` /
+    # ``add_files_from_blobs`` / ``upload_files`` event). Anything
+    # in cwd top-level that isn't in the manifest is presumed
+    # sandbox-output and refused. Files under ``<cwd>/.nora/runs/``
+    # are exempt — those are Nora-controlled (the wrapper script
+    # the executor wrote and the manifest-allowlisted helper plots),
+    # and the runs-dir fallbacks above already enforce their own
+    # rewind / manifest checks.
+    try:
+        resolved_target = target.resolve()
+        cwd_resolved = cwd.resolve()
+    except OSError:
+        resolved_target = target
+        cwd_resolved = cwd
+    nora_subdir = (cwd_resolved / ".nora").resolve() if cwd_resolved.exists() else cwd_resolved / ".nora"
+    is_under_nora = False
+    try:
+        is_under_nora = resolved_target.is_relative_to(nora_subdir)
+    except (ValueError, OSError):
+        is_under_nora = False
+    if not is_under_nora:
+        try:
+            from nora.file_provenance import is_known
+            staged_ok = is_known(cwd, resolved_target.name)
+        except Exception:  # noqa: BLE001 — manifest must not break recall
+            staged_ok = True
+        if not staged_ok:
+            return _as_mcp_text({
+                "status": "rejected",
+                "reason": (
+                    f"{safe_name!r} is not in this session's staged-"
+                    f"files manifest, so I (the model) cannot read it. "
+                    f"This guard exists because the analysis sandbox "
+                    f"intentionally lets scripts write to your cwd, "
+                    f"and a script that wrote raw rows into a "
+                    f"script-shaped file would otherwise round-trip "
+                    f"the data back through this tool — bypassing the "
+                    f"SDC sanitizer. To make this file readable, "
+                    f"please re-attach it via the chat composer "
+                    f"(drop or paste it into the message box) so the "
+                    f"bridge marks it as researcher-staged."
+                ),
+            })
 
     ext = target.suffix.lower()
 

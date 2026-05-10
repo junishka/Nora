@@ -1349,6 +1349,35 @@ def _sanitize_crosstab(
         out["suppressed_row_count"] = suppressed_row_count
     if suppressed_cell_count:
         out["suppressed_cell_count"] = suppressed_cell_count
+
+    # Strip ``missing_count`` when the cross-query back-calc is trivial.
+    # ``n`` is already in ``_XTAB_FORBIDDEN_MARGIN_FIELDS`` so the
+    # crosstab payload alone never exposes the grand total — but the
+    # model can derive ``N`` from a separate descriptive query, then
+    # compute ``sum(suppressed) = (N - missing_count) - sum(visible)``.
+    # The unsafe configuration is "exactly one cell suppressed AND no
+    # row was fully dropped": the surviving row's ``[suppressed]``
+    # bucket then contains exactly that cell's count, the bucket sum
+    # equals ``(N - missing_count) - sum(visible)`` exactly, and the
+    # row label is published, so a single arithmetic step recovers the
+    # cell. Mirrors the freq-table guard at ``_sanitize_frequency_table``
+    # which drops both ``n`` and ``missing_count`` for the analogous
+    # in-payload case. With a fully-dropped row in the mix, the dropped
+    # row's cells contribute to the same sum but can't be separated, so
+    # the cleanly-recoverable case requires ``suppressed_row_count == 0``.
+    if (
+        suppressed_cell_count == 1
+        and suppressed_row_count == 0
+        and "missing_count" in out
+    ):
+        out.pop("missing_count", None)
+        transformations.append(
+            "stripped missing_count: exactly one cell was suppressed "
+            "and no row was dropped, so the published "
+            "'[suppressed]' bucket would have been back-calculable "
+            "from missing_count plus an externally-known N"
+        )
+
     out["counts"] = nested
 
     return SanitizerResult(

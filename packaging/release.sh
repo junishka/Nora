@@ -314,6 +314,29 @@ if [[ "$APP_ONLY" == "false" ]] && [[ -f "$DMG" ]]; then
         echo "    xcrun stapler validate \"$DMG\"" >&2
         exit 1
     fi
+
+    # Emit a SHA-256 sidecar file alongside the .dmg. Researchers and
+    # downstream packagers (homebrew-cask, internal IT distribution,
+    # mirrors) need a way to verify the binary they got matches what
+    # we shipped. Apple's notarization signs the bundle but doesn't
+    # publish a per-release fingerprint anyone can check from the
+    # outside, and Gatekeeper only catches "Apple no longer trusts
+    # this developer" — not "the .dmg was modified after we built
+    # it." A SHA-256 in the same dist directory is the conventional
+    # fix; ``shasum -a 256`` ships with macOS so there's no toolchain
+    # cost. The ``.sha256`` file format mirrors what GitHub Releases
+    # accepts so users can ``shasum -a 256 -c Nora.dmg.sha256`` after
+    # downloading both. Recompute on every release so the file always
+    # corresponds to the .dmg next to it.
+    SHA256_FILE="$DMG.sha256"
+    # ``shasum`` writes ``<hash>  <path>``; rewrite to use the
+    # basename so verification works regardless of where the user
+    # downloaded the artifacts to.
+    DMG_BASENAME="$(basename "$DMG")"
+    DMG_HASH="$(/usr/bin/shasum -a 256 "$DMG" | awk '{print $1}')"
+    printf '%s  %s\n' "$DMG_HASH" "$DMG_BASENAME" > "$SHA256_FILE"
+    echo "  ✓ DMG SHA-256 written to $(basename "$SHA256_FILE")"
+    echo "    $DMG_HASH"
 fi
 
 # ── Install ───────────────────────────────────────────────────────────
@@ -377,4 +400,7 @@ echo "Done."
 echo "  App: $APP"
 if [[ "$APP_ONLY" == "false" ]] && [[ -f "$DMG" ]]; then
     echo "  DMG: $DMG  ($(du -h "$DMG" | cut -f1))"
+    if [[ -f "$DMG.sha256" ]]; then
+        echo "  SHA: $DMG.sha256"
+    fi
 fi

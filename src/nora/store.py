@@ -328,6 +328,46 @@ class ResultStore:
                 )
             return list(to_hide)
 
+    def purge_script_code(self, ids: list[str]) -> int:
+        """Blank the ``script_code`` column on the given rows.
+
+        Called by the rewind path AFTER ``hide_results_not_in`` and
+        the chat-history truncate have both succeeded — i.e. once the
+        rewind has reached its commit point and ``unhide_results``
+        rollback is no longer in play. Without this, a researcher who
+        pasted a credential or PII into a script (``api_key = "sk-…"``
+        in an ``.r`` file, an SSN string-literal in an exploratory
+        block) leaves that text on disk in ``results.db`` indefinitely
+        even though the model can no longer see the row — the row is
+        hidden, but ``sqlite3`` queries against the file (or anyone
+        who exfiltrates the file) still see the secret.
+
+        Returns the number of rows whose ``script_code`` was actually
+        replaced with the empty string (rows that already had empty
+        ``script_code`` are no-ops). The audit/debug ``include_hidden``
+        path keeps the row's other columns (label, payload,
+        transformations, raw_log_path) intact — only the verbatim
+        researcher-authored script text is dropped, since that's the
+        only column whose contents come straight from a free-form
+        researcher input.
+        """
+        if not ids:
+            return 0
+        with self._txn():
+            BATCH = 500
+            total = 0
+            for i in range(0, len(ids), BATCH):
+                chunk = ids[i:i + BATCH]
+                placeholders = ",".join("?" * len(chunk))
+                cur = self._conn.execute(
+                    f"UPDATE results SET script_code = '' "
+                    f"WHERE script_code != '' AND id IN "
+                    f"({placeholders})",
+                    tuple(chunk),
+                )
+                total += cur.rowcount or 0
+            return total
+
     def unhide_results(self, ids: list[str]) -> int:
         """Clear ``hidden_at`` / ``hidden_reason`` on the given rows.
 

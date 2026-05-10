@@ -212,13 +212,25 @@ program define nora_result_regress
     * regress, the chi2 gate (``e(chi2)`` non-empty) keeps the
     * fields disjoint: the value would be available as ``e(p)``
     * but would not flow into ``chi_squared_p_value`` because
-    * regress doesn't set ``e(chi2)``. We don't capture it as
-    * ``f_p_value`` here because the value isn't in ``e()`` to
-    * read; researchers who need the F-test p-value can compute
-    * it from ``F``, ``df_m``, and ``df_r`` (via ``Ftail``).
+    * regress doesn't set ``e(chi2)``. To close the cross-language
+    * consistency gap (R's ``lm()`` and Python's statsmodels OLS
+    * both ship the F p-value via ``from_lm``), compute the F
+    * p-value here ourselves from ``e(F)``, ``e(df_m)``, ``e(df_r)``
+    * via ``Ftail`` whenever all three are populated. Without this
+    * the model could not tell "missing-by-design" from "missing-
+    * by-error" on a Stata OLS card and would silently lose a
+    * field every other regression card carries.
     if "`e(F)'" != "" & !missing(`=e(F)') {
         local _x = strofreal(`=e(F)', "%21.17e")
         file write `fh' `","f_statistic":`_x'"'
+        if "`e(df_m)'" != "" & !missing(`=e(df_m)') ///
+                & "`e(df_r)'" != "" & !missing(`=e(df_r)') {
+            local _fp = Ftail(`=e(df_m)', `=e(df_r)', `=e(F)')
+            if !missing(`_fp') {
+                local _x = strofreal(`_fp', "%21.17e")
+                file write `fh' `","f_p_value":`_x'"'
+            }
+        }
     }
     if "`e(rmse)'" != "" & !missing(`=e(rmse)') {
         local _x = strofreal(`=e(rmse)', "%21.17e")

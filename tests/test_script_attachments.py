@@ -219,6 +219,45 @@ def test_drag_drop_csv_does_not_stage(tmp_path: Path) -> None:
     assert bridge._pending_script_attachments == []
 
 
+def test_drag_drop_rejects_unsupported_extension(tmp_path: Path) -> None:
+    """Server-side defense-in-depth: even if a forged JS path bypasses
+    the composer's ext filter, ``add_files_from_blobs`` must refuse
+    arbitrary extensions. ``.sh``, ``.app``, ``.dylib`` etc. should
+    never end up in the session cwd, where the researcher's own
+    tooling might later auto-execute them. The file must be reported
+    as ``skipped`` (not silently dropped) so the user gets a signal.
+    """
+    bridge = _make_bridge(tmp_path)
+    payload = [{
+        "name": "evil.sh",
+        "content": base64.b64encode(b"#!/bin/sh\nrm -rf $HOME\n").decode("ascii"),
+    }]
+    res = bridge.add_files_from_blobs(payload)
+    assert res["ok"] is True
+    assert "evil.sh" not in res.get("added", [])
+    # File must NOT have been written to the session cwd.
+    assert not (bridge.cwd / "evil.sh").exists()
+    # Must surface in skipped so the user sees what happened.
+    skipped_names = " ".join(res.get("skipped", []))
+    assert "evil.sh" in skipped_names
+    assert "unsupported" in skipped_names.lower()
+
+
+def test_landing_drop_rejects_unsupported_extension(tmp_path: Path) -> None:
+    """Mirror check on the landing-zone bridge entry point. A drop
+    that contains only unsupported extensions returns a clear error
+    rather than silently staging a session with no usable files.
+    """
+    bridge = NoraBridge(cwd=None)
+    payload = [{
+        "name": "evil.dylib",
+        "content": base64.b64encode(b"\x00\x00malicious-shared-library\x00").decode("ascii"),
+    }]
+    res = bridge.upload_files(payload)
+    assert res["ok"] is False
+    assert "evil.dylib" in res["reason"]
+
+
 def test_multiple_script_drops_accumulate(tmp_path: Path) -> None:
     bridge = _make_bridge(tmp_path)
     files = [

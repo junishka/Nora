@@ -482,12 +482,23 @@ def _quartiles(series: Any, n_total: int) -> RequestResult:
 
     q25 = float(non_na.quantile(0.25))
     q75 = float(non_na.quantile(0.75))
+    # Compute the published IQR by SUBTRACTING the rounded quartiles
+    # rather than independently rounding ``q75 - q25``. Independently
+    # rounded triples over-determine the system: comparing
+    # ``rounded(q75) - rounded(q25)`` against an independently-rounded
+    # IQR recovers ~1 extra bit per quartile from the rounding-error
+    # disagreement. Holding ``iqr == p75 - p25`` exactly removes that
+    # channel — the model now sees three numbers that are mutually
+    # consistent at the published precision, with no over-determined
+    # constraint to invert.
+    rounded_q25 = round_to_sigfigs(q25, 2)
+    rounded_q75 = round_to_sigfigs(q75, 2)
     return RequestResult(
         status="granted",
         answer={
-            "percentile_25": round_to_sigfigs(q25, 2),
-            "percentile_75": round_to_sigfigs(q75, 2),
-            "iqr": round_to_sigfigs(q75 - q25, 2),
+            "percentile_25": rounded_q25,
+            "percentile_75": rounded_q75,
+            "iqr": rounded_q75 - rounded_q25,
             "precision": "2 significant figures",
             "n_nonmissing": n_effective,
             "note": (
