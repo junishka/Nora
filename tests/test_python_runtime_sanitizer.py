@@ -375,6 +375,56 @@ def test_from_magnitude_table_through_sanitizer(runtime) -> None:
     assert res.analysis_type == "magnitude_table"
 
 
+def test_generic_result_strips_helper_provenance_marker(runtime) -> None:
+    """``nora.result()`` is the generic emit. A script that tries to
+    publish a magnitude_table through this path with a forged
+    ``_via_helper`` marker — bypassing the typed helper that
+    computes max_share from data — must NOT slip past the sanitizer.
+    The runtime strips the marker from caller-passed fields here;
+    the sanitizer rejects payloads without it. Together they block
+    the trivial ``nora.result(type="magnitude_table",
+    _via_helper="from_magnitude_table", cells={..., max_share: 0})``
+    bypass.
+    """
+    mod, path = runtime
+    # Forge the marker through the generic API.
+    mod.result(
+        type="magnitude_table",
+        row_variable="industry",
+        value_variable="revenue",
+        aggregation="sum",
+        # Looks innocent: max_share=0. Reality (in the attacker
+        # scenario) would be one company contributing 99%.
+        cells={"tech": {"value": 1e9, "n": 50, "max_share": 0.0}},
+        _via_helper="from_magnitude_table",
+    )
+    payload = _read_payload_strip_token(path)
+    # The generic ``result()`` stripped the forged marker before
+    # writing — so the on-disk JSON has no ``_via_helper`` at all.
+    assert "_via_helper" not in payload, (
+        "nora.result() must strip _via_helper from caller-passed fields"
+    )
+    # Without the marker the sanitizer rejects.
+    res = sanitize(payload)
+    assert not res.ok
+    assert "typed runtime helper" in (res.rejection_reason or "")
+
+
+def test_typed_helper_marker_survives_to_sanitizer(runtime) -> None:
+    """Companion to the strip test: the typed helper bypasses
+    ``result()`` and writes through ``_write_result`` directly so
+    the marker reaches the sanitizer. Without this round-trip the
+    sanitizer would reject every legitimate magnitude_table."""
+    mod, path = runtime
+    df = pd.DataFrame({
+        "g": ["a"] * 50 + ["b"] * 50,
+        "v": list(range(50)) + list(range(100, 150)),
+    })
+    mod.from_magnitude_table(df, "g", "v", aggregation="sum")
+    payload = _read_payload_strip_token(path)
+    assert payload.get("_via_helper") == "from_magnitude_table"
+
+
 # ---------------------------------------------------------------------------
 # from_correlation
 # ---------------------------------------------------------------------------
@@ -417,20 +467,27 @@ def test_from_correlation_drops_complete_case_rows(runtime) -> None:
     """Helper computes correlation on rows complete over the chosen
     variables. ``n`` must reflect the COMPLETE sample size, not the
     raw row count — pairwise N would make off-diagonals draw from
-    different samples and joint inference dishonest."""
+    different samples and joint inference dishonest. Use a missing
+    count above the disclosure-threshold (10) so the orthogonal
+    rare-missingness coarsening doesn't shadow the assertion below
+    — that gate has its own test in ``test_sanitizer``."""
     mod, path = runtime
+    # 13 complete + 12 incomplete = 25 raw rows, missing_count=12.
     df = pd.DataFrame({
         "age": [20, 25, 30, 35, 40, 45, 50, 55, 60, 65,
-                70, 75, 80, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan],
+                70, 75, 80,
+                np.nan, np.nan, np.nan, np.nan, np.nan, np.nan,
+                np.nan, np.nan, np.nan, np.nan, np.nan, np.nan],
         "income": [30, 35, 40, 50, 55, 60, 70, 80, 85, 90,
-                   95, 100, 110, 50, 55, 60, 65, 70, 75, 80],
+                   95, 100, 110,
+                   50, 55, 60, 65, 70, 75, 80, 85, 90, 95, 100, 105],
     })
     mod.from_correlation(df)
     payload = _read_payload_strip_token(path)
     res = sanitize(payload)
     assert res.ok
     assert res.sanitized["n"] == 13
-    assert res.sanitized["missing_count"] == 7
+    assert res.sanitized["missing_count"] == 12
 
 
 def test_from_correlation_invalid_method_raises(runtime) -> None:

@@ -2049,17 +2049,29 @@ def _cross_session_enabled() -> bool:
 
 def _resolve_cross_session_cwd(session_path: str) -> Path | None:
     """Validate a researcher-supplied session_path and return its
-    resolved Path, or None if it isn't a session under
-    ``~/.nora-sessions/``. Path-confined to that root so the model
-    can't direct the store-loader at arbitrary paths on the
-    machine."""
-    from nora.ui import SESSIONS_ROOT, _is_within
+    resolved Path, or None if it isn't a concrete Nora session
+    directly under ``~/.nora-sessions/``.
+
+    Require a *direct* child of SESSIONS_ROOT — not the root itself
+    and not an arbitrary descendant. ``_is_within`` alone is too
+    loose: it accepts the sessions root (cwd would then point at
+    the directory that contains every session) and any nested
+    sub-path beneath a session. Either case lets the caller direct
+    ``get_store(target_cwd)`` at a location it would then *create*
+    a ``.nora/results.db`` inside — turning the read-side recall
+    path into an arbitrary-directory write under the sessions root.
+    The narrow gate ``target.parent == SESSIONS_ROOT.resolve()``
+    matches the equivalent fix in ``ui.switch_session`` /
+    ``ui.delete_session``.
+    """
+    from nora.ui import SESSIONS_ROOT
 
     try:
         target = Path(session_path).expanduser().resolve()
     except OSError:
         return None
-    if not _is_within(target, SESSIONS_ROOT.resolve()):
+    sessions_root = SESSIONS_ROOT.resolve()
+    if target == sessions_root or target.parent != sessions_root:
         return None
     if not target.is_dir():
         return None
@@ -2614,12 +2626,27 @@ async def list_results_global(args: dict[str, Any]) -> dict[str, Any]:
     # for that — cross-session is the value-add. Including it would
     # double-list and waste tokens.
     current_cwd = get_cwd().resolve()
+    sessions_root_resolved = SESSIONS_ROOT.resolve()
     for child in sorted(SESSIONS_ROOT.iterdir()):
-        if not child.is_dir():
+        # ``is_dir()`` follows symlinks, so a symlink in
+        # ~/.nora-sessions/ pointing at an arbitrary directory
+        # outside the sessions root would otherwise pass and let
+        # this scan open a results.db under attacker-controlled
+        # paths. Resolve and re-check that the target is still a
+        # direct child of SESSIONS_ROOT — same discipline the
+        # bridge's session-management paths enforce.
+        try:
+            resolved_child = child.resolve()
+        except (OSError, RuntimeError):
             continue
-        if child.resolve() == current_cwd:
+        if not resolved_child.is_dir():
             continue
-        db_path = child / ".nora" / "results.db"
+        if resolved_child.parent != sessions_root_resolved:
+            # Symlink escape (or otherwise not a direct child).
+            continue
+        if resolved_child == current_cwd:
+            continue
+        db_path = resolved_child / ".nora" / "results.db"
         if not db_path.is_file():
             continue
         # Open uncached + close after reading. ``get_store`` keeps a
@@ -2637,13 +2664,13 @@ async def list_results_global(args: dict[str, Any]) -> dict[str, Any]:
         # ``finally`` closes whatever this iteration opened.
         store = None
         try:
-            store = open_store_uncached(child)
+            store = open_store_uncached(resolved_child)
             rows = store.list_all()
         except Exception:  # noqa: BLE001 — never let one bad db kill the listing
             from nora.store import _stores
             if (
                 store is not None
-                and _stores.get(child.resolve()) is not store
+                and _stores.get(resolved_child) is not store
             ):
                 try:
                     store.close()
@@ -2676,8 +2703,14 @@ async def list_results_global(args: dict[str, Any]) -> dict[str, Any]:
                 ):
                     continue
                 rows_out.append({
-                    "session_path": str(child),
-                    "session_name": child.name,
+                    # Publish the resolved path so the model's
+                    # ``expand_result(session_path=...)`` call also
+                    # passes the tightened direct-child gate in
+                    # ``_resolve_cross_session_cwd``. The symlink
+                    # name is the entry point; the resolved target
+                    # is the session.
+                    "session_path": str(resolved_child),
+                    "session_name": resolved_child.name,
                     "id": r.id,
                     "label": label,
                     "analysis_type": atype,
@@ -2691,7 +2724,7 @@ async def list_results_global(args: dict[str, Any]) -> dict[str, Any]:
             # closing in that case would surprise other callers.
             # Tell them apart by re-checking the cache.
             from nora.store import _stores
-            if store is not None and _stores.get(child.resolve()) is not store:
+            if store is not None and _stores.get(resolved_child) is not store:
                 try:
                     store.close()
                 except Exception:  # noqa: BLE001

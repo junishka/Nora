@@ -425,9 +425,8 @@ def _na_count(series: Any, n_total: int, config: SDCConfig) -> RequestResult:
     """Return the NA count for a variable.
 
     Symmetric suppression: BOTH ``na_count`` and ``non_na_count``
-    must clear the disclosure threshold (or be exactly zero). The
-    schema summary suppresses missingness counts on either side
-    (``schema._suppress_rare_count``) because:
+    must clear the disclosure threshold (or be exactly zero). Same
+    rule the schema summary uses (``schema._suppress_rare_count``):
 
       - "only 3 people have a non-NA value" identifies those 3 by
         inverse (the genuinely disclosive case);
@@ -435,15 +434,20 @@ def _na_count(series: Any, n_total: int, config: SDCConfig) -> RequestResult:
         missingness — combined with other variables, it supports
         re-identification.
 
-    The previous gate only checked the non-NA side, reopening the
-    rare-missing channel that the schema path closed.
+    A count of zero on either side is fine — "0 missing" doesn't
+    pick out any individual. The suppression rule is "0 or
+    >=threshold", same as a frequency_table cell. The previous gate
+    only checked the non-NA side, reopening the rare-missing
+    channel that the schema path already closed.
     """
     na_count = int(series.isna().sum())
     non_na_count = n_total - na_count
     threshold = config.cell_suppression_threshold
     # Skip suppression when one side is exactly zero (no missingness, or
     # all-missing): no rare subgroup exists to identify, same handling
-    # as ``schema._suppress_rare_count``.
+    # as ``schema._suppress_rare_count``. The denial reason names "the
+    # rarer side" generically rather than echoing whether it's NA or
+    # non-NA — that distinction is itself an inference signal.
     rare = min(na_count, non_na_count)
     if rare > 0 and rare < threshold:
         return RequestResult(
@@ -495,13 +499,29 @@ def _quartiles(series: Any, n_total: int) -> RequestResult:
 
     non_na = series.dropna()
     n_effective = int(len(non_na))
-    if n_effective < 10:
+    # Same N-floor as ``numeric_bounds`` (5th / 95th). Quartiles are
+    # interpolations between adjacent sorted observations: at N=10
+    # the 25th percentile sits at index 2.25, i.e. ``0.75 * x[2] +
+    # 0.25 * x[3]`` — a weighted blend of two specific individuals.
+    # After 2-sigfig rounding the published value can still echo
+    # those individuals when they're close in value, especially in
+    # narrow distributions. N>=30 puts ~7-8 observations on either
+    # side of each quartile, so the percentile is interpolated over
+    # roughly 1.5-2.5 observations and the rounded output no longer
+    # ties to a specific 2-3 of them. This matches the stricter
+    # bound the tail percentiles use; quartiles are less extreme but
+    # the order-statistic interpolation argument is the same.
+    QUARTILES_MIN_N = 30
+    if n_effective < QUARTILES_MIN_N:
         return RequestResult(
             status="denied",
             reason=(
                 f"variable has only {n_effective} non-missing observations "
                 f"— too few to publish quartiles without identifying "
-                f"individuals."
+                f"individuals (need at least {QUARTILES_MIN_N}). At "
+                f"smaller N, q25 and q75 are weighted blends of 2-3 "
+                f"specific sorted observations and 2-sigfig rounding "
+                f"doesn't reliably hide them."
             ),
         )
 
@@ -650,6 +670,19 @@ def _correlation_pair(
         return RequestResult(status="denied", reason=reason)
 
     sigfigs = sigfigs_for_n(n_complete)
+    # Coarsen rare ``missing_count`` — same gate the schema-side
+    # ``na_count`` request applies. ``len(s1) - n_complete`` is the
+    # number of rows where at least one of the two variables is
+    # missing; if that count is small but nonzero (e.g. 1 of 1000),
+    # it directly identifies the one incomplete observation.
+    # Zero missingness is fine (no individual to identify); counts
+    # at or above the threshold are aggregate enough to publish.
+    threshold = DEFAULT_CONFIG.cell_suppression_threshold
+    missing = int(len(s1) - n_complete)
+    if 0 < missing < threshold:
+        missing_field: int | str = suppression_marker(threshold)
+    else:
+        missing_field = missing
     return RequestResult(
         status="granted",
         answer={
@@ -658,7 +691,7 @@ def _correlation_pair(
             "correlation": round_to_sigfigs(r, sigfigs),
             "method": "pearson",
             "n_complete": n_complete,
-            "missing_count": int(len(s1) - n_complete),
+            "missing_count": missing_field,
             "note": (
                 "Pearson correlation between the two variables on rows "
                 "where BOTH are observed. For a multi-variable matrix "

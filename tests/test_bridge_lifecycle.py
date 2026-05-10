@@ -366,6 +366,49 @@ def test_switch_session_returns_to_existing_runner(tmp_path: Path):
         ui_mod.SESSIONS_ROOT = real_root
 
 
+def test_switch_session_rejects_root_and_nested_paths(tmp_path: Path):
+    """``switch_session`` must accept only direct children of
+    SESSIONS_ROOT. Accepting the root itself would point cwd at the
+    directory that contains every session, breaking the cross-session
+    isolation gate (every other session becomes a child of cwd).
+    Accepting a nested path inside a session would spawn a runner
+    whose cwd doesn't see the session's ``.nora/`` state.
+    """
+    import nora.ui as ui_mod
+    real_root = ui_mod.SESSIONS_ROOT
+    ui_mod.SESSIONS_ROOT = tmp_path
+    try:
+        a = tmp_path / "a"
+        a.mkdir()
+        nested = a / "subdir"
+        nested.mkdir()
+
+        bridge = NoraBridge(cwd=a)
+
+        # The sessions root itself is NOT a session.
+        result = bridge.switch_session(str(tmp_path))
+        assert not result["ok"]
+        assert "direct session directory" in result["reason"]
+        assert bridge.cwd == a.resolve(), (
+            "rejected switch must not change focus"
+        )
+
+        # A nested directory inside a session is also NOT a session.
+        result = bridge.switch_session(str(nested))
+        assert not result["ok"]
+        assert "direct session directory" in result["reason"]
+        assert bridge.cwd == a.resolve()
+
+        # Sanity: a real direct child still works.
+        b = tmp_path / "b"
+        b.mkdir()
+        result = bridge.switch_session(str(b))
+        assert result["ok"], result
+        assert bridge.cwd == b.resolve()
+    finally:
+        ui_mod.SESSIONS_ROOT = real_root
+
+
 # ---------------------------------------------------------------------------
 # Cold start prefix — unchanged (memory still per-cwd)
 # ---------------------------------------------------------------------------

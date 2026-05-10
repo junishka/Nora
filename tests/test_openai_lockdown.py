@@ -494,6 +494,92 @@ def test_request_failure_does_not_advance_committed_response_id(
     )
 
 
+def test_handler_exception_does_not_leak_message_to_model(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """When a tool handler raises, the OpenAI tool loop's catch-all
+    fallback must NOT interpolate ``str(e)`` into the model-visible
+    reason. The exception message can include parser excerpts,
+    file paths, or raw data values that per-tool error handling
+    would have redacted. Return only the exception class (a bounded
+    identifier) plus a generic recovery hint; log full details
+    locally.
+
+    The sentinel text is constructed to look like the kind of
+    content the per-tool redaction pass would scrub: a row of
+    data with a name, dollar amount, and email. If any of those
+    tokens reach the function_call_output the fix didn't hold.
+    """
+    import asyncio
+
+    from nora.provider import openai as openai_provider
+    from nora.tools import HANDLERS
+    monkeypatch.setattr(openai_provider, "_resolve_api_key", lambda: "sk-test")
+
+    SENSITIVE = (
+        "row 42: name=Jane Doe income=$487192 email=jane.doe@example.com"
+    )
+
+    async def _raising_handler(args: dict[str, Any]) -> dict[str, Any]:
+        raise RuntimeError(SENSITIVE)
+
+    # The scripted tool call names ``list_results``; route THAT handler
+    # to our raising one for the test only. monkeypatch undoes the
+    # change at teardown so other tests aren't affected.
+    monkeypatch.setitem(HANDLERS, "list_results", _raising_handler)
+
+    # Two scripted responses: round 1 emits the function_call; round 2
+    # (after our raising handler) emits a clean message so the loop
+    # exits and we can inspect what the provider sent back in
+    # ``function_call_output``.
+    scripted = [
+        _ScriptedResponse("resp_call", with_tool_call=True),
+        _ScriptedResponse("resp_done", with_tool_call=False),
+    ]
+    import openai as openai_pkg
+    monkeypatch.setattr(
+        openai_pkg, "AsyncOpenAI",
+        lambda api_key=None: _ScriptedAsyncOpenAI(api_key, responses=scripted),
+        raising=True,
+    )
+
+    sess = OpenAISession(
+        cwd=tmp_path,
+        model="gpt-5.5",
+        system_prompt="you are nora",
+    )
+
+    async def _drive() -> None:
+        async for _ in sess.send("trigger the failing tool"):
+            pass
+    asyncio.run(_drive())
+
+    api = sess._client.responses  # type: ignore[union-attr]
+    assert len(api.calls) == 2, "expected exactly two round-trips"
+    # The function_call_output that travels back to the model on
+    # round 2 carries the tool result.
+    round2 = api.calls[1]
+    func_outputs = [
+        item for item in round2["input"]
+        if item.get("type") == "function_call_output"
+    ]
+    assert func_outputs, "round 2 must carry the tool's output back"
+    output_text = func_outputs[0]["output"]
+    # Critical: the raw exception message must NOT appear.
+    assert SENSITIVE not in output_text, (
+        f"sensitive exception text leaked into model-visible tool "
+        f"result: {output_text!r}"
+    )
+    assert "Jane Doe" not in output_text
+    assert "jane.doe@example.com" not in output_text
+    assert "$487192" not in output_text
+    # The class name is a bounded identifier and stays — the model
+    # can route on it without seeing the redacted detail.
+    assert "RuntimeError" in output_text
+    # Generic recovery hint surfaces.
+    assert "Retry" in output_text or "fall back" in output_text
+
+
 def test_send_yields_turnerror_when_tool_loop_does_not_converge(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
 ) -> None:

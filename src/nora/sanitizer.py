@@ -324,6 +324,26 @@ _MAGTAB_ALLOWED_STRING_FIELDS: frozenset[str] = frozenset(
 # these; anything else is rejected as a schema violation.
 _MAGTAB_VALID_AGGREGATIONS: frozenset[str] = frozenset(("sum", "mean"))
 
+# Helper-provenance marker. Typed runtime helpers (Python's
+# ``from_magnitude_table``, R's ``nora$from_magnitude_table``, Stata's
+# ``nora_result_magnitude``) stamp this on payloads they emit. The
+# generic runtime ``result()`` API strips the field from caller-passed
+# kwargs, so a script can't forge it through the public entry point.
+# Required for ``magnitude_table`` because cell-level ``max_share`` is
+# consulted-only and stripped: without proof the metric came from
+# raw-data computation, a script could publish a dominance-violating
+# value with a forged ``max_share=0`` and skip the (1, k)-dominance
+# gate. The token gate alone doesn't catch this — token validation
+# proves the line passed through *some* runtime path (including the
+# generic ``result()`` API), not specifically the typed helper. Same
+# "raise the bar, not absolute guarantee" posture as the token: a
+# script that hand-writes JSON to NORA_RESULT_PATH (after reading
+# nora._RUN_TOKEN) can still forge the marker, but trivial misuse
+# of ``nora.result(type="magnitude_table", cells={..., "max_share":
+# 0})`` is rejected.
+_HELPER_PROVENANCE_FIELD = "_via_helper"
+_MAGTAB_HELPER_VALUE = "from_magnitude_table"
+
 
 # --- Structural size caps --------------------------------------------------
 # Hard limits on the number of top-level entries each payload type can
@@ -676,6 +696,38 @@ def _collect_allowed(
             f"(cap {_COLLECT_ALLOWED_LOG_CAP})"
         )
     return out
+
+
+def _coarsen_small_missing_count(
+    out: dict[str, Any],
+    transformations: list[str],
+    config: SDCConfig,
+) -> None:
+    """Replace ``missing_count`` with the suppression marker when its
+    exact value is itself disclosive (``0 < missing_count < threshold``).
+
+    An exact small missingness count identifies the few records whose
+    value on this variable is missing — combined with other variables
+    it supports re-identification ("the one patient who declined to
+    answer income"). Same threshold as cell suppression so the rule
+    is uniform across payload kinds. Zero is left as 0 (no
+    missingness, nothing to suppress).
+
+    Mutates ``out`` in place. Appends one log line if coarsening
+    fired. The schema-side ``request_data(na_count)`` path already
+    enforces this gate symmetrically; this helper closes the gap on
+    the stored-result path (descriptive / frequency_table /
+    correlation_matrix / crosstab) where ``missing_count`` is
+    allowlisted but was previously forwarded verbatim.
+    """
+    threshold = config.cell_suppression_threshold
+    miss_raw = out.get("missing_count")
+    if isinstance(miss_raw, int) and 0 < miss_raw < threshold:
+        out["missing_count"] = suppression_marker(threshold)
+        transformations.append(
+            f"coarsened missing_count to {suppression_marker(threshold)} "
+            f"(exact small missingness counts are themselves disclosive)"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -1169,22 +1221,7 @@ def _sanitize_descriptive(
             f"{variable_name!r} is on the dataset's "
             f"non_disclosive_variables opt-in list)"
         )
-    # Coarsen ``missing_count`` below the cell suppression threshold.
-    # An exact small missingness count is itself disclosive — the
-    # one record whose ``height`` is missing is identifiable as
-    # "the missing one," and combined with other variables it
-    # supports re-identification. Apply the same threshold the
-    # frequency-table / crosstab cell suppression uses so the
-    # disclosure rule is uniform across payload kinds. Zero is left
-    # as 0 (no missingness, nothing to suppress).
-    threshold = config.cell_suppression_threshold
-    miss_raw = out.get("missing_count")
-    if isinstance(miss_raw, int) and 0 < miss_raw < threshold:
-        out["missing_count"] = suppression_marker(threshold)
-        transformations.append(
-            f"coarsened missing_count to {suppression_marker(threshold)} "
-            f"(exact small missingness counts are themselves disclosive)"
-        )
+    _coarsen_small_missing_count(out, transformations, config)
     transformations.append(
         f"clamped numeric fields to {sigfigs_for_n(n)} significant "
         f"figures (n={n})"
@@ -1385,6 +1422,15 @@ def _sanitize_frequency_table(
         )
         out["suppressed_cell_count"] = total_suppressed_distinct
     out["counts"] = bucketed_counts
+
+    # Coarsen any rare ``missing_count`` that survived the back-calc
+    # strip above. ``submit_script`` can publish a frequency_table
+    # with ``missing_count=1`` even when the cell suppression rule
+    # otherwise fires cleanly — the schema-side ``request_data
+    # (na_count)`` path already suppresses the same disclosure on
+    # the discovery side, this closes the gap on the stored-result
+    # side.
+    _coarsen_small_missing_count(out, transformations, config)
 
     return SanitizerResult(
         ok=True, analysis_type="frequency_table",
@@ -1642,6 +1688,14 @@ def _sanitize_crosstab(
             "from missing_count plus an externally-known N"
         )
 
+    # Coarsen any rare ``missing_count`` that survived the back-calc
+    # strip above. The exact small-missingness disclosure ("the one
+    # row missing on either dimension") is independent of the
+    # back-calc concern handled by the strip — the strip protects
+    # the suppressed-cell bucket sum, this protects the missingness
+    # cell itself.
+    _coarsen_small_missing_count(out, transformations, config)
+
     out["counts"] = nested
 
     return SanitizerResult(
@@ -1685,6 +1739,28 @@ def _sanitize_magnitude_table(
             rejection_reason=missing_reason,
         )
 
+    # Helper-provenance gate. ``max_share`` is caller-supplied and
+    # consulted-only — the dominance gate trusts it. A script that
+    # bypasses the typed helper (e.g. via the generic ``result()``)
+    # could publish a dominance-violating value with a forged
+    # ``max_share=0`` and skip the gate. Require the marker the typed
+    # helper stamps. See the constant's docstring for threat-model
+    # detail and the limits of this defense.
+    if raw.get(_HELPER_PROVENANCE_FIELD) != _MAGTAB_HELPER_VALUE:
+        return SanitizerResult(
+            ok=False, analysis_type="magnitude_table",
+            rejection_reason=(
+                "magnitude_table payloads must come through the "
+                "typed runtime helper (Python: nora.from_magnitude_table; "
+                "R: nora$from_magnitude_table; Stata: "
+                "nora_result_magnitude). The generic nora.result() API "
+                "is rejected for this type because cell-level max_share "
+                "is consulted-only and a hand-crafted payload could "
+                "publish a dominance-violating value with max_share=0 "
+                "to skip the dominance gate."
+            ),
+        )
+
     aggregation = raw.get("aggregation")
     if aggregation not in _MAGTAB_VALID_AGGREGATIONS:
         return SanitizerResult(
@@ -1721,7 +1797,14 @@ def _sanitize_magnitude_table(
 
     # Strip the raw cells dict before _collect_allowed — we handle it
     # specially. Without this, the log spuriously says "dropped cells".
-    raw_pruned = {k: v for k, v in raw.items() if k != "cells"}
+    # Also strip the helper-provenance marker so it doesn't appear in
+    # the transformation log as a "dropped unknown field" — the marker
+    # is internal to the runtime-library/sanitizer boundary and the
+    # model has no business seeing its name.
+    raw_pruned = {
+        k: v for k, v in raw.items()
+        if k != "cells" and k != _HELPER_PROVENANCE_FIELD
+    }
     out = _collect_allowed(
         raw_pruned,
         string=_MAGTAB_ALLOWED_STRING_FIELDS,
@@ -2092,6 +2175,14 @@ def _sanitize_correlation_matrix(
     transformations.append(
         f"clamped correlation values to {sigfigs} significant figures (n={n})"
     )
+
+    # Coarsen rare ``missing_count``. The complete-case correlation
+    # path can publish a single-row-missing count exactly, which
+    # identifies the one observation that's incomplete on at least
+    # one of the variables in the matrix — same disclosure shape
+    # the schema-side ``request_data(na_count)`` gate already
+    # closes.
+    _coarsen_small_missing_count(out, transformations, config)
 
     return SanitizerResult(
         ok=True, analysis_type="correlation_matrix",

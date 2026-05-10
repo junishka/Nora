@@ -263,3 +263,98 @@ def test_expand_result_rejects_session_path_outside_sessions_root(
     body = _mcp_text(res)
     assert body["status"] == "denied"
     assert "~/.nora-sessions/" in body["reason"]
+
+
+def test_expand_result_rejects_sessions_root_itself(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The sessions root itself is not a session — accepting it
+    would let ``get_store(target_cwd)`` create
+    ``~/.nora-sessions/.nora/results.db`` at the root, polluting
+    the directory the bridge uses to enumerate sessions. The
+    narrow gate matches the equivalent fix in
+    ``ui.switch_session`` / ``ui.delete_session``."""
+    monkeypatch.setenv("NORA_ALLOW_CROSS_SESSION_RECALL", "1")
+    sessions_root = tmp_path / "sessions"
+    sessions_root.mkdir()
+    _patch_sessions_root(monkeypatch, sessions_root)
+    current = sessions_root / "current"
+    current.mkdir()
+
+    with use_cwd(current):
+        res = asyncio.run(HANDLERS["expand_result"]({
+            "result_id": "M1",
+            "session_path": str(sessions_root),
+        }))
+    body = _mcp_text(res)
+    assert body["status"] == "denied"
+    # Crucial: no .nora/ was planted at the root.
+    assert not (sessions_root / ".nora").exists()
+
+
+def test_expand_result_rejects_nested_path_under_session(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A subdirectory inside a session is not itself a session.
+    Accepting it would create a parallel ``<subdir>/.nora/results.db``
+    that the bridge's session-management paths don't see."""
+    monkeypatch.setenv("NORA_ALLOW_CROSS_SESSION_RECALL", "1")
+    sessions_root = tmp_path / "sessions"
+    sessions_root.mkdir()
+    _patch_sessions_root(monkeypatch, sessions_root)
+    current = sessions_root / "current"
+    current.mkdir()
+    other = sessions_root / "other"
+    other.mkdir()
+    nested = other / "subdir"
+    nested.mkdir()
+
+    with use_cwd(current):
+        res = asyncio.run(HANDLERS["expand_result"]({
+            "result_id": "M1",
+            "session_path": str(nested),
+        }))
+    body = _mcp_text(res)
+    assert body["status"] == "denied"
+    # And no .nora/ planted at the nested location either.
+    assert not (nested / ".nora").exists()
+
+
+def test_list_results_global_skips_symlink_escape(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A symlink under ~/.nora-sessions/ pointing at an arbitrary
+    directory outside the sessions root must not be followed by
+    the global scan. ``is_dir()`` follows symlinks; the fix is to
+    resolve the entry and re-check that the target is still a
+    direct child of SESSIONS_ROOT — the same discipline the
+    bridge enforces on other paths."""
+    monkeypatch.setenv("NORA_ALLOW_CROSS_SESSION_RECALL", "1")
+    sessions_root = tmp_path / "sessions"
+    sessions_root.mkdir()
+    _patch_sessions_root(monkeypatch, sessions_root)
+
+    # A legitimate session with a stored row — we should see this one.
+    current = sessions_root / "current"
+    legit = sessions_root / "20260101T000000Z_legit"
+    for d in (current, legit):
+        d.mkdir()
+    _insert_fake_result(legit, label="legit row")
+
+    # Plant a results.db OUTSIDE the sessions root and symlink to
+    # the *containing directory* from inside the root. Pre-fix the
+    # scan would follow the symlink and read that DB.
+    outside = tmp_path / "outside_session"
+    outside.mkdir()
+    (outside / ".nora").mkdir()
+    _insert_fake_result(outside, label="LEAKED through symlink")
+    (sessions_root / "20260101T000000Z_evil").symlink_to(outside)
+
+    with use_cwd(current):
+        res = asyncio.run(HANDLERS["list_results_global"]({"query": ""}))
+    body = _mcp_text(res)
+    assert body["status"] == "ok"
+    labels = [r["label"] for r in body["results"]]
+    assert "legit row" in labels
+    # The symlinked-out content must NOT appear.
+    assert "LEAKED through symlink" not in labels

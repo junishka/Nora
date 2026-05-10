@@ -163,7 +163,15 @@ def result(*, type: str, **fields: Any) -> None:  # noqa: A002 — match R API
     a matching one — they pull standard fields out of common Python
     objects (statsmodels results, scipy ttest_result, pandas
     DataFrames) so the researcher doesn't have to assemble the dict
-    by hand."""
+    by hand.
+
+    The ``_via_helper`` field is reserved as a sanitizer-side
+    helper-provenance marker (typed helpers stamp it after computing
+    disclosure metrics from raw data). Strip it here so a script
+    can't bypass the typed helper for ``magnitude_table`` etc. by
+    passing a forged marker through ``result()``.
+    """
+    fields = {k: v for k, v in fields.items() if k != "_via_helper"}
     payload = {"type": type, **fields}
     _write_result(payload)
 
@@ -606,7 +614,21 @@ def from_magnitude_table(df: Any, group_var: str, value_var: str, *,
         "cells": cells,
     }
     fields.update(extra)
-    result(type="magnitude_table", **fields)
+    # Helper-provenance marker. The sanitizer requires this for
+    # ``magnitude_table`` because cell-level ``max_share`` is
+    # consulted-only and stripped — without proof that max_share
+    # came from raw-data computation a malicious script could
+    # publish a dominance-violating value with a forged
+    # ``max_share=0`` and skip the dominance gate. Write directly
+    # via _write_result, bypassing ``result()`` (which strips this
+    # field from caller fields), so the marker can't be forged
+    # through the generic API.
+    payload = {
+        "type": "magnitude_table",
+        **fields,
+        "_via_helper": "from_magnitude_table",
+    }
+    _write_result(payload)
 
 
 def from_correlation(
