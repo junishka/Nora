@@ -41,6 +41,7 @@ Future types (deferred):
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal
@@ -220,14 +221,23 @@ def handle(
     try:
         df = load_data(dataset_path)
     except Exception as e:  # ValueError from load_data or library errors
-        # Exception messages from pandas / pyreadstat can echo column
-        # names or file paths verbatim. Sanitize the string body before
-        # forwarding.
+        # Library exception bodies (pandas ParserError, pyreadstat
+        # ReadstatError, etc.) frequently quote the offending row text
+        # or cell value. ``safe_text`` only enforces injection bounds
+        # (length, control chars), not disclosure control. Match the
+        # ``get_schema`` posture (tools.py): forward the exception
+        # class name only and keep the underlying message in the
+        # researcher's logs.
+        logging.getLogger(__name__).warning(
+            "request_data load_data failed for %s: %s",
+            dataset_path, e, exc_info=True,
+        )
         return RequestResult(
             status="error",
             reason=(
-                f"could not read dataset: {e.__class__.__name__}: "
-                f"{safe_text(str(e))}"
+                f"could not read dataset: {e.__class__.__name__}. "
+                f"The dataset may be malformed or corrupted; researcher "
+                f"logs have the underlying parser error."
             ),
         )
 
@@ -414,22 +424,37 @@ def _numeric_bounds(series: Any, n_total: int) -> RequestResult:
 def _na_count(series: Any, n_total: int, config: SDCConfig) -> RequestResult:
     """Return the NA count for a variable.
 
-    NA counts by themselves are pipeline metadata, not subgroup
-    breakdowns — disclosure risk is low. We still suppress when the
-    *non-NA* count is below threshold (the genuinely disclosive case:
-    "only 3 people have a non-NA value for this variable" identifies
-    those people by inverse).
+    Symmetric suppression: BOTH ``na_count`` and ``non_na_count``
+    must clear the disclosure threshold (or be exactly zero). The
+    schema summary suppresses missingness counts on either side
+    (``schema._suppress_rare_count``) because:
+
+      - "only 3 people have a non-NA value" identifies those 3 by
+        inverse (the genuinely disclosive case);
+      - "only 1 missing observation" identifies the one person with
+        missingness — combined with other variables, it supports
+        re-identification.
+
+    The previous gate only checked the non-NA side, reopening the
+    rare-missing channel that the schema path closed.
     """
     na_count = int(series.isna().sum())
     non_na_count = n_total - na_count
     threshold = config.cell_suppression_threshold
-    if non_na_count < threshold:
+    # Skip suppression when one side is exactly zero (no missingness, or
+    # all-missing): no rare subgroup exists to identify, same handling
+    # as ``schema._suppress_rare_count``.
+    rare = min(na_count, non_na_count)
+    if rare > 0 and rare < threshold:
         return RequestResult(
             status="denied",
             reason=(
-                f"only {non_na_count} non-missing observation(s) — below "
-                f"the disclosure threshold of {threshold}. The count is "
-                f"suppressed because the non-missing subgroup is too small."
+                f"variable has {rare} observation(s) on the rarer side "
+                f"(missing vs. non-missing) — that subgroup is too "
+                f"small (below the disclosure threshold of "
+                f"{threshold}). The count is suppressed because "
+                f"either subgroup at small N can identify the "
+                f"observations on that side."
             ),
         )
     return RequestResult(

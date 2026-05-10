@@ -268,8 +268,8 @@ _R_CALLS_RE = re.compile(r"^Calls: .*$", re.MULTILINE)
 
 
 def _extract_r(stderr: str) -> Optional[str]:
-    """Pull the LAST ``Error in ... :`` block plus its ``Calls:``
-    trailer if present.
+    """Pull the LAST ``Error`` block's parser-owned framing plus its
+    ``Calls:`` trailer if present.
 
     R errors look like::
 
@@ -277,24 +277,23 @@ def _extract_r(stderr: str) -> Optional[str]:
           object 'wage' not found
         Calls: lm -> eval -> eval
 
-    We keep the whole block, including the "Calls:" chain, and
-    drop "Execution halted" / "In addition: Warning..." trailers
-    (they're rarely the cause and just spend budget).
+    The ``Error in <call> :`` portion and the message body are both
+    script-controlled in the limit: ``<call>`` is R's deparse of the
+    failing expression (and a script using ``do.call(fn, list(arg=
+    secret))`` could put cell data in there), and the message body
+    is whatever R's error formatter or ``stop()`` produced (with
+    ``stop(value)`` allowing direct exfiltration of any short cell).
+    We keep the ``Error`` anchor and the ``Calls:`` chain — function
+    names from the call stack that the model already knows because
+    it wrote the script — and discard both the call deparse and the
+    body. The researcher still has the un-scrubbed message in the
+    on-disk run log.
     """
     matches = list(_R_ERROR_RE.finditer(stderr))
     if not matches:
         return None
     last = matches[-1]
-    # Reconstruct the block from its parts so we can scrub the
-    # message body (data-origin text — see ``_scrub_exception_body``)
-    # while keeping the parser-owned framing intact. Using
-    # ``last.group(0)`` would forward script-controlled text verbatim.
-    call = last.group("call")
-    msg = _scrub_exception_body(last.group("msg") or "")
-    if call:
-        block = f"Error in {call} : {msg}".rstrip() if msg else f"Error in {call} :"
-    else:
-        block = f"Error : {msg}".rstrip() if msg else "Error :"
+    block = "Error : [message body redacted]"
 
     # Look for a Calls: line in the slice immediately after the
     # error block (within the next 200 chars - the chain is always
@@ -324,7 +323,7 @@ _STATA_EOF_RE = re.compile(r"^end of do-file\s*$", re.MULTILINE)
 
 
 def _extract_stata(stdout: str) -> Optional[str]:
-    """Pull the failing command + error message + r(<code>); line.
+    """Pull the failing command's VERB + r(<code>); line.
 
     Stata batch-mode log on a failed run looks like::
 
@@ -338,9 +337,20 @@ def _extract_stata(stdout: str) -> Optional[str]:
 
     The closing ``r(111);`` after "end of do-file" is just an exit
     echo; the meaningful one is the inline ``r(111);`` that
-    appears immediately after the error message. We anchor on the
-    FIRST ``r(<code>);`` (after stripping the trailing exit echo)
-    and walk back to the last ``. <cmd>`` line above it.
+    appears immediately after the error message.
+
+    Previous versions returned the whole block from ``. <cmd>`` to
+    ``r(<code>);``. That forwarded two script-controlled channels:
+    the command echo (whose arguments can carry macro-expanded raw
+    values — ``local secret = df[1]; regress y `secret'`` → echoed
+    as ``. regress y patient_42``), and the Stata error message
+    body (which embeds variable / file names that may be data-derived).
+    Neither is parser-owned. We now keep only the command's VERB
+    (first whitespace-separated token — ``regress``, ``summarize``,
+    ``use``) and the ``r(<code>);`` line: enough framing for the
+    model to know the kind of failure without exfiltrating any
+    arguments or error text. The researcher's run log retains the
+    full block for audit.
     """
     if not stdout:
         return None
@@ -357,34 +367,31 @@ def _extract_stata(stdout: str) -> Optional[str]:
     rc_code = rc.group("code")
 
     # Walk back from the rc line to find the most recent command
-    # echo (`. <cmd>`). Anything between that echo and the rc line
-    # is the error message - usually 1-4 lines.
+    # echo (`. <cmd>`); extract only the verb.
     region = scan[:rc.start()]
     cmd_matches = list(_STATA_CMD_RE.finditer(region))
     if not cmd_matches:
-        # No command echo found - return just the error message
-        # bounded by the previous blank line, falling back to the
-        # last 6 lines if no clear delimiter.
-        lines = region.rstrip("\n").splitlines()
-        # Walk back collecting non-blank lines until a blank one.
-        msg_lines: list[str] = []
-        for ln in reversed(lines):
-            if not ln.strip():
-                if msg_lines:
-                    break
-                continue
-            msg_lines.append(ln)
-            if len(msg_lines) >= 6:
-                break
-        msg_lines.reverse()
-        msg = "\n".join(msg_lines)
-        return (msg + f"\nr({rc_code});").strip() or None
+        # No command echo found — return the rc line alone. We don't
+        # walk back over error-message lines (they may carry data).
+        return f"[command body redacted]\nr({rc_code});"
 
-    cmd = cmd_matches[-1]
-    # Slice from the command echo to the rc line; that's the full
-    # logical block.
-    block = scan[cmd.start(): rc.end()].rstrip()
-    return block
+    cmd_text = cmd_matches[-1].group("cmd").strip()
+    # First whitespace-separated token is the command verb. Cap at
+    # 32 chars as a defense-in-depth against an attacker-chosen
+    # ``capture noisily`` prefix that combines the verb with an
+    # inline data argument before whitespace. Stata verbs are short
+    # identifiers; anything longer than 32 chars in the first token
+    # almost certainly is an attempt to push data through.
+    verb = cmd_text.split(None, 1)[0] if cmd_text else ""
+    verb = verb[:32]
+    # Validate against Stata's verb alphabet (lowercase letters and
+    # underscores). If it doesn't match, redact entirely rather than
+    # forwarding what an attacker constructed.
+    if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", verb or ""):
+        verb = ""
+    if verb:
+        return f". {verb} [args redacted]\n[message body redacted]\nr({rc_code});"
+    return f"[command body redacted]\nr({rc_code});"
 
 
 # -----------------------------------------------------------------
@@ -392,38 +399,36 @@ def _extract_stata(stdout: str) -> Optional[str]:
 # -----------------------------------------------------------------
 
 def _scrub_exception_body(msg: str) -> str:
-    """Treat exception message bodies as data-origin text.
+    """Drop exception message bodies entirely.
 
     The exception type (``KeyError``) and traceback frame (file +
     line) are parser-owned — Python / R themselves emit those in a
-    fixed shape we can verify. The body that follows the type, on the
-    other hand, is whatever the script chose to put there:
-    ``raise RuntimeError(df.iloc[0].to_json())`` would otherwise ship
-    raw cell content out as a "diagnostic". This scrub:
+    fixed shape we can verify. The body that follows the type, on
+    the other hand, is whatever the script chose to put there.
+    Previous versions allowed short non-data-shaped bodies through
+    on the assumption that "column names and missing-file paths are
+    exactly what the model needs", but a 1-cell, sub-cap body
+    (``raise RuntimeError(df.iloc[0]['secret'])``) survived the cap
+    and the shape detector — a deliberate SDC bypass available to
+    any model-authored script.
 
-      1. Suppresses bodies whose shape looks like a data dump (JSON
-         dicts, comma-separated rows, pipe-separated cells).
-      2. Caps surviving bodies at ``MAX_EXCEPTION_MSG_BYTES`` to
-         bound the leak per call even when the shape detector
-         misses (e.g. a single short cell value the model
-         deliberately formatted as a plain word).
+    The threat model treats the model as untrusted with respect to
+    the researcher's data. So the body cannot be forwarded: only the
+    parser-owned framing (TYPE for Python, "Error :" template for R,
+    ``r(<code>);`` for Stata, plus the function / call chain) is
+    preserved. The model still gets enough framing to know what
+    KIND of failure happened and where in the script source it
+    fired — and it wrote the script, so it knows what the affected
+    identifier was without us having to echo it back.
 
-    Residual risk: a body that is both short AND not data-shaped
-    (a single column name, a number, a few words) still passes
-    through. Eliminating that residual would require dropping all
-    bodies, which kills the feature's debugging value (column names
-    and missing-file paths are exactly what the model needs). The
-    cap reduces per-call payload, the system prompt directs the
-    model not to do this, and persisted run logs preserve the audit
-    trail.
+    Researchers can still read the un-scrubbed stderr / stdout from
+    the on-disk run dir (``raw_log_path`` / the UI). This redaction
+    only applies to the model-visible ``debug_excerpt`` channel.
     """
-    if not msg:
-        return msg
-    if _DATA_SHAPED_RE.search(msg):
-        return _REDACTED_DATA_BODY
-    if len(msg) > MAX_EXCEPTION_MSG_BYTES:
-        return msg[:MAX_EXCEPTION_MSG_BYTES] + "…[truncated]"
-    return msg
+    return _REDACTED_BODY if msg else msg
+
+
+_REDACTED_BODY = "[message body redacted]"
 
 
 # -----------------------------------------------------------------

@@ -57,9 +57,10 @@ _JWT = (
 def test_stata_display_output_before_failure_is_not_forwarded() -> None:
     """A researcher who runs ``display var`` followed by a
     failing regression must not have the displayed values bleed
-    into the excerpt. The Stata extractor anchors on the LAST
-    ``r(<code>);`` and walks back to the most-recent ``. <cmd>``
-    - anything earlier is excluded by construction."""
+    into the excerpt. The Stata extractor now keeps only the
+    failing command's verb plus the ``r(<code>);`` line, so neither
+    pre-failure display output nor the post-cmd error message can
+    cross."""
     log = f"""\
 . set more off
 
@@ -86,8 +87,11 @@ r(111);
     assert _PII_ROW not in excerpt
     assert _PII_VALUE not in excerpt
     assert "secret_token" not in excerpt
-    # Sanity: the actual error IS forwarded.
-    assert "x_missing not found" in excerpt
+    # The failing command's args and error body are redacted; only
+    # the verb and rc line survive.
+    assert "x_missing" not in excerpt
+    assert "variable x_missing not found" not in excerpt
+    assert ". regress" in excerpt
     assert "r(111);" in excerpt
 
 
@@ -109,10 +113,12 @@ def test_stata_list_dump_inside_failing_command_block_is_bounded() -> None:
 # Long quoted blob - Python ValueError with a 5 KB repr arg
 # ---------------------------------------------------------------------------
 
-def test_python_oversized_quoted_arg_gets_truncated() -> None:
+def test_python_oversized_quoted_arg_is_redacted() -> None:
     """A ValueError whose message embeds a multi-KB repr (because
     pandas formatted the offending row) must not be forwarded
-    verbatim - the in-place truncation rule kicks in."""
+    verbatim. The exception body is now redacted wholesale — the
+    blob never reaches the excerpt at all, no per-arg truncation
+    needed."""
     blob = "X" * (MAX_QUOTED_ARG_BYTES * 5)
     stderr = (
         'Traceback (most recent call last):\n'
@@ -126,9 +132,8 @@ def test_python_oversized_quoted_arg_gets_truncated() -> None:
     assert blob not in excerpt
     # ValueError type still surfaces.
     assert "ValueError" in excerpt
-    # And the truncation is visible so the model knows something
-    # was elided rather than guessing.
-    assert "truncated" in excerpt
+    # Body redacted.
+    assert "[message body redacted]" in excerpt
 
 
 def test_extreme_oversize_message_capped_overall() -> None:
@@ -166,25 +171,26 @@ def test_python_to_json_exfil_via_runtimeerror_is_redacted() -> None:
     assert "RuntimeError" in excerpt
 
 
-def test_r_stop_exfil_long_message_is_truncated() -> None:
+def test_r_stop_exfil_message_is_redacted() -> None:
     """``stop(paste(df$secret, collapse=','))`` would otherwise
     pour a row of comma-separated cell values into the message
-    body. The data-shape detector + per-body cap together limit
-    the leak."""
+    body. The body is now redacted wholesale — no shape detection
+    or cap-based partial leak."""
     secret_row = ",".join(f"value_{i}" for i in range(20))
     stderr = f"Error in stop(...) : {secret_row}\n"
     excerpt = extract_debug_excerpt("", stderr, 1, "R")
     assert excerpt is not None
     # The full 20-cell row is not present.
     assert secret_row not in excerpt
-    # The framing IS — model still sees the call site.
-    assert "Error in stop" in excerpt
+    # The "Error :" anchor is the parser-owned framing — call
+    # deparse ``in stop(...)`` is also script-controlled and dropped.
+    assert "Error :" in excerpt
+    assert "stop(" not in excerpt
 
 
-def test_python_long_unquoted_message_is_capped() -> None:
-    """A message body longer than ``MAX_EXCEPTION_MSG_BYTES`` is
-    truncated even when it doesn't trip the data-shape detector
-    (e.g. a long English sentence assembled from row values)."""
+def test_python_long_unquoted_message_is_redacted() -> None:
+    """Long unquoted message bodies are redacted wholesale — no
+    per-arg truncation or quote-shape required."""
     long_body = "the offending row contains " + ("extremely_long_cell_value " * 20)
     stderr = (
         'Traceback (most recent call last):\n'
@@ -195,13 +201,18 @@ def test_python_long_unquoted_message_is_capped() -> None:
     excerpt = extract_debug_excerpt("", stderr, 1, "Python")
     assert excerpt is not None
     assert long_body not in excerpt
-    assert "truncated" in excerpt
+    assert "ValueError" in excerpt
+    assert "[message body redacted]" in excerpt
 
 
-def test_short_python_keyerror_passes_through() -> None:
-    """The cap must NOT break the legitimate use case: a short
-    ``KeyError: 'typo'`` should still surface the column name so
-    the model can fix the script."""
+def test_short_python_keyerror_body_redacted() -> None:
+    """Previous versions allowed short non-data-shaped exception
+    bodies to pass through the cap. A model-authored script could
+    ``raise KeyError(df.loc[0, 'name'])`` and read the cell back
+    under the 80-byte ceiling. The cap is gone; the exception body
+    is now redacted on its line. (The source-line preview ``df[
+    'typo']`` is the model's own script source — Python's traceback
+    formatter echoes it back, and the model wrote it.)"""
     stderr = (
         'Traceback (most recent call last):\n'
         '  File "/abs/x.py", line 3, in <module>\n'
@@ -210,26 +221,33 @@ def test_short_python_keyerror_passes_through() -> None:
     )
     excerpt = extract_debug_excerpt("", stderr, 1, "Python")
     assert excerpt is not None
-    assert "'typo'" in excerpt
-    assert "KeyError" in excerpt
+    last_line = excerpt.strip().splitlines()[-1]
+    # Body redacted on the exception line — the key value 'typo'
+    # no longer surfaces THROUGH the exception body channel.
+    assert "'typo'" not in last_line
+    assert last_line.startswith("KeyError")
+    assert "[message body redacted]" in last_line
 
 
-def test_short_r_object_not_found_passes_through() -> None:
-    """Same legitimate-use guarantee for R: a short
-    ``object 'wage' not found`` body must still reach the model."""
+def test_short_r_object_not_found_body_redacted() -> None:
+    """Same posture for R: a short ``object 'wage' not found`` body
+    used to pass the cap. It now doesn't reach the excerpt — the
+    model has the script source and knows which symbol was
+    referenced without us forwarding it."""
     stderr = (
         "Error in eval(predvars, data, env) : object 'wage' not found\n"
     )
     excerpt = extract_debug_excerpt("", stderr, 1, "R")
     assert excerpt is not None
-    assert "'wage'" in excerpt
-    assert "Error in eval" in excerpt
+    assert "'wage'" not in excerpt
+    assert "Error :" in excerpt
+    assert "[message body redacted]" in excerpt
 
 
-def test_python_filenotfound_errno_pattern_passes_through() -> None:
-    """``FileNotFoundError: [Errno 2] No such file: 'foo.csv'`` is
-    a common, legitimate pattern. The data-shape regex must not
-    treat ``[Errno 2]`` as a data dump."""
+def test_python_filenotfound_body_redacted() -> None:
+    """``FileNotFoundError: [Errno 2] No such file: 'foo.csv'``
+    surfaces the type only — the filename in the body is data-
+    controlled (a model can ``open(df.loc[0, 'secret'])``)."""
     stderr = (
         'Traceback (most recent call last):\n'
         '  File "/abs/x.py", line 1, in <module>\n'
@@ -239,7 +257,11 @@ def test_python_filenotfound_errno_pattern_passes_through() -> None:
     excerpt = extract_debug_excerpt("", stderr, 1, "Python")
     assert excerpt is not None
     assert "FileNotFoundError" in excerpt
-    assert "foo.csv" in excerpt
+    # The literal 'foo.csv' that appeared in the body is gone;
+    # the source-line preview that shows ``open('foo.csv')`` is
+    # the model's own script source, so its quoted-path basename
+    # form remains.
+    assert "[message body redacted]" in excerpt
 
 
 # ---------------------------------------------------------------------------
@@ -248,9 +270,11 @@ def test_python_filenotfound_errno_pattern_passes_through() -> None:
 
 def test_openai_key_in_traceback_is_redacted() -> None:
     """``print(os.environ)`` followed by a crash is the canonical
-    foot-gun. The extractor's credential scrub must catch
-    Anthropic / OpenAI / AWS / JWT shapes regardless of where they
-    appear in the stderr text."""
+    foot-gun. With the new body-redaction posture, the key never
+    even reaches the credential scrub — it's dropped wholesale
+    with the rest of the exception body. The earlier marker
+    ``[redacted-credential]`` is therefore not generated; the
+    important guarantee is that the key string itself is gone."""
     stderr = (
         'Traceback (most recent call last):\n'
         '  File "/abs/x.py", line 3, in <module>\n'
@@ -260,7 +284,9 @@ def test_openai_key_in_traceback_is_redacted() -> None:
     excerpt = extract_debug_excerpt("", stderr, 1, "Python")
     assert excerpt is not None
     assert _OPENAI_KEY not in excerpt
-    assert "[redacted-credential]" in excerpt
+    # The body is now redacted wholesale, so the credential never
+    # reaches the per-token credential scrub.
+    assert "[message body redacted]" in excerpt
 
 
 def test_anthropic_key_redacted() -> None:
@@ -344,15 +370,18 @@ def test_python_traceback_strips_home_directory_prefix() -> None:
     assert "line 17" in excerpt
 
 
-def test_bare_absolute_path_in_message_is_basenamed() -> None:
+def test_bare_absolute_path_in_message_is_redacted() -> None:
     """R / Stata error messages sometimes embed a bare absolute
-    path (e.g., the .dta file that couldn't open). The
-    home-directory prefix is dropped; the filename remains."""
+    path (e.g., the .dta file that couldn't open). With body
+    redaction, the entire path — including the filename, which is
+    data-derived (a model can construct a script that ``read_dta(
+    df.loc[0, 'secret'])``) — never reaches the excerpt."""
     stderr = 'Error in read_dta : file /Users/jdoe/private/secrets.dta not found\n'
     excerpt = extract_debug_excerpt("", stderr, 1, "R")
     assert excerpt is not None
     assert "/Users/jdoe/private" not in excerpt
-    assert "secrets.dta" in excerpt
+    assert "secrets.dta" not in excerpt
+    assert "Error :" in excerpt
 
 
 # ---------------------------------------------------------------------------
@@ -379,10 +408,13 @@ def test_python_extractor_ignores_stdout_entirely() -> None:
 
 def test_r_extractor_ignores_stdout_entirely() -> None:
     """Same boundary for R: a ``cat()`` / ``print(df)`` to stdout
-    must never bleed into the excerpt."""
+    must never bleed into the excerpt. The error message body
+    (``NA in design matrix``) is also dropped under the new
+    posture — only ``Error :`` framing remains."""
     stdout = f"printed row: {_PII_ROW}\n"
     stderr = "Error in lm.fit : NA in design matrix\n"
     excerpt = extract_debug_excerpt(stdout, stderr, 1, "R")
     assert excerpt is not None
     assert _PII_ROW not in excerpt
-    assert "NA in design matrix" in excerpt
+    assert "Error :" in excerpt
+    assert "NA in design matrix" not in excerpt

@@ -1612,6 +1612,17 @@ class NoraBridge:
         cwd_resolved = self.cwd.resolve()
         candidate = (self.cwd / safe_name).resolve()
         target: Path | None = None
+        # Rewind-aware: ``list_session_files`` and
+        # ``read_attached_file`` already filter run-dir artifacts to
+        # the rewind-visible set so a discarded chat branch's scripts
+        # / plots are not reachable. This bridge attach path is the
+        # researcher-side counterpart and used to bypass the same
+        # contract — staging a known display name from a hidden
+        # branch still worked. Compute the visible set once and use
+        # it on both the helper-plot iteration and the run-script
+        # lookup below.
+        from nora.session_files import visible_run_dir_names
+        visible_runs = visible_run_dir_names(self.cwd)
         if _is_within(candidate, cwd_resolved) and candidate.is_file():
             target = candidate
         else:
@@ -1622,6 +1633,9 @@ class NoraBridge:
             if runs_root.is_dir():
                 try:
                     for run_dir in runs_root.iterdir():
+                        if (visible_runs is not None
+                                and run_dir.name not in visible_runs):
+                            continue
                         plots_dir = run_dir / "_nora_plots"
                         if not plots_dir.is_dir():
                             continue
@@ -1647,7 +1661,9 @@ class NoraBridge:
             # the panel uses so the advertised recovery path
             # actually works.
             from nora.run_files import find_run_dir_script_by_name
-            run_script = find_run_dir_script_by_name(self.cwd, safe_name)
+            run_script = find_run_dir_script_by_name(
+                self.cwd, safe_name, visible_run_dirs=visible_runs,
+            )
             if (
                 run_script is not None
                 and _is_within(run_script, cwd_resolved)
@@ -2191,10 +2207,20 @@ class NoraBridge:
             return {"ok": False, "reason": f"not a directory: {target}"}
         # Only allow switching into paths we manage — prevents a
         # page-side exploit from pointing cwd at an arbitrary folder.
-        if not _is_within(target, SESSIONS_ROOT.resolve()):
+        # Must be a direct child of SESSIONS_ROOT, not the root
+        # itself: ``_is_within`` returns True for ``target ==
+        # sessions_root`` (relative_to of equal paths is ``Path('.')``),
+        # and a cwd anchored at the sessions root would let path
+        # resolution in downstream tools traverse every session.
+        # Matches the narrower check ``delete_session`` already uses.
+        sessions_root = SESSIONS_ROOT.resolve()
+        if target == sessions_root or target.parent != sessions_root:
             return {
                 "ok": False,
-                "reason": "path is outside ~/.nora-sessions/",
+                "reason": (
+                    "must be a direct session directory under "
+                    "~/.nora-sessions/"
+                ),
             }
 
         return self._set_cwd(target)
@@ -2216,10 +2242,19 @@ class NoraBridge:
             target = Path(path).expanduser().resolve()
         except OSError as e:
             return {"ok": False, "reason": f"bad path: {e}"}
-        if not _is_within(target, SESSIONS_ROOT.resolve()):
+        # Same direct-child gate as ``delete_session`` /
+        # ``switch_session``: ``_is_within`` alone would accept
+        # SESSIONS_ROOT itself (relative_to of equal paths is
+        # ``Path('.')``) and writing a custom_name at that level
+        # would corrupt the sessions root with a phantom session_state.
+        sessions_root = SESSIONS_ROOT.resolve()
+        if target == sessions_root or target.parent != sessions_root:
             return {
                 "ok": False,
-                "reason": "path is outside ~/.nora-sessions/",
+                "reason": (
+                    "must be a direct session directory under "
+                    "~/.nora-sessions/"
+                ),
             }
         if not target.is_dir():
             return {"ok": False, "reason": f"not a directory: {target}"}
