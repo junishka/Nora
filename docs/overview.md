@@ -7,7 +7,7 @@ been in the design conversation.
 ## What Nora is
 
 Nora is a tool that sits on a researcher's own computer and lets
-them use Claude (or another AI assistant) to analyze sensitive data
+them use an AI assistant to analyze sensitive data
 — medical records, HR data, survey responses, IRB-restricted
 research — without sending that data to any third party.
 
@@ -15,22 +15,23 @@ The problem it solves: AI assistants are useful for data analysis,
 but using one normally means either uploading the data or
 describing it in detail to the assistant. Both expose the data.
 Researchers with confidential datasets legally or ethically can't
-do that. Nora is a thin local layer that lets Claude help with
-analysis while the actual values stay on the researcher's machine.
+do that. Nora is a thin local layer that lets the assistant help
+with analysis while the actual values stay on the researcher's
+machine.
 
 ## How it works
 
 The researcher drags the data files into Nora's window or points
-Nora at a directory on launch. Supported formats are `.csv`, `.dta`
-(Stata), and `.rds` (R). A chat starts with Claude through Nora;
-Claude is then restricted — no filesystem access, no shell, no
-network tools.
+Nora at a directory on launch. Supported formats are `.csv`, `.tsv`,
+`.dta` (Stata), `.rds` (R), `.parquet`, `.jsonl`, and `.ndjson`. A
+chat starts through Nora; the model is then restricted — no
+filesystem access, no shell, no network tools.
 
-Instead, Claude reaches the researcher's machine through ten
+Instead, the model reaches the researcher's machine through fourteen
 narrow operations:
 
 1. **Ask for the schema** of a dataset — variable names, types,
-   and (optionally) labels.
+   labels, and summary metadata within the dataset's policy ceiling.
 2. **Search the schema** by name or label substring on wide
    datasets, instead of pulling the full schema.
 3. **Ask bounded questions** about a variable — how many
@@ -44,15 +45,21 @@ narrow operations:
    trimmed to coefficients, or rendered as a canonical markdown
    table).
 7. **List results** in this session.
-8. **List results across all sessions** (env-gated).
-9. **Recall earlier turns** of the conversation — Nora persists
-   the chat log to disk and Claude can search older turns when
+8. **Compose multiple stored results** into one canonical table.
+9. **List results across sessions** when the researcher enables
+   cross-session recall.
+10. **Recall earlier turns** of the conversation — Nora persists
+   the chat log to disk and the model can search older turns when
    the auto-loaded recent window isn't enough.
-10. **Re-fetch an attached file** the researcher mentioned
+11. **Re-fetch an attached file** the researcher mentioned
     earlier (script text or image), so the model can act on it
     without asking the researcher to re-attach.
+12. **List files in the session** such as scripts, logs, and plots.
+13. **Search session files** without opening unrelated files.
+14. **Install analysis packages** through the controlled package
+    installer when the researcher approves that workflow.
 
-When Claude submits a script, Nora runs it locally in a
+When the model submits a script, Nora runs it locally in a
 **sandbox** that blocks network access and restricts which files
 the script can read (only the researcher's data directory plus the
 paths R/Stata need to start up). The output of the script passes
@@ -63,11 +70,11 @@ observations like min/max, and never passes through raw text values
 from the data.
 
 The researcher sees the full raw script output in the chat window
-(in a result panel under each script run). Claude sees only the
+(in a result panel under each script run). The model sees only the
 sanitized version.
 
 Nora also remembers the conversation across restarts. Every turn
-is persisted to a per-session log file; when Claude opens a fresh
+is persisted to a per-session log file; when the model opens a fresh
 client (after the researcher closes and reopens, switches sessions,
 or changes models), the recent turns plus a list of stored
 analytical results are auto-injected as the warm-start prefix so
@@ -75,7 +82,7 @@ the conversation picks up where it left off. Older turns that have
 fallen out of that window can be retrieved on demand via the
 `recall_conversation` tool.
 
-The load-bearing property: **Claude never directly touches the
+The load-bearing property: **the model never directly touches the
 data.** It writes questions about the data (as code) and gets back
 privacy-filtered answers. The boundary is enforced by three
 independent layers — the tool interface, the sandbox, and the
@@ -90,27 +97,28 @@ of the pipeline?
 
 ### Option A — no local model (current architecture)
 
-The pipeline: Claude writes R/Stata → local sandbox runs it →
-sanitizer filters the output → Claude sees the sanitized result.
+The pipeline: the model writes R/Stata/Python → local sandbox runs
+it → sanitizer filters the output → the model sees the sanitized
+result.
 
 **What this gets right:**
-- Claude is an excellent coder. Scripts are usually correct on the
+- Frontier models are strong coders. Scripts are usually correct on the
   first try.
-- Installation is light. Python + whatever R or Stata the
+- Installation is light. Nora uses the analysis runtime(s) the
   researcher already has. No gigabyte-scale model downloads.
-- Quality is as high as Claude can make it, which is higher than
+- Quality is as high as the selected model can make it, which is higher than
   any open-source model.
 
 **What's missing:**
-- When a script fails, Claude is debugging blind. The raw error
+- When a script fails, the model is debugging blind. The raw error
   message stays on the researcher's machine for privacy reasons —
-  so Claude can't see exactly what went wrong. It has to guess
+  so it can't see exactly what went wrong. It has to guess
   from limited context.
 - Nora can't yet analyze text-heavy data — survey open-ends,
   clinical notes, legal documents. The sanitizer currently rejects
   free-text values as too risky to pass through without a way to
   redact PII.
-- A theoretically-adversarial Claude could encode small amounts of
+- A theoretically-adversarial model could encode small amounts of
   non-sensitive system info (like usernames from a system config
   file) into result fields. Low bandwidth, contained by the
   sandbox's file-access allowlist, but real.
@@ -121,18 +129,18 @@ The pipeline adds a step: an open-source coder model (Qwen3-Coder
 or similar) running on the researcher's laptop joins the loop.
 
 Variants:
-- **B1:** The local model writes code from Claude's plans. Claude
-  never writes executable code.
-- **B2:** Claude still writes code; the local model handles
-  recovery when execution fails (it can see raw stderr that Claude
-  can't) and redacts text values so free-text data can flow
-  through.
+- **B1:** The local model writes code from the frontier model's
+  plans. The frontier model never writes executable code.
+- **B2:** The frontier model still writes code; the local model handles
+  recovery when execution fails (it can see raw stderr that the
+  frontier model can't) and redacts text values so free-text data
+  can flow through.
 
 **What it gets:**
-- Claude gets a debugging partner for failed scripts.
+- The frontier model gets a debugging partner for failed scripts.
 - Text data becomes analyzable via local-model redaction.
 - Under B1, a narrow additional privacy property: an adaptive,
-  adversarial Claude can no longer choose exactly which
+  adversarial model can no longer choose exactly which
   computation runs on the data. That's a real gain, but it's
   bounded — it doesn't address the harder problem of cumulative
   inference across many sanitized queries (the "20 questions"
@@ -144,23 +152,23 @@ Variants:
   4-bit quantization.
 - Researcher needs a laptop that can run it (16 GB+ RAM, recent
   Apple Silicon or equivalent).
-- Local models are worse coders than Claude, especially in Stata
-  where the open training corpus is thin. Researchers may notice
-  the quality dip.
+- Local models are worse coders than frontier models, especially in
+  Stata where the open training corpus is thin. Researchers may
+  notice the quality dip.
 - More moving parts to build, test, and maintain.
 
 ## Why Option A was chosen
 
 The key realization: **the core privacy guarantee doesn't depend on
-which option is chosen.** In both, Claude can't touch the data
+which option is chosen.** In both, the model can't touch the data
 directly — that's enforced by the tool interface, the sandbox, and
 the sanitizer. Those three layers work identically either way.
 
-A local model would close one narrower channel (an adaptive
-Claude choosing exactly which computations run) and would add
-capability (debugging help, text-data handling). It would not
-address the harder privacy problem — cumulative inference across
-many sanitized queries — which is inherent to any interactive
+A local model would close one narrower channel: an adaptive model
+choosing exactly which computations run. It would also add
+capability such as debugging help and text-data handling. It would
+not address the harder privacy problem — cumulative inference
+across many sanitized queries — which is inherent to any interactive
 analysis system and is handled by session-level budgets and SDC
 rules, not by code authorship.
 
@@ -178,7 +186,7 @@ The pragmatic decision:
   analyze my free-text survey responses" would make text-redaction
   via a local model the specific blocker).
 - **Resist over-architecting.** The external reviewer's proposal
-  to replace Claude's code authorship entirely with a local-model
+  to replace frontier-model code authorship entirely with a local-model
   pipeline was a larger swing than the privacy gains justified,
   given that the sandbox and sanitizer already enforce the
   important boundary.
@@ -196,17 +204,11 @@ What's done since this overview was first written:
 - ✅ Researcher consent UI: per-dataset Permission chip in the
   composer row, editing `.nora/policy.json`.
 - ✅ Packaging: `.app` is built and launches the web UI directly
-  (no Terminal popup). Build pipeline produces a `.dmg` too. Both
-  work locally.
+  (no Terminal popup). The release `.dmg` is signed and notarized.
 
 What's left:
 
-1. **Apple Developer Program signing** so the .dmg can actually be
-   handed to a researcher. Without it, Gatekeeper refuses unsigned
-   apps cleanly enough that the right-click-Open workaround is
-   real friction. $99/yr cert.
-2. **One real researcher on real data.** The most important
+1. **One real researcher on real data.** The most important
    missing signal. Everything else is preparation for it.
 
-The signing is paperwork-and-dollars; the pilot is where the real
-feedback lives.
+The pilot is where the real feedback lives.

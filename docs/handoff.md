@@ -42,9 +42,9 @@ A local macOS app that lets a researcher drive statistical analysis
 (R, Stata, or Python) on their own data with a frontier model behind
 the scenes, without that data leaving the machine. From the
 researcher's point of view, Nora is one product they talk to — the
-underlying model (Claude or ChatGPT) is the engine, not exposed in
-the UI. The model reaches the researcher's files through a narrow
-ten-tool MCP interface — no Bash, no filesystem, no network. Scripts
+underlying provider model is the engine, not exposed as the product.
+The model reaches the researcher's files through a narrow
+fourteen-tool MCP interface — no Bash, no filesystem, no network. Scripts
 run under `sandbox-exec` with network denied and a tight
 subpath-allowlist for reads; every output passes through a
 disclosure-control sanitizer (SDC rules from Eurostat / UK ONS
@@ -86,7 +86,7 @@ keep streaming.
 | **Image attachments** — saved to cwd, staged for vision, rendered above the user bubble, clickable lightbox; persistent chip under the user bubble matches accent styling so a script attachment reads as obviously as an image thumbnail | ✅ done |
 | **Cache-busted JS/CSS** — `_materialize_cache_busted_index` writes a per-launch `index.bust-<hash>.html` so WKWebView reloads frontend assets instead of serving stale cached versions on Python restart | ✅ done |
 | **Frontend** (`nora`) — pywebview shell, sessions sidebar, theme toggle, model picker grouped by provider with $ pricing links, drag-drop file/image upload, Lottie cat loader, status line, per-message attachment chips, topbar visually integrated with chat surface | ✅ done |
-| **Packaging** (`.app` + `.dmg`) — bundles the web UI; .app launches pywebview with no Terminal popup; launcher logging now resilient to unwritable log dirs | ✅ done & smoke-tested locally (unsigned) |
+| **Packaging** (`.app` + `.dmg`) — bundles the web UI; .app launches pywebview with no Terminal popup; release `.dmg` is signed and notarized; launcher logging now resilient to unwritable log dirs | ✅ done |
 | **Product-identity prompt rule** — model introduces itself as Nora, uses first person ("I noticed…" not "Nora flagged…") | ✅ done |
 | **Token-budget pass** — Anthropic 1h prompt-cache TTL via `ENABLE_PROMPT_CACHING_1H`; OpenAI uses `previous_response_id` so per-turn input is just the new content; tool-result JSON minified (~25-35% off every payload); warm-start prefix tightened (5k → 2.7k tokens on resume); `turn_done` events now persisted for cache-rate diagnostics; system-prompt content trim + STAGE NOTE deletion + em-dash dedupes | ✅ done |
 | **Per-provider system prompt + lean OpenAI tool descriptions** — `build_system_prompt(cwd, server_name, provider)`; OpenAI gets a name-only tool intro instead of the Anthropic `mcp__nora__` mention; `ToolSpec.openai_description` field for the four biggest tools (recall_conversation, read_attached_file, submit_script, get_schema) cuts tool-array tokens by ~46% on the OpenAI path. Saves ~818 tokens/call, biggest wins compound across 100+ turn sessions | ✅ done |
@@ -121,7 +121,7 @@ keep streaming.
 | **Loading-label rotation expansion + sidebar shortcut guard** — added 18 data-themed gerunds (`crunching`, `wrangling`, `polishing`, …) and 3 noun-phrase jokes (`herding outliers`, `minding the gaps`, `reticulating splines`). Sidebar arrow/Backspace shortcut handler now bails out when focus is inside an `<input>` / `<textarea>` / `[contenteditable]` so typing in the rename input doesn't fire the row's delete confirm | ✅ done |
 | **Real-researcher pilot** | ⏳ self-pilot in progress |
 | **Cross-query composition / release ledger** | ⏭ named, future-deployment scope |
-| **Apple Developer Program signing + notarization for distributable .dmg** | ✅ done — release `.dmg` is signed (Developer ID Application) and notarized; first-launch on a colleague's Mac doesn't trip Gatekeeper |
+| **Apple Developer Program signing + notarization for distributable .dmg** | ✅ done — release `.dmg` is signed (Developer ID Application) and notarized |
 | **Stata batch wrapper around `_cons` "omitted" edge case** | ⏭ named, low-priority |
 
 **758 tests passing**, 17 skipped (sandbox-exec / pandas-dependent).
@@ -237,15 +237,16 @@ Three independent privacy layers. A break in any one is a bug; a
 break in two at the same time is a privacy incident.
 
 1. **Tool interface** (`src/nora/tools.py` + `provider/tool_schemas.py`)
-   — the model has exactly thirteen tools: `get_schema`,
+   — the model has exactly fourteen tools: `get_schema`,
    `search_schema`, `request_data`, `submit_script`,
    `submit_script_file`, `expand_result`, `compose_results`,
    `list_results`, `list_results_global`, `recall_conversation`,
    `read_attached_file`, `list_session_files`,
-   `search_in_session_files`. Anthropic SDK built-ins (Bash, Read,
-   Write, …) are disabled via `disallowed_tools` + `can_use_tool`
-   catch-all + `setting_sources=[]`. OpenAI: only the thirteen
-   function tools are passed; built-ins (`web_search`,
+   `search_in_session_files`, `install_packages`. Anthropic SDK
+   built-ins (Bash, Read, Write, …) are disabled via
+   `disallowed_tools` + `can_use_tool` catch-all +
+   `setting_sources=[]`. OpenAI: only the fourteen function tools
+   are passed; built-ins (`web_search`,
    `code_interpreter`, `file_search`, `image_generation`, `mcp`)
    are explicitly forbidden — verified on every request by
    `_verify_lockdown` and pinned by `test_openai_lockdown.py`.
@@ -372,15 +373,9 @@ next time, even when the launcher passes the cwd directly.
 
 The actual near-term blocker is one item:
 
-- **`.app` / `.dmg` distribution to other people.** The local build
-  works (`.app` launches the web UI directly via pywebview, no
-  Terminal popup). What's missing is an Apple Developer Program
-  signature — without it, anyone you hand the .dmg to hits a hard
-  Gatekeeper warning and most users won't get past it. Right-click →
-  Open / `xattr -cr` workarounds are documented in install.md but
-  aren't acceptable for a "just install this" handoff. Cost: $99/yr.
-  Once signed, also worth notarizing for the cleanest first-launch
-  experience.
+- **Outside pilot.** The release `.dmg` is signed and notarized.
+  What is still missing is a real outside researcher using Nora on
+  real data and feeding back where the workflow drags.
 
 ## Longer-term: governance for wider distribution
 
@@ -480,7 +475,7 @@ them by surprise.
   existing stack. Re-opens only when a specific use case demands
   it (stderr-based repair, text-data redaction).
 - **Multi-provider, not local model.** Anthropic + OpenAI both go
-  through the same six-tool MCP surface; the privacy layers
+  through the same fourteen-tool MCP surface; the privacy layers
   (sandbox + sanitizer) don't depend on which provider authored
   the call. Adding a third provider means writing a new
   `provider/foo.py` and one lockdown test; the SDC and sandbox
@@ -489,8 +484,7 @@ them by surprise.
   programmatic API access; mixing browser-OAuth with API-key
   flows in one input field is a UX trap. If/when OpenAI adds a
   subscription-included API tier, revisit.
-- **macOS-only for now.** Sandbox relies on `sandbox-exec`. Linux
-  would need `bubblewrap`/`nsjail`, Windows is on nobody's path.
+- **macOS-only for now.** Script execution relies on `sandbox-exec`.
 - **Schema policy is a ceiling, not a fixed value.** The model
   can request any depth ≤ ceiling. Researchers edit via the
   Permission chip in the composer row.
@@ -506,11 +500,10 @@ them by surprise.
   with a `pip install` hint otherwise); `statsmodels` and
   `scipy` are needed only by `from_lm` / `from_t_test`
   respectively, so descriptive scripts work without them.
-- **The product is Nora; the model is Claude or ChatGPT.** Don't
-  expose model names in user-facing copy. The system prompt has
-  an explicit identity rule telling the model to introduce
-  itself as Nora and to use first person ("I noticed…" not
-  "Nora flagged…").
+- **User-facing copy says Nora or assistant.** Provider and model
+  names belong in the auth/model picker, not as the product voice.
+  The system prompt tells the model to introduce itself as Nora and
+  to use first person ("I noticed…" not "Nora flagged…").
 - **Plot vision is helper-allowlist, not file-allowlist.** A
   `register_plot(file, kind)` API was tried and removed — the
   kind label was self-attested by the script, so a histogram
@@ -564,14 +557,10 @@ If you're picking this up to finish and ship it, in this order:
 
 1. **Run it yourself on your own data.** Catch the UX rough
    edges before anyone else sees them.
-2. **Sign and notarize the .app.** The build pipeline already
-   produces a working .app that launches the web UI directly with
-   no Terminal popup. The blocker for handing it to colleagues is
-   the missing Apple Developer Program signature. $99/yr.
-3. **Try it on a colleague's data** (or yours via a colleague).
+2. **Try it on a colleague's data** (or yours via a colleague).
    The difference between "self-pilot" and "someone who didn't
    build it" is where most real UX bugs live.
-4. **Distribution-mode concerns (cumulative-inference /
+3. **Distribution-mode concerns (cumulative-inference /
    release-ledger, multi-tenant policy, audit retention) wait
    until distribution itself is real.** They're meaningful work
    for a future deployment, not for the current self-pilot mode.

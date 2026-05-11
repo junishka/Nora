@@ -28,31 +28,30 @@ isn't, and why.
 **Keep the current architecture.** Remaining work is hardening, UX,
 and real-researcher contact — not restructuring.
 
-A recent external reviewer proposed replacing Claude's direct
-script authorship with a plan-submission architecture where Claude
-writes structured plans and a bundled local LLM compiles them into
-R/Stata. After working through the argument, that proposal was
-rejected as over-correction.
+A recent external reviewer proposed replacing the frontier model's
+direct script authorship with a plan-submission architecture where
+the model writes structured plans and a bundled local LLM compiles
+them into R/Stata. After working through the argument, that proposal
+was rejected as over-correction.
 
 The privacy guarantee in Nora comes from three independent
 layers:
 
-1. **The tool interface** — Claude can only do six things
-   (`get_schema`, `request_data`, `submit_script`, `expand_result`,
-   `list_results`, `recall_conversation`). No filesystem, no shell,
-   no network.
+1. **The tool interface** — the model can only use the registered
+   Nora tools. No filesystem, no shell, no network.
 2. **The sandbox** — scripts run under macOS `sandbox-exec` with a
    `(deny default)` profile and a narrow subpath-allowlist for
    reads; network denied entirely.
 3. **The sanitizer** — every output payload passes through SDC +
-   text-safety checks before reaching Claude.
+   text-safety checks before reaching the model.
 
 None of those three layers depends on *who authored the code*.
-Claude writing R is fine as long as Claude cannot directly touch
-data — which the tool interface and sandbox together enforce.
+The model writing R/Stata/Python is fine as long as it cannot
+directly touch data — which the tool interface and sandbox together
+enforce.
 
 A local LLM in the loop would close one narrow additional channel:
-an adaptive, adversarial Claude choosing exactly which
+an adaptive, adversarial model choosing exactly which
 computations run on the data. That's not nothing — it's a real but
 bounded gain. What it does *not* solve is the harder privacy
 problem, which is **cumulative inference from many sanitized
@@ -143,9 +142,8 @@ As of 2026-04-25, the implementation covers:
   picker, drag-drop file/image upload, Lottie cat loading indicator,
   status line, Permission/Model chips with popups, image-paste
   support.
-- Packaging: `.app` launches the web UI directly (no Terminal popup),
-  `.dmg` build pipeline. Local-only until Apple Developer Program
-  signing is in place.
+- Packaging: `.app` launches the web UI directly (no Terminal popup);
+  the release `.dmg` is signed and notarized.
 - 283 tests, ~3,600 Hypothesis-generated adversarial cases. Pushed
   to [github.com/junishka/builder](https://github.com/junishka/builder).
 
@@ -174,7 +172,7 @@ As of 2026-04-25, the implementation covers:
     find the token in the library's loaded environment. Useful
     interim measure.
   - **(c) Pre-opened fd** the subprocess inherits but can't
-    discover by path. Structural fix — the path Claude's code
+    discover by path. Structural fix — the path the model's code
     knows about simply isn't the fd the library writes through.
     Significantly more work in R.
 
@@ -190,7 +188,7 @@ Schema depth is now an explicit researcher policy in
 dataset has a per-file `max_depth` ceiling (or inherits
 `default_max_depth`); `get_schema` denies requests above the
 ceiling, annotates successful responses with the current
-`policy_max_depth` so Claude knows the limit without probing.
+`policy_max_depth` so the model knows the limit without probing.
 Malformed policy files fall back to the default silently — a
 broken file can't lock the researcher out.
 
@@ -217,7 +215,7 @@ Unknown depths / malformed entries silently fall back to the
 conservative default — a broken policy never locks anyone out.
 
 Also covered: ceiling annotation on successful responses (so
-Claude learns the limit without probing), per-dataset
+the model learns the limit without probing), per-dataset
 independence (each dataset has its own ceiling), explicit-vs-
 default distinction in denial messages.
 
@@ -225,20 +223,11 @@ Still on the list: automatic prompt on first-open of an
 un-policy'd dataset (currently the conservative default just
 applies silently and the chip reflects it).
 
-### 3. Packaging to `.dmg` (2–4 sessions)
+### 3. Packaging to `.dmg` — *done*
 
-The "install must be double-click" rule has been owed since early
-in the project. Current path (`uv sync` + `uv run python -m
-`nora`) is a developer workflow.
-
-Approach:
-- PyInstaller (or py2app / Briefcase — decision open) to a `.app`
-  bundle.
-- Notarize + sign; distribute as `.dmg`.
-- R must either be bundled or instructed-to-install (Homebrew cask
-  redirect). Stata stays user-installed — commercial license.
-- First-run UX: pick data dir, set schema policy, configure
-  Claude auth.
+The release path is a signed and notarized `.dmg`. The app bundles
+Nora's Python code and web assets, then invokes external analysis
+runtimes (R, Stata, Python) from the researcher's machine.
 
 ### 4. One real researcher on real data
 
@@ -262,7 +251,7 @@ current friction bites:
   (e.g. `~/Library/Application Support/Nora/sessions/<id>/`)
   and use that as cwd. Avoids the `~/Users/bb/…` path-expansion
   class of mistake entirely, and doesn't expose a whole project
-  directory to the sandbox just to give Claude two files.
+  directory to the sandbox just to give the model two files.
 - **Markdown-rendered assistant text with tables and code blocks.**
   *Done.* `src/nora/web/markdown.js` is an in-tree renderer that
   covers paragraphs, headings, fenced code, inline code, bold /
@@ -296,9 +285,8 @@ current friction bites:
   which calls `nora.ui:main`, so a double-click opens the pywebview
   chat window directly with no Terminal popup.
   Logs go to `~/Library/Logs/Nora/nora-YYYY-MM-DD.log` for
-  debugging when it fails to start. The .dmg pipeline produces a
-  working bundle locally; what's still missing is the Apple
-  Developer Program signature for distribution to other people.
+  debugging when it fails to start. The release `.dmg` is signed
+  and notarized for distribution.
 - **Turn-state discipline in the web UI.** *Done* (after
   feedback that the Send button was re-enabling too early). The
   bridge's `send_message` is fire-and-forget by design; the web
@@ -314,7 +302,7 @@ current friction bites:
 **Status as of the current pilot:** named, design-pending, and
 *not* the right thing to spend time on yet. The current and
 intended near-term mode is a researcher running Nora against their
-own data with their own API key — adversarial Claude and
+own data with their own API key — adversarial models and
 adversarial researchers aren't part of that threat model. Where
 this becomes load-bearing is wider deployment: shared instances,
 researchers analysing data they don't own, regulated datasets
@@ -326,7 +314,7 @@ Nora's SDC rules (precision clamping, cell suppression,
 dominance, text-safety) constrain what any **single** sanitized
 result reveals. They do not constrain the **joint distribution of
 answers across many queries**. A researcher — or an adaptive,
-adversarial Claude — who issues 200 individually-compliant queries
+adversarial model — who issues 200 individually-compliant queries
 can learn things about the dataset that no single query would
 release. This is the "20 questions" attack, and it is inherent to
 every interactive analysis system (not a Nora-specific bug).
@@ -370,9 +358,9 @@ datasets. Not urgent for pilot-scale public-ish research.
 
 ## Invariants (non-negotiable)
 
-- Claude has no general-purpose tools. SDK built-ins stay
+- The model has no general-purpose tools. SDK built-ins stay
   disabled.
-- Claude's only interface to the machine is the MCP tools registered
+- The model's only interface to the machine is the MCP tools registered
   in `ALLOWED_TOOL_NAMES` (the source of truth — currently 14: the
   six original plus `search_schema`, `submit_script_file`,
   `compose_results`, `list_results_global`, `read_attached_file`,
@@ -415,14 +403,14 @@ datasets. Not urgent for pilot-scale public-ish research.
 
 - **Bundling a local LLM on the critical path.** 15–17 GB install
   footprint, requires 16 GB+ RAM, produces worse R/Stata than
-  Claude — especially Stata, where the open training corpus is
+  frontier models — especially Stata, where the open training corpus is
   thin. Privacy benefit is narrow (closes the
   frontier-authored-code channel for adaptive attackers) but does
   not address cumulative-inference / adaptive-probing risks, which
   are inherent to interactive analysis regardless of authorship
   and are handled by session-level disclosure budgets and the
   SDC rules. Stays available as a future optional helper for:
-  error recovery using raw stderr (which Claude can't see),
+  error recovery using raw stderr (which the frontier model can't see),
   text-data redaction so free-text values can flow through the
   sanitizer, and quality improvements in specific edge cases.
   Re-enters the discussion when a real researcher's task actually
@@ -431,13 +419,13 @@ datasets. Not urgent for pilot-scale public-ish research.
 - **Mandatory safe variable IDs as the frontier-facing identity
   surface.** Schema exposure is policy, not architecture. If a
   researcher's dataset has non-sensitive variable names and they
-  opt in to sharing them with Claude, that's their call. Nora
+  opt in to sharing them with the model, that's their call. Nora
   enforces conservative defaults and makes the choice visible; it
   doesn't enforce a ceiling.
 
-- **Language-specific hybrid (Claude writes Stata, local model
+- **Language-specific hybrid (frontier model writes Stata, local model
   writes R/Python).** The premise — that local models are weak on
-  Stata — is true, but Option A has Claude writing all three
+  Stata — is true, but Option A has the frontier model writing all three
   languages directly. The hybrid solves a problem we don't have.
 
 - **A `register_plot(file, kind)` API for arbitrary plot files.**
@@ -482,8 +470,8 @@ datasets. Not urgent for pilot-scale public-ish research.
 
 ## What must not happen
 
-- Claude gains general-purpose tools at any stage.
+- The model gains general-purpose tools at any stage.
 - Sandbox or sanitizer becomes conditional on a flag.
-- Raw stderr / stdout reaches Claude.
+- Raw stderr / stdout reaches the model.
 - Schema-exposure defaults widen silently.
 - Runtime-library bypass remains open indefinitely.
