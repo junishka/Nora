@@ -1017,6 +1017,28 @@ def _sanitize_linear_regression(
         # adj_r_squared can be mildly negative; clamp only the upper bound.
         out["adj_r_squared"] = min(1.0, out["adj_r_squared"])
 
+    # Survival-specific small-cell guard. ``n_subjects`` / ``n_failures``
+    # come from Cox PH (and analogous survival models) and are themselves
+    # rare-outcome counts — a fit with n=200 records but n_failures=1
+    # discloses the one event in the cohort, which is the same disclosure
+    # shape ``cell_suppression_threshold`` guards against everywhere else.
+    # The records ``n`` is already gated by ``min_n_regression`` above, but
+    # both subjects and events can be below that gate when records are
+    # split-episode rows (stset can multiply rows per subject) so they
+    # need their own threshold check. Coarsen below threshold with the
+    # marker string; ``result_render._fmt_int`` already passes strings
+    # through so downstream rendering degrades cleanly.
+    threshold = config.cell_suppression_threshold
+    for survival_field in ("n_subjects", "n_failures"):
+        raw_val = out.get(survival_field)
+        if isinstance(raw_val, int) and 0 < raw_val < threshold:
+            out[survival_field] = suppression_marker(threshold)
+            transformations.append(
+                f"coarsened {survival_field} to {suppression_marker(threshold)} "
+                f"(survival event/subject counts < {threshold} are themselves "
+                f"disclosive)"
+            )
+
     return SanitizerResult(
         ok=True, analysis_type="linear_regression",
         sanitized=out, transformations=transformations,

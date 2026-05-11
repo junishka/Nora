@@ -1616,7 +1616,20 @@ function pendingFor(cwd) {
 
 async function fireQueuedMessage(cwd, item) {
   item.userEl.classList.remove('queued');
-  activeLiveTurn = { id: null, nodes: [item.userEl], hasVisibleReply: false };
+  // ``activeLiveTurn`` is the focused-session global the Stop button
+  // and ``assistant_*`` event handlers read. A queued message can
+  // fire AFTER the researcher has switched sessions — if we
+  // unconditionally wrote the global, a background flush would
+  // steal Stop / hasVisibleReply / disposable-turn cleanup from the
+  // focused session's live turn (clicking Stop would cancel the
+  // wrong turn; the focused turn's "model replied" flag would land
+  // on the background turn's tracking object). The local handle
+  // still exists so this function's own try/catch can attach error
+  // nodes to the queued user bubble; we just don't promote it to
+  // the focused-only global when the queue isn't for the focus.
+  const isFocused = (cwd === currentCwd);
+  const localTurn = { id: null, nodes: [item.userEl], hasVisibleReply: false };
+  if (isFocused) activeLiveTurn = localTurn;
   // Use the explicit-target send variants. The plain ``send_message``
   // routes to the bridge's ``self.cwd`` (focused session); a queue
   // can flush AFTER the user has switched sessions, so falling back
@@ -1656,12 +1669,15 @@ async function fireQueuedMessage(cwd, item) {
         // path above is the durable fix.
         turnId = await api.send_message_with_images(item.text, payload);
       } else {
-        const errEl = appendError('Restart Nora to send images.');
-        if (activeLiveTurn) {
-          activeLiveTurn.nodes.push(errEl);
-          queueDisposableTurn(activeLiveTurn.nodes);
+        // The error bubble is a focused-transcript surface; only
+        // surface it (and queue disposable nodes against the focused
+        // global) when this flush is for the focused session.
+        if (isFocused) {
+          const errEl = appendError('Restart Nora to send images.');
+          localTurn.nodes.push(errEl);
+          queueDisposableTurn(localTurn.nodes);
+          activeLiveTurn = null;
         }
-        activeLiveTurn = null;
         setSending(false, cwd);
         return;
       }
@@ -1672,14 +1688,15 @@ async function fireQueuedMessage(cwd, item) {
     } else {
       turnId = await api.send_message(item.text);
     }
-    if (activeLiveTurn) activeLiveTurn.id = turnId;
+    localTurn.id = turnId;
   } catch (err) {
-    const errEl = appendError('send failed: ' + err);
-    if (activeLiveTurn) {
-      activeLiveTurn.nodes.push(errEl);
-      queueDisposableTurn(activeLiveTurn.nodes);
+    // Same focused-only routing as the no-image-support branch above.
+    if (isFocused) {
+      const errEl = appendError('send failed: ' + err);
+      localTurn.nodes.push(errEl);
+      queueDisposableTurn(localTurn.nodes);
+      activeLiveTurn = null;
     }
-    activeLiveTurn = null;
     setSending(false, cwd);
   }
 }
@@ -2299,6 +2316,16 @@ window.nora_event = function (evt) {
       break;
     case 'policy_updated':
       updatePolicyChip(evt.policy);
+      break;
+    case 'install_confirmation_request':
+      // Hard consent gate for the install_packages tool. The Python
+      // handler is blocked awaiting a response keyed by ``evt.token``;
+      // a missing emitter would have made it deny immediately, so the
+      // request only arrives here when a real install is pending.
+      // Show the modal regardless of focused vs background cwd: the
+      // install affects the researcher's machine globally, so the
+      // confirmation belongs in front of them right now.
+      showInstallConfirmationModal(evt);
       break;
     default:
       console.warn('unknown event type', evt);
@@ -4189,6 +4216,116 @@ function formatContextWindow(n) {
     return (Math.round(m * 100) / 100) + 'M ctx';
   }
   return (n / 1000) + 'k ctx';
+}
+
+function showInstallConfirmationModal(evt) {
+  /* Hard consent gate for the ``install_packages`` tool. The Python
+   * handler is awaiting a response keyed by ``evt.token``; the
+   * researcher's click on Approve / Deny calls
+   * ``respond_install_confirmation`` to release that future. If the
+   * researcher closes the modal without clicking either button
+   * (Esc / overlay-click), we send an explicit deny so the handler
+   * doesn't sit on its 5-minute timeout.
+   *
+   * Multiple concurrent requests are stacked: each call creates its
+   * own overlay (token-keyed) so an early decision can't be applied
+   * to a later request by accident. */
+  if (!evt || !evt.token) return;
+
+  const overlay = document.createElement('div');
+  overlay.className = 'install-confirmation-overlay';
+  overlay.setAttribute('role', 'dialog');
+  overlay.setAttribute('aria-modal', 'true');
+  overlay.setAttribute('aria-label', 'Confirm package install');
+  overlay.tabIndex = -1;
+
+  const card = document.createElement('div');
+  card.className = 'install-confirmation-card';
+
+  const title = document.createElement('div');
+  title.className = 'install-confirmation-title';
+  const actionLabel = (evt.action === 'remove')
+    ? 'Remove'
+    : (evt.action === 'reinstall') ? 'Reinstall' : 'Install';
+  title.textContent = actionLabel + ' ' + (evt.language || '') + ' packages?';
+
+  const desc = document.createElement('div');
+  desc.className = 'install-confirmation-desc';
+  desc.textContent = (
+    'Nora wants to ' + actionLabel.toLowerCase() + ' the following '
+    + 'packages on this machine. This runs the language’s package '
+    + 'manager outside the sandbox and writes to your user library.'
+  );
+
+  const pkgList = document.createElement('ul');
+  pkgList.className = 'install-confirmation-pkgs';
+  (evt.packages || []).slice(0, 50).forEach((name) => {
+    const li = document.createElement('li');
+    li.textContent = String(name);
+    pkgList.appendChild(li);
+  });
+  if ((evt.packages || []).length > 50) {
+    const more = document.createElement('li');
+    more.className = 'install-confirmation-more';
+    more.textContent = '… and ' + ((evt.packages.length - 50)) + ' more';
+    pkgList.appendChild(more);
+  }
+
+  const actions = document.createElement('div');
+  actions.className = 'install-confirmation-actions';
+  const denyBtn = document.createElement('button');
+  denyBtn.type = 'button';
+  denyBtn.className = 'install-confirmation-deny';
+  denyBtn.textContent = 'Deny';
+  const approveBtn = document.createElement('button');
+  approveBtn.type = 'button';
+  approveBtn.className = 'install-confirmation-approve';
+  approveBtn.textContent = actionLabel;
+  actions.appendChild(denyBtn);
+  actions.appendChild(approveBtn);
+
+  card.appendChild(title);
+  card.appendChild(desc);
+  card.appendChild(pkgList);
+  card.appendChild(actions);
+  overlay.appendChild(card);
+
+  let resolved = false;
+  const respond = async (approved) => {
+    if (resolved) return;
+    resolved = true;
+    overlay.remove();
+    document.removeEventListener('keydown', onKey);
+    if (!window.pywebview || !window.pywebview.api) return;
+    if (typeof window.pywebview.api.respond_install_confirmation !== 'function') {
+      // Older bridge build without the new method. The Python
+      // handler will time out; nothing we can do from JS to fix.
+      return;
+    }
+    try {
+      await window.pywebview.api.respond_install_confirmation(evt.token, !!approved);
+    } catch (err) {
+      console.warn('respond_install_confirmation failed', err);
+    }
+  };
+
+  approveBtn.addEventListener('click', () => respond(true));
+  denyBtn.addEventListener('click', () => respond(false));
+  // Esc / overlay-click default to deny — closing without an explicit
+  // approve is the safe interpretation, and Python is blocked on the
+  // future, so silently dismissing would leave it waiting.
+  overlay.addEventListener('click', (e) => {
+    if (e.target === overlay) respond(false);
+  });
+  const onKey = (e) => {
+    if (e.key === 'Escape') respond(false);
+    if (e.key === 'Enter' && !e.shiftKey) respond(true);
+  };
+  document.addEventListener('keydown', onKey);
+  document.body.appendChild(overlay);
+  // Focus Deny by default so an absent-minded Enter doesn't approve;
+  // researcher must move to Approve deliberately.
+  denyBtn.focus();
 }
 
 function showImageLightbox(url) {

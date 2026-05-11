@@ -27,8 +27,15 @@ SCRIPT_EXTS: frozenset[str] = frozenset({
 # EPS land here because researchers iterate on plots in those formats
 # even though they're more general — within Nora's scope, anything
 # matching this extension set IS a plot.
+#
+# WebP and GIF are screenshot / animation formats the composer accepts
+# (see ``ui._IMAGE_EXTS_MIMES``); they're saved to cwd alongside PNG /
+# JPEG. Without them in this set, ``classify_ext`` returned ``None``
+# and the Files panel filtered them out entirely — the researcher
+# uploaded an image, the UI promised they could mention it later, but
+# the panel and ``read_attached_file`` never saw it again.
 GRAPH_EXTS: frozenset[str] = frozenset({
-    ".gph", ".png", ".jpg", ".jpeg", ".pdf", ".eps",
+    ".gph", ".png", ".jpg", ".jpeg", ".pdf", ".eps", ".webp", ".gif",
 })
 
 # Stata's text logs (.log) and SMCL logs (.smcl).

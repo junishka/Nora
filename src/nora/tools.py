@@ -64,6 +64,21 @@ _PLOT_HELPER_NAME_MAX_LEN = 80
 # actually decides whether to forward the message at all.
 _PLOT_HELPER_MESSAGE_MAX_LEN = 160
 
+# Structural caps on the plot-helper summary payload returned by
+# ``_summarize_plot_helpers``. Per-entry fields are already bounded by
+# the length caps above (~280 bytes/row), but without entry-count caps
+# a script can loop over helper calls (or write directly to the JSONL
+# files in its run_dir) and force a megabyte-scale ``plots.succeeded``
+# / ``plots.failed`` payload that bypasses ``_INLINE_PAYLOAD_BUDGET``
+# trimming — the trim logic only inspects ``payload`` / ``markdown``
+# on result entries, not the ``plots`` envelope. The numbers below
+# comfortably accommodate legitimate research output (a single
+# script rarely produces more than a handful of plots, and helper
+# failures stop being useful past the first few) and refuse anything
+# that looks engineered.
+_PLOT_HELPER_MAX_ROWS = 50
+_PLOT_HELPER_MAX_BYTES = 16_000
+
 # Anchored full-string regexes for canonical import / dependency
 # error shapes the model can act on. Each pattern matches the
 # ENTIRE cleaned message; a partial match is not enough. The
@@ -686,6 +701,27 @@ def _summarize_plot_helpers(run_dir: Any) -> dict[str, Any] | None:
     # ``_PLOT_KIND_ALLOWLIST``; the surface here just keeps the
     # signal so the model doesn't loop calling ``plot_residuals``.
     from nora.runner import _PLOT_KIND_RESEARCHER_ONLY
+
+    # Running totals enforced across both lists. Once we hit either the
+    # row count cap or the byte budget, remaining entries are counted in
+    # ``truncated_succeeded`` / ``truncated_failed`` (surfaced as
+    # ``_truncated`` markers below) rather than appended. The byte cost
+    # is measured on the per-row JSON encoding so the cap reflects the
+    # actual size shipped through the bridge.
+    bytes_used = 0
+    truncated_succeeded = 0
+    truncated_failed = 0
+
+    def _row_bytes(r: dict[str, Any]) -> int:
+        return len(json.dumps(r, ensure_ascii=False, separators=(",", ":")))
+
+    def _budget_exhausted(extra: int) -> bool:
+        total_rows = len(succeeded) + len(failed)
+        return (
+            total_rows >= _PLOT_HELPER_MAX_ROWS
+            or bytes_used + extra > _PLOT_HELPER_MAX_BYTES
+        )
+
     if manifest.is_file():
         for entry in _read_jsonl(manifest):
             raw_file = entry.get("file", "?")
@@ -709,7 +745,12 @@ def _summarize_plot_helpers(run_dir: Any) -> dict[str, Any] | None:
             }
             if kind_str in _PLOT_KIND_RESEARCHER_ONLY:
                 row["researcher_only"] = True
+            cost = _row_bytes(row)
+            if _budget_exhausted(cost):
+                truncated_succeeded += 1
+                continue
             succeeded.append(row)
+            bytes_used += cost
     if errors.is_file():
         for entry in _read_jsonl(errors):
             raw_helper = entry.get("helper", "?")
@@ -739,7 +780,12 @@ def _summarize_plot_helpers(run_dir: Any) -> dict[str, Any] | None:
                     )
                     if cleaned_fix:
                         row["fix"] = cleaned_fix
+            cost = _row_bytes(row)
+            if _budget_exhausted(cost):
+                truncated_failed += 1
+                continue
             failed.append(row)
+            bytes_used += cost
 
     if not succeeded and not failed:
         return None
@@ -747,6 +793,10 @@ def _summarize_plot_helpers(run_dir: Any) -> dict[str, Any] | None:
         "succeeded": succeeded,
         "failed": failed,
     }
+    if truncated_succeeded:
+        summary["truncated_succeeded"] = truncated_succeeded
+    if truncated_failed:
+        summary["truncated_failed"] = truncated_failed
     if failed and not succeeded:
         # Make the failure mode obvious in the model's reading of
         # the response. The model has been observed to say
@@ -2968,6 +3018,12 @@ _RECALL_IMAGE_MIMES: dict[str, str] = {
     ".png": "image/png",
     ".jpg": "image/jpeg",
     ".jpeg": "image/jpeg",
+    # WebP and GIF are accepted by the composer (drop / paste / +
+    # button); without them here ``read_attached_file`` rejected
+    # the same files the UI promised the researcher could re-mention.
+    # Anthropic and OpenAI vision both accept these MIME types.
+    ".webp": "image/webp",
+    ".gif": "image/gif",
 }
 # PDF / EPS are graphs the researcher might mention. We rasterise via
 # the existing sips-backed sidecar (same path the Files panel uses)
@@ -3490,9 +3546,9 @@ async def read_attached_file(args: dict[str, Any]) -> dict[str, Any]:
             f"{safe_name} is a {ext or 'unknown'} file; only scripts "
             f"(.py / .do / .r / .rmd), notebooks (.ipynb — code + "
             f"markdown cells only), and images (.png / .jpg / .jpeg / "
-            f".pdf / .eps) can be recalled through this tool. For "
-            f"datasets use get_schema; for stored results use "
-            f"expand_result."
+            f".webp / .gif / .pdf / .eps) can be recalled through "
+            f"this tool. For datasets use get_schema; for stored "
+            f"results use expand_result."
         ),
     })
 
@@ -4055,11 +4111,17 @@ async def install_packages(args: dict[str, Any]) -> dict[str, Any]:
     """Install / remove / reinstall language packages out-of-band.
 
     Network + library-write happens here, not in submit_script. The
-    confirm-with-the-researcher flow is enforced by the system prompt
-    (the model asks in chat, the researcher answers, the model then
-    calls this tool); this handler does NOT pop a UI dialog.
+    system prompt instructs the model to ask the researcher in chat
+    first; this handler is the HARD gate behind that prompt-only
+    request. Before running the underlying installer we surface a
+    modal in the UI via ``install_confirmation.request_confirmation``
+    and only proceed on an explicit approval. Without a UI attached
+    (headless / test), the gate fails closed — denying the install
+    is the safe default for a tool that mutates the researcher's
+    machine.
     """
     from nora.package_installer import install_packages as _do_install
+    from nora.install_confirmation import request_confirmation
 
     language = args.get("language", "")
     packages_arg = args.get("packages") or []
@@ -4079,6 +4141,37 @@ async def install_packages(args: dict[str, Any]) -> dict[str, Any]:
         return _as_mcp_text({
             "status": "error",
             "reason": "action must be a string ('install', 'remove', or 'reinstall')",
+        })
+
+    # Validate before opening the modal — pointless to ask the
+    # researcher to approve an install we'd reject downstream anyway.
+    # The package_installer module re-validates internally; the
+    # checks here are just to fail fast on obvious malformed input.
+    if not packages_arg:
+        return _as_mcp_text({
+            "status": "error",
+            "reason": "packages list is empty",
+        })
+
+    approved = await request_confirmation(
+        language=language,
+        packages=list(packages_arg),
+        action=action,
+    )
+    if not approved:
+        return _as_mcp_text({
+            "status": "rejected",
+            "reason": (
+                "researcher declined the install (or did not respond "
+                "within the confirmation window). Ask the researcher "
+                "directly in chat what they'd like to do; do not "
+                "re-call this tool without their explicit go-ahead."
+            ),
+            "language": language,
+            "action": action,
+            # Package names echoed back so the model can confirm what
+            # was proposed, but no install was performed.
+            "packages": list(packages_arg),
         })
 
     result = await _do_install(language, list(packages_arg), action)
