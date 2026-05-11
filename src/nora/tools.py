@@ -4251,6 +4251,14 @@ async def install_packages(args: dict[str, Any]) -> dict[str, Any]:
             "reason": result.error,
             "statuses": statuses,
             "duration_seconds": round(result.duration_seconds, 2),
+            # Scrub both stdout and stderr through ``scrub_raw_output``
+            # — the credential / path scrubber documented above. This
+            # supersedes the earlier "drop stdout, keep stderr" posture
+            # because the scrubber handles the exact concrete leaks
+            # that motivated dropping stdout (pip's ``user:token@`` in
+            # index URLs, absolute filesystem paths a malicious
+            # ``setup.py`` could echo) while preserving the diagnostic
+            # value of stdout for legitimate install failures.
             "raw_stdout_excerpt": scrub_raw_output(
                 (result.raw_stdout or "")[-1500:], cap_bytes=1500,
             ),
@@ -4258,16 +4266,14 @@ async def install_packages(args: dict[str, Any]) -> dict[str, Any]:
                 (result.raw_stderr or "")[-3000:], cap_bytes=3000,
             ),
         })
-    # No ``raw_stdout_excerpt`` on success. pip's progress output
-    # echoes the full index URL — including any token-bearing
+    # No raw output on success. pip's progress output echoes the full
+    # index URL — including any token-bearing
     # ``index-url = https://USER:TOKEN@private-pypi.acme.com/simple``
     # the researcher configured in pip.conf or PIP_INDEX_URL — and
     # that excerpt was being forwarded into the model's transcript on
     # every successful install. The ``statuses`` list already tells
     # the model which packages were touched and at what version;
-    # pip's chatty output adds no information beyond that. Errors
-    # still get the excerpt (above) because diagnosing a failed
-    # install genuinely needs it.
+    # pip's chatty output adds no information beyond that.
     return _as_mcp_text({
         "status": "ok",
         "language": result.language,

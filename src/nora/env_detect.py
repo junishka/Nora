@@ -311,14 +311,29 @@ def _python_missing_packages(
         "        missing.append(pkg)\n"
         "sys.stdout.write(json.dumps(missing))\n"
     )
-    # Lazy import: ``package_installer`` is a sibling module and
-    # cheap to import, but keeping it lazy avoids any import-cycle
-    # surprise if env_detect ever gets pulled in earlier in startup.
+    # Lazy import: ``package_installer`` and ``executor`` are sibling
+    # modules and cheap to import, but keeping them lazy avoids any
+    # import-cycle surprise if env_detect ever gets pulled in earlier
+    # in startup.
     from nora.package_installer import nora_python_pkg_dir
+    from nora.executor import _filter_env
     pkg_dir = str(nora_python_pkg_dir(binary))
-    existing = os.environ.get("PYTHONPATH", "")
+    # Filter the probe's env through the same allowlist the executor
+    # uses for analysis scripts. The probe runs ``__import__(pkg)`` for
+    # the configured packages — pandas, numpy, statsmodels, scipy,
+    # matplotlib — which executes each package's ``__init__.py``
+    # OUTSIDE the script sandbox and with no network deny. Without the
+    # filter, those imports inherit secrets like ``ANTHROPIC_API_KEY``
+    # / AWS credentials from the parent process env. If
+    # ``install_packages`` ever wrote a malicious package masquerading
+    # as one of the probed names into ``nora_python_pkg_dir``, its
+    # import code would have a clean exfiltration path. The script
+    # executor's ``_filter_env`` is the canonical allowlist; using it
+    # here keeps the two surfaces aligned.
+    filtered = _filter_env(dict(os.environ))
+    existing = filtered.get("PYTHONPATH", "")
     probe_env = {
-        **os.environ,
+        **filtered,
         "PYTHONPATH": (
             f"{pkg_dir}{os.pathsep}{existing}" if existing else pkg_dir
         ),

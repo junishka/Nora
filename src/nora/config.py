@@ -27,6 +27,7 @@ runner-bound context gets the override.
 
 from __future__ import annotations
 
+import os
 from contextlib import contextmanager
 from contextvars import ContextVar
 from pathlib import Path
@@ -97,6 +98,50 @@ def use_cwd(path: Path) -> Iterator[Path]:
         yield resolved
     finally:
         _cwd_var.reset(token)
+
+
+def ensure_private_nora_dir(cwd: Path) -> Path:
+    """Create ``<cwd>/.nora`` (if missing) and force it to mode 0o700.
+
+    Every Nora-owned file lives under ``.nora`` — chat history with
+    verbatim user messages (including any credentials a researcher
+    pasted), the SQLite results store with sanitized payloads and
+    script source, the pre-SDC ``result.json`` for each run, the
+    raw ``stdout.log`` / ``stderr.log`` for each script, the
+    researcher-authored script source itself, and per-run scratch
+    via ``TMPDIR=<run_dir>/tmp``. None of that should be readable
+    by other users on the same machine.
+
+    The default umask leaves files inside ``.nora`` at 0o644 —
+    world-readable on any filesystem where the home directory's
+    own mode permits traversal (HPC, NFS, university research
+    servers). Gating the parent directory at 0o700 makes every
+    descendant unreachable regardless of per-file modes: without
+    execute on ``.nora`` itself, another user cannot ``open()``
+    paths inside it even with a literal absolute path. So the
+    one-line fix is also the load-bearing one — per-file chmods
+    inside would just be defense-in-depth on top.
+
+    Idempotent: returns the path whether the directory was just
+    created or already existed; the chmod runs either way so a
+    pre-existing 0o755 ``.nora`` from an earlier Nora run is
+    upgraded.
+
+    Errors during chmod are silently swallowed. On a filesystem
+    that doesn't support POSIX modes (some network mounts, FAT
+    volumes) we still want the rest of Nora to work — the
+    application is just less hardened on that mount.
+    """
+    nora_dir = cwd / ".nora"
+    nora_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        os.chmod(nora_dir, 0o700)
+    except OSError:
+        # Best-effort: some network filesystems / Windows mounts
+        # don't honor POSIX mode bits. Better to keep going than
+        # block session creation.
+        pass
+    return nora_dir
 
 
 def resolve_in_cwd(user_path: str) -> Path:

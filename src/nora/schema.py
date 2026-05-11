@@ -181,42 +181,35 @@ def load_data(dataset_path: Path) -> Any:
     )
 
 
-def _looks_like_header(first_line: bytes | None, sep: bytes) -> bool:
-    """Heuristic: does the first line of a delimited file look like a
-    header row (column names) or a data row?
+def _record_looks_like_header(record: list[str]) -> bool:
+    """Heuristic: does a parsed CSV/TSV record look like a header row
+    (column names) or a data row?
 
-    True (header) when the line is non-empty AND at least one
-    delimiter-separated token can't be parsed as a number. The vast
-    majority of real-world CSVs/TSVs use string column names, so this
-    classifies the common case correctly. Edge cases:
+    Takes an already-parsed list of cells from ``csv.reader`` (which
+    correctly handles quoted, multi-line fields) rather than raw
+    bytes. True (header) when at least one cell can't be parsed as a
+    number. Same edge-case posture as the previous bytes-based
+    version:
 
-    - Empty or single-token line: treated as a header (common case is
-      a single-column file with a name like ``"id"``).
-    - Every token is numeric (e.g. raw sensor dump where the model's
-      first reading is ``"123,45.6,7"``): treated as data, no header
-      offset applied. The previous unconditional ``-1`` was wrong
-      here.
-    - Quoted strings: not de-quoted before the parse. A row like
-      ``"42","43"`` would be classified as header (non-numeric due
-      to the quotes); that matches typical usage where the first
-      row of such a file IS a header.
-
-    Used by ``row_count`` for the submit_script row-count audit. The
-    audit treats ``None`` and "best-effort numeric count" as the
-    same low-confidence signal, so a misclassification at the
-    heuristic boundary is harmless beyond the audit message wording.
+    - Empty or single-cell record: treated as a header (a single-
+      column file with a name like ``"id"`` is the common case).
+    - Every cell is numeric (raw sensor dump etc.): treated as data,
+      no header offset applied.
     """
-    if not first_line:
+    if not record:
         return True
-    tokens = first_line.split(sep)
-    for tok in tokens:
-        s = tok.strip().strip(b'"').strip(b"'").decode("utf-8", errors="replace")
+    saw_any = False
+    for cell in record:
+        s = (cell or "").strip()
         if not s:
             continue
+        saw_any = True
         try:
             float(s)
         except ValueError:
             return True
+    if not saw_any:
+        return True
     return False
 
 
@@ -266,23 +259,37 @@ def row_count(dataset_path: Path) -> int | None:
             import pyarrow.parquet as pq
             return int(pq.ParquetFile(str(dataset_path)).metadata.num_rows)
         if suffix == ".csv" or suffix == ".tsv":
-            # Line count minus 1 ONLY when the first line looks like
-            # a header. Streamed read so we don't materialise the
-            # file in memory. The header heuristic peeks at the
-            # first line: if every comma/tab-separated token parses
-            # as a number, it's data; otherwise treat as a header.
-            sep = b"," if suffix == ".csv" else b"\t"
-            n_lines = 0
-            first_line: bytes | None = None
-            with open(dataset_path, "rb") as f:
-                for line in f:
-                    if first_line is None:
-                        first_line = line.rstrip(b"\r\n")
-                    n_lines += 1
-            if n_lines == 0:
+            # Streamed parse via ``csv.reader`` so quoted fields with
+            # embedded newlines count as ONE record, not multiple.
+            # The previous byte-streamed line counter treated every
+            # physical ``\n`` as a row boundary, so a valid CSV like
+            #   id,note\n
+            #   1,"hello\n
+            #   world"\n
+            # was counted as 3 lines (- 1 for header) = 2 rows even
+            # though the actual analysis sees 1 row, false-flagging
+            # the row-count audit. ``csv.reader`` honours RFC 4180
+            # quoting and is memory-efficient (it streams the file
+            # without materialising the whole thing). The header
+            # heuristic operates on the parsed first record so it
+            # works through quotes correctly.
+            import csv
+            delimiter = "," if suffix == ".csv" else "\t"
+            n_records = 0
+            first_record: list[str] | None = None
+            with open(
+                dataset_path, "r", encoding="utf-8",
+                errors="replace", newline="",
+            ) as f:
+                reader = csv.reader(f, delimiter=delimiter)
+                for record in reader:
+                    if first_record is None:
+                        first_record = record
+                    n_records += 1
+            if n_records == 0:
                 return 0
-            has_header = _looks_like_header(first_line, sep)
-            return max(0, n_lines - 1 if has_header else n_lines)
+            has_header = _record_looks_like_header(first_record or [])
+            return max(0, n_records - 1 if has_header else n_records)
         if suffix in (".jsonl", ".ndjson"):
             n_lines = 0
             with open(dataset_path, "rb") as f:
@@ -500,12 +507,54 @@ def _extract_rds(path: Path, depth: str) -> dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
+# names_only fast path — column names only, no full data load
+# ---------------------------------------------------------------------------
+
+def _names_only_payload(
+    column_names: list[str], path: Path, file_type: str,
+) -> dict[str, Any]:
+    """Build a names_only response from a list of column names and the
+    path. Used by the CSV/TSV/Parquet/JSONL fast paths to avoid
+    loading the whole dataset when the model only asked for the
+    variable list.
+
+    Observation count comes from ``row_count(path)`` (metadata- or
+    streaming-only for these formats). A ``None`` return falls back
+    to ``0`` so the response stays well-formed; the caller can decide
+    to escalate to the full-load path if they need a real count.
+    """
+    obs = row_count(path) or 0
+    variables = [{"name": safe_key(str(c))} for c in column_names]
+    return {
+        "status": "ok",
+        # See _extract_stata for the prompt-injection rationale on
+        # filenames passing through safe_text.
+        "dataset": safe_text(path.name),
+        "file_type": file_type,
+        "depth": "names_only",
+        "observation_count": int(obs),
+        "variables": variables,
+    }
+
+
+# ---------------------------------------------------------------------------
 # CSV — pandas
 # ---------------------------------------------------------------------------
 
 def _extract_csv(path: Path, depth: str) -> dict[str, Any]:
     import pandas as pd
 
+    if depth == "names_only":
+        # Fast path: ``nrows=0`` makes pandas read only the header
+        # row and return an empty DataFrame with the correct columns.
+        # For a multi-GB CSV this is constant-time + a single read of
+        # the first line, vs a full pass that materialises every
+        # column in memory for type inference. A bare "what columns
+        # does this dataset have" call should not OOM the app.
+        header_df = pd.read_csv(path, nrows=0)
+        return _names_only_payload(
+            list(header_df.columns), path, "csv",
+        )
     # low_memory=False gives a single-pass type inference — more accurate
     # for columns where the type isn't obvious from the first chunk. For
     # genuinely huge CSVs this will be slow; step 7 can add streaming.
@@ -522,6 +571,12 @@ def _extract_csv(path: Path, depth: str) -> dict[str, Any]:
 def _extract_tsv(path: Path, depth: str) -> dict[str, Any]:
     import pandas as pd
 
+    if depth == "names_only":
+        # See _extract_csv for the fast-path rationale.
+        header_df = pd.read_csv(path, sep="\t", nrows=0)
+        return _names_only_payload(
+            list(header_df.columns), path, "tsv",
+        )
     df = pd.read_csv(path, sep="\t", low_memory=False)
     return _extract_from_pandas(
         df, depth=depth, dataset_name=path.name, file_type="tsv"
@@ -545,6 +600,18 @@ def _extract_parquet(path: Path, depth: str) -> dict[str, Any]:
     pilot, where datasets fit comfortably."""
     import pandas as pd
 
+    if depth == "names_only":
+        # Fast path: pyarrow exposes the Parquet schema in the file
+        # footer (constant-time regardless of file size). The full-
+        # load fallback below covers any depth that actually needs
+        # column data.
+        try:
+            import pyarrow.parquet as pq
+            pf = pq.ParquetFile(str(path))
+            names = list(pf.schema_arrow.names)
+            return _names_only_payload(names, path, "parquet")
+        except Exception:  # noqa: BLE001 — fall through to full load
+            pass
     df = pd.read_parquet(path)
     return _extract_from_pandas(
         df, depth=depth, dataset_name=path.name, file_type="parquet"
@@ -567,6 +634,17 @@ def _extract_jsonl(path: Path, depth: str) -> dict[str, Any]:
     """
     import pandas as pd
 
+    if depth == "names_only":
+        # Fast path: read only the first record to discover keys.
+        # JSONL has no separate schema, so we can't avoid reading at
+        # least one line; ``nrows=1`` keeps memory bounded.
+        # Note: this only sees keys present in the first record. A
+        # downstream consumer that needs the full column union must
+        # use a deeper depth (which loads the file).
+        header_df = pd.read_json(path, lines=True, nrows=1)
+        return _names_only_payload(
+            list(header_df.columns), path, "jsonl",
+        )
     df = pd.read_json(path, lines=True)
     return _extract_from_pandas(
         df, depth=depth, dataset_name=path.name, file_type="jsonl"

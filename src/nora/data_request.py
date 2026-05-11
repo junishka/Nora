@@ -390,16 +390,17 @@ def _numeric_bounds(series: Any, n_total: int) -> RequestResult:
     NUMERIC_BOUNDS_MIN_N = 30
     if n_effective < NUMERIC_BOUNDS_MIN_N:
         # Don't echo ``n_effective`` in the reason. The denial itself
-        # already reveals ``n_effective < NUMERIC_BOUNDS_MIN_N``;
-        # spelling out e.g. "3 non-missing observations" leaks the
-        # precise small N — exactly the disclosure the threshold was
-        # meant to hide. Same posture as ``_na_count``'s rarer-side
-        # denial above.
+        # already reveals that the non-missing N is below
+        # ``NUMERIC_BOUNDS_MIN_N``; spelling out e.g. "3 non-missing
+        # observations" publishes the precise small subgroup size the
+        # suppression was meant to hide. The threshold is safe to
+        # disclose — it's a fixed configuration constant — the actual
+        # count is not. Same posture as ``_na_count`` above.
         return RequestResult(
             status="denied",
             reason=(
-                f"variable has fewer than {NUMERIC_BOUNDS_MIN_N} non-"
-                f"missing observations — too few for tail-percentile "
+                f"variable has fewer than {NUMERIC_BOUNDS_MIN_N} "
+                f"non-missing observations — too few for tail-percentile "
                 f"bounds. At small N the 5th and 95th percentiles "
                 f"interpolate close to the min and max and would "
                 f"identify the tail individuals."
@@ -523,10 +524,10 @@ def _quartiles(series: Any, n_total: int) -> RequestResult:
     # the order-statistic interpolation argument is the same.
     QUARTILES_MIN_N = 30
     if n_effective < QUARTILES_MIN_N:
-        # Same suppression posture as ``_numeric_bounds`` above: don't
-        # echo ``n_effective`` in the reason. The fact of the denial
-        # plus the disclosed threshold is enough to tell the model to
-        # back off; spelling the exact small N leaks it.
+        # Don't echo ``n_effective`` — see ``_numeric_bounds`` and
+        # ``_na_count`` above for the same lesson. The fact of the
+        # denial plus the disclosed threshold is enough for the model
+        # to back off; spelling the exact small N leaks it.
         return RequestResult(
             status="denied",
             reason=(

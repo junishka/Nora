@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import threading
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -73,9 +74,15 @@ class StoredResult:
 class ResultStore:
     """Thin wrapper over a SQLite file.
 
-    Methods are synchronous — SQLite's own locking is enough for our
-    single-writer-single-reader pattern (the MCP tool serializes tool
-    calls per session anyway).
+    Methods are synchronous. Every public method acquires
+    ``self._lock`` so the underlying SQLite connection is only ever
+    touched from one Python thread at a time — required because the
+    runner thread (submit_script → ``insert``, expand_result →
+    ``get``) and the UI/bridge thread (rewind → ``hide_results_not_in``,
+    ``unhide_results``, ``purge_script_code``; sidebar render →
+    ``list_all``) share one cached ``ResultStore`` per cwd. The MCP
+    tool serializes tool calls within one session, but it does NOT
+    serialize against bridge-driven operations from the UI thread.
     """
 
     SCHEMA = """
@@ -98,7 +105,12 @@ class ResultStore:
 
     def __init__(self, db_path: Path):
         self.db_path = db_path
-        self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        # ``db_path`` is ``<cwd>/.nora/results.db``; route directory
+        # creation through the central helper so .nora gets the 0o700
+        # mode that gates every Nora-owned file on shared filesystems
+        # (HPC, NFS) where the user's home isn't 0o700.
+        from nora.config import ensure_private_nora_dir
+        ensure_private_nora_dir(self.db_path.parent.parent)
         # isolation_level=None → autocommit; we manage transactions with
         # explicit BEGIN/COMMIT blocks.
         #
@@ -108,15 +120,43 @@ class ResultStore:
         # thread first calls ``get_store`` opens the connection; the
         # other thread reusing the cached store would otherwise get
         # ``ProgrammingError: SQLite objects created in a thread can
-        # only be used in that same thread``. Single-writer-single-
-        # reader serialization (this class's docstring) plus SQLite's
-        # own locking and the GIL is enough; we don't need Python's
-        # default thread-affinity check on top.
+        # only be used in that same thread``.
         self._conn = sqlite3.connect(
             str(db_path), isolation_level=None, check_same_thread=False,
         )
         self._conn.row_factory = sqlite3.Row
+        # ``PRAGMA secure_delete = ON`` zeroes freed pages on
+        # DELETE / UPDATE that shrinks a value. The rewind path's
+        # ``purge_script_code`` blanks ``script_code`` to drop any
+        # credentials / PII the researcher pasted into a script;
+        # without secure_delete, the previous bytes survive on the
+        # SQLite freelist until the page is overwritten by an
+        # unrelated insert, and a forensic tool reading raw pages
+        # (undark / hexdump / sqlite3_analyzer / file carving on a
+        # stolen-laptop or backup-acquisition scenario) can recover
+        # the supposedly-purged content. ``VACUUM`` after every
+        # purge would also work but rewrites the entire DB; the
+        # PRAGMA is the lightweight equivalent, applied once and
+        # honoured for every subsequent DELETE / UPDATE.
+        self._conn.execute("PRAGMA secure_delete = ON")
         self._conn.executescript(self.SCHEMA)
+        # Per-store lock serializing every operation that touches
+        # ``self._conn``. ``check_same_thread=False`` allows cross-
+        # thread reuse but the sqlite3 module relies on the caller to
+        # serialize statements — overlapping calls from the bridge
+        # thread (rewind's ``hide_results_not_in`` /
+        # ``unhide_results``) and the runner thread (submit_script's
+        # ``insert``, expand_result's ``get``) can interleave inside
+        # one transaction and trip ``ProgrammingError: recursive use
+        # of cursors not allowed`` on the connection's shared cursor
+        # state. The "single-writer-single-reader" property in the
+        # class docstring is an INVARIANT of well-behaved callers,
+        # not something the connection enforces; we make it concrete
+        # by acquiring this lock around every public method. The
+        # lock also closes the ``_next_id`` race below (count + 1
+        # outside the txn could see the same N from two concurrent
+        # inserters and collide on the same M#).
+        self._lock = threading.RLock()
         self._migrate()
 
     def _migrate(self) -> None:
@@ -170,7 +210,8 @@ class ResultStore:
         )
 
     def close(self) -> None:
-        self._conn.close()
+        with self._lock:
+            self._conn.close()
 
     # -- Insert -------------------------------------------------------------
 
@@ -187,40 +228,49 @@ class ResultStore:
         script_run_id: str | None = None,
     ) -> StoredResult:
         """Add a new result; return the hydrated row (including assigned ID)."""
-        result_id = self._next_id()
         now = datetime.now(timezone.utc).isoformat()
-        row = StoredResult(
-            id=result_id,
-            label=label,
-            analysis_type=analysis_type,
-            sanitized_payload=sanitized_payload,
-            language=language,
-            script_code=script_code,
-            transformations=list(transformations),
-            raw_log_path=str(raw_log_path) if raw_log_path else None,
-            created_at=now,
-            script_run_id=script_run_id,
-        )
-        with self._txn():
-            self._conn.execute(
-                "INSERT INTO results (id, label, analysis_type, "
-                "sanitized_payload, language, script_code, transformations, "
-                "raw_log_path, created_at, script_run_id) VALUES "
-                "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (
-                    row.id,
-                    row.label,
-                    row.analysis_type,
-                    json.dumps(row.sanitized_payload, ensure_ascii=False),
-                    row.language,
-                    row.script_code,
-                    json.dumps(row.transformations, ensure_ascii=False),
-                    row.raw_log_path,
-                    row.created_at,
-                    row.script_run_id,
-                ),
-            )
-        return row
+        with self._lock:
+            with self._txn():
+                # ID allocation inside the transaction so two concurrent
+                # inserters can't both compute ``count + 1`` and race
+                # to the same ``M#``. BEGIN IMMEDIATE makes one of them
+                # wait for the other to commit, so the count this
+                # reads reflects every committed row. The Python lock
+                # above already serializes Python-side, but moving
+                # the count inside the txn also closes the door on
+                # any future caller that goes around the lock.
+                result_id = self._next_id_locked()
+                row = StoredResult(
+                    id=result_id,
+                    label=label,
+                    analysis_type=analysis_type,
+                    sanitized_payload=sanitized_payload,
+                    language=language,
+                    script_code=script_code,
+                    transformations=list(transformations),
+                    raw_log_path=str(raw_log_path) if raw_log_path else None,
+                    created_at=now,
+                    script_run_id=script_run_id,
+                )
+                self._conn.execute(
+                    "INSERT INTO results (id, label, analysis_type, "
+                    "sanitized_payload, language, script_code, transformations, "
+                    "raw_log_path, created_at, script_run_id) VALUES "
+                    "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        row.id,
+                        row.label,
+                        row.analysis_type,
+                        json.dumps(row.sanitized_payload, ensure_ascii=False),
+                        row.language,
+                        row.script_code,
+                        json.dumps(row.transformations, ensure_ascii=False),
+                        row.raw_log_path,
+                        row.created_at,
+                        row.script_run_id,
+                    ),
+                )
+            return row
 
     # -- Read ---------------------------------------------------------------
 
@@ -235,19 +285,20 @@ class ResultStore:
         default so the model can't reach into rows that were
         invalidated by a rewind; audit / debug paths can opt in.
         """
-        if include_hidden:
-            cur = self._conn.execute(
-                "SELECT * FROM results WHERE id = ?", (result_id,)
-            )
-        else:
-            cur = self._conn.execute(
-                "SELECT * FROM results WHERE id = ? AND hidden_at IS NULL",
-                (result_id,),
-            )
-        row = cur.fetchone()
-        if row is None:
-            return None
-        return self._hydrate(row)
+        with self._lock:
+            if include_hidden:
+                cur = self._conn.execute(
+                    "SELECT * FROM results WHERE id = ?", (result_id,)
+                )
+            else:
+                cur = self._conn.execute(
+                    "SELECT * FROM results WHERE id = ? AND hidden_at IS NULL",
+                    (result_id,),
+                )
+            row = cur.fetchone()
+            if row is None:
+                return None
+            return self._hydrate(row)
 
     def list_all(self, *, include_hidden: bool = False) -> list[StoredResult]:
         """List rows in chronological-ascending order.
@@ -258,16 +309,17 @@ class ResultStore:
         visible enumeration don't surface them. Audit code paths
         pass ``include_hidden=True`` to see the whole history.
         """
-        if include_hidden:
-            cur = self._conn.execute(
-                "SELECT * FROM results ORDER BY created_at ASC"
-            )
-        else:
-            cur = self._conn.execute(
-                "SELECT * FROM results WHERE hidden_at IS NULL "
-                "ORDER BY created_at ASC"
-            )
-        return [self._hydrate(r) for r in cur.fetchall()]
+        with self._lock:
+            if include_hidden:
+                cur = self._conn.execute(
+                    "SELECT * FROM results ORDER BY created_at ASC"
+                )
+            else:
+                cur = self._conn.execute(
+                    "SELECT * FROM results WHERE hidden_at IS NULL "
+                    "ORDER BY created_at ASC"
+                )
+            return [self._hydrate(r) for r in cur.fetchall()]
 
     def hide_results_not_in(
         self, kept_ids: set[str], *, reason: str,
@@ -304,29 +356,30 @@ class ResultStore:
         so the in-memory diff is cheap.
         """
         now = datetime.now(timezone.utc).isoformat()
-        with self._txn():
-            visible_rows = self._conn.execute(
-                "SELECT id FROM results WHERE hidden_at IS NULL"
-            ).fetchall()
-            visible_ids = [r["id"] for r in visible_rows]
-            to_hide = [vid for vid in visible_ids if vid not in kept_ids]
-            if not to_hide:
-                return []
-            # SQLite's default parameter limit is 999. Batch at 500
-            # to leave headroom for the two leading parameters
-            # (``now``, ``reason``) and any future schema growth.
-            BATCH = 500
-            for i in range(0, len(to_hide), BATCH):
-                chunk = to_hide[i:i + BATCH]
-                placeholders = ",".join("?" * len(chunk))
-                self._conn.execute(
-                    f"UPDATE results SET hidden_at = ?, "
-                    f"hidden_reason = ? "
-                    f"WHERE hidden_at IS NULL AND id IN "
-                    f"({placeholders})",
-                    (now, reason, *chunk),
-                )
-            return list(to_hide)
+        with self._lock:
+            with self._txn():
+                visible_rows = self._conn.execute(
+                    "SELECT id FROM results WHERE hidden_at IS NULL"
+                ).fetchall()
+                visible_ids = [r["id"] for r in visible_rows]
+                to_hide = [vid for vid in visible_ids if vid not in kept_ids]
+                if not to_hide:
+                    return []
+                # SQLite's default parameter limit is 999. Batch at 500
+                # to leave headroom for the two leading parameters
+                # (``now``, ``reason``) and any future schema growth.
+                BATCH = 500
+                for i in range(0, len(to_hide), BATCH):
+                    chunk = to_hide[i:i + BATCH]
+                    placeholders = ",".join("?" * len(chunk))
+                    self._conn.execute(
+                        f"UPDATE results SET hidden_at = ?, "
+                        f"hidden_reason = ? "
+                        f"WHERE hidden_at IS NULL AND id IN "
+                        f"({placeholders})",
+                        (now, reason, *chunk),
+                    )
+                return list(to_hide)
 
     def purge_script_code(self, ids: list[str]) -> int:
         """Blank the ``script_code`` column on the given rows.
@@ -353,20 +406,21 @@ class ResultStore:
         """
         if not ids:
             return 0
-        with self._txn():
-            BATCH = 500
-            total = 0
-            for i in range(0, len(ids), BATCH):
-                chunk = ids[i:i + BATCH]
-                placeholders = ",".join("?" * len(chunk))
-                cur = self._conn.execute(
-                    f"UPDATE results SET script_code = '' "
-                    f"WHERE script_code != '' AND id IN "
-                    f"({placeholders})",
-                    tuple(chunk),
-                )
-                total += cur.rowcount or 0
-            return total
+        with self._lock:
+            with self._txn():
+                BATCH = 500
+                total = 0
+                for i in range(0, len(ids), BATCH):
+                    chunk = ids[i:i + BATCH]
+                    placeholders = ",".join("?" * len(chunk))
+                    cur = self._conn.execute(
+                        f"UPDATE results SET script_code = '' "
+                        f"WHERE script_code != '' AND id IN "
+                        f"({placeholders})",
+                        tuple(chunk),
+                    )
+                    total += cur.rowcount or 0
+                return total
 
     def unhide_results(self, ids: list[str]) -> int:
         """Clear ``hidden_at`` / ``hidden_reason`` on the given rows.
@@ -383,21 +437,22 @@ class ResultStore:
         """
         if not ids:
             return 0
-        with self._txn():
-            BATCH = 500
-            total = 0
-            for i in range(0, len(ids), BATCH):
-                chunk = ids[i:i + BATCH]
-                placeholders = ",".join("?" * len(chunk))
-                cur = self._conn.execute(
-                    f"UPDATE results SET hidden_at = NULL, "
-                    f"hidden_reason = NULL "
-                    f"WHERE hidden_at IS NOT NULL AND id IN "
-                    f"({placeholders})",
-                    tuple(chunk),
-                )
-                total += cur.rowcount or 0
-            return total
+        with self._lock:
+            with self._txn():
+                BATCH = 500
+                total = 0
+                for i in range(0, len(ids), BATCH):
+                    chunk = ids[i:i + BATCH]
+                    placeholders = ",".join("?" * len(chunk))
+                    cur = self._conn.execute(
+                        f"UPDATE results SET hidden_at = NULL, "
+                        f"hidden_reason = NULL "
+                        f"WHERE hidden_at IS NOT NULL AND id IN "
+                        f"({placeholders})",
+                        tuple(chunk),
+                    )
+                    total += cur.rowcount or 0
+                return total
 
     def list_by_script_run(self, script_run_id: str) -> list[StoredResult]:
         """All rows produced by one ``submit_script`` invocation, in
@@ -410,28 +465,33 @@ class ResultStore:
         helpers fire within the same microsecond; falling back to
         ``id ASC`` lexically would then produce M1, M10, M11, ..., M2.
         """
-        cur = self._conn.execute(
-            "SELECT * FROM results WHERE script_run_id = ? "
-            "ORDER BY rowid ASC",
-            (script_run_id,),
-        )
-        return [self._hydrate(r) for r in cur.fetchall()]
+        with self._lock:
+            cur = self._conn.execute(
+                "SELECT * FROM results WHERE script_run_id = ? "
+                "ORDER BY rowid ASC",
+                (script_run_id,),
+            )
+            return [self._hydrate(r) for r in cur.fetchall()]
 
     def count(self) -> int:
-        cur = self._conn.execute("SELECT COUNT(*) AS c FROM results")
-        return int(cur.fetchone()["c"])
+        with self._lock:
+            cur = self._conn.execute("SELECT COUNT(*) AS c FROM results")
+            return int(cur.fetchone()["c"])
 
     # -- Internals ----------------------------------------------------------
 
-    def _next_id(self) -> str:
+    def _next_id_locked(self) -> str:
         """Assign the next sequential ID of the form `M1`, `M2`, ...
 
         We compute it from the current row count rather than using SQLite's
         autoincrement because the IDs are human-facing (Claude types them)
-        and should be readable / predictable. Concurrent inserts aren't a
-        concern; see class docstring.
+        and should be readable / predictable. MUST be called with
+        ``self._lock`` held AND inside a ``BEGIN IMMEDIATE`` transaction —
+        the count read and the subsequent insert have to be atomic so
+        two concurrent inserters don't both compute the same M#.
         """
-        return f"M{self.count() + 1}"
+        cur = self._conn.execute("SELECT COUNT(*) AS c FROM results")
+        return f"M{int(cur.fetchone()['c']) + 1}"
 
     def _hydrate(self, row: sqlite3.Row) -> StoredResult:
         keys = row.keys() if hasattr(row, "keys") else None

@@ -259,6 +259,71 @@ def test_stata_value_labels_total_cap_across_variables(tmp_path: Path) -> None:
     assert truncated_count >= 1
 
 
+def test_names_only_csv_does_not_load_full_dataset(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``names_only`` must NOT materialize the whole CSV/TSV/Parquet/
+    JSONL into a DataFrame. Pre-fix, every extractor called
+    ``pd.read_csv(path, low_memory=False)`` / ``pd.read_parquet(path)``
+    / ``pd.read_json(path, lines=True)`` unconditionally, which OOMs
+    or freezes on multi-GB files even for a harmless "what columns
+    does this dataset have" request.
+
+    Test strategy: intercept ``pandas.read_csv`` so any call without
+    ``nrows=0`` fails the test. The names_only branch should hit the
+    fast path (``nrows=0``) — the test would catch a regression that
+    re-introduces the full load.
+    """
+    import pandas as pd
+    real_read_csv = pd.read_csv
+
+    def fast_path_only(*args, **kwargs):
+        if kwargs.get("nrows") != 0:
+            pytest.fail(
+                "names_only must use nrows=0 fast path — got full "
+                f"read_csv with kwargs {kwargs!r}"
+            )
+        return real_read_csv(*args, **kwargs)
+
+    monkeypatch.setattr(pd, "read_csv", fast_path_only)
+
+    # Real file so the row_count() observation-count branch works.
+    p = tmp_path / "wide.csv"
+    p.write_text("a,b,c,d\n1,2,3,4\n5,6,7,8\n")
+    out = schema.extract(p, "names_only")
+
+    assert out["status"] == "ok"
+    assert out["file_type"] == "csv"
+    assert [v["name"] for v in out["variables"]] == ["a", "b", "c", "d"]
+    # Observation count comes from row_count(), which is the cheap
+    # streaming counter — not a full pandas load.
+    assert out["observation_count"] == 2
+    # At names_only depth no type is emitted.
+    assert all("type" not in v for v in out["variables"])
+
+
+def test_names_only_parquet_uses_metadata_only(tmp_path: Path) -> None:
+    """For Parquet specifically, schema lives in the file footer —
+    pyarrow can read column names without touching the data pages.
+    The fast path should hit that surface, not pull every row
+    through pandas. Pinning the file_type + variables shape; a
+    regression that fell back to ``pd.read_parquet`` would still
+    pass functionally but lose the constant-time-on-huge-files
+    property the fix is about.
+    """
+    n = 100
+    df = pd.DataFrame({"x": range(n), "y": [float(i) for i in range(n)]})
+    path = tmp_path / "metadata_path.parquet"
+    df.to_parquet(path)
+
+    out = schema.extract(path, "names_only")
+    assert out["status"] == "ok"
+    assert out["file_type"] == "parquet"
+    assert [v["name"] for v in out["variables"]] == ["x", "y"]
+    assert out["observation_count"] == n
+    assert all("type" not in v for v in out["variables"])
+
+
 def test_unsupported_format_lists_all_supported(tmp_path: Path) -> None:
     """A researcher who drops a ``.xlsx`` should get a message that
     names what Nora actually accepts — not just a ``KeyError`` from

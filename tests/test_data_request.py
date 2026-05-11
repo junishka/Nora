@@ -242,6 +242,30 @@ def test_numeric_bounds_grants_at_n_30(sample_csv: Path) -> None:
     assert r.status == "granted"
 
 
+def test_numeric_bounds_denial_does_not_leak_exact_n(
+    sample_csv: Path,
+) -> None:
+    """The low-N denial used to read ``"variable has only 7
+    non-missing observations — too few ..."``. That sentence
+    publishes the very count suppression was meant to hide: a
+    researcher's "rare subgroup of 7" leaks through the denial
+    reason itself, which is forwarded to the model the same as a
+    granted answer. The fix names the threshold (a safe-to-disclose
+    config constant) but never echoes the actual ``n_effective``.
+    Same posture as ``_na_count`` and the quartiles / correlation
+    paths.
+    """
+    df = pd.DataFrame({"v": [float(i) for i in range(7)]})
+    p = sample_csv.parent / "leaky_n.csv"
+    df.to_csv(p, index=False)
+    r = handle(p, "numeric_bounds", "v")
+    assert r.status == "denied"
+    # The actual count must not appear in the reason.
+    assert "7" not in r.reason, (
+        f"low-N denial leaks exact n_effective in reason: {r.reason!r}"
+    )
+
+
 # ---------------------------------------------------------------------------
 # na_count
 # ---------------------------------------------------------------------------

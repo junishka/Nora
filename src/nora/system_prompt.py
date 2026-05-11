@@ -849,9 +849,34 @@ def dataset_listing(cwd: Path) -> str:
             "datasets detected in this directory)"
         )
     cap = 80
-    names = [safe_text(d.name) for d in datasets[:cap]]
-    names = [n for n in names if n]
-    body = "\n".join(f"  - {n}" for n in names)
+    # Only list filenames that round-trip through ``safe_text``
+    # unchanged. ``get_schema`` resolves the exact string the model
+    # passes back, so if ``safe_text(d.name) != d.name`` (control
+    # chars stripped, whitespace flattened, or length-truncated) the
+    # displayed name isn't a valid path on disk — the model would get
+    # ``file not found``. Worse, a sanitized display name could
+    # accidentally collide with a different real file and the model
+    # would inspect the wrong dataset. Better to hide the unreachable
+    # name and tell the model (and researcher) explicitly that some
+    # files were skipped so the count of "things in this directory"
+    # stays honest.
+    visible_pairs: list[tuple[str, str]] = []
+    skipped_count = 0
+    for d in datasets[:cap]:
+        cleaned = safe_text(d.name)
+        if cleaned == d.name and cleaned:
+            visible_pairs.append((cleaned, d.name))
+        else:
+            skipped_count += 1
+    body = "\n".join(f"  - {n}" for n, _ in visible_pairs)
+    if skipped_count:
+        skipped_line = (
+            f"  … and {skipped_count} file(s) hidden because their "
+            f"names contain control characters or exceed the safe "
+            f"display length — rename to ASCII-only short names if "
+            f"you want Claude to see them"
+        )
+        body = (body + "\n" + skipped_line) if body else skipped_line
     if len(datasets) > cap:
         body += f"\n  … and {len(datasets) - cap} more"
     return body

