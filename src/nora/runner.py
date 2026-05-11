@@ -201,6 +201,18 @@ class SessionRunner:
         # Either way the proc gets killed; neither thread can hide
         # a live subprocess from the cancellation path.
         self._turn_lock: threading.Lock = threading.Lock()
+        # Deferred-close flag: set by the bridge's ``delete_credential``
+        # path when this runner is busy with a turn whose underlying
+        # provider client was constructed with the now-deleted key.
+        # ``run_turn``'s finally block honours the flag and closes the
+        # session after the in-flight turn finishes, evicting the
+        # cached client (the OpenAI SDK captures ``api_key`` at
+        # ``AsyncOpenAI(...)`` construction time and reuses it until
+        # the client is closed). Without this, subsequent sends on
+        # the same runner would keep authenticating with the deleted
+        # credential. The next ``ensure_session`` then opens a fresh
+        # session, which fails cleanly with ``no API key configured``.
+        self._pending_close: bool = False
         # Warm-start: the next turn after a fresh session open
         # prepends prior-turn memory. Set whenever we open a session
         # (initial or after a model swap that closes/reopens).
@@ -393,11 +405,30 @@ class SessionRunner:
         """Close the underlying provider session. Idempotent."""
         session = self._session
         self._session = None
+        self._pending_close = False
         if session is not None:
             try:
                 await session.close()
             except Exception:  # noqa: BLE001 — close-time errors aren't useful
                 pass
+
+    def mark_close_after_turn(self) -> None:
+        """Request that the runner close its provider session as soon
+        as the in-flight turn finishes.
+
+        Bridge use case: ``delete_credential`` was called while this
+        runner is busy. Interrupting the in-flight stream is worse
+        than letting it complete, but we MUST evict the cached
+        provider client once it's done — both the OpenAI and
+        Anthropic SDKs capture the API key at client construction
+        and reuse it until close, so without this flag the runner
+        would keep authenticating with the deleted credential on
+        every subsequent send.
+
+        Idempotent. No-op if the runner has no live session.
+        """
+        if self._session is not None:
+            self._pending_close = True
 
     async def swap_model(self, model_id: str, provider: str) -> dict[str, Any]:
         """Swap the active model.
@@ -984,9 +1015,12 @@ class SessionRunner:
                         "[Result plots from your previous script are "
                         "attached:\n"
                         + "\n".join(notice_lines)
-                        + "\nThese are model-output plots (residuals, "
-                        "predicted-response curves, etc.). Raw-data "
-                        "visualizations are not surfaced.]\n\n"
+                        + "\nThese are model-output plots (coefficient "
+                        "comparisons, predicted-response curves, "
+                        "interactions, marginal effects). Per-"
+                        "observation diagnostics like residuals are "
+                        "produced for the researcher but deliberately "
+                        "withheld from this attachment path.]\n\n"
                     )
                     prompt = plot_notice + prompt
                 if images:
@@ -1008,6 +1042,17 @@ class SessionRunner:
                 # successful completion and consume the carried
                 # context that the next attempt still needs.
                 turn_failed_event = False
+                # Set when a provider error indicates its server-side
+                # conversation memory is gone (OpenAI's
+                # ``previous_response_id`` expiry). The next turn must
+                # re-prime via the warm-start context prefix, even if
+                # this turn didn't itself carry one — otherwise we'd
+                # restore prefix state only for the rare "first turn
+                # after open" case and silently lose context for every
+                # later turn that hits chain expiry. See the
+                # ``context_reset`` field on ``TurnError`` in
+                # ``provider/base.py``.
+                turn_context_reset = False
                 try:
                     async for evt in session.send(
                         prompt,
@@ -1017,6 +1062,8 @@ class SessionRunner:
                             saw_terminal = True
                             if isinstance(evt, (TurnError, AuthFailure)):
                                 turn_failed_event = True
+                            if isinstance(evt, TurnError) and evt.context_reset:
+                                turn_context_reset = True
                         # Capture any plots produced by submit_script
                         # so they're available on the NEXT user turn.
                         from nora.provider import ToolCallResult
@@ -1049,7 +1096,16 @@ class SessionRunner:
                         # cleared on send, so re-prepending would
                         # smuggle attachments the researcher no
                         # longer sees.
-                        if carried_prefix:
+                        if carried_prefix or turn_context_reset:
+                            # ``carried_prefix``: standard retry path
+                            # — re-arm so the prefix that THIS turn
+                            # consumed but failed to land rides on
+                            # the retry. ``turn_context_reset``: the
+                            # provider's server-side memory just
+                            # expired, so the next turn must
+                            # re-prime EVEN IF this turn didn't
+                            # itself carry a prefix. Both lead to
+                            # the same flag.
                             self.needs_context_prefix = True
                         if carried_dataset_diff:
                             self.known_datasets = (
@@ -1125,6 +1181,21 @@ class SessionRunner:
                     # natural-error path.
                     with self._turn_lock:
                         self._turn_processes.pop(turn_id, None)
+                    # Honour any deferred-close request from a
+                    # mid-turn ``delete_credential``. ``close()``
+                    # clears the flag and evicts the cached provider
+                    # client whose api_key was constructed BEFORE the
+                    # delete; the next ``ensure_session`` will see no
+                    # credential and fail cleanly. Best-effort: a
+                    # close-time error here mustn't mask the turn's
+                    # actual result, but we DO need ``_pending_close``
+                    # reset either way so the next turn doesn't
+                    # repeatedly hit a stale flag.
+                    if self._pending_close:
+                        try:
+                            await self.close()
+                        except Exception:  # noqa: BLE001
+                            self._pending_close = False
 
 
 # ---------------------------------------------------------------------------
