@@ -3,17 +3,21 @@
 ## What you'll need
 
 - **A Mac** — macOS 11 (Big Sur) or later, Intel or Apple Silicon.
-- **R installed** — download from [cran.r-project.org](https://cran.r-project.org) if you don't have it. Required if you want Nora to run R scripts.
-- **Stata installed** (optional) — Nora finds Stata at `/Applications/Stata` or on your PATH.
-- **A Claude account or API key** — either log in via the `claude` CLI or set `ANTHROPIC_API_KEY`. Nora inherits whichever is available.
+- **Analysis runtime(s)** — install the tools you want Nora to run:
+  R (`Rscript` on PATH), Stata (`stata-mp` / `stata-se` / `stata`
+  on PATH or `/Applications/Stata`), or Python with the packages
+  your analysis needs.
+- **A model credential** — use an Anthropic account/API key or an
+  OpenAI API key. The auth screen stores credentials in the system
+  keyring.
 
 ## Two install paths
 
-Nora has two ways to run: a released `.dmg` you double-click (the recommended path for researchers) and a from-source clone (for development or local builds). The released `.dmg` is signed with a Developer ID Application certificate and notarized by Apple, so first-launch on a colleague's Mac doesn't trip Gatekeeper.
+Nora has two ways to run: a released `.dmg` you double-click (the recommended path for researchers) and a from-source clone (for development or local builds). The released `.dmg` is signed with a Developer ID Application certificate and notarized by Apple.
 
 ## Path 1 — install the `.dmg` (recommended)
 
-Download the latest `Nora.dmg`, open it, and drag `Nora.app` to `/Applications`. Double-click to launch — the first run goes straight to the auth screen, no right-click-Open dance and no Terminal popup. R, Stata, and Python aren't bundled (Nora invokes them as subprocesses), so make sure you have at least one of them installed first.
+Download the latest `Nora.dmg`, open it, and drag `Nora.app` to `/Applications`. Double-click to launch — the first run goes straight to the auth screen, no right-click-Open dance and no Terminal popup. R, Stata, and Python aren't bundled; Nora invokes the runtime you choose as a subprocess.
 
 ## Path 2 — from source
 
@@ -26,7 +30,12 @@ uv run nora                   # landing screen for files / folder
 uv run nora /path/to/data     # open straight into chat
 ```
 
-`nora` opens a native window with a drop zone for `.csv` / `.dta` / `.rds` files. Dropped files land in `~/.nora-sessions/<timestamp>_<id>/` — a per-session scratch dir that becomes the sandbox root. Cleanest way to share exactly the files you want to analyze without exposing a whole project folder.
+`nora` opens a native window with a drop zone for `.csv`, `.tsv`,
+`.dta`, `.rds`, `.parquet`, `.jsonl`, and `.ndjson` files. Dropped
+files land in `~/.nora-sessions/<timestamp>_<id>/` — a per-session
+scratch dir that becomes the sandbox root. Cleanest way to share
+exactly the files you want to analyze without exposing a whole
+project folder.
 
 ## Building the `.dmg` yourself
 
@@ -53,13 +62,13 @@ Two workarounds for the unsigned local-build case:
 
 ## Running Nora
 
-Whichever path you took, the entry point is the same: a chat window with a landing screen the first time, and your sandbox-rooted data thereafter. The first thing it asks is what files you want Claude to see — drop them on the landing zone, or pick a folder. That selection becomes the sandbox: Claude cannot read anything outside it.
+Whichever path you took, the entry point is the same: a chat window with a landing screen the first time, and your sandbox-rooted data thereafter. The first thing it asks is what files you want the assistant to use — drop them on the landing zone, or pick a folder. That selection becomes the sandbox: the model cannot read anything outside it.
 
-Once you're in the chat, you talk. Claude proposes; you steer. Scripts that Claude runs are sandboxed (no network, narrow filesystem allowlist), every result is sanitized before Claude sees it, and the raw R/Stata output stays visible to you in the result panels.
+Once you're in the chat, you talk. The assistant proposes; you steer. Scripts the model runs are sandboxed (no network, narrow filesystem allowlist), every result is sanitized before the model sees it, and the raw R/Stata/Python output stays visible to you in the result panels.
 
-## Schema policy — controlling what Claude sees
+## Schema policy — controlling what the model sees
 
-Claude sees only structural metadata about each dataset, never the rows. The default ceiling is **`names_types_labels_summary`** — variable names, types, value labels, and per-variable NA / distinct-value counts. That's the most informative tier that doesn't leak per-observation data.
+The model sees only structural metadata about each dataset, never the rows. The default ceiling is **`names_types_labels_summary`** — variable names, types, value labels, and per-variable NA / distinct-value counts. That's the most informative tier that doesn't leak per-observation data.
 
 You change this via the **Permission chip** in the composer row (a dropdown per dataset). It edits `<your-data-dir>/.nora/policy.json`, which you can also hand-edit:
 
@@ -85,7 +94,7 @@ Available tiers, from most private to most permissive:
 3. `names_types_labels` — + variable labels and value labels.
 4. `names_types_labels_summary` — + per-variable NA count and distinct-value count for categoricals. **Default.**
 
-**At no tier** does Nora share raw values, min, max, median, or any other per-observation value. Those require a separate tool call (`request_data`) that applies statistical disclosure control rules, or a full analysis via `submit_script` whose output is sanitized before Claude sees it.
+**At no tier** does Nora share raw values, min, max, median, or any other per-observation value. Those require a separate tool call (`request_data`) that applies statistical disclosure control rules, or a full analysis via `submit_script` whose output is sanitized before the model sees it.
 
 ## Uninstalling
 
@@ -116,6 +125,6 @@ Most common cause: an import error in the bundled binary. The traceback in the l
 
 **`sandbox-exec not found` warning.** Should never happen on macOS — `/usr/bin/sandbox-exec` is part of the OS. If you see this, file a bug.
 
-**No R or Stata installed warning.** Install R (or Stata) and relaunch. Schema and bounded data queries still work without them, but `submit_script` — the analysis path — won't.
+**No analysis runtime installed warning.** Install R, Stata, or Python packages for the language you want to use, then relaunch. Schema and bounded data queries still work without them, but `submit_script` — the analysis path — won't.
 
-**Claude asks to see variable labels and gets denied.** That's the schema policy working as intended. If the labels aren't sensitive for this dataset, raise the ceiling via the Permission chip in the composer row.
+**The assistant asks to see variable labels and gets denied.** That's the schema policy working as intended. If the labels aren't sensitive for this dataset, raise the ceiling via the Permission chip in the composer row.

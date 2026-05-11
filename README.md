@@ -1,10 +1,9 @@
 # Nora
 
 Local research assistant for sensitive data. The data stays on the
-researcher's machine. The model behind Nora is Claude (Anthropic) or
-ChatGPT (OpenAI). The product the researcher talks to is Nora.
+researcher's machine. Nora can use Anthropic or OpenAI models.
 
-The model reaches the researcher's files through a thirteen-tool MCP
+The model reaches the researcher's files through a fourteen-tool MCP
 interface. No Bash. No filesystem. No network. Scripts run under
 macOS `sandbox-exec` with network denied and a tight subpath
 allowlist for reads. Every result passes through a disclosure-control
@@ -22,8 +21,7 @@ the long-form direction and open-question log,
 Beta. Privacy invariants are implemented and tested. The frontend is
 the pywebview-based `nora`, which is also what the `.app`
 launches. The released `.dmg` is signed with a Developer ID
-Application certificate and notarized by Apple, so a colleague
-double-clicking the bundle on their own Mac doesn't trip Gatekeeper.
+Application certificate and notarized by Apple.
 See [the handoff status table](docs/handoff.md#where-it-stands) for
 the layer-by-layer view.
 
@@ -32,8 +30,7 @@ the layer-by-layer view.
 macOS only at this stage. The `submit_script` tool relies on
 `sandbox-exec` for its privacy boundary. On other platforms,
 schema inspection and bounded-fact queries still work, but
-scripts refuse to execute. A Linux port via `bubblewrap` is
-possible but not on the near-term roadmap.
+scripts refuse to execute.
 
 Also needs:
 
@@ -41,14 +38,14 @@ Also needs:
 - At least one of: R (`Rscript` on PATH), Stata (`stata-mp` /
   `stata-se` / `stata` on PATH, or installed at `/Applications/Stata`),
   or Python with `pandas` + `statsmodels`.
-- Anthropic credentials (Claude subscription or `ANTHROPIC_API_KEY`)
-  or an OpenAI API key. The first launch shows an auth screen and
-  stores the credential in the system keyring.
+- A model credential: Anthropic account/API key or OpenAI API key.
+  The first launch shows an auth screen and stores the credential in
+  the system keyring.
 
 ## Install
 
 If you have a `Nora.dmg`, see [`docs/install.md`](docs/install.md)
-for the double-click flow and the first-run Gatekeeper workaround.
+for the double-click flow.
 
 To build the `.dmg` yourself or run from source, see below.
 
@@ -119,7 +116,7 @@ because Nora invokes them as subprocesses.
   - `__main__.py` — entry-point shim that calls `nora.ui.main`.
   - `ui.py` and `web/` for the pywebview shell and the HTML, CSS,
     JS frontend.
-  - `tools.py` for the thirteen MCP tools the model sees.
+  - `tools.py` for the fourteen MCP tools the model sees.
   - `executor.py` for the sandbox profile and the R, Stata,
     Python subprocess runners.
   - `sanitizer.py`, `sdc.py`, `text_safety.py` for disclosure
@@ -141,13 +138,13 @@ because Nora invokes them as subprocesses.
 - `packaging/` for the PyInstaller spec and the `.app` / `.dmg`
   build scripts.
 
-## The thirteen tools
+## The fourteen tools
 
 `get_schema`, `search_schema`, `request_data`, `submit_script`,
 `submit_script_file`, `expand_result`, `compose_results`,
 `list_results`, `list_results_global` (env-gated cross-session
 recall), `recall_conversation`, `read_attached_file`,
-`list_session_files`, `search_in_session_files`. The full
+`list_session_files`, `search_in_session_files`, `install_packages`. The full
 descriptions live in `src/nora/tools.py`.
 
 ## Security model
@@ -155,7 +152,7 @@ descriptions live in `src/nora/tools.py`.
 Three independent layers carry the privacy guarantee:
 
 1. **Tool interface.** No general-purpose tools. No filesystem,
-   no shell, no network. Thirteen tools, enumerated exhaustively.
+   no shell, no network. Fourteen tools, enumerated exhaustively.
 2. **Sandbox.** A `(deny default)` `sandbox-exec` profile.
    Narrow subpath allowlist for reads and writes. Network
    denied entirely.
