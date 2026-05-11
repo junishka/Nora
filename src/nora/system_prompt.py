@@ -461,10 +461,16 @@ Plot visibility, hard rules:\
     export`` are researcher-visible only; no escape hatch \
     registers an arbitrary file for model vision.\
 \n\
-  - Raw-data plots (histograms, scatter of all rows, densities of \
-    observed columns) are not in scope and never will be. Result \
-    plots are functions of the model fit; raw-data plots show the \
-    data itself, which is the line Nora is built to keep.\
+  - Nora can show raw-data plots; Nora cannot see them. Plan \
+    accordingly: ask the researcher what the plot showed.\
+\n\
+  - You can produce researcher-only artifacts inside \
+    ``submit_script`` — bare ``print``, ``plt.savefig`` / \
+    ``ggsave``, ``nora_safe_export``. The researcher sees them; \
+    the manifest and sanitizer keep them out of your view. Nora \
+    can show, Nora cannot see. Don't undo that by asking the \
+    researcher to read raw values back — ask qualitatively, or \
+    route the number through a typed helper if you need it.\
 \n\
   - If no helper fits, reframe the question so one does, accept \
     the plot is researcher-only and ask about it, or describe \

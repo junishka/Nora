@@ -278,6 +278,22 @@ DMG="$REPO_ROOT/dist/Nora.dmg"
 /usr/bin/codesign --verify --deep --strict "$APP"
 echo "  ✓ codesign verify"
 
+# Architecture check — the nested running binary MUST be arm64. The
+# spec pins target_arch="arm64", but a future edit (or a stray
+# Rosetta-installed PyInstaller) could silently revert that and ship
+# an x86_64 bundle that runs fine on the build machine but triggers
+# the Rosetta-deprecation banner on every user's Mac. Fail closed
+# here so the bad artifact never reaches the install / DMG step.
+NESTED_BIN="$APP/Contents/Resources/nora/nora"
+APP_ARCHS="$(/usr/bin/lipo -archs "$NESTED_BIN" 2>/dev/null || true)"
+if [[ "$APP_ARCHS" != "arm64" ]]; then
+    echo "  ✗ Wrong architecture: $NESTED_BIN is '$APP_ARCHS' (want 'arm64')." >&2
+    echo "    Likely cause: PyInstaller ran under an Intel Python." >&2
+    echo "    Check: file \$(which python3); arch" >&2
+    exit 1
+fi
+echo "  ✓ Architecture: arm64"
+
 ASSESS="$( /usr/sbin/spctl --assess --verbose=2 --type execute "$APP" 2>&1 || true )"
 if echo "$ASSESS" | grep -qE "accepted"; then
     echo "  ✓ spctl assess: $(echo "$ASSESS" | tr '\n' ' ' | sed 's/  */ /g')"
