@@ -18,6 +18,35 @@
 
 set -euo pipefail
 
+# Bridge the GUI process's PATH to the user's tool installs.
+#
+# macOS launches a double-clicked .app under launchd with a bare PATH
+# (typically just /usr/bin:/bin:/usr/sbin:/sbin) — none of /usr/local/bin,
+# /opt/homebrew/bin, ~/.local/bin, or any Node version manager dirs are
+# visible. The Claude Agent SDK that backs Nora spawns the ``claude``
+# CLI as a subprocess to run the agent loop; when ``claude`` is the
+# npm-installed script (``#!/usr/bin/env node``), launching it from a
+# double-clicked .app fails immediately with
+#   env: node: No such file or directory
+#   Fatal error in message reader: Command failed with exit code 127
+# and the chat UI surfaces "session setup failed: Command failed with
+# exit code 127". The same install works fine from a terminal because
+# the shell's PATH was assembled by /etc/profile + ~/.zshrc.
+#
+# Fix: prepend the conventional macOS dev-tool locations to PATH so the
+# subprocess can find both ``claude`` (native or npm) AND ``node``. This
+# does NOT source the user's shell init — that risks running arbitrary
+# code on every launch — it just adds well-known directories that
+# either exist or don't. Order matters: user-scope paths come before
+# system-scope so a per-user override wins over a system install.
+#
+# Anything beyond this list (asdf, mise, exotic prefixes) the user can
+# add by exporting PATH from ~/.zshenv (loaded for non-interactive
+# shells); the launcher reads PATH from the environment, so an export
+# there flows through.
+_NORA_EXTRA_PATH="$HOME/.local/bin:$HOME/.npm-global/bin:$HOME/.volta/bin:$HOME/.bun/bin:/opt/homebrew/bin:/usr/local/bin"
+export PATH="$_NORA_EXTRA_PATH:${PATH:-/usr/bin:/bin:/usr/sbin:/sbin}"
+
 # Resolve the .app's own path from wherever macOS launched us.
 # $0 is Contents/MacOS/Nora (inside the app bundle); two dirs up
 # gets us to the .app root.
