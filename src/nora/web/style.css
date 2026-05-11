@@ -80,9 +80,9 @@
     --bg-error: #7a2e3a;         /* deep rose — alert (less alarming than hot pink) */
     --text: #e6d5c7;             /* warm off-white — body text */
     --text-dim: #8a7a82;         /* muted mauve-gray — secondary text */
-    --accent: #ee8ba9;           /* pink — focus, tool-name (palette highlight) */
+    --accent: #d68aa0;           /* dusty rose — focus, tool-name (palette highlight). Earlier #ee8ba9 read closer to a vivid hot pink; this is the same hue at lower saturation so it stays warm without competing with --hot-pink (the deeper rose-red used for errors). */
     --accent-soft: #a87382;      /* dusty mauve — soft accents */
-    --sage: #ee8ba9;             /* dark accent pink — success status, cohesive with the rest of the dark theme (light mode used teal) */
+    --sage: #d68aa0;             /* dark accent rose — success status, cohesive with the new --accent (light mode used teal) */
     --hot-pink: #d96979;         /* deeper rose-red — error status (light mode's #e05a8b reads pink in dark; this is clearly redder for danger semantics) */
     --border: #3a2a30;
     --code-bg: #120d10;
@@ -102,9 +102,9 @@
   --bg-error: #7a2e3a;
   --text: #e6d5c7;
   --text-dim: #8a7a82;
-  --accent: #ee8ba9;
+  --accent: #d68aa0;
   --accent-soft: #a87382;
-  --sage: #ee8ba9;
+  --sage: #d68aa0;
   --hot-pink: #d96979;
   --border: #3a2a30;
   --code-bg: #120d10;
@@ -584,22 +584,40 @@ kbd {
   justify-content: center;
 }
 
+/* The link sits at the bottom of the landing card next to muted
+ * helper copy, so the affordance has to do all the lifting on its
+ * own — without color and an obvious underline it just reads as
+ * body text. ``--accent`` (teal in light, pink in dark) is the
+ * same token the topbar uses for clickable handles, so this picks
+ * up the existing "interactive accent" pattern instead of inventing
+ * a one-off color. Bumping ``font-weight`` to 500 and giving the
+ * underline a matching accent color (instead of the near-invisible
+ * ``--border``) keeps the chrome compact while making the
+ * "this is a link" reading unambiguous against the soft card bg. */
 .landing-link {
   background: none;
   border: none;
   padding: 4px 8px;
   font-family: inherit;
   font-size: 12px;
-  color: var(--text-dim);
+  font-weight: 500;
+  color: var(--accent);
   cursor: pointer;
   text-decoration: underline;
-  text-underline-offset: 2px;
-  text-decoration-color: var(--border);
+  text-underline-offset: 3px;
+  text-decoration-thickness: 1px;
+  text-decoration-color: var(--accent);
+  border-radius: 4px;
+  transition: text-decoration-thickness 0.12s ease;
 }
 
 .landing-link:hover {
-  color: var(--text);
-  text-decoration-color: var(--text);
+  text-decoration-thickness: 2px;
+}
+
+.landing-link:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
 }
 
 .landing-sessions {
@@ -1828,29 +1846,31 @@ kbd {
  *
  * Scope — ``.tool-code`` only. ``.tool-body`` also contains
  * ``pre.tool-output`` (raw R/Stata stdout, ``background: var(--bg)``);
- * painting tool-card-toned scrollbars onto that surface would put a
- * card-colored rail on a different-toned output panel. .tool-output
+ * painting code-panel-toned scrollbars onto that surface would put a
+ * code-toned rail on a different-toned output panel. .tool-output
  * is left to inherit the theme-aware global ``.messages *::-webkit-
  * scrollbar-thumb`` rules below — those use translucent burgundy
  * (light) and translucent cream (dark), matching --bg naturally.
  *
- * Track color — ``var(--bg-tool)`` (the wrapping .tool-card surface)
- * rather than ``var(--code-bg)``. The rail then visually merges with
- * the card around the code panel and the gutter "disappears" into
- * the card edge instead of reading as a colored strip on the dark
- * code surface. ``transparent`` is intentionally avoided here: in
- * WKWebView with macOS "Always show scrollbars", a transparent
- * track can fall through to a default light native fill (we have
- * ``color-scheme: dark`` declared as a backstop, but an explicit
- * theme color is belt-and-suspenders).
+ * Track color — ``var(--code-bg)`` matches the pre's own background,
+ * so the rail blends INTO the dark code panel where it actually lives
+ * instead of painting a card-pink strip against the burgundy surface.
+ * Earlier this used ``var(--bg-tool)`` on the theory the rail would
+ * "merge with the card around the code panel," but the rail sits
+ * inside the panel, not around it, so the pink track read as a
+ * misplaced white strip in light mode. ``transparent`` is
+ * intentionally avoided: in WKWebView with macOS "Always show
+ * scrollbars", a transparent track can fall through to a default
+ * light native fill, so an explicit theme color is belt-and-suspenders.
  *
- * Thumb — darker fill, brighter outer ring. The fill uses
- * ``var(--code-bg)`` (the deep code-panel tone) and an inset
- * ``box-shadow`` paints a 1px ``var(--pink)`` halo around it. We use
+ * Thumb — accent-soft fill with an accent ring. ``--accent-soft``
+ * (blue-gray light / dusty-mauve dark) is light enough to read on
+ * the new ``--code-bg`` track, and the inset ``var(--accent)`` ring
+ * (teal light / pink dark) provides a brighter highlight rim. We use
  * ``box-shadow: inset`` rather than ``border`` because a real border
  * would shrink the thumb's hit area and fight ``background-clip``;
  * the inset shadow gives the same ring without those side effects.
- * Hover swaps the ring to ``--accent`` for a theme-aware affordance.
+ * Hover swaps the fill to ``--accent`` for a theme-aware affordance.
  *
  * Specificity: ``.tool-card .tool-body pre.tool-code`` is (0,3,1),
  * which beats the broader ``.tool-card .tool-body pre`` (0,2,1)
@@ -1860,16 +1880,17 @@ kbd {
   scrollbar-width: thin;
   /* Firefox: thumb / track. ``--accent`` flips with the theme tokens
    * (teal in light, pink in dark) so the thumb stays in-palette in
-   * both modes; the track matches the card surface. We can't paint
-   * the inset ring in Firefox (no equivalent property), so Firefox
-   * gets a solid accent-colored thumb — same intent, less detail. */
-  scrollbar-color: var(--accent) var(--bg-tool);
+   * both modes; the track matches the code panel itself so the rail
+   * embeds into the panel. We can't paint the inset ring in Firefox
+   * (no equivalent property), so Firefox gets a solid accent-colored
+   * thumb — same intent, less detail. */
+  scrollbar-color: var(--accent) var(--code-bg);
 }
 
 .tool-card .tool-body pre.tool-code::-webkit-scrollbar {
   height: 8px;
   width: 8px;
-  background: var(--bg-tool);
+  background: var(--code-bg);
 }
 
 /* Thumb: darker inside, brighter outside, both theme-aware. The fill
@@ -1891,11 +1912,11 @@ kbd {
 }
 
 .tool-card .tool-body pre.tool-code::-webkit-scrollbar-track {
-  background: var(--bg-tool);
+  background: var(--code-bg);
 }
 
 .tool-card .tool-body pre.tool-code::-webkit-scrollbar-corner {
-  background: var(--bg-tool);
+  background: var(--code-bg);
 }
 
 .tool-card .tool-label {

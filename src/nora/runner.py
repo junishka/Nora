@@ -213,6 +213,15 @@ class SessionRunner:
         # credential. The next ``ensure_session`` then opens a fresh
         # session, which fails cleanly with ``no API key configured``.
         self._pending_close: bool = False
+        # Detached teardown tasks for SDK sessions abandoned by Stop.
+        # The cancel branch of ``run_turn`` nils ``self._session``
+        # synchronously and schedules ``stale_session.close()`` here so
+        # a follow-up cancel can't kill the teardown mid-flight; the
+        # list also keeps strong refs so the asyncio task isn't GC'd
+        # before the underlying provider subprocess actually exits.
+        # Pruned of completed entries on each enqueue so a long-lived
+        # session that Stops often doesn't grow this without bound.
+        self._stale_close_tasks: list[asyncio.Task[Any]] = []
         # Warm-start: the next turn after a fresh session open
         # prepends prior-turn memory. Set whenever we open a session
         # (initial or after a model swap that closes/reopens).
@@ -1144,6 +1153,52 @@ class SessionRunner:
                         self.pending_plot_images = (
                             attached_plots + self.pending_plot_images
                         )
+                    # Drop the SDK session so unfinished work from the
+                    # cancelled turn can't leak into the next one. The
+                    # asyncio cancel above stops THIS coroutine, but the
+                    # underlying provider client (Claude CLI subprocess
+                    # for Anthropic, HTTP client state for OpenAI) is
+                    # still mid-round if Stop fired between a tool_use
+                    # and its tool_result — and the SDK pumps that
+                    # leftover round through on the next ``client.query``,
+                    # so the researcher's NEW message lands behind a
+                    # cancelled turn's submit_script firing one more
+                    # time. Closing here forces ``ensure_session`` to
+                    # rebuild on the next run_turn; the rebuild flips
+                    # ``needs_context_prefix`` back on, so the next
+                    # send re-injects history from chat_history.jsonl
+                    # via build_context_prefix and the conversation
+                    # stays continuous from the researcher's POV. Cost:
+                    # the 1h prompt cache is dropped, so the post-Stop
+                    # turn pays a one-time cache-write surcharge —
+                    # acceptable on a path the researcher reaches only
+                    # by explicitly hitting Stop. Detach the actual
+                    # close() with ``create_task`` so a follow-up
+                    # cancel can't kill the teardown mid-flight; the
+                    # critical bit (``self._session = None``) happens
+                    # synchronously before this handler returns. The
+                    # detached task is retained on the runner so the
+                    # GC doesn't drop it before the SDK subprocess
+                    # actually exits.
+                    stale_session = self._session
+                    self._session = None
+                    if stale_session is not None:
+                        try:
+                            loop = asyncio.get_running_loop()
+                            self._stale_close_tasks.append(
+                                loop.create_task(stale_session.close())
+                            )
+                        except RuntimeError:
+                            # Loop already closing — nothing left to do;
+                            # the subprocess will be reaped on process
+                            # exit.
+                            pass
+                        # Trim completed teardown tasks so the list
+                        # doesn't accumulate across many Stops in one
+                        # session lifetime.
+                        self._stale_close_tasks = [
+                            t for t in self._stale_close_tasks if not t.done()
+                        ]
                     emit({
                         "type": "turn_error",
                         "message": "cancelled",

@@ -443,7 +443,7 @@ async function loadLandingSessions() {
       btn.title = s.path;
 
       // Title = the resolved session title (custom name if set, else
-      // the dataset filename, else "+N more"). Renders single-line
+      // the dataset filename, else "<first> +N"). Renders single-line
       // with the relative-age label pinned to the right.
       const title = document.createElement('span');
       title.className = 'landing-session-title';
@@ -4553,7 +4553,7 @@ function renderSessions(sessions, currentPath) {
     if (busySessions.has(s.path)) btn.classList.add('busy');
     // Single-line layout: [title …] [age | busy-dot]
     // ``s.title`` already resolves to custom_name if the researcher
-    // set one, otherwise to the dataset filename ("+N more" for
+    // set one, otherwise to the dataset filename ("<first> +N" for
     // multi-file sessions), otherwise to a session-stamp fallback.
     // The busy dot lives in the same right-side slot as the age and
     // CSS flips visibility — pulse replaces "1d" while a turn runs.
@@ -4676,7 +4676,7 @@ function beginRenameSession(targetEl, path) {
    *
    * Empty / whitespace-only saves are intentional: they clear the
    * custom name and revert to the auto-derived label (single
-   * dataset filename, "+N more", or session timestamp).
+   * dataset filename, "<first> +N", or session timestamp).
    */
   if (!targetEl || !path) return;
   if (targetEl.classList.contains('editing')) return;
