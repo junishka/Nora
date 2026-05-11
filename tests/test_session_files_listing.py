@@ -581,6 +581,304 @@ def test_delete_session_file_no_active_session_returns_clean_error() -> None:
 
 
 # ---------------------------------------------------------------------------
+# read_session_file_text — Files-panel "copy" button
+# ---------------------------------------------------------------------------
+
+def test_read_session_file_text_refuses_unlisted_run_log(tmp_path: Path) -> None:
+    """``stdout.log`` / ``stderr.log`` live under ``.nora/runs/<id>/``
+    but the Files panel intentionally never lists them — the
+    executor's contract is that raw subprocess transcripts never
+    cross to the model. Containment in cwd alone is not enough to
+    let a page-rendered JS caller pull them onto the page (same
+    threat model that ``delete_session_file`` defends against).
+    ``read_session_file_text`` must mirror that gate: only files
+    the Files panel surfaces are readable through the bridge.
+    """
+    cwd = tmp_path / "session"
+    run_dir = cwd / ".nora" / "runs" / "r0001"
+    run_dir.mkdir(parents=True)
+    raw_log = run_dir / "stdout.log"
+    raw_log.write_text("subject 17 PII leak in raw output", encoding="utf-8")
+
+    bridge = NoraBridge(cwd=cwd)
+    res = bridge.read_session_file_text(str(raw_log))
+    assert res["ok"] is False
+    # The reason should point at the listing gate, not the
+    # extension gate — .log IS in the allowed-extension set, so a
+    # caller catching "wrong extension" would miss this regression.
+    assert "Files panel listing" in res["reason"]
+
+
+def test_delete_session_file_drops_run_dir_script_by_display_name(
+    tmp_path: Path,
+) -> None:
+    """Run-dir scripts live on disk as ``<run_dir>/script.<ext>`` but
+    are staged in ``pending_script_attachments`` under their
+    label-derived display name (e.g. ``linear_regression.py``).
+    Before the fix, ``delete_session_file`` filtered the pending
+    list by ``target.name`` (``script.py``) — a stale match that
+    left the deleted script content staged in memory, and the
+    next send would inline a file the researcher just deleted.
+
+    Verify the path-based filter drops the right entry and that
+    the response carries the dropped display name in ``unstaged``
+    so JS can splice its composer-chip list.
+    """
+    cwd = tmp_path / "session"
+    run_dir = cwd / ".nora" / "runs" / "20260511T120000Z_abcdef01"
+    run_dir.mkdir(parents=True)
+    script_on_disk = run_dir / "script.py"
+    script_on_disk.write_text("print('hi')\n", encoding="utf-8")
+    # Drive the display name via label.txt — same source
+    # enumerate_run_dir_scripts reads, so the attach path will
+    # stage under the label-derived display name.
+    (run_dir / "label.txt").write_text(
+        "Linear Regression Run", encoding="utf-8",
+    )
+
+    bridge = NoraBridge(cwd=cwd)
+    # Stage via the same path the JS Files-panel click would
+    # follow. Look up the display name from the same enumeration
+    # the panel uses so the test matches reality.
+    from nora.run_files import enumerate_run_dir_scripts
+    [entry] = enumerate_run_dir_scripts(cwd)
+    display_name = entry.display_name
+    assert display_name != script_on_disk.name, (
+        "test relies on display name diverging from on-disk name"
+    )
+
+    attach_res = bridge.attach_session_file(display_name)
+    assert attach_res["ok"] is True
+    assert len(bridge._pending_script_attachments) == 1
+    staged = bridge._pending_script_attachments[0]
+    assert staged["name"] == display_name
+    assert staged.get("path") == str(script_on_disk.resolve())
+
+    del_res = bridge.delete_session_file(str(script_on_disk))
+    assert del_res["ok"] is True
+    # Pending list cleared — without the fix this still held the
+    # staged entry because name comparison missed the display
+    # name.
+    assert bridge._pending_script_attachments == []
+    # ``unstaged`` surfaces the chip name JS needs to splice.
+    assert del_res.get("unstaged") == [display_name]
+
+
+def test_delete_session_file_unstaged_handles_top_level_basename(
+    tmp_path: Path,
+) -> None:
+    """Top-level scripts have name == on-disk basename, so the
+    pre-fix behaviour was already correct for that case. Pin it:
+    delete must still drop the staged entry and surface the name
+    in ``unstaged``."""
+    cwd = tmp_path / "session"
+    cwd.mkdir()
+    script = cwd / "regression.py"
+    script.write_text("import pandas as pd\n", encoding="utf-8")
+
+    bridge = NoraBridge(cwd=cwd)
+    bridge.attach_session_file("regression.py")
+    assert len(bridge._pending_script_attachments) == 1
+
+    res = bridge.delete_session_file(str(script))
+    assert res["ok"] is True
+    assert bridge._pending_script_attachments == []
+    assert res.get("unstaged") == ["regression.py"]
+
+
+def test_delete_session_file_unstaged_drops_mentioned_image(
+    tmp_path: Path,
+) -> None:
+    """Helper plots in different run dirs can share a basename
+    (``coefficients.png`` in run A and run B). Each is staged as a
+    ``pending_mentioned_images`` entry with its absolute path; a
+    delete on one must leave the other intact."""
+    cwd = tmp_path / "session"
+    run_a = cwd / ".nora" / "runs" / "20260511T100000Z_aaaaaaaa" / "_nora_plots"
+    run_b = cwd / ".nora" / "runs" / "20260511T110000Z_bbbbbbbb" / "_nora_plots"
+    run_a.mkdir(parents=True)
+    run_b.mkdir(parents=True)
+    png_bytes = b"\x89PNG\r\n\x1a\nfake"
+    plot_a = run_a / "coefficients.png"
+    plot_b = run_b / "coefficients.png"
+    plot_a.write_bytes(png_bytes)
+    plot_b.write_bytes(png_bytes)
+
+    bridge = NoraBridge(cwd=cwd)
+    # Stage both by passing the explicit path — this is the new
+    # @-mention contract.
+    bridge.attach_session_file("coefficients.png", str(plot_a))
+    bridge.attach_session_file("coefficients.png", str(plot_b))
+    assert len(bridge._active_runner().pending_mentioned_images) == 2
+
+    res = bridge.delete_session_file(str(plot_a))
+    assert res["ok"] is True
+    # Only plot A's entry should be gone; plot B's still staged.
+    remaining = bridge._active_runner().pending_mentioned_images
+    assert len(remaining) == 1
+    assert remaining[0].get("path") == str(plot_b.resolve())
+
+
+def test_attach_session_file_path_resolves_exact_helper_plot(
+    tmp_path: Path,
+) -> None:
+    """The mention dropdown surfaces two rows when two run dirs
+    produce the same plot basename (``coefficients.png``). The JS
+    side now passes ``item.path`` to ``attach_session_file``;
+    without it the backend's ``iterdir`` walk staged whichever run
+    dir the filesystem returned first, not the row the user
+    clicked. Verify both that the path picks the right plot AND
+    that the name-only fallback still resolves *something* for
+    back-compat."""
+    cwd = tmp_path / "session"
+    run_a = cwd / ".nora" / "runs" / "20260511T100000Z_aaaaaaaa" / "_nora_plots"
+    run_b = cwd / ".nora" / "runs" / "20260511T110000Z_bbbbbbbb" / "_nora_plots"
+    run_a.mkdir(parents=True)
+    run_b.mkdir(parents=True)
+    plot_a = run_a / "coefficients.png"
+    plot_b = run_b / "coefficients.png"
+    plot_a.write_bytes(b"\x89PNG run A bytes")
+    plot_b.write_bytes(b"\x89PNG run B bytes")
+
+    bridge = NoraBridge(cwd=cwd)
+    res = bridge.attach_session_file("coefficients.png", str(plot_b))
+    assert res["ok"] is True
+    staged = bridge._active_runner().pending_mentioned_images
+    assert len(staged) == 1
+    assert staged[0].get("path") == str(plot_b.resolve()), (
+        "explicit path must override the iterdir walk and pin "
+        "the staged entry to the exact row clicked"
+    )
+
+
+def test_attach_session_file_path_refuses_outside_cwd(
+    tmp_path: Path,
+) -> None:
+    """A caller-supplied path must still pass containment. A
+    malicious or buggy page-rendered JS that hands the bridge a
+    path outside cwd must be refused — same posture as
+    ``delete_session_file``."""
+    cwd = tmp_path / "session"
+    cwd.mkdir()
+    outside = tmp_path / "secret.py"
+    outside.write_text("# secrets\n", encoding="utf-8")
+
+    bridge = NoraBridge(cwd=cwd)
+    # ``name`` is a basename that doesn't exist in cwd; ``path``
+    # points outside. Both gates must combine to reject.
+    res = bridge.attach_session_file("secret.py", str(outside))
+    assert res["ok"] is False
+    assert bridge._pending_script_attachments == []
+
+
+def test_record_user_message_persists_mentioned_files_and_images(
+    tmp_path: Path,
+) -> None:
+    """Before the fix, ``_record_user_message`` only persisted
+    ``pending_script_attachments`` plus direct composer images. A
+    researcher who @-mentioned a CSV (notice ride-along) and a
+    PNG (vision ride-along) saw chips and thumbnails in the live
+    UI, but a reload or session switch replayed a bare text
+    bubble — the durable transcript no longer matched what the
+    model actually saw.
+
+    Pin the unified persistence: ``attachments`` carries every
+    chip name the live UI showed (scripts + mention notices +
+    mention-image names) and ``images`` carries direct composer
+    blobs PLUS the @-mention vision blobs."""
+    cwd = tmp_path / "session"
+    cwd.mkdir()
+
+    bridge = NoraBridge(cwd=cwd)
+    runner = bridge._active_runner()
+    assert runner is not None
+
+    # Simulate a turn's worth of staged state, the way attach_*
+    # paths would have populated it before send. (We bypass the
+    # actual attach so the test stays focused on the persistence
+    # contract, not the staging plumbing.)
+    runner.pending_script_attachments = [
+        {
+            "name": "regression.py",
+            "ext": ".py",
+            "content": "import pandas as pd\n",
+            "bytes": 22,
+            "path": str((cwd / "regression.py").resolve()),
+        },
+    ]
+    runner.pending_mentioned_files = ["panel.csv"]
+    runner.pending_mentioned_images = [
+        {
+            "name": "coefficients.png",
+            "data": "ZmFrZQ==",  # base64 "fake"
+            "mime": "image/png",
+            "path": str((cwd / ".nora" / "runs" / "r1" / "_nora_plots"
+                         / "coefficients.png").resolve()),
+        },
+    ]
+
+    composer_image = {
+        "name": "screenshot.png",
+        "data": "ZHJvcA==",  # base64 "drop"
+        "mime": "image/png",
+    }
+    bridge._record_user_message(
+        runner, "explain these", images=[composer_image],
+    )
+
+    # Read what landed on disk.
+    import json
+    hist = (cwd / ".nora" / "chat_history.jsonl").read_text(encoding="utf-8")
+    records = [json.loads(line) for line in hist.splitlines() if line.strip()]
+    user_records = [r for r in records if r.get("type") == "user_message"]
+    assert len(user_records) == 1
+    rec = user_records[0]
+
+    assert rec.get("text") == "explain these"
+    # ``attachments`` is the unified chip list.
+    attachments = rec.get("attachments") or []
+    assert "regression.py" in attachments
+    assert "panel.csv" in attachments, (
+        "@-mentioned non-image files must be persisted so the "
+        "transcript reflects what the model was pointed at"
+    )
+    assert "coefficients.png" in attachments
+
+    # ``images`` carries both the direct composer image AND the
+    # mentioned-image vision blob.
+    images = rec.get("images") or []
+    datas = {i.get("data") for i in images}
+    assert "ZHJvcA==" in datas, "direct composer image must persist"
+    assert "ZmFrZQ==" in datas, (
+        "@-mentioned vision blob must persist — without it a "
+        "reload replays the bubble with no thumbnail even "
+        "though the model received vision input"
+    )
+    assert rec.get("image_count") == 2
+
+
+def test_read_session_file_text_allows_listed_script(tmp_path: Path) -> None:
+    """A script that the Files panel surfaces (under
+    ``.nora/runs/<id>/script.do``) must still be readable through
+    the bridge — that's the entire point of the copy button. Pin
+    the positive case alongside the negative one so a future
+    tightening doesn't accidentally break the legitimate flow."""
+    cwd = tmp_path / "session"
+    run_dir = cwd / ".nora" / "runs" / "r0001"
+    run_dir.mkdir(parents=True)
+    # enumerate_run_dir_scripts surfaces ``<run_dir>/script.<ext>``
+    # for ext in _SCRIPT_EXTS; no label.txt required (the fallback
+    # display name uses the short_id).
+    script = run_dir / "script.do"
+    script.write_text("regress y x\n", encoding="utf-8")
+
+    bridge = NoraBridge(cwd=cwd)
+    res = bridge.read_session_file_text(str(script))
+    assert res["ok"] is True, res.get("reason")
+    assert "regress y x" in res["text"]
+
+
+# ---------------------------------------------------------------------------
 # Files panel renders graphs first
 # ---------------------------------------------------------------------------
 

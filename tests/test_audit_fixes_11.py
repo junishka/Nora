@@ -299,6 +299,75 @@ def test_list_sessions_surfaces_folder_backed(tmp_path: Path, monkeypatch) -> No
     assert folder_entries[0]["path"] == str(project.resolve())
 
 
+def test_list_sessions_skips_dir_size_for_folder_backed(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    """``_dir_size`` recursively stats every file in a session dir to
+    fill the ``size`` field that drives the delete-confirm prompt.
+    Folder-backed sessions don't get a delete affordance (the
+    backend rejects rmtree on anything outside SESSIONS_ROOT and the
+    sidebar hides the button), so on a real project dir the walk is
+    pure cost — ``node_modules`` alone can be tens of thousands of
+    files. ``list_sessions`` must short-circuit ``size`` to 0 for
+    folder-backed entries; staged sessions still get the real walk
+    so their delete prompt remains informative.
+    """
+    from nora import ui as ui_mod
+    from nora.ui import NoraBridge
+    from nora.external_sessions import register
+
+    sessions_root = tmp_path / ".nora-sessions"
+    sessions_root.mkdir()
+    monkeypatch.setattr(ui_mod, "SESSIONS_ROOT", sessions_root)
+
+    # Staged session with one file — _dir_size should return >0.
+    staged = sessions_root / "20260511T120000Z_aaaaaaaa"
+    staged.mkdir()
+    (staged / "data.csv").write_text("a,b\n1,2\n", encoding="utf-8")
+
+    # Folder-backed project with a "node_modules-like" tree — we
+    # want to prove _dir_size never runs over it. Drop a sentinel:
+    # monkeypatch _dir_size to raise if it's called with the
+    # folder-backed path, so any regression that re-enables the
+    # walk fails the test loudly.
+    project = tmp_path / "my-project"
+    (project / "node_modules" / "pkg").mkdir(parents=True)
+    (project / "node_modules" / "pkg" / "index.js").write_text(
+        "module.exports = {}", encoding="utf-8",
+    )
+    register(sessions_root, project)
+
+    real_dir_size = ui_mod._dir_size
+
+    def guarded_dir_size(p: Path) -> int:
+        if Path(p).resolve() == project.resolve():
+            raise AssertionError(
+                "list_sessions must not walk folder-backed project dirs"
+            )
+        return real_dir_size(p)
+
+    monkeypatch.setattr(ui_mod, "_dir_size", guarded_dir_size)
+
+    bridge = NoraBridge(cwd=None)
+    res = bridge.list_sessions()
+    assert res["ok"]
+
+    folder_entries = [s for s in res["sessions"] if s.get("kind") == "folder"]
+    staged_entries = [s for s in res["sessions"] if s.get("kind") == "staged"]
+    assert len(folder_entries) == 1
+    assert len(staged_entries) == 1
+
+    assert folder_entries[0]["size"] == 0, (
+        "folder-backed sessions must report size=0 — the field "
+        "drives the delete prompt and folder sessions have no "
+        "delete affordance"
+    )
+    assert staged_entries[0]["size"] > 0, (
+        "staged sessions still need the real size for the "
+        "delete-confirm dialog"
+    )
+
+
 def test_switch_session_accepts_folder_backed(tmp_path: Path, monkeypatch) -> None:
     """``switch_session`` must accept a folder-backed path even
     though the parent isn't ``SESSIONS_ROOT``. Without the registry

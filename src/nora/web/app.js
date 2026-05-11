@@ -1496,15 +1496,20 @@ async function selectMention(idx) {
   input.selectionStart = input.selectionEnd = caret;
   autosize();
   closeMentionPopup();
-  await stageMentionedFile(item.name);
+  // Pass the row's path through to the bridge so basename
+  // collisions (helper plots in different run dirs commonly
+  // produce ``coefficients.png`` or ``marginal_effects.png``)
+  // resolve to the exact row the researcher clicked, not
+  // whichever copy ``iterdir`` returns first.
+  await stageMentionedFile(item.name, item.path);
   input.focus();
 }
 
-async function stageMentionedFile(name) {
+async function stageMentionedFile(name, path) {
   if (!window.pywebview || !window.pywebview.api) return;
   if (typeof window.pywebview.api.attach_session_file !== 'function') return;
   try {
-    const res = await window.pywebview.api.attach_session_file(name);
+    const res = await window.pywebview.api.attach_session_file(name, path);
     if (!res || !res.ok) {
       const reason = (res && res.reason) || 'unknown';
       toast('Could not attach: ' + reason, 'error');
@@ -1899,29 +1904,65 @@ function autosize() {
 // Rotating placeholder — short, slightly silly, changes each time
 // the input goes empty (initial load, after send, after clearing).
 const PLACEHOLDERS = [
-  'Nam nam nam data…',
-  'I grant your wishes',
-  'Hello there, I am Nora',
-  'What shall we regress today',
-  'Coefficients on tap',
+  'State your hypothesis',
+  'What are we estimating today?',
+  'Ask me something causal',
+  'One regression at a time',
+  'Ask, regress, repeat',
+  'What shall we regress today?',
+  'Show me a variable',
   'Feed me a question',
-  'Standard errors, on the house',
-  'Poke the dataset',
-  'Tell me where it hurts (in the data)',
-  'Ready when you are',
-  'A t-test? A table? Surprise me',
-  'Pun buffer: loaded',
   'Ask away, researcher',
-  'Postcard from the ivory tower',
-  'Reviewer 2 is asleep, talk to me',
+  'Ready when you are',
+  'What’s the question?',
+  'What a beautiful day',
+  'AMA',
+  'Where should we start?',
+  'What are you working on?',
+  'Tell me what you need',
+  'Let’s take a look',
+  'What’s on your mind?',
+  'What’s your estimand?',
+  'Name your outcome',
+  'Choose your treatment',
+  'Power calculations on request',
+  'The model is caffeinated',
+  'Cluster me softly',
+  'Propensity scores and good intentions',
+  'The p-value trembles',
+  'Frequentist by day, Bayesian by night',
+  'I do not fear missingness',
   'Endogeneity hotline',
   'Heteroskedasticity-robust greetings',
-  'I read code so you don\'t have to',
+  'Placebo tests for the soul',
+  'DiD or it didn’t happen',
+  'May your joins be many-to-one',
   'Bring me your messy joins',
-  'Give me your tired, your missing, your truncated',
-  'Surrender the .dta',
-  'Throw your reshapes at me',
+  'Long or wide, I do not judge',
+  'Reshape me like one of your French panels',
+  'Fixed effects, flexible morals',
   'Panel data, biscuits, tea',
+  'I read code so you don’t have to',
+  'Surrender the .dta',
+  'Securely curious',
+  'I come in privacy',
+  'Nothing raw leaves the room',
+  'No raw access, all the insight',
+  'Your data stays home tonight',
+  'Ask without peeking',
+  'A question walks into a dataset',
+  'The answer is in there somewhere',
+  'The data is restless tonight',
+  'Tell me where it hurts, in the data',
+  'Poke the dataset',
+  'Reviewer 2 is asleep, talk to me',
+  'Postcard from the ivory tower',
+  'The replication crisis sends regards',
+  'Coffee or coefficient?',
+  'Pun buffer: loaded',
+  'Identification, please',
+  'What a fine day for a join',
+  'Nam nam nam data…',
 ];
 
 function rotatePlaceholder() {
@@ -3896,7 +3937,22 @@ async function deleteSessionFile(path, displayName) {
     }
     toast('Deleted ' + (res.name || label) + '.', 'success');
     refreshFilesChip();
-    // Composer chips may have referenced the file too; re-render.
+    // Drop matching composer chips before re-rendering. ``res.unstaged``
+    // is the authoritative list of staged names the backend just
+    // dropped from the runner's pending_* lists — for run-dir scripts
+    // it carries the label-derived display name (``linear_regression.py``)
+    // that the chip shows, not the on-disk basename (``script.py``)
+    // in ``res.name``. Splicing by both keeps the chip row honest
+    // for older bridges that don't populate ``unstaged``.
+    const dropped = Array.isArray(res.unstaged) ? res.unstaged.slice() : [];
+    if (res.name) dropped.push(res.name);
+    if (dropped.length > 0) {
+      for (let i = stagedDataNotices.length - 1; i >= 0; i--) {
+        if (dropped.includes(stagedDataNotices[i])) {
+          stagedDataNotices.splice(i, 1);
+        }
+      }
+    }
     renderAttachments();
   } catch (err) {
     console.warn('delete_session_file failed', err);
@@ -4579,38 +4635,49 @@ function renderSessions(sessions, currentPath) {
     );
     row.appendChild(btn);
 
-    const rename = document.createElement('button');
-    rename.type = 'button';
-    rename.className = 'session-rename';
-    rename.setAttribute('aria-label', 'Rename session');
-    rename.title = 'Rename this session';
-    rename.textContent = '✎';
-    rename.addEventListener('click', (e) => {
-      e.stopPropagation();
-      // Putting an <input> inside the <button.session-item>
-      // would be invalid nesting (interactive in interactive),
-      // so swap the whole button for an edit container. On
-      // commit/cancel, beginRenameSession's loadSessions()
-      // refresh redraws the row from server state.
-      const editor = document.createElement('div');
-      editor.className = 'session-item session-item-editing';
-      editor.textContent = s.custom_name || s.title || '';
-      row.replaceChild(editor, btn);
-      beginRenameSession(editor, s.path);
-    });
-    row.appendChild(rename);
+    // Folder-backed sessions (opened via the folder picker) are
+    // not stored under ~/.nora-sessions/, so the backend's
+    // delete_session and set_session_name reject them outright
+    // (they require parent == SESSIONS_ROOT). Offering the
+    // buttons here would prompt the researcher with a
+    // destructive confirm or an editable name, then fail on
+    // commit. Hide them so the controls match what the backend
+    // will accept; the researcher manages their own project
+    // dir for those sessions.
+    if (s.kind !== 'folder') {
+      const rename = document.createElement('button');
+      rename.type = 'button';
+      rename.className = 'session-rename';
+      rename.setAttribute('aria-label', 'Rename session');
+      rename.title = 'Rename this session';
+      rename.textContent = '✎';
+      rename.addEventListener('click', (e) => {
+        e.stopPropagation();
+        // Putting an <input> inside the <button.session-item>
+        // would be invalid nesting (interactive in interactive),
+        // so swap the whole button for an edit container. On
+        // commit/cancel, beginRenameSession's loadSessions()
+        // refresh redraws the row from server state.
+        const editor = document.createElement('div');
+        editor.className = 'session-item session-item-editing';
+        editor.textContent = s.custom_name || s.title || '';
+        row.replaceChild(editor, btn);
+        beginRenameSession(editor, s.path);
+      });
+      row.appendChild(rename);
 
-    const del = document.createElement('button');
-    del.type = 'button';
-    del.className = 'session-delete';
-    del.setAttribute('aria-label', 'Delete session');
-    del.title = 'Delete this session (data + history)';
-    del.textContent = '×';
-    del.addEventListener('click', (e) => {
-      e.stopPropagation();
-      deleteSession(s, s.path === currentPath);
-    });
-    row.appendChild(del);
+      const del = document.createElement('button');
+      del.type = 'button';
+      del.className = 'session-delete';
+      del.setAttribute('aria-label', 'Delete session');
+      del.title = 'Delete this session (data + history)';
+      del.textContent = '×';
+      del.addEventListener('click', (e) => {
+        e.stopPropagation();
+        deleteSession(s, s.path === currentPath);
+      });
+      row.appendChild(del);
+    }
 
     sidebarListEl.appendChild(row);
   });
@@ -5068,6 +5135,101 @@ if (shortcutsOverlay) {
   });
 }
 
+// ----- feedback modal ----------------------------------------------------
+
+const feedbackBtn = document.getElementById('feedback-btn');
+const feedbackOverlay = document.getElementById('feedback-overlay');
+const feedbackCloseBtn = document.getElementById('feedback-close');
+const feedbackCancelBtn = document.getElementById('feedback-cancel');
+const feedbackSubmitBtn = document.getElementById('feedback-submit');
+const feedbackSubjectEl = document.getElementById('feedback-subject');
+const feedbackMessageEl = document.getElementById('feedback-message');
+const feedbackEmailEl = document.getElementById('feedback-email');
+
+function openFeedback() {
+  if (!feedbackOverlay) return;
+  feedbackOverlay.classList.remove('hidden');
+  if (feedbackMessageEl) {
+    feedbackMessageEl.focus();
+  }
+}
+
+function closeFeedback() {
+  if (!feedbackOverlay) return;
+  feedbackOverlay.classList.add('hidden');
+}
+
+function resetFeedback() {
+  if (feedbackSubjectEl) feedbackSubjectEl.value = '';
+  if (feedbackMessageEl) feedbackMessageEl.value = '';
+  if (feedbackEmailEl) feedbackEmailEl.value = '';
+}
+
+if (feedbackBtn) feedbackBtn.addEventListener('click', openFeedback);
+if (feedbackCloseBtn) feedbackCloseBtn.addEventListener('click', closeFeedback);
+if (feedbackCancelBtn) feedbackCancelBtn.addEventListener('click', closeFeedback);
+if (feedbackOverlay) {
+  feedbackOverlay.addEventListener('click', (e) => {
+    if (e.target === feedbackOverlay) closeFeedback();
+  });
+  // Cmd+Enter (or Ctrl+Enter) submits without forcing the
+  // researcher to mouse over to the button. Plain Enter still
+  // adds a newline inside the textarea — same convention as the
+  // chat composer. Scoped to the overlay so the binding only
+  // fires while the modal is open.
+  feedbackOverlay.addEventListener('keydown', (e) => {
+    if (e.key !== 'Enter') return;
+    if (!(e.metaKey || e.ctrlKey)) return;
+    e.preventDefault();
+    submitFeedback();
+  });
+}
+
+async function submitFeedback() {
+  if (!feedbackMessageEl) return;
+  const message = (feedbackMessageEl.value || '').trim();
+  if (!message) {
+    toast('Write a quick note before sending.', 'info');
+    feedbackMessageEl.focus();
+    return;
+  }
+  if (!window.pywebview || !window.pywebview.api
+      || typeof window.pywebview.api.send_feedback !== 'function') {
+    toast('Restart Nora to enable feedback.', 'error');
+    return;
+  }
+  const replyTo = (feedbackEmailEl && feedbackEmailEl.value || '').trim();
+  const subject = (feedbackSubjectEl && feedbackSubjectEl.value || '').trim();
+  if (feedbackSubmitBtn) {
+    feedbackSubmitBtn.disabled = true;
+    feedbackSubmitBtn.textContent = 'Sending…';
+  }
+  try {
+    const res = await window.pywebview.api.send_feedback(
+      message,
+      replyTo || null,
+      subject || null,
+    );
+    if (!res || !res.ok) {
+      toast('Could not send: ' + ((res && res.reason) || 'unknown'), 'error');
+      return;
+    }
+    toast('Feedback sent. Thanks!', 'success');
+    resetFeedback();
+    closeFeedback();
+  } catch (err) {
+    console.warn('send_feedback failed', err);
+    toast('Could not send: ' + (err && err.message ? err.message : err), 'error');
+  } finally {
+    if (feedbackSubmitBtn) {
+      feedbackSubmitBtn.disabled = false;
+      feedbackSubmitBtn.textContent = 'Send feedback';
+    }
+  }
+}
+
+if (feedbackSubmitBtn) feedbackSubmitBtn.addEventListener('click', submitFeedback);
+
 function isTypingInField(el) {
   if (!el) return false;
   const tag = el.tagName;
@@ -5093,6 +5255,10 @@ document.addEventListener('keydown', (e) => {
 
   // Escape: close the shortcuts overlay or any open popup.
   if (e.key === 'Escape') {
+    if (feedbackOverlay && !feedbackOverlay.classList.contains('hidden')) {
+      closeFeedback();
+      return;
+    }
     if (shortcutsOverlay && !shortcutsOverlay.classList.contains('hidden')) {
       closeShortcuts();
       return;
