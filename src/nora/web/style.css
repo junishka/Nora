@@ -191,6 +191,179 @@ body {
   padding: 24px;
 }
 
+/* Feedback modal — same backdrop + card vocabulary as the
+   shortcuts overlay so the two dialogs feel consistent. */
+.feedback-overlay {
+  position: fixed;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(0, 0, 0, 0.35);
+  z-index: 1100;
+  padding: 24px;
+}
+
+.feedback-card {
+  width: 460px;
+  max-width: 100%;
+  max-height: 90vh;
+  overflow-y: auto;
+  padding: 20px 22px 16px;
+  background: var(--bg-surface);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  box-shadow: 0 20px 60px rgba(0, 0, 0, 0.3);
+  display: flex;
+  flex-direction: column;
+}
+
+.feedback-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  font-weight: 600;
+  font-size: 14px;
+  margin-bottom: 14px;
+}
+
+.feedback-close {
+  width: 28px;
+  height: 28px;
+  padding: 0;
+  border: none;
+  border-radius: 50%;
+  background: transparent;
+  color: var(--text-dim);
+  font-size: 20px;
+  line-height: 1;
+  cursor: pointer;
+  transition: background 0.15s, color 0.15s;
+}
+
+.feedback-close:hover {
+  background: var(--bg);
+  color: var(--text);
+}
+
+.feedback-body {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.feedback-label {
+  font-size: 12px;
+  color: var(--text-dim);
+  margin-top: 10px;
+}
+
+.feedback-label:first-child {
+  margin-top: 0;
+}
+
+.feedback-textarea,
+.feedback-input {
+  width: 100%;
+  padding: 8px 10px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  color: var(--text);
+  font-family: inherit;
+  font-size: 13px;
+  line-height: 1.5;
+  resize: vertical;
+}
+
+.feedback-textarea:focus,
+.feedback-input:focus {
+  outline: none;
+  border-color: var(--accent, var(--text-dim));
+}
+
+.feedback-file {
+  font-size: 12px;
+  color: var(--text-dim);
+}
+
+.feedback-preview {
+  position: relative;
+  margin-top: 6px;
+  display: inline-block;
+  max-width: 100%;
+}
+
+.feedback-preview img {
+  display: block;
+  max-width: 100%;
+  max-height: 180px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+}
+
+.feedback-image-clear {
+  position: absolute;
+  top: 4px;
+  right: 4px;
+  width: 22px;
+  height: 22px;
+  padding: 0;
+  border: none;
+  border-radius: 50%;
+  background: rgba(0, 0, 0, 0.55);
+  color: #fff;
+  font-size: 14px;
+  line-height: 1;
+  cursor: pointer;
+}
+
+.feedback-note {
+  margin: 14px 0 0;
+  font-size: 12px;
+  color: var(--text-dim);
+  line-height: 1.5;
+}
+
+.feedback-footer {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-top: 16px;
+}
+
+.feedback-button {
+  padding: 7px 14px;
+  border-radius: 8px;
+  font-family: inherit;
+  font-size: 13px;
+  cursor: pointer;
+  border: 1px solid var(--border);
+  background: var(--bg);
+  color: var(--text);
+  transition: background 0.15s, border-color 0.15s;
+}
+
+.feedback-button:hover {
+  background: var(--bg-surface);
+}
+
+.feedback-button-primary {
+  background: var(--accent, #b45c6f);
+  border-color: var(--accent, #b45c6f);
+  color: #fff;
+}
+
+.feedback-button-primary:hover {
+  filter: brightness(1.05);
+  background: var(--accent, #b45c6f);
+}
+
+.feedback-button-primary[disabled] {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
 .shortcuts-card {
   width: 420px;
   max-width: 100%;

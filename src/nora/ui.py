@@ -1150,6 +1150,7 @@ class NoraBridge:
                             _stage_script_for_next_turn(
                                 runner.pending_script_attachments,
                                 src.name, ext, dst.read_bytes(),
+                                path=str(dst.resolve()),
                             )
                         except OSError:
                             pass  # script is on disk; just no inline copy
@@ -1364,6 +1365,7 @@ class NoraBridge:
                         _stage_script_for_next_turn(
                             runner.pending_script_attachments,
                             safe_name, ext, blob,
+                            path=str(dst.resolve()),
                         )
             elif ext in _IMAGE_EXTS_MIMES:
                 # Save to cwd alongside vision staging — see the
@@ -1646,20 +1648,63 @@ class NoraBridge:
         # follows the file's life cycle. Cover every pending list
         # the file could have landed on (script content inline,
         # @-mention notice, @-mention vision).
+        #
+        # Match by absolute path where the staging recorded one
+        # (script attachments and mentioned-image vision blobs),
+        # falling back to name for the older mention-notice list
+        # where only the display name is tracked. Path matching is
+        # necessary because run-dir scripts live on disk as
+        # ``<run_dir>/script.<ext>`` but were staged under their
+        # label-derived display name (``linear_regression.py``);
+        # a name-only filter against ``target.name`` would leave
+        # the deleted script content staged in memory and the next
+        # send would inline a file the researcher just deleted.
+        # Helper plots in different run dirs can also share a
+        # basename, so name-only matching there could clear the
+        # wrong entry.
+        target_str = str(target)
+        unstaged_names: list[str] = []
         runner = self._active_runner()
         if runner is not None:
-            runner.pending_script_attachments = [
-                a for a in runner.pending_script_attachments
-                if a.get("name") != target.name
-            ]
-            runner.pending_mentioned_files = [
-                n for n in runner.pending_mentioned_files
-                if n != target.name
-            ]
-            runner.pending_mentioned_images = [
-                a for a in runner.pending_mentioned_images
-                if a.get("name") != target.name
-            ]
+            kept_scripts: list[dict[str, Any]] = []
+            for a in runner.pending_script_attachments:
+                staged_path = a.get("path")
+                matched = (
+                    staged_path == target_str
+                    if staged_path
+                    else a.get("name") == target.name
+                )
+                if matched:
+                    unstaged_names.append(a.get("name", ""))
+                else:
+                    kept_scripts.append(a)
+            runner.pending_script_attachments = kept_scripts
+
+            kept_imgs: list[dict[str, Any]] = []
+            for a in runner.pending_mentioned_images:
+                staged_path = a.get("path")
+                matched = (
+                    staged_path == target_str
+                    if staged_path
+                    else a.get("name") == target.name
+                )
+                if matched:
+                    unstaged_names.append(a.get("name", ""))
+                else:
+                    kept_imgs.append(a)
+            runner.pending_mentioned_images = kept_imgs
+
+            # pending_mentioned_files only tracks display names, but
+            # those display names match top-level basenames for the
+            # non-script, non-image kinds that land here (run-dir
+            # scripts go into pending_script_attachments instead).
+            kept_mentions: list[str] = []
+            for n in runner.pending_mentioned_files:
+                if n == target.name:
+                    unstaged_names.append(n)
+                else:
+                    kept_mentions.append(n)
+            runner.pending_mentioned_files = kept_mentions
         # Best-effort: also remove the cached PDF/EPS → PNG sidecar
         # if there was one. Otherwise the orphan PNG would keep
         # showing in the Files panel until the bridge restarted.
@@ -1669,7 +1714,18 @@ class NoraBridge:
                 sidecar.unlink()
             except OSError:
                 pass
-        return {"ok": True, "name": target.name}
+        # Return the dropped staged names so JS can splice them
+        # out of ``stagedDataNotices`` — the chip-list array
+        # rendered by ``renderAttachments``. Without this, a
+        # delete that targeted a run-dir script (display name
+        # ``linear_regression.py``, disk name ``script.py``)
+        # would still see its chip on screen because JS only
+        # had ``res.name`` (= ``script.py``) to splice with.
+        return {
+            "ok": True,
+            "name": target.name,
+            "unstaged": [n for n in unstaged_names if n],
+        }
 
     def read_session_file_text(self, path: str) -> dict[str, Any]:
         """Read a session-resident text file's UTF-8 contents so the
@@ -1712,6 +1768,36 @@ class NoraBridge:
         cwd_resolved = self.cwd.resolve()
         if not _is_within(target, cwd_resolved) or not target.is_file():
             return {"ok": False, "reason": f"not found: {Path(path).name}"}
+        # Defence-in-depth, mirroring ``delete_session_file``: only
+        # permit reads of files the Files panel actually surfaces.
+        # Containment in cwd is too loose — the bridge is callable
+        # from page-rendered JS, and a compromised result that escaped
+        # sanitization could call read_session_file_text() with
+        # ``<cwd>/.nora/runs/<id>/stdout.log`` to pull the raw
+        # subprocess transcript onto the page. The executor's
+        # contract is that raw .log files never cross to the model
+        # (see executor.py's "raw .log files NEVER cross" comment),
+        # so the panel never lists those files — and any request
+        # naming one has no legitimate UI origin.
+        from nora.session_files import enumerate_session_files
+        listing_paths: set[Path] = set()
+        for row in enumerate_session_files(
+            cwd_resolved,
+            include_data=True,
+            include_run_scripts=True,
+        ):
+            try:
+                listing_paths.add(Path(row["path"]).resolve())
+            except OSError:
+                continue
+        if target not in listing_paths:
+            return {
+                "ok": False,
+                "reason": (
+                    "this file isn't in the Files panel listing — "
+                    "refused as a precaution"
+                ),
+            }
         ext = target.suffix.lower()
         text_exts = _INLINE_SCRIPT_EXTS | {".ipynb", ".log", ".smcl"}
         if ext not in text_exts:
@@ -1806,7 +1892,9 @@ class NoraBridge:
         )
         return {"ok": True, "name": target, "removed": before - after}
 
-    def attach_session_file(self, name: str) -> dict[str, Any]:
+    def attach_session_file(
+        self, name: str, path: str | None = None,
+    ) -> dict[str, Any]:
         """Stage a file already in the session cwd as inline context
         for the next user message. Used by the Files panel to let
         the researcher click an uploaded script and "bring it to the
@@ -1821,6 +1909,17 @@ class NoraBridge:
         directory component is stripped before resolving against
         cwd. The resolved path must live inside cwd, otherwise the
         request is refused.
+
+        ``path`` is the optional absolute on-disk path the JS
+        mention dropdown was looking at when the row was clicked.
+        Helper plots in different run dirs can share a basename
+        (``coefficients.png`` in both run A and run B), so a
+        name-only resolution walks the run dirs and stages
+        whichever ``iterdir`` returns first — not the row the user
+        actually selected. When ``path`` is provided we use it
+        directly after the same containment check the name-only
+        path would have applied; without it we fall through to
+        the name-based search for back-compat with older JS.
         """
         if self.cwd is None:
             return {"ok": False, "reason": "no active session"}
@@ -1844,7 +1943,49 @@ class NoraBridge:
         # lookup below.
         from nora.session_files import visible_run_dir_names
         visible_runs = visible_run_dir_names(self.cwd)
-        if _is_within(candidate, cwd_resolved) and candidate.is_file():
+        # Explicit path wins. The JS mention dropdown carries the
+        # exact ``path`` of the clicked row, so passing it through
+        # avoids the basename-collision bug: helper plots in
+        # different run dirs can share a name (``coefficients.png``
+        # in run A and run B) and the name-only fallback below
+        # iterates run dirs in filesystem order, staging whichever
+        # appears first rather than the row the user clicked. The
+        # supplied path MUST still pass the same gates a name-only
+        # call would — contained in cwd, real file, not a
+        # symlink-escape, and rewind-visible if it lives in a run
+        # dir.
+        if path:
+            try:
+                supplied = Path(path).resolve()
+            except OSError:
+                supplied = None
+            if (
+                supplied is not None
+                and _is_within(supplied, cwd_resolved)
+                and supplied.is_file()
+                and not supplied.is_symlink()
+            ):
+                runs_root_resolved = (
+                    (self.cwd / ".nora" / "runs").resolve()
+                )
+                in_run_dir = _is_within(supplied, runs_root_resolved)
+                run_dir_visible = True
+                if in_run_dir and visible_runs is not None:
+                    try:
+                        rel = supplied.relative_to(runs_root_resolved)
+                    except ValueError:
+                        run_dir_visible = False
+                    else:
+                        run_dir_name = rel.parts[0] if rel.parts else ""
+                        run_dir_visible = run_dir_name in visible_runs
+                if run_dir_visible:
+                    target = supplied
+        if target is not None:
+            # Path-based resolution already landed; skip the
+            # name-based fallbacks so we don't overwrite the
+            # caller's selected row with a same-name file in cwd.
+            pass
+        elif _is_within(candidate, cwd_resolved) and candidate.is_file():
             target = candidate
         else:
             # Fall through to the helper-plot dirs so an @-mention of
@@ -1898,13 +2039,27 @@ class NoraBridge:
             return {"ok": False, "reason": "no active session"}
 
         ext = target.suffix.lower()
+        target_str = str(target.resolve())
         if ext in _INLINE_SCRIPT_EXTS:
             try:
                 content = target.read_bytes()
             except OSError as e:
                 return {"ok": False, "reason": f"read failed: {e}"}
+            # Dedup by absolute path so two run-dir scripts that
+            # happen to share a display name (e.g. both lack a
+            # label.txt and fall back to ``script_<short_id>.py``,
+            # which disambiguation already widens, but the same
+            # pattern protects against any future collision) are
+            # both stageable. Fall back to name when the staged
+            # entry pre-dates the path field.
             for staged in runner.pending_script_attachments:
-                if staged.get("name") == safe_name:
+                staged_path = staged.get("path")
+                matched = (
+                    staged_path == target_str
+                    if staged_path
+                    else staged.get("name") == safe_name
+                )
+                if matched:
                     return {
                         "ok": True,
                         "name": safe_name,
@@ -1913,6 +2068,7 @@ class NoraBridge:
                     }
             _stage_script_for_next_turn(
                 runner.pending_script_attachments, safe_name, ext, content,
+                path=target_str,
             )
             return {"ok": True, "name": safe_name, "kind": "script"}
 
@@ -1947,8 +2103,19 @@ class NoraBridge:
                 blob = blob_path.read_bytes()
             except OSError as e:
                 return {"ok": False, "reason": f"read failed: {e}"}
+            # Same path-aware dedup as the script branch — helper
+            # plots in different run dirs commonly share a basename
+            # (``coefficients.png``), so dedup-by-name would silently
+            # noop the second mention even though the researcher
+            # selected a different row.
             for staged in runner.pending_mentioned_images:
-                if staged.get("name") == safe_name:
+                staged_path = staged.get("path")
+                matched = (
+                    staged_path == target_str
+                    if staged_path
+                    else staged.get("name") == safe_name
+                )
+                if matched:
                     return {
                         "ok": True,
                         "name": safe_name,
@@ -1960,6 +2127,13 @@ class NoraBridge:
                 "data": _b64.b64encode(blob).decode("ascii"),
                 "mime": mime or "image/png",
                 "name": safe_name,
+                # ``path`` lets ``delete_session_file`` drop this
+                # entry by absolute path. Helper plots from
+                # different run dirs can share a basename
+                # (``coefficients.png`` in run A and run B), so
+                # filtering by ``name`` alone would clear both
+                # when only one was deleted.
+                "path": target_str,
             })
             if safe_name not in runner.pending_mentioned_files:
                 runner.pending_mentioned_files.append(safe_name)
@@ -2000,6 +2174,180 @@ class NoraBridge:
                 if k not in ("data", "mime")
             })
         return {"ok": True, "files": files}
+
+    def send_feedback(
+        self,
+        message: str,
+        reply_to: str | None = None,
+        subject: str | None = None,
+    ) -> dict[str, Any]:
+        """POST a feedback note to the maintainer's Web3Forms
+        endpoint.
+
+        Web3Forms forwards the submission to the inbox the access
+        key is bound to. The key only allows submissions to that
+        inbox, so embedding it in the distributed app is safe:
+        extraction grants no capability beyond spamming the
+        maintainer's own feedback channel, which the service
+        already rate-limits.
+
+        Privacy trade-off: feedback bodies transit a third-party
+        server (web3forms.com) on the way to the maintainer. This
+        is a deliberate carve-out for the feedback surface only.
+        Chat history, datasets, and analysis state never leave
+        the machine. The modal UI states this so the researcher
+        consents at submit time.
+
+        Text-only by design: Web3Forms' free tier doesn't
+        forward file attachments, so the modal exposes no upload
+        affordance. If attachment support is needed later,
+        upgrading the plan or swapping endpoints is a localised
+        change.
+        """
+        text = (message or "").strip()
+        if not text:
+            return {"ok": False, "reason": "empty feedback"}
+
+        # Embedded Web3Forms access key. Bound to the maintainer's
+        # inbox; extraction grants no capability beyond filling
+        # that same inbox.
+        access_key = "732eaf71-0eac-4f34-9f14-2aef3000ae4d"
+
+        # Build a multipart/form-data body by hand. Stdlib has no
+        # multipart builder, so the boundary is assembled
+        # explicitly. The hex suffix is random per request so the
+        # body bytes can never accidentally contain the delimiter.
+        import secrets
+        boundary = "----nora-feedback-" + secrets.token_hex(12)
+        crlf = b"\r\n"
+        parts: list[bytes] = []
+
+        def _field(name: str, value: str) -> None:
+            parts.extend([
+                f"--{boundary}".encode("ascii"), crlf,
+                f'Content-Disposition: form-data; name="{name}"'.encode("ascii"),
+                crlf, crlf,
+                value.encode("utf-8"), crlf,
+            ])
+
+        # Researcher-typed subject when present so the inbox can
+        # be sorted at a glance ("Bug: ...", "Feature: ..."). Fall
+        # back to a generic label only when blank, and cap length
+        # so an accidentally pasted novel can't bloat the header.
+        cleaned_subject = ""
+        if isinstance(subject, str):
+            cleaned_subject = subject.strip()[:120]
+        _field("access_key", access_key)
+        _field("subject", cleaned_subject or "Nora feedback")
+        _field("message", text)
+        _field("from_name", "Nora app")
+        # ``_replyto`` magic field rewrites the Reply-To header of
+        # the notification email so the maintainer's Reply button
+        # goes to the researcher. Light validation only — must
+        # contain ``@`` — so a typo doesn't poison the header.
+        if isinstance(reply_to, str):
+            cleaned_reply = reply_to.strip()
+            if cleaned_reply and "@" in cleaned_reply:
+                _field("_replyto", cleaned_reply)
+
+        parts.extend([f"--{boundary}--".encode("ascii"), crlf])
+        body = b"".join(parts)
+
+        # Browser-shaped headers. Web3Forms sits behind Cloudflare,
+        # and a generic urllib User-Agent gets served a 200-OK bot-
+        # challenge HTML page instead of the JSON API response. A
+        # recognizable Chrome UA + Accept-Language + Origin makes
+        # the request pass Cloudflare's default heuristics without
+        # needing JS execution. The UA identifies the kind of
+        # client, not a specific user.
+        import urllib.error
+        import urllib.request
+        req = urllib.request.Request(
+            "https://api.web3forms.com/submit",
+            data=body,
+            headers={
+                "Content-Type": f"multipart/form-data; boundary={boundary}",
+                "User-Agent": (
+                    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/127.0.0.0 Safari/537.36"
+                ),
+                "Accept": "application/json, text/plain, */*",
+                "Accept-Language": "en-US,en;q=0.9",
+                "Origin": "https://api.web3forms.com",
+                "Referer": "https://api.web3forms.com/",
+            },
+            method="POST",
+        )
+        status = 0
+        raw = b""
+        try:
+            with urllib.request.urlopen(req, timeout=20) as resp:
+                status = resp.status
+                raw = resp.read()
+        except urllib.error.HTTPError as e:
+            # Non-2xx — Web3Forms still puts a JSON error body on
+            # most failures, so read it so we can surface the
+            # actual rejection reason instead of a bare status.
+            status = e.code
+            try:
+                raw = e.read() or b""
+            except Exception:  # noqa: BLE001
+                raw = b""
+        except urllib.error.URLError as e:  # network / DNS / TLS failures
+            return {
+                "ok": False,
+                "reason": f"could not reach feedback service: {e.reason}",
+            }
+        except Exception as e:  # noqa: BLE001 — surface any other failure
+            return {"ok": False, "reason": f"send failed: {e}"}
+
+        # Response can be one of three shapes:
+        #   * JSON (``/ajax/<email>`` endpoint) — parse and look for
+        #     ``success``.
+        #   * HTML success page (``/el/<alias>`` endpoint after
+        #     urllib follows the success redirect) — status is 2xx
+        #     and the body is FormSubmit's thank-you page.
+        #   * Error page or non-2xx — treat as failure.
+        text_body = raw.decode("utf-8", errors="replace").strip()
+
+        # Non-2xx: always an error. Surface a snippet so the cause
+        # (404 from wrong URL, 422 from missing field, 5xx from the
+        # service, etc.) is visible to the maintainer reading bug
+        # reports.
+        if not (200 <= status < 300):
+            snippet = text_body[:400] if text_body else "(empty body)"
+            return {
+                "ok": False,
+                "reason": f"rejected (HTTP {status}): {snippet}",
+            }
+
+        # 2xx response. Web3Forms always returns JSON on success
+        # (``{"success": true, ...}``). A 2xx HTML body would be a
+        # Cloudflare bot-challenge page slipping through despite
+        # our browser-shaped headers — treat that as a failure
+        # rather than reporting a phantom "sent" while no email
+        # actually leaves.
+        try:
+            payload = json.loads(text_body) if text_body else None
+        except Exception:  # noqa: BLE001
+            payload = None
+        if not isinstance(payload, dict):
+            snippet = text_body[:300] if text_body else "(empty body)"
+            return {
+                "ok": False,
+                "reason": f"unexpected response (HTTP {status}): {snippet}",
+            }
+        success_raw = payload.get("success")
+        ok = (
+            success_raw is True
+            or (isinstance(success_raw, str)
+                and success_raw.strip().lower() == "true")
+        )
+        if not ok:
+            msg = payload.get("message") or "rejected"
+            return {"ok": False, "reason": f"{msg} (HTTP {status})"}
+        return {"ok": True}
 
     def open_external(self, url: str) -> dict[str, Any]:
         """Open ``url`` in the OS default browser, NOT inside the
@@ -2317,13 +2665,23 @@ class NoraBridge:
             except Exception:  # noqa: BLE001
                 state = None
             custom = state.custom_name if state is not None else None
+            # ``size`` drives the delete-confirm dialog so the
+            # researcher knows how much data is about to be wiped.
+            # Folder-backed sessions don't get a delete button (the
+            # backend rejects rmtree on anything outside SESSIONS_ROOT
+            # and the sidebar hides the affordance), so the recursive
+            # walk would be pure cost — on a real project dir with
+            # node_modules / .venv / build artefacts, _dir_size can
+            # stat tens of thousands of files just to fill a field
+            # nothing reads.
+            size = 0 if kind == "folder" else _dir_size(child)
             return {
                 "path": str(child.resolve()),
                 "name": child.name,
                 "timestamp": ts,
                 "last_activity": last_activity,
                 "datasets": datasets,
-                "size": _dir_size(child),
+                "size": size,
                 "title": _session_title(child),
                 "custom_name": custom,
                 # ``kind`` distinguishes staged (under SESSIONS_ROOT)
@@ -3028,9 +3386,37 @@ class NoraBridge:
         legacy histories that pre-date this persistence.
         """
         self._drop_trailing_orphan_user_message(runner.cwd)
-        attached_names = [
-            a["name"] for a in runner.pending_script_attachments
-        ]
+        # The transcript needs to reflect every file/image the
+        # model actually saw with this message. Three classes ride
+        # the live turn:
+        #   1. ``pending_script_attachments`` — uploaded scripts
+        #      inlined as a context block (already persisted).
+        #   2. ``pending_mentioned_files`` — @-mention notices for
+        #      non-image session files. Shown as composer chips in
+        #      the live UI; the runner prepends a "the researcher
+        #      referenced these" notice to the prompt.
+        #   3. ``pending_mentioned_images`` — @-mention vision
+        #      blobs for PDF/PNG/JPG/etc. The runner merges them
+        #      into the turn's image list; without persisting the
+        #      bytes, a reload shows a bare text bubble even
+        #      though the model saw vision input.
+        # ``attachments`` is the unified chip list (existing JS
+        # already replays it as filename chips); ``images``
+        # carries both direct composer images and @-mentioned
+        # vision blobs so the bubble shows real thumbnails on
+        # reload, not a phantom "you sent an image".
+        attached_names: list[str] = []
+        for a in runner.pending_script_attachments:
+            n = a.get("name")
+            if n and n not in attached_names:
+                attached_names.append(n)
+        for n in runner.pending_mentioned_files:
+            if n and n not in attached_names:
+                attached_names.append(n)
+        for a in runner.pending_mentioned_images:
+            n = a.get("name")
+            if n and n not in attached_names:
+                attached_names.append(n)
         record: dict[str, Any] = {
             "type": "user_message",
             "text": text,
@@ -3038,10 +3424,20 @@ class NoraBridge:
         }
         if attached_names:
             record["attachments"] = attached_names
+        # Combine direct composer images with @-mentioned vision
+        # blobs so the persisted ``images`` list mirrors what the
+        # model received. Both shapes carry ``data`` + ``mime``;
+        # the ``name`` on a mentioned-image entry is already
+        # reflected via ``attachments`` above.
+        combined_images: list[dict[str, Any]] = []
         if images:
-            record["image_count"] = len(images)
+            combined_images.extend(images)
+        if runner.pending_mentioned_images:
+            combined_images.extend(runner.pending_mentioned_images)
+        if combined_images:
+            record["image_count"] = len(combined_images)
             persisted_images: list[dict[str, str]] = []
-            for img in images:
+            for img in combined_images:
                 data = img.get("data") if isinstance(img, dict) else None
                 mime = img.get("mime") if isinstance(img, dict) else None
                 if not isinstance(data, str) or not isinstance(mime, str):
@@ -4008,6 +4404,8 @@ def _stage_script_for_next_turn(
     name: str,
     ext: str,
     content_bytes: bytes,
+    *,
+    path: str | None = None,
 ) -> None:
     """Decode ``content_bytes`` as text (best-effort UTF-8) and append
     a stage entry. Decoding failures are recorded as a placeholder
@@ -4017,6 +4415,15 @@ def _stage_script_for_next_turn(
     Per-file size cap is enforced here: scripts longer than
     ``_INLINE_SCRIPT_MAX_BYTES`` get their first chunk + a clear
     truncation marker. The on-disk copy is always full.
+
+    ``path`` records the absolute on-disk path the staged content
+    came from. ``delete_session_file`` uses it to drop staged
+    entries by path rather than by display name — for run-dir
+    scripts the staged ``name`` is the label-derived display name
+    (e.g. ``linear_regression.py``) but the file on disk is
+    ``script.py``, so a name-only match would leave deleted script
+    content staged in memory and the next send would inline a file
+    the researcher just deleted.
     """
     if ext not in _INLINE_SCRIPT_EXTS:
         return
@@ -4037,6 +4444,7 @@ def _stage_script_for_next_turn(
         "ext": ext,
         "content": text + truncated_note,
         "bytes": len(content_bytes),
+        "path": path,
     })
 
 
@@ -4695,6 +5103,17 @@ def main() -> None:
 
     cwd = _resolve_cwd(args.cwd)
     if cwd is not None:
+        # Same privacy gate the folder picker applies (see
+        # _reject_dangerous_cwd). The CLI is the other entry point
+        # that can hand Nora an arbitrary directory, so it has to
+        # honour the same boundary — without this, `nora ~` or
+        # `nora /` silently grants the sandbox read+write over the
+        # whole home tree (or worse), which is exactly what the
+        # picker refuses.
+        reason = _reject_dangerous_cwd(cwd)
+        if reason is not None:
+            print(f"nora: {reason}", file=sys.stderr)
+            sys.exit(2)
         set_cwd(cwd)
 
     # Preflight: sandbox-exec on macOS. The webview can still run for

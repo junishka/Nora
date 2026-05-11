@@ -531,8 +531,9 @@ def test_reject_dangerous_cwd_rejects_home_and_system_roots():
     Document, and write anywhere under home.
 
     The fix lives in ``ui._reject_dangerous_cwd`` and is wired into
-    ``choose_folder`` (the only entry point where a researcher can
-    hand Nora an arbitrary directory). Staged sessions land under
+    both entry points where a researcher can hand Nora an arbitrary
+    directory: the folder picker (``choose_folder``) and the CLI
+    positional argument (``main``). Staged sessions land under
     SESSIONS_ROOT and ``switch_session`` enforces parent ==
     SESSIONS_ROOT, so those paths don't need this check.
 
@@ -560,6 +561,40 @@ def test_reject_dangerous_cwd_rejects_home_and_system_roots():
     # Plausible project directories must pass through.
     home_subdir = Path.home() / "Documents" / "some-project"
     assert _reject_dangerous_cwd(home_subdir) is None
+
+
+def test_cli_main_rejects_dangerous_cwd(monkeypatch, capsys):
+    """``nora <cwd>`` must apply the same privacy gate as the folder
+    picker. Without this, a researcher who launches ``nora ~`` would
+    silently grant the sandbox read+write over their entire home tree
+    (only ``.nora`` is carved out), which is exactly what
+    ``_reject_dangerous_cwd`` was added to refuse on the picker path.
+
+    The check is wired into ``main()`` between ``_resolve_cwd`` and
+    ``set_cwd``; on rejection we exit with code 2 and a researcher-
+    readable message, mirroring the picker's ``{ok: False, reason}``
+    return. This regression test pins the wiring so a future
+    refactor of ``main`` doesn't accidentally drop the gate.
+    """
+    import nora.ui as ui_mod
+
+    set_cwd_calls: list[Path] = []
+    monkeypatch.setattr(
+        ui_mod, "set_cwd",
+        lambda p: set_cwd_calls.append(Path(p)),
+    )
+    # ``main()`` parses ``sys.argv`` via argparse.
+    monkeypatch.setattr("sys.argv", ["nora", str(Path.home())])
+
+    with pytest.raises(SystemExit) as excinfo:
+        ui_mod.main()
+
+    assert excinfo.value.code == 2
+    err = capsys.readouterr().err
+    assert "home directory" in err
+    # And — crucially — set_cwd was never called: a rejected CLI
+    # cwd must not partially install itself before the exit.
+    assert set_cwd_calls == []
 
 
 def test_switch_session_rejects_root_and_nested_paths(tmp_path: Path):

@@ -333,6 +333,19 @@
           aria-label="Add data files or images"
           title="Add data, scripts (.py, .do, .r), or images. Scripts and images travel with your next message; data files land in the session."
         >+</button>
+        <!-- Feedback heart. Opens a modal where the researcher can
+             write a note, attach a screenshot, and optionally leave
+             a reply-to address. On submit the bridge POSTs the
+             submission (including any screenshot as a real
+             attachment) to a Web3Forms endpoint that forwards it to
+             the maintainer's inbox. -->
+        <button
+          type="button"
+          id="feedback-btn"
+          class="composer-chip composer-chip-action"
+          aria-label="Send feedback"
+          title="Send feedback to Nora's maintainer"
+        >♥</button>
         <div class="permission-wrap">
           <button
             type="button"
@@ -382,6 +395,59 @@
        belong to the conversation flow still go through appendError()
        so they land in the transcript with the turn that produced
        them. -->
+
+  <!-- Feedback modal. Opened from the ✉ button in the composer
+       meta row. Submit composes a mailto: draft and opens the
+       researcher's mail client; nothing is sent until they click
+       Send in that client. -->
+  <div id="feedback-overlay" class="feedback-overlay hidden" role="dialog" aria-modal="true" aria-label="Send feedback">
+    <div class="feedback-card">
+      <div class="feedback-header">
+        Send feedback
+        <button type="button" id="feedback-close" class="feedback-close" aria-label="Close">×</button>
+      </div>
+      <div class="feedback-body">
+        <label for="feedback-subject" class="feedback-label">
+          Subject
+        </label>
+        <input
+          id="feedback-subject"
+          class="feedback-input"
+          type="text"
+          placeholder="Bug, feature, question, or pat on the back"
+          maxlength="120"
+        />
+
+        <label for="feedback-message" class="feedback-label">
+          Your message
+        </label>
+        <textarea
+          id="feedback-message"
+          class="feedback-textarea"
+          rows="6"
+          placeholder="Indoor thoughts welcome here"
+        ></textarea>
+
+        <label for="feedback-email" class="feedback-label">
+          Your email (optional)
+        </label>
+        <input
+          id="feedback-email"
+          class="feedback-input"
+          type="email"
+          placeholder="If you'd like a reply"
+        />
+
+        <p class="feedback-note">
+          Sent directly to Nora's maintainer. Only this note leaves your machine. Chat history and datasets stay local.
+        </p>
+      </div>
+      <div class="feedback-footer">
+        <button type="button" id="feedback-cancel" class="feedback-button feedback-button-secondary">Cancel</button>
+        <button type="button" id="feedback-submit" class="feedback-button feedback-button-primary">Send feedback</button>
+      </div>
+    </div>
+  </div>
 
   <!-- Keyboard shortcuts overlay. Hidden by default, shown when the
        researcher presses `?` outside the composer. -->
