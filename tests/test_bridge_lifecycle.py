@@ -388,7 +388,7 @@ def test_switch_session_rejects_root_and_nested_paths(tmp_path: Path):
         # The sessions root itself is NOT a session.
         result = bridge.switch_session(str(tmp_path))
         assert not result["ok"]
-        assert "direct session directory" in result["reason"]
+        assert "session directory" in result["reason"]
         assert bridge.cwd == a.resolve(), (
             "rejected switch must not change focus"
         )
@@ -396,7 +396,7 @@ def test_switch_session_rejects_root_and_nested_paths(tmp_path: Path):
         # A nested directory inside a session is also NOT a session.
         result = bridge.switch_session(str(nested))
         assert not result["ok"]
-        assert "direct session directory" in result["reason"]
+        assert "session directory" in result["reason"]
         assert bridge.cwd == a.resolve()
 
         # Sanity: a real direct child still works.

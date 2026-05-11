@@ -3895,3 +3895,88 @@ kbd {
   opacity: 0.9;
 }
 
+/* Install-packages confirmation modal — hard consent gate that fires
+ * before the install_packages tool actually runs the package manager.
+ * Modal because the install mutates the user's machine; using a chip
+ * or toast would let the researcher miss the prompt and have it
+ * silently default to deny on timeout. */
+.install-confirmation-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.55);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 1100;
+  padding: 16px;
+}
+.install-confirmation-card {
+  background: var(--bg, #fff);
+  color: var(--text, #111);
+  border-radius: 10px;
+  box-shadow: 0 12px 36px rgba(0, 0, 0, 0.35);
+  max-width: 480px;
+  width: 100%;
+  padding: 20px 22px;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+}
+.install-confirmation-title {
+  font-size: 16px;
+  font-weight: 600;
+  margin-bottom: 6px;
+}
+.install-confirmation-desc {
+  font-size: 13px;
+  color: var(--text-dim, #555);
+  margin-bottom: 12px;
+  line-height: 1.5;
+}
+.install-confirmation-pkgs {
+  list-style: disc inside;
+  padding-left: 0;
+  margin: 0 0 16px;
+  max-height: 180px;
+  overflow-y: auto;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 12px;
+  background: rgba(0, 0, 0, 0.04);
+  border-radius: 6px;
+  padding: 8px 12px;
+}
+.install-confirmation-pkgs li {
+  line-height: 1.5;
+}
+.install-confirmation-more {
+  list-style: none;
+  font-style: italic;
+  color: var(--text-dim, #555);
+}
+.install-confirmation-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+}
+.install-confirmation-deny,
+.install-confirmation-approve {
+  padding: 8px 18px;
+  border-radius: 6px;
+  font-size: 13px;
+  font-weight: 500;
+  cursor: pointer;
+  border: 1px solid transparent;
+}
+.install-confirmation-deny {
+  background: transparent;
+  border-color: rgba(0, 0, 0, 0.18);
+  color: var(--text, #111);
+}
+.install-confirmation-deny:hover {
+  background: rgba(0, 0, 0, 0.04);
+}
+.install-confirmation-approve {
+  background: #d2502b;
+  color: #fff;
+}
+.install-confirmation-approve:hover {
+  background: #b94221;
+}
