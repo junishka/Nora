@@ -417,6 +417,78 @@ def test_freq_negative_count_rejected():
 # Shape tests — hand-written, confirm the exact output for known inputs.
 # ---------------------------------------------------------------------------
 
+def test_ols_cox_n_failures_below_threshold_is_suppressed():
+    """Cox survival fits ride the ``linear_regression`` payload type
+    so ``n_failures`` (event count) gets allowlisted alongside ``n``.
+    The top-level ``n`` is gated by ``require_minimum_n
+    (min_n_regression)``, but ``n_failures`` was forwarded verbatim
+    even when small — and on rare-outcome studies it commonly is.
+
+    "n=2000 records, 3 deaths" identifies those 3 individuals just
+    as a frequency_table cell with count 3 would. Apply the same
+    cell-suppression rule we already apply to ``missing_count``:
+    when the raw value is in ``(0, threshold)``, replace with
+    ``suppression_marker(threshold)`` and log the transformation.
+    Zero events stays as 0 (no individual to identify).
+    """
+    result = sanitize({
+        "type": "linear_regression",
+        "n": 2000,
+        "n_subjects": 1500,
+        "n_failures": 3,  # rare-event study — discloses 3 individuals
+        "response_variable": "time_to_event",
+        "predictor_variables": ["age"],
+        "coefficients": {"age": 0.05},
+        "standard_errors": {"age": 0.01},
+    })
+    assert result.ok, result.rejection_reason
+    assert result.sanitized["n_failures"] == "<10", (
+        f"n_failures=3 must be coarsened to a suppression marker, "
+        f"got {result.sanitized['n_failures']!r}"
+    )
+    # Per-field log entry so the transformation is auditable.
+    assert any("n_failures" in t for t in result.transformations)
+
+
+def test_ols_cox_zero_failures_left_as_zero():
+    """The suppression rule fires for ``0 < n < threshold`` — at
+    exactly 0 there's no individual to identify, so a zero event
+    count stays as 0 (matching the ``missing_count`` rule and the
+    frequency_table cell rule).
+    """
+    result = sanitize({
+        "type": "linear_regression",
+        "n": 2000,
+        "n_failures": 0,
+        "response_variable": "y",
+        "predictor_variables": ["x"],
+        "coefficients": {"x": 0.1},
+        "standard_errors": {"x": 0.02},
+    })
+    assert result.ok
+    assert result.sanitized["n_failures"] == 0
+
+
+def test_ols_cox_n_failures_above_threshold_passes_through():
+    """Pin the upper boundary: at or above the threshold, the count
+    is published verbatim. The suppression should not kick in for
+    healthy event counts.
+    """
+    result = sanitize({
+        "type": "linear_regression",
+        "n": 2000,
+        "n_subjects": 1500,
+        "n_failures": 178,  # well above any plausible threshold
+        "response_variable": "y",
+        "predictor_variables": ["x"],
+        "coefficients": {"x": 0.1},
+        "standard_errors": {"x": 0.02},
+    })
+    assert result.ok
+    assert result.sanitized["n_failures"] == 178
+    assert result.sanitized["n_subjects"] == 1500
+
+
 def test_ols_precision_clamped_to_expected_sigfigs():
     result = sanitize({
         "type": "linear_regression",

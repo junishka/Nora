@@ -48,20 +48,42 @@ REPO_ROOT = Path(SPECPATH).parent  # type: ignore[name-defined]  # SPECPATH from
 # console-script so it doesn't need entry-point metadata at build time.
 ENTRY = str(REPO_ROOT / "src" / "nora" / "__main__.py")
 
-# Runtime libraries (R + Stata) are loaded via `importlib.resources`
-# inside `executor._stage_runtime`. PyInstaller preserves the package
-# layout when we list them explicitly.
+# Runtime libraries (R + Stata + Python) are loaded via
+# ``importlib.resources`` inside ``executor._stage_runtime``.
+# PyInstaller preserves the package layout when we list them
+# explicitly as data files.
+#
+# Glob, don't enumerate. The previous hand-maintained list missed
+# 8 of the 13 .ado helpers (correlation, every plot helper,
+# safe_export, plot_export, the standalone ttest) plus the Python
+# runtime ``nora.py`` — every Stata script that used a plot helper
+# or correlation, and every Python script entirely, crashed in
+# .app builds with FileNotFoundError because
+# ``importlib.resources.files("nora.runtime").joinpath(name)
+# .read_text()`` returned nothing for the un-bundled files. The
+# dev install (pip / uv from source) worked because the package
+# dir on disk had every file; only the PyInstaller bundle was
+# missing them. Globbing closes the door on this regression class:
+# any new helper dropped into ``runtime/`` ships with the build
+# without a spec edit. We include .py too because:
+#   - ``__init__.py`` is required for ``importlib.resources.files
+#     ("nora.runtime")`` to resolve as a package
+#   - ``nora.py`` is the Python user-runtime that the executor
+#     stages into every Python script's ``lib_dir`` and the user
+#     script then imports — it has to be readable as a *file
+#     resource*, not just importable as a module (PyInstaller's
+#     bytecode-only archive doesn't satisfy resources.files's
+#     ``.read_text()`` call)
+#   - any other Python helper module in ``runtime/`` is also
+#     picked up by PyInstaller's normal tree-shake; listing it as
+#     data is harmless redundancy.
+# Hidden / cache files (``__pycache__``, ``.DS_Store``) are
+# skipped by ``is_file()`` + dot-prefix filter.
 RUNTIME_DIR = REPO_ROOT / "src" / "nora" / "runtime"
 RUNTIME_DATAS = [
-    (str(RUNTIME_DIR / "nora.R"), "nora/runtime"),
-    (str(RUNTIME_DIR / "nora_result_regress.ado"), "nora/runtime"),
-    (str(RUNTIME_DIR / "nora_result_ttest.ado"), "nora/runtime"),
-    (str(RUNTIME_DIR / "nora_result_sum.ado"), "nora/runtime"),
-    (str(RUNTIME_DIR / "nora_result_tab.ado"), "nora/runtime"),
-    (str(RUNTIME_DIR / "nora_result_magnitude.ado"), "nora/runtime"),
-    # __init__.py so `importlib.resources.files("nora.runtime")`
-    # resolves as a package resource rather than a bare directory.
-    (str(RUNTIME_DIR / "__init__.py"), "nora/runtime"),
+    (str(p), "nora/runtime")
+    for p in sorted(RUNTIME_DIR.iterdir())
+    if p.is_file() and not p.name.startswith(".")
 ]
 
 # Web UI assets (HTML + JS + CSS + the bundled Lottie player + the

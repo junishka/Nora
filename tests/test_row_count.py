@@ -267,3 +267,33 @@ def test_row_count_header_only_file(tmp_path: Path) -> None:
     p = tmp_path / "only_header.csv"
     p.write_text("a,b,c\n")
     assert row_count(p) == 0
+
+
+def test_row_count_csv_with_quoted_multiline_field(tmp_path: Path) -> None:
+    """RFC 4180 lets a CSV field contain newlines inside quotes — one
+    logical record can span multiple physical lines. The pre-fix
+    byte-streamed line counter treated every physical ``\\n`` as a row
+    boundary, so:
+
+        id,note
+        1,"hello
+        world"
+        2,"another
+        multi
+        line"
+
+    counted as 6 lines → 5 rows after header offset, even though the
+    file has 2 data rows. That false count then false-flagged the
+    submit_script row-count audit with a ``ROW COUNT CHANGE`` warning
+    whenever the analysis (correctly) saw N=2. The fix routes through
+    ``csv.reader`` which honours quoting and treats embedded newlines
+    as part of the field, not a record terminator.
+    """
+    from nora.schema import row_count
+
+    p = tmp_path / "multiline.csv"
+    p.write_text('id,note\n1,"hello\nworld"\n2,"another\nmulti\nline"\n')
+    assert row_count(p) == 2, (
+        "embedded \\n inside quoted CSV fields must not bump the row "
+        "count — that would false-flag the submit_script audit"
+    )

@@ -259,6 +259,60 @@ def test_python_preamble_adds_nora_pkg_dir_to_sys_path(
     )
 
 
+def test_python_preamble_lib_dir_wins_over_pkg_dir(
+    tmp_path, monkeypatch,
+) -> None:
+    """The staged Nora runtime (``<run_dir>/lib/nora.py``) must take
+    precedence over anything in ``nora_python_pkg_dir`` on ``sys.path``.
+
+    Concrete threat: a model-authored ``install_packages(["nora"])``
+    call (or any third-party wheel that ships a top-level ``nora``
+    module) writes to ``nora_python_pkg_dir``. If pkg_dir is on
+    ``sys.path`` ahead of ``lib_dir``, the user script's
+    ``import nora`` resolves to the installed (potentially malicious)
+    module instead of the staged runtime — bypassing the
+    ``NORA_RUN_TOKEN`` env-pop and the authenticity-token machinery
+    the runtime owns. The preamble must therefore order the inserts
+    so ``lib_dir`` ends up at ``sys.path[0]``.
+
+    The same ordering also ensures ``pkg_dir`` sits after stdlib (via
+    ``append`` rather than ``insert(0, ...)``), so an installed
+    package can't shadow ``os`` / ``json`` / other stdlib modules.
+    """
+    monkeypatch.setenv("NORA_PYTHON_PKG_BASE", str(tmp_path / "pkgs"))
+    from nora.executor import _write_script
+    from nora.package_installer import nora_python_pkg_dir
+    from nora.env_detect import find_python
+
+    py_tool = find_python()
+    if py_tool is None:
+        pytest.skip("python3 not on PATH in this test env")
+
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    lib_dir = run_dir / "lib"
+    lib_dir.mkdir()
+    script_path = _write_script(run_dir, "Python", "print('hi')\n")
+
+    text = script_path.read_text(encoding="utf-8")
+    pkg_dir = str(nora_python_pkg_dir(py_tool.binary))
+    # Both paths must be in the preamble.
+    assert str(lib_dir) in text
+    assert pkg_dir in text
+    # ``lib_dir`` must be inserted at the front of sys.path (so it
+    # wins over everything else). The literal we check for is the
+    # ``insert(0, ...)`` form on lib_dir, paired with anything other
+    # than ``insert(0, ...)`` on pkg_dir.
+    assert f"insert(0, {str(lib_dir)!r})" in text, (
+        "lib_dir must use insert(0, ...) so the staged runtime wins"
+    )
+    assert f"insert(0, {pkg_dir!r})" not in text, (
+        "pkg_dir must NOT use insert(0, ...) — that would shadow "
+        "lib_dir's nora.py with any package masquerading as 'nora', "
+        "and shadow stdlib modules too"
+    )
+
+
 def test_sandbox_profile_grants_read_on_nora_pkg_dir(
     tmp_path, monkeypatch,
 ) -> None:

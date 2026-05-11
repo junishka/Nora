@@ -73,6 +73,70 @@ from nora.runner import SessionRunner
 SESSIONS_ROOT = Path.home() / ".nora-sessions"
 
 
+# Cwd choices that are too broad to act as a sandbox root. The
+# sandbox profile grants ``file-read*`` and ``file-write*`` over the
+# entire ``cwd`` subtree (minus the narrow ``cwd/.nora`` carve-out),
+# so a cwd of ``~`` would let scripts read ``~/.ssh/id_rsa``,
+# ``~/.aws/credentials``, ``~/Documents/...``, etc. — every
+# personal file the user has — and write anywhere under the home.
+# The deny carve-out only protects Nora's own state.
+#
+# This list captures the unambiguous cases. ``~/Documents`` /
+# ``~/Desktop`` / ``~/Downloads`` are intentionally NOT here:
+# they're plausible project parents (a researcher might keep a
+# study under ``~/Documents/IESE/dropout-2026/``), and rejecting
+# them would over-block real workflows. The check fires only on
+# roots so broad that no realistic project lives directly there.
+_DANGEROUS_CWD_LITERALS: frozenset[Path] = frozenset({
+    Path("/"),
+    Path("/Users"),
+    Path("/home"),
+    Path("/tmp"),
+    Path("/private"),
+    Path("/private/tmp"),
+    Path("/var"),
+    Path("/private/var"),
+    Path("/etc"),
+    Path("/private/etc"),
+    Path("/usr"),
+    Path("/System"),
+    Path("/Library"),
+    Path("/Applications"),
+    Path("/opt"),
+    Path("/bin"),
+    Path("/sbin"),
+    Path("/dev"),
+})
+
+
+def _reject_dangerous_cwd(path: Path) -> str | None:
+    """Return a researcher-readable reason if ``path`` is too broad to
+    be a sandbox cwd, or ``None`` if it's fine.
+
+    Rejects the user's home dir itself and a handful of system roots.
+    Anything under those (e.g. ``~/Documents/project/``) passes — the
+    user is expected to point Nora at a specific project subdirectory,
+    not at a root that contains every other file they own.
+    """
+    resolved = path.resolve()
+    if resolved in _DANGEROUS_CWD_LITERALS:
+        return (
+            f"{resolved} is too broad to use as a project folder — "
+            "the sandbox would grant scripts read+write access to "
+            "this entire subtree. Pick a specific project directory "
+            "instead."
+        )
+    if resolved == Path.home().resolve():
+        return (
+            "your home directory is too broad to use as a project "
+            "folder — the sandbox would grant scripts read+write "
+            "access to ~/.ssh, ~/.aws, every Document, and any "
+            "other personal file. Pick a specific project "
+            "subdirectory (e.g. ~/Documents/<project>/) instead."
+        )
+    return None
+
+
 # ---------------------------------------------------------------------------
 # The bridge between the web UI and the Python backend
 # ---------------------------------------------------------------------------
@@ -364,6 +428,15 @@ class NoraBridge:
         folder = Path(result[0]).expanduser().resolve()
         if not folder.is_dir():
             return {"ok": False, "reason": f"not a directory: {folder}"}
+        # Refuse cwd choices broad enough to make the sandbox
+        # functionally toothless — see ``_reject_dangerous_cwd``.
+        # The user-driven file picker is the only entry point where a
+        # researcher can hand Nora an arbitrary directory; staged
+        # sessions land under SESSIONS_ROOT and ``switch_session``
+        # already enforces parent == SESSIONS_ROOT.
+        reason = _reject_dangerous_cwd(folder)
+        if reason is not None:
+            return {"ok": False, "reason": reason}
         return self._set_cwd(folder)
 
     def upload_files(
@@ -2847,8 +2920,8 @@ class NoraBridge:
             datetime.now(timezone.utc).isoformat(timespec="seconds"),
         )
         try:
-            history_dir = target_cwd / ".nora"
-            history_dir.mkdir(parents=True, exist_ok=True)
+            from nora.config import ensure_private_nora_dir
+            history_dir = ensure_private_nora_dir(target_cwd)
             path = history_dir / "chat_history.jsonl"
             with path.open("a", encoding="utf-8") as f:
                 f.write(json.dumps(record, ensure_ascii=False) + "\n")

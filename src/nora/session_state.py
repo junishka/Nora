@@ -381,7 +381,11 @@ def _atomic_write(path: Path, state: SessionState) -> None:
     persistence failures are not allowed to break a chat turn.
     """
     try:
-        path.parent.mkdir(parents=True, exist_ok=True)
+        # ``path`` is ``<cwd>/.nora/session_state.json``; route through
+        # the central helper so the .nora dir gets the 0o700 mode that
+        # gates every Nora-owned file on shared filesystems.
+        from nora.config import ensure_private_nora_dir
+        ensure_private_nora_dir(path.parent.parent)
         payload = asdict(state)
         # asdict recursively converts RecentResult too, which is what
         # we want — the on-disk schema is a flat dict-of-primitives.

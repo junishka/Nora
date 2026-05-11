@@ -366,6 +366,47 @@ def test_switch_session_returns_to_existing_runner(tmp_path: Path):
         ui_mod.SESSIONS_ROOT = real_root
 
 
+def test_reject_dangerous_cwd_rejects_home_and_system_roots():
+    """A cwd of ``~`` (or ``/``, ``/Users``, ``/Library``, etc.) is too
+    broad for the sandbox: the profile grants ``file-read*`` and
+    ``file-write*`` over the entire subtree, and the ``.nora`` carve-
+    out only blocks Nora's own state. A researcher who picks their
+    home directory (intentionally or via mis-click in the folder
+    picker) would let scripts read ``~/.ssh``, ``~/.aws``, every
+    Document, and write anywhere under home.
+
+    The fix lives in ``ui._reject_dangerous_cwd`` and is wired into
+    ``choose_folder`` (the only entry point where a researcher can
+    hand Nora an arbitrary directory). Staged sessions land under
+    SESSIONS_ROOT and ``switch_session`` enforces parent ==
+    SESSIONS_ROOT, so those paths don't need this check.
+
+    Plausible project parents like ``~/Documents`` are intentionally
+    NOT rejected — a researcher might keep studies under
+    ``~/Documents/IESE/dropout-2026/`` and over-blocking would harm
+    real workflows. The check fires only on roots that no realistic
+    project lives directly inside.
+    """
+    from pathlib import Path
+    from nora.ui import _reject_dangerous_cwd
+
+    # Home dir itself must be rejected.
+    reason = _reject_dangerous_cwd(Path.home())
+    assert reason is not None
+    assert "home directory" in reason
+
+    # Filesystem roots that would grant unreasonable scope.
+    for forbidden in ("/", "/Users", "/Library", "/System", "/etc"):
+        reason = _reject_dangerous_cwd(Path(forbidden))
+        assert reason is not None, (
+            f"{forbidden} must be rejected as a too-broad cwd"
+        )
+
+    # Plausible project directories must pass through.
+    home_subdir = Path.home() / "Documents" / "some-project"
+    assert _reject_dangerous_cwd(home_subdir) is None
+
+
 def test_switch_session_rejects_root_and_nested_paths(tmp_path: Path):
     """``switch_session`` must accept only direct children of
     SESSIONS_ROOT. Accepting the root itself would point cwd at the

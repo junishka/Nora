@@ -42,6 +42,112 @@ def test_empty_store_has_zero_count(store: ResultStore):
     assert store.list_all() == []
 
 
+def test_store_enables_secure_delete(store: ResultStore):
+    """``purge_script_code`` blanks the ``script_code`` column to drop
+    any credentials / PII the researcher may have pasted into a
+    script that has since been hidden by rewind. Without
+    ``PRAGMA secure_delete = ON`` the previous bytes survive on
+    SQLite's freelist until the page is overwritten by an unrelated
+    insert, and a forensic tool reading raw pages (undark, hexdump,
+    sqlite3_analyzer) can recover the supposedly-purged content
+    even when the row has been re-saved as empty.
+
+    The fix sets the PRAGMA at connection time. Test reads it back
+    to confirm the connection state actually carries the property —
+    a future regression that drops the line in __init__ would
+    re-open the recovery channel silently.
+    """
+    cur = store._conn.execute("PRAGMA secure_delete")
+    value = cur.fetchone()[0]
+    # SQLite reports it as ``1`` (boolean ON) on macOS' sqlite3
+    # build. The pragma's accepted boolean inputs are 0/1/ON/OFF;
+    # the read-back is the numeric form.
+    assert value == 1, (
+        f"secure_delete must be ON so purged script_code bytes are "
+        f"zeroed on the freelist; got value={value!r}"
+    )
+
+
+def test_store_creates_nora_dir_with_owner_only_mode(tmp_path: Path):
+    """Every Nora-owned file lives under ``<cwd>/.nora``. Default
+    umask leaves files inside at 0o644 — readable by other users on
+    any filesystem where the home directory's mode permits
+    traversal (HPC, NFS, university research servers). Gating the
+    parent directory at 0o700 makes every descendant unreachable
+    via the no-execute-on-parent rule, regardless of per-file
+    modes. The store's __init__ routes through
+    ``ensure_private_nora_dir`` to enforce this whenever it lazily
+    creates the directory.
+    """
+    import os
+    import stat
+
+    db_path = tmp_path / ".nora" / "results.db"
+    ResultStore(db_path)
+    mode = stat.S_IMODE(os.stat(tmp_path / ".nora").st_mode)
+    assert mode == 0o700, (
+        f"expected .nora at 0o700, got {oct(mode)}; lower modes "
+        f"expose chat history / raw logs / pre-SDC result.json on "
+        f"shared filesystems"
+    )
+
+
+def test_concurrent_inserts_get_distinct_ids(store: ResultStore):
+    """The runner thread (submit_script → insert) and the bridge
+    thread (rewind → hide_results_not_in / unhide_results, sidebar
+    render → list_all) share one cached ResultStore per cwd.
+    ``check_same_thread=False`` allows the cross-thread reuse but
+    the sqlite3 module relies on Python-side serialization. The
+    pre-fix ``_next_id`` read ``count()`` OUTSIDE the transaction,
+    so two concurrent inserters could both observe N, both compute
+    M(N+1), and one of them would crash on UNIQUE-constraint
+    violation when it tried to commit.
+
+    With the per-store lock + id allocation inside the BEGIN
+    IMMEDIATE transaction, concurrent inserts serialize cleanly:
+    each gets a distinct sequential id, no collisions.
+    """
+    import threading
+
+    payload = _sample_payload()
+    barrier = threading.Barrier(8)
+
+    def insert_one(label: str) -> str:
+        # Wait for all threads to be ready before racing, so the
+        # window where two inserters could read the same count is
+        # maximized.
+        barrier.wait()
+        result = store.insert(
+            label=label, analysis_type="linear_regression",
+            sanitized_payload=payload,
+            language="R", script_code="x <- 1", transformations=[],
+        )
+        return result.id
+
+    ids: list[str] = []
+    lock = threading.Lock()
+
+    def worker(i: int) -> None:
+        rid = insert_one(f"row {i}")
+        with lock:
+            ids.append(rid)
+
+    threads = [threading.Thread(target=worker, args=(i,)) for i in range(8)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    # All ids must be unique.
+    assert len(set(ids)) == 8, (
+        f"concurrent inserts collided on the same id: {sorted(ids)}"
+    )
+    # And contiguous M1..M8 — the lock + in-txn count delivers
+    # monotone sequential ids even under racing inserters.
+    assert sorted(ids, key=lambda s: int(s[1:])) == [f"M{i}" for i in range(1, 9)]
+    assert store.count() == 8
+
+
 def test_insert_returns_sequential_ids(store: ResultStore):
     r1 = store.insert(
         label="first", analysis_type="linear_regression",

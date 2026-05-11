@@ -389,14 +389,21 @@ def _numeric_bounds(series: Any, n_total: int) -> RequestResult:
     # of 3 buys real interpolation breadth.
     NUMERIC_BOUNDS_MIN_N = 30
     if n_effective < NUMERIC_BOUNDS_MIN_N:
+        # Don't echo ``n_effective`` in the reason. The denial itself
+        # already reveals that the non-missing N is below
+        # ``NUMERIC_BOUNDS_MIN_N``; spelling it out publishes the exact
+        # small subgroup size the suppression was meant to hide. The
+        # threshold is safe to disclose — it's a fixed configuration
+        # constant — the actual count is not. Same posture as
+        # ``_na_count`` above.
         return RequestResult(
             status="denied",
             reason=(
-                f"variable has only {n_effective} non-missing observations "
-                f"— too few for tail-percentile bounds (need at least "
-                f"{NUMERIC_BOUNDS_MIN_N}). At small N the 5th and 95th "
-                f"percentiles interpolate close to the min and max and "
-                f"would identify the tail individuals."
+                f"variable has fewer than {NUMERIC_BOUNDS_MIN_N} "
+                f"non-missing observations — too few for tail-percentile "
+                f"bounds. At small N the 5th and 95th percentiles "
+                f"interpolate close to the min and max and would "
+                f"identify the tail individuals."
             ),
         )
 
@@ -517,15 +524,19 @@ def _quartiles(series: Any, n_total: int) -> RequestResult:
     # the order-statistic interpolation argument is the same.
     QUARTILES_MIN_N = 30
     if n_effective < QUARTILES_MIN_N:
+        # Don't echo ``n_effective`` — see ``_numeric_bounds`` and
+        # ``_na_count`` above for the same lesson. The denial itself
+        # publishes "below the threshold"; the exact small count below
+        # is the disclosive part.
         return RequestResult(
             status="denied",
             reason=(
-                f"variable has only {n_effective} non-missing observations "
-                f"— too few to publish quartiles without identifying "
-                f"individuals (need at least {QUARTILES_MIN_N}). At "
-                f"smaller N, q25 and q75 are weighted blends of 2-3 "
-                f"specific sorted observations and 2-sigfig rounding "
-                f"doesn't reliably hide them."
+                f"variable has fewer than {QUARTILES_MIN_N} non-missing "
+                f"observations — too few to publish quartiles without "
+                f"identifying individuals. At smaller N, q25 and q75 "
+                f"are weighted blends of 2-3 specific sorted "
+                f"observations and 2-sigfig rounding doesn't reliably "
+                f"hide them."
             ),
         )
 
@@ -629,14 +640,21 @@ def _correlation_pair(
 
     pair = pd.concat([s1, s2], axis=1).dropna()
     n_complete = int(len(pair))
-    if n_complete < 10:
+    # Use the same threshold as the schema and na_count gates so the
+    # boundary "what counts as identifying" is consistent across SDC
+    # surfaces. The threshold itself is safe to name (fixed config);
+    # the actual ``n_complete`` is not — echoing it would publish the
+    # rare-pair size the suppression is meant to hide. Same posture
+    # as ``_numeric_bounds`` / ``_quartiles`` / ``_na_count`` above.
+    CORR_MIN_N = DEFAULT_CONFIG.cell_suppression_threshold
+    if n_complete < CORR_MIN_N:
         return RequestResult(
             status="denied",
             reason=(
-                f"only {n_complete} row(s) with both variables observed "
-                f"— too few to publish a correlation without identifying "
-                f"individuals (a near-perfect r at small N usually just "
-                f"says 'these three points are collinear')."
+                f"fewer than {CORR_MIN_N} row(s) have both variables "
+                f"observed — too few to publish a correlation without "
+                f"identifying individuals (a near-perfect r at small N "
+                f"usually just says 'these few points are collinear')."
             ),
         )
 

@@ -4095,22 +4095,36 @@ async def install_packages(args: dict[str, Any]) -> dict[str, Any]:
             "reason": result.error,
             "statuses": statuses,
             "duration_seconds": round(result.duration_seconds, 2),
-            # Truncate raw output so a noisy installer log doesn't
-            # blow the model's context. Stderr is more informative for
-            # failures than stdout, so we keep it longer.
-            "raw_stdout_excerpt": (result.raw_stdout or "")[-1500:],
+            # Stderr only — and truncated. Two reasons to drop stdout
+            # even on the error path:
+            #   1. The same ``pip.conf`` / ``PIP_INDEX_URL`` token leak
+            #      that the success path was hardened against also
+            #      fires on errors. pip prints the resolved index URL
+            #      on every invocation, regardless of exit code.
+            #   2. Installer subprocesses run OUTSIDE the script
+            #      sandbox (they need network + library-write). A
+            #      compromised package's ``setup.py`` can read
+            #      ``~/.ssh`` / ``~/.aws`` / other filesystem secrets
+            #      and ``print()`` them, then exit non-zero to trigger
+            #      this error path and route the dump through the
+            #      model's tool-result context. Stderr is the natural
+            #      home for pip's actual error messages; restricting
+            #      the model-visible output to stderr narrows the
+            #      surface (a malicious package would have to write
+            #      to stderr specifically, which is unusual). Install
+            #      env is already filtered (``_filter_env``), so the
+            #      remaining channel is filesystem reads from
+            #      attacker-controlled package code.
             "raw_stderr_excerpt": (result.raw_stderr or "")[-3000:],
         })
-    # No ``raw_stdout_excerpt`` on success. pip's progress output
-    # echoes the full index URL — including any token-bearing
+    # No raw output on success. pip's progress output echoes the full
+    # index URL — including any token-bearing
     # ``index-url = https://USER:TOKEN@private-pypi.acme.com/simple``
     # the researcher configured in pip.conf or PIP_INDEX_URL — and
     # that excerpt was being forwarded into the model's transcript on
     # every successful install. The ``statuses`` list already tells
     # the model which packages were touched and at what version;
-    # pip's chatty output adds no information beyond that. Errors
-    # still get the excerpt (above) because diagnosing a failed
-    # install genuinely needs it.
+    # pip's chatty output adds no information beyond that.
     return _as_mcp_text({
         "status": "ok",
         "language": result.language,

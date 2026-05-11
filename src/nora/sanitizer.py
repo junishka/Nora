@@ -730,6 +730,46 @@ def _coarsen_small_missing_count(
         )
 
 
+def _coarsen_small_cox_counts(
+    out: dict[str, Any],
+    transformations: list[str],
+    config: SDCConfig,
+) -> None:
+    """Replace ``n_failures`` / ``n_subjects`` with the suppression
+    marker when their exact values fall below ``cell_suppression_threshold``.
+
+    Survival-specific Cox fits commonly report "n records / n subjects /
+    n failures" together. ``n`` (top-level) is already gated by
+    ``require_minimum_n(config.min_n_regression)`` upstream — typically
+    a much higher floor than the cell-suppression threshold — so a
+    Cox payload that survives to this point has at least
+    ``min_n_regression`` records. But ``n_failures`` is a different
+    quantity: it counts events (deaths, conversions, churn) and on a
+    rare-outcome study can be tiny even when ``n`` is in the thousands.
+    "324 subjects, 3 events" identifies those 3 specific individuals
+    just as surely as a frequency_table cell with count 3 would.
+
+    Apply the same threshold as cell suppression / missing_count for
+    a uniform disclosure rule. Zero is left as 0 (no events — no
+    individual to identify; same posture as ``_coarsen_small_missing_count``).
+    ``n_subjects`` is coarsened for symmetry: in survival data it CAN
+    differ from ``n`` (records can split into multiple per-subject
+    episodes via ``stset``) and an analyst studying a panel of e.g.
+    very rare patient subgroups could have a small ``n_subjects``
+    even with many records.
+    """
+    threshold = config.cell_suppression_threshold
+    for field in ("n_failures", "n_subjects"):
+        raw = out.get(field)
+        if isinstance(raw, int) and 0 < raw < threshold:
+            out[field] = suppression_marker(threshold)
+            transformations.append(
+                f"coarsened {field} to {suppression_marker(threshold)} "
+                f"(exact small Cox-style event/subject counts are "
+                f"themselves disclosive)"
+            )
+
+
 # ---------------------------------------------------------------------------
 # Linear regression sanitizer
 # ---------------------------------------------------------------------------
@@ -1016,6 +1056,15 @@ def _sanitize_linear_regression(
     if "adj_r_squared" in out:
         # adj_r_squared can be mildly negative; clamp only the upper bound.
         out["adj_r_squared"] = min(1.0, out["adj_r_squared"])
+
+    # Cox-style survival counts (``n_failures`` / ``n_subjects``) ride
+    # in via the same payload type as OLS but aren't gated by
+    # ``min_n_regression``. ``n_failures`` is the event count and is
+    # commonly small on rare-outcome studies — "n=2000 records,
+    # 3 deaths" identifies those 3 individuals. Apply the same
+    # cell-suppression rule we use for ``missing_count`` so the
+    # disclosure floor is uniform.
+    _coarsen_small_cox_counts(out, transformations, config)
 
     return SanitizerResult(
         ok=True, analysis_type="linear_regression",
