@@ -1991,13 +1991,22 @@ class NoraBridge:
         if not res.get("ok"):
             return {**res, "auth": self._auth_status_payload()}
         # Close any IDLE runner that's bound to the now-unauthed
-        # provider. We deliberately leave busy runners alone — their
-        # turn will surface an auth_failure on the next request, but
-        # interrupting an in-flight stream is worse than letting it
-        # error out naturally. Closed runners reopen lazily on the
-        # next send (and will see the unauthed provider then too).
+        # provider. BUSY runners get marked for close-after-turn
+        # instead — interrupting the in-flight stream is worse than
+        # letting it complete, but we MUST evict the cached provider
+        # client once the turn finishes. Both the OpenAI and
+        # Anthropic SDKs capture ``api_key`` at client construction
+        # and reuse it until close, so without the deferred-close
+        # path a busy runner would keep authenticating with the
+        # deleted credential on every subsequent send in the same
+        # process — effectively making "Delete API key" a no-op for
+        # any session that happened to be mid-turn.
         for runner in list(self._runners.values()):
-            if runner.provider == provider and not runner.is_busy():
+            if runner.provider != provider:
+                continue
+            if runner.is_busy():
+                runner.mark_close_after_turn()
+            else:
                 self._run_on_loop(runner.close())
         # Anthropic specifically: ``_ensure_anthropic_env`` copies the
         # keyring credential into ``ANTHROPIC_API_KEY`` so the SDK

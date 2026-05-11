@@ -125,6 +125,67 @@ def nora_python_pkg_dir(binary: str) -> Path:
     base = Path(base_env) if base_env else Path.home() / ".nora-packages" / "python"
     return base / _python_version_tag(binary)
 
+
+def _python_packages_installed_in_nora_target(
+    target: Path, names: list[str],
+) -> set[str]:
+    """Return the subset of ``names`` for which a distribution actually
+    lives in Nora's Python target directory.
+
+    Why this matters: ``pip uninstall`` has NO ``--target`` flag (see
+    the pip issue tracker — long-standing limitation). pip locates
+    the package via ``sys.path`` and removes whichever copy it finds
+    first. The installer passes ``PYTHONPATH=<target>`` in env so
+    Nora's copy is on sys.path, but if the package is NOT in the
+    Nora target AND IS in the user/system/venv site-packages, pip
+    will happily remove it from there — mutating the researcher's
+    broader Python environment, potentially yanking packages Nora
+    itself depends on.
+
+    The defense: pre-check the Nora target dir for each requested
+    package's ``*.dist-info`` (PEP 376) or ``*.egg-info`` directory.
+    Only packages present here are eligible to flow into the
+    ``pip uninstall`` subprocess; the rest are reported as
+    ``skipped`` with a clear reason and never reach pip.
+
+    PEP 503 normalisation: pip / wheel directories canonicalise the
+    distribution name (``-`` and ``_`` collapse to ``-``, lowercased).
+    We compare normalised names to match how pip wrote the directory
+    so ``scikit_learn`` and ``scikit-learn`` resolve to the same
+    install, same as the canonical lookup.
+    """
+    if not target.is_dir():
+        return set()
+
+    def _normalize(name: str) -> str:
+        return re.sub(r"[-_.]+", "-", name).lower()
+
+    installed_normalized: set[str] = set()
+    try:
+        children = list(target.iterdir())
+    except OSError:
+        return set()
+    for child in children:
+        if not child.is_dir():
+            continue
+        stem: str | None = None
+        if child.name.endswith(".dist-info"):
+            # ``<name>-<version>.dist-info``
+            stem = child.name[: -len(".dist-info")]
+            stem = stem.rsplit("-", 1)[0]
+        elif child.name.endswith(".egg-info"):
+            stem = child.name[: -len(".egg-info")]
+            # ``<name>-<version>-pyX.Y.egg-info`` or just
+            # ``<name>.egg-info`` for source layouts. Strip a trailing
+            # version segment if it looks like one.
+            if "-" in stem:
+                head, tail = stem.rsplit("-", 1)
+                if re.fullmatch(r"\d[\w.]*", tail) and head:
+                    stem = head
+        if stem:
+            installed_normalized.add(_normalize(stem))
+    return {n for n in names if _normalize(n) in installed_normalized}
+
 # Per-action wall-clock cap. Network installs of ~10 packages can be
 # slow on a cold cache; 5 minutes is generous enough for most real
 # cases without hanging the agent indefinitely.
@@ -407,15 +468,56 @@ async def install_packages(
                 duration_seconds=0.0,
                 error="python3 not found on this machine",
             )
+        # ``pip uninstall`` has no ``--target``; it locates the
+        # package via ``sys.path`` and removes the first copy it
+        # finds — which may be the user's site-packages, a venv, or
+        # the system Python, not the Nora target dir we wrote at
+        # install time. To keep ``install_packages(action='remove')``
+        # from mutating the researcher's broader Python environment
+        # (including yanking packages Nora itself depends on),
+        # pre-check the Nora target for each requested package's
+        # dist-info / egg-info and ONLY hand pip the ones that
+        # actually live there. Anything else is reported as
+        # ``skipped`` with a reason; the model can re-issue the
+        # request after a real install if needed.
+        target_dir = nora_python_pkg_dir(env.python.binary)
+        if action == "remove":
+            in_nora = _python_packages_installed_in_nora_target(
+                target_dir, valid,
+            )
+            not_in_nora = [n for n in valid if n not in in_nora]
+            valid = [n for n in valid if n in in_nora]
+            rejected.extend(
+                PackageStatus(
+                    name=n, status="skipped",
+                    detail=(
+                        "package is not installed in Nora's package dir; "
+                        "refusing to uninstall it because pip would "
+                        "otherwise remove it from the researcher's "
+                        "broader Python environment (site-packages, "
+                        "venv, etc.)"
+                    ),
+                ) for n in not_in_nora
+            )
+            if not valid:
+                return InstallResult(
+                    language="Python", action=action,  # type: ignore[arg-type]
+                    statuses=tuple(rejected),
+                    raw_stdout="", raw_stderr="",
+                    duration_seconds=0.0,
+                    error=(
+                        "no eligible packages to remove: none of the "
+                        "requested names are installed in Nora's "
+                        "managed Python directory"
+                    ),
+                )
         cmd = _python_command(env.python.binary, valid, action)  # type: ignore[arg-type]
         proc_stdin = None
-        # ``pip uninstall`` has no ``--target``; route the Nora pkg
-        # dir through ``PYTHONPATH`` so pip resolves the package via
-        # ``sys.path`` and removes the right copy. Install commands
-        # are unaffected by this (``--target`` is explicit on argv)
-        # but it's harmless to pass — pip ignores PYTHONPATH for
-        # ``--target`` installs.
-        target_dir = nora_python_pkg_dir(env.python.binary)
+        # Route the Nora pkg dir through ``PYTHONPATH`` so the
+        # uninstall subprocess's pip finds Nora's copy first.
+        # Install commands are unaffected (``--target`` is explicit
+        # on argv) but it's harmless to pass — pip ignores PYTHONPATH
+        # for ``--target`` installs.
         existing = base_env.get("PYTHONPATH", "")
         new_pp = (
             f"{target_dir}{os.pathsep}{existing}" if existing else str(target_dir)

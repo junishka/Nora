@@ -537,3 +537,33 @@ def test_r_extractor_ignores_stdout_entirely() -> None:
     assert _PII_ROW not in excerpt
     assert "Error :" in excerpt
     assert "NA in design matrix" not in excerpt
+
+
+def test_url_embedded_userinfo_credentials_are_redacted() -> None:
+    """SDC closure for the install-path leak: pip echoes the index URL
+    from ``~/.pip/pip.conf`` (or ``PIP_INDEX_URL``) on every run,
+    embedding any ``user:token@`` segment that file contains. The
+    scrubber must redact the userinfo while preserving the scheme so
+    a reader still sees "this was a URL" without seeing the
+    credentials. The same regex also protects an R / Python error
+    message that happens to print a token-bearing repository URL.
+
+    The check runs through ``extract_debug_excerpt`` (the public
+    entry that ``install_packages``' wrapper ``scrub_raw_output``
+    shares) to keep the contract pinned at the chokepoint, not at
+    the regex.
+    """
+    from nora.error_summary import scrub_raw_output
+    raw = (
+        "ERROR: Could not find a version\n"
+        "Looking in indexes: https://user_alice:tok-abc123XYZ@"
+        "private-pypi.acme.com/simple\n"
+    )
+    out = scrub_raw_output(raw, cap_bytes=500)
+    assert "user_alice" not in out
+    assert "tok-abc123XYZ" not in out
+    assert "[redacted-credential]" in out
+    # Scheme and host survive — they're useful for diagnosis and
+    # neither is a credential.
+    assert "https://" in out
+    assert "private-pypi.acme.com" in out

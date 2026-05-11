@@ -35,18 +35,53 @@ def _mcp_text(payload: dict) -> dict:
     return json.loads(payload["content"][0]["text"])
 
 
+def _stage_cwd_into_manifest() -> None:
+    """Snapshot whatever's in the active cwd into the file-provenance
+    manifest before invoking a tool.
+
+    The search tool gates top-level cwd reads on the
+    ``file_provenance`` manifest (SDC closure: an unstaged
+    script-shaped file in cwd is presumed sandbox-written and refused).
+    In production the bridge initialises the manifest at session-open;
+    these tests bypass the bridge layer, so each call needs the
+    equivalent setup. Matches the ``_call`` helper in
+    ``test_read_attached_file.py``.
+    """
+    from nora.config import get_cwd
+    from nora.file_provenance import initialize as _init_staged
+    cwd = get_cwd()
+    if cwd is None:
+        return
+    try:
+        _init_staged(cwd)
+    except Exception:  # noqa: BLE001 — manifest is best-effort
+        pass
+
+
 def _list(args: dict) -> dict:
+    _stage_cwd_into_manifest()
     return _mcp_text(asyncio.run(HANDLERS["list_session_files"](args)))
 
 
 def _search(args: dict) -> dict:
+    _stage_cwd_into_manifest()
     return _mcp_text(asyncio.run(HANDLERS["search_in_session_files"](args)))
 
 
 @pytest.fixture
 def populated_session(tmp_path: Path) -> Path:
     """A session cwd with one of every kind, plus a dataset so we can
-    confirm datasets are excluded."""
+    confirm datasets are excluded.
+
+    Snapshots the cwd into the file-provenance manifest AFTER writing
+    so the search tool's SDC gate treats these as researcher-staged.
+    In production the bridge does the same at session-open: files on
+    disk at first open are considered researcher-staged, sandbox
+    output added later is not. Tests that simulate the unstaged-
+    sandbox-output side of that contract should write their files
+    AFTER this fixture (or in a separate fixture) so the manifest
+    does not pick them up.
+    """
     set_cwd(tmp_path)
     (tmp_path / "main.do").write_text(
         "use mydata.dta, clear\nreg wage age educ\n"
@@ -61,6 +96,8 @@ def populated_session(tmp_path: Path) -> Path:
     )
     (tmp_path / "fig.png").write_bytes(b"\x89PNG\r\n\x1a\n" + b"\x00" * 16)
     (tmp_path / "mydata.csv").write_text("a,b\n1,2\n")
+    from nora.file_provenance import initialize as _init_staged
+    _init_staged(tmp_path)
     return tmp_path
 
 
@@ -323,6 +360,50 @@ def test_search_truncates_long_lines(tmp_path: Path):
     # 1000-char line into the model's context.
     assert len(excerpt) < 300
     assert "x" * 200 not in excerpt
+
+
+def test_search_excludes_unstaged_top_level_cwd_files(tmp_path: Path) -> None:
+    """SDC closure: ``search_in_session_files`` returns verbatim line
+    excerpts for ``.py`` / ``.do`` / ``.r`` / ``.rmd``. A model
+    script can write raw rows into a script-shaped file at cwd top
+    level via the analysis sandbox's legitimate cwd-write surface
+    (``open("smuggled.py", "w").write(row_text)``), then call this
+    tool to fish those bytes back through the matched excerpts —
+    bypassing the JSON sanitizer that gates ``submit_script``.
+
+    The fix mirrors ``read_attached_file`` and ``submit_script_file``:
+    refuse to scan cwd top-level files whose basename is not in the
+    ``file_provenance`` manifest. The drop is silent (the basename
+    itself is data-origin and shouldn't echo back through a denial
+    payload). Run-dir scripts under ``<cwd>/.nora/runs/...`` are
+    unaffected — those are Nora-written copies of the model's own
+    submissions, not arbitrary cwd files."""
+    set_cwd(tmp_path)
+    # Genuinely sandbox-output: write directly, NO ``initialize`` call,
+    # so the manifest doesn't list this file.
+    (tmp_path / "smuggled.py").write_text(
+        "# pretend this carries raw rows from a sandboxed run\n"
+        "row_47291 = 'pid=47291 wage=120000'\n",
+        encoding="utf-8",
+    )
+    # NOTE: this test deliberately bypasses ``_search`` (which calls
+    # ``initialize`` for the legitimate path) to keep the file
+    # unstaged.
+    payload = asyncio.run(HANDLERS["search_in_session_files"](
+        {"query": "row_47291"},
+    ))
+    out = _mcp_text(payload)
+    assert out["status"] == "ok"
+    # File is filtered out before content read — no skipped entry,
+    # no results entry, no echo of the basename.
+    assert all(r["name"] != "smuggled.py" for r in out["results"])
+    assert all(s["name"] != "smuggled.py" for s in out["skipped"])
+    # And the raw row content is nowhere in the response.
+    response_text = json.dumps(out)
+    assert "row_47291" not in response_text or response_text.count(
+        "row_47291",
+    ) == 1  # only in the query echo if any
+    assert "wage=120000" not in response_text
 
 
 def test_search_rejects_empty_query(populated_session: Path):

@@ -298,6 +298,161 @@ def test_record_user_message_keeps_completed_prior_turn(tmp_path: Path):
 # switch_session — DOES NOT close any runner (the multi-session fix)
 # ---------------------------------------------------------------------------
 
+def test_runner_close_clears_pending_close_flag(tmp_path: Path) -> None:
+    """``mark_close_after_turn`` arms the flag; ``close`` is the
+    chokepoint that clears it. A future direct ``close`` (e.g., a
+    model swap that tears down the session) MUST drop the flag too,
+    otherwise the next time the runner is reopened and bound to a
+    NEW session, ``run_turn``'s finally block would still see
+    ``_pending_close = True`` and close the freshly opened session
+    after one turn — a memory-leak-of-state bug.
+    """
+    runner = SessionRunner(
+        cwd=tmp_path, provider="openai", model="gpt-x",
+    )
+    # Pretend a session exists so ``mark_close_after_turn`` arms.
+    runner._session = MagicMock()
+    runner.mark_close_after_turn()
+    assert runner._pending_close is True
+    asyncio.run(runner.close())
+    assert runner._pending_close is False, (
+        "close must clear pending_close so a future reopen doesn't "
+        "inherit a stale flag"
+    )
+
+
+def test_runner_mark_close_noop_without_session(tmp_path: Path) -> None:
+    """``mark_close_after_turn`` on a runner that never opened a
+    session is a no-op: there's nothing to close, and arming the
+    flag would cause the FIRST turn after a future open to
+    immediately close — exactly wrong for the typical "user added
+    a key, deleted it, then added it again" flow.
+    """
+    runner = SessionRunner(
+        cwd=tmp_path, provider="openai", model="gpt-x",
+    )
+    assert runner._session is None
+    runner.mark_close_after_turn()
+    assert runner._pending_close is False
+
+
+def test_turn_error_carries_context_reset_flag() -> None:
+    """SDC + continuity closure: ``TurnError.context_reset`` defaults
+    to False (preserving the prior single-arg call sites) and gets
+    set to True only when the provider's server-side memory has
+    been lost. The OpenAI provider sets it on
+    ``previous_response_id`` expiry. The runner reads it in the
+    failure-restoration branch and re-arms ``needs_context_prefix``
+    so the next turn re-injects the warm-start context — without
+    this flag, an established session that hits chain expiry would
+    silently start fresh with no recoverable context.
+    """
+    from nora.provider.base import TurnError
+    plain = TurnError(message="generic failure")
+    assert plain.context_reset is False
+    reset = TurnError(
+        message="chain expired", context_reset=True,
+    )
+    assert reset.context_reset is True
+
+
+def test_delete_credential_closes_idle_and_marks_busy_runner_for_close(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """SDC + credential-hygiene closure: deleting an API key while a
+    runner of that provider is mid-turn must NOT leak the deleted
+    credential into subsequent sends.
+
+    Mechanism. Both provider SDKs (``AsyncOpenAI``,
+    ``AsyncAnthropic``) capture ``api_key`` at client construction
+    and reuse it until the client is closed. If
+    ``delete_credential`` skipped busy runners entirely, the cached
+    client would happily keep authenticating with the now-deleted
+    key for every subsequent send in the same process.
+
+    The fix: idle runners are closed immediately (as before), but
+    busy runners are marked for close-after-turn via
+    ``mark_close_after_turn``. The next turn's finally block honours
+    the flag and closes the session, evicting the cached client.
+    The send after that opens a fresh session, which fails cleanly
+    at ``_resolve_api_key`` (no key left in keychain).
+
+    This test exercises the bridge-side dispatch — that idle and
+    busy runners are routed to the right path. The runner-side
+    contract (the flag actually closes after the turn finishes) is
+    pinned by ``test_runner_lifecycle.test_pending_close_runs_after_turn``.
+    """
+    a = tmp_path / "a"
+    b = tmp_path / "b"
+    a.mkdir()
+    b.mkdir()
+
+    import nora.ui as ui_mod
+    real_root = ui_mod.SESSIONS_ROOT
+    ui_mod.SESSIONS_ROOT = tmp_path
+    try:
+        bridge = NoraBridge(cwd=a)
+        idle_runner = bridge._active_runner()
+        assert idle_runner is not None
+        idle_runner.provider = "openai"
+        idle_runner._session = MagicMock()
+        # Switch focus to B to lazy-create a second runner. Both
+        # runners are on the OpenAI provider for this test.
+        bridge.switch_session(str(b))
+        busy_runner = bridge._active_runner()
+        assert busy_runner is not None
+        assert busy_runner is not idle_runner
+        busy_runner.provider = "openai"
+        busy_runner._session = MagicMock()
+        # busy_runner is_busy() returns True; idle_runner stays idle.
+        monkeypatch.setattr(busy_runner, "is_busy", lambda: True)
+        monkeypatch.setattr(idle_runner, "is_busy", lambda: False)
+
+        # Patch the auth call so we don't touch the real keychain;
+        # match the success shape ``delete_credential`` expects.
+        import nora.auth as _auth
+        monkeypatch.setattr(
+            _auth, "delete_credential",
+            lambda provider: {"ok": True, "provider": provider},
+        )
+
+        # Track close + mark_close calls on each runner.
+        idle_close_calls: list[bool] = []
+        busy_close_calls: list[bool] = []
+        busy_mark_calls: list[bool] = []
+
+        async def _idle_close():
+            idle_close_calls.append(True)
+        async def _busy_close():
+            busy_close_calls.append(True)
+        monkeypatch.setattr(idle_runner, "close", _idle_close)
+        monkeypatch.setattr(busy_runner, "close", _busy_close)
+        monkeypatch.setattr(
+            busy_runner, "mark_close_after_turn",
+            lambda: busy_mark_calls.append(True),
+        )
+        # Also stub _run_on_loop so the test doesn't need an event
+        # loop. The schedulers it would invoke are already covered
+        # by their own tests; here we only care that the bridge
+        # picked the right path per runner.
+        monkeypatch.setattr(
+            bridge, "_run_on_loop", lambda coro: asyncio.run(coro),
+        )
+
+        result = bridge.delete_credential("openai")
+        assert result["ok"] is True
+
+        # Idle runner: close ran.
+        assert idle_close_calls == [True]
+        # Busy runner: NOT closed mid-turn, but marked for close-
+        # after-turn so the in-flight stream finishes naturally and
+        # the cached client gets evicted before the next send.
+        assert busy_close_calls == []
+        assert busy_mark_calls == [True]
+    finally:
+        ui_mod.SESSIONS_ROOT = real_root
+
+
 def test_switch_session_does_not_close_other_runners(tmp_path: Path):
     """The bug we fixed: switching focus used to tear down the
     previous session's SDK client mid-stream. The new contract:

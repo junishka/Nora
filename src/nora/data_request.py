@@ -389,14 +389,20 @@ def _numeric_bounds(series: Any, n_total: int) -> RequestResult:
     # of 3 buys real interpolation breadth.
     NUMERIC_BOUNDS_MIN_N = 30
     if n_effective < NUMERIC_BOUNDS_MIN_N:
+        # Don't echo ``n_effective`` in the reason. The denial itself
+        # already reveals ``n_effective < NUMERIC_BOUNDS_MIN_N``;
+        # spelling out e.g. "3 non-missing observations" leaks the
+        # precise small N — exactly the disclosure the threshold was
+        # meant to hide. Same posture as ``_na_count``'s rarer-side
+        # denial above.
         return RequestResult(
             status="denied",
             reason=(
-                f"variable has only {n_effective} non-missing observations "
-                f"— too few for tail-percentile bounds (need at least "
-                f"{NUMERIC_BOUNDS_MIN_N}). At small N the 5th and 95th "
-                f"percentiles interpolate close to the min and max and "
-                f"would identify the tail individuals."
+                f"variable has fewer than {NUMERIC_BOUNDS_MIN_N} non-"
+                f"missing observations — too few for tail-percentile "
+                f"bounds. At small N the 5th and 95th percentiles "
+                f"interpolate close to the min and max and would "
+                f"identify the tail individuals."
             ),
         )
 
@@ -517,15 +523,19 @@ def _quartiles(series: Any, n_total: int) -> RequestResult:
     # the order-statistic interpolation argument is the same.
     QUARTILES_MIN_N = 30
     if n_effective < QUARTILES_MIN_N:
+        # Same suppression posture as ``_numeric_bounds`` above: don't
+        # echo ``n_effective`` in the reason. The fact of the denial
+        # plus the disclosed threshold is enough to tell the model to
+        # back off; spelling the exact small N leaks it.
         return RequestResult(
             status="denied",
             reason=(
-                f"variable has only {n_effective} non-missing observations "
-                f"— too few to publish quartiles without identifying "
-                f"individuals (need at least {QUARTILES_MIN_N}). At "
-                f"smaller N, q25 and q75 are weighted blends of 2-3 "
-                f"specific sorted observations and 2-sigfig rounding "
-                f"doesn't reliably hide them."
+                f"variable has fewer than {QUARTILES_MIN_N} non-missing "
+                f"observations — too few to publish quartiles without "
+                f"identifying individuals. At smaller N, q25 and q75 "
+                f"are weighted blends of 2-3 specific sorted "
+                f"observations and 2-sigfig rounding doesn't reliably "
+                f"hide them."
             ),
         )
 
@@ -629,14 +639,24 @@ def _correlation_pair(
 
     pair = pd.concat([s1, s2], axis=1).dropna()
     n_complete = int(len(pair))
-    if n_complete < 10:
+    # Same N floor as ``_numeric_bounds`` and ``_quartiles`` (30). The
+    # docstring above already commits to this posture ("the same
+    # minimum N as numeric_bounds"); the previous literal was 10,
+    # which let near-perfect r values at N=10-29 imply the
+    # coordinates of individual observations exactly as the comment
+    # warns. As with the other tail-statistics, the denial reason
+    # doesn't echo the exact ``n_complete`` — the fact of the denial
+    # plus the disclosed threshold is enough.
+    CORRELATION_MIN_N = 30
+    if n_complete < CORRELATION_MIN_N:
         return RequestResult(
             status="denied",
             reason=(
-                f"only {n_complete} row(s) with both variables observed "
-                f"— too few to publish a correlation without identifying "
-                f"individuals (a near-perfect r at small N usually just "
-                f"says 'these three points are collinear')."
+                f"fewer than {CORRELATION_MIN_N} rows with both "
+                f"variables observed — too few to publish a "
+                f"correlation without identifying individuals (a "
+                f"near-perfect r at small N usually just says 'these "
+                f"few points are collinear')."
             ),
         )
 

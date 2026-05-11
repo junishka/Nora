@@ -162,6 +162,77 @@ def test_numeric_bounds_denies_n_below_30(sample_csv: Path) -> None:
     assert "too few" in r.reason.lower()
 
 
+def test_low_n_denials_do_not_echo_exact_n(sample_csv: Path) -> None:
+    """SDC closure: the small-N denial reasons for ``numeric_bounds``,
+    ``quartiles``, and ``correlation_pair`` must NOT echo the exact
+    ``n_effective`` / ``n_complete`` back at the model. The fact of
+    the denial plus the disclosed threshold already tells the caller
+    to back off; spelling out e.g. "only 3 non-missing observations"
+    discloses the precise small N — exactly the value the threshold
+    exists to hide.
+
+    The disclosed threshold (30) IS allowed to appear since it is a
+    fixed configuration constant. Same posture as ``_na_count``'s
+    rarer-side denial: don't echo ``rare`` back.
+    """
+    # numeric_bounds: N=3 should deny without echoing "3".
+    df_nb = pd.DataFrame({"v": [1.0, 2.0, 3.0]})
+    p_nb = sample_csv.parent / "tiny_nb.csv"
+    df_nb.to_csv(p_nb, index=False)
+    r_nb = handle(p_nb, "numeric_bounds", "v")
+    assert r_nb.status == "denied"
+    assert " 3 " not in r_nb.reason
+    assert "only 3" not in r_nb.reason
+
+    # quartiles: same posture.
+    r_q = handle(p_nb, "quartiles", "v")
+    assert r_q.status == "denied"
+    assert " 3 " not in r_q.reason
+    assert "only 3" not in r_q.reason
+
+    # correlation_pair: also denies and also hides exact N.
+    df_corr = pd.DataFrame({
+        "a": [1.0, 2.0, 3.0, 4.0, 5.0],
+        "b": [2.0, 4.0, 6.0, 8.0, 10.0],
+    })
+    p_corr = sample_csv.parent / "tiny_corr.csv"
+    df_corr.to_csv(p_corr, index=False)
+    r_corr = handle(p_corr, "correlation_pair", "a", variable2="b")
+    assert r_corr.status == "denied"
+    assert " 5 " not in r_corr.reason
+    assert "only 5" not in r_corr.reason
+
+
+def test_correlation_pair_min_n_matches_numeric_bounds(
+    sample_csv: Path,
+) -> None:
+    """Correlation min-N must match ``numeric_bounds`` (30). The
+    module-level rationale ("a near-perfect r at small N usually
+    just says 'these few points are collinear'") only holds if the
+    two thresholds agree — a lower correlation floor lets near-1 r
+    values at N=10-29 imply individual coordinates while numeric
+    bounds would refuse to publish percentiles for the same N.
+    """
+    # N=25 (between old 10 and the documented 30): MUST be denied.
+    df_25 = pd.DataFrame({
+        "a": [float(i) for i in range(25)],
+        "b": [float(i) * 2 for i in range(25)],
+    })
+    p_25 = sample_csv.parent / "n25.csv"
+    df_25.to_csv(p_25, index=False)
+    r_25 = handle(p_25, "correlation_pair", "a", variable2="b")
+    assert r_25.status == "denied"
+    # N=30 (the boundary): granted.
+    df_30 = pd.DataFrame({
+        "a": [float(i) for i in range(30)],
+        "b": [float(i) * 2 + 1 for i in range(30)],
+    })
+    p_30 = sample_csv.parent / "n30_corr.csv"
+    df_30.to_csv(p_30, index=False)
+    r_30 = handle(p_30, "correlation_pair", "a", variable2="b")
+    assert r_30.status == "granted"
+
+
 def test_numeric_bounds_grants_at_n_30(sample_csv: Path) -> None:
     """The boundary: N=30 passes."""
     df = pd.DataFrame({"v": [float(i) for i in range(30)]})
@@ -570,10 +641,13 @@ def test_correlation_pair_denies_constant_column(tmp_path: Path) -> None:
     (pandas returns NaN). Don't ship NaN as a granted answer — the
     token serializes to non-strict-JSON and forces every consumer
     to special-case the value. Reject with a reason that names the
-    constant column so the model knows which one to drop."""
+    constant column so the model knows which one to drop.
+
+    Uses N=40 (above the correlation N floor) so the test exercises
+    the zero-variance branch rather than the small-N denial."""
     df = pd.DataFrame({
-        "x": np.arange(20, dtype=float),
-        "k": np.full(20, 7.0),  # constant
+        "x": np.arange(40, dtype=float),
+        "k": np.full(40, 7.0),  # constant
     })
     p = tmp_path / "const.csv"
     df.to_csv(p, index=False)

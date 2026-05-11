@@ -1979,11 +1979,19 @@ async def submit_script_file(args: dict[str, Any]) -> dict[str, Any]:
     except (ValueError, OSError):
         is_under_nora = False
     if not is_under_nora:
+        # Fail CLOSED: a manifest read that raises (corrupt JSON,
+        # permission-blocked path, FS error) used to flip
+        # ``staged_ok`` to True and let the call through. That
+        # behavior turns the safety gate into a no-op exactly where
+        # raw file bytes can cross into execution — the failure mode
+        # most likely to be exploited via deliberate manifest
+        # corruption. Treat manifest-unreadable as "not staged" and
+        # tell the caller to re-stage.
         try:
             from nora.file_provenance import is_known
             staged_ok = is_known(cwd_for_check, resolved_target.name)
-        except Exception:  # noqa: BLE001 — manifest must not break runs
-            staged_ok = True
+        except Exception:  # noqa: BLE001 — fail closed (see above)
+            staged_ok = False
         if not staged_ok:
             return _as_mcp_text(_with_zero_phase_metadata({
                 "status": "rejected",
@@ -3314,11 +3322,18 @@ async def read_attached_file(args: dict[str, Any]) -> dict[str, Any]:
     except (ValueError, OSError):
         is_under_nora = False
     if not is_under_nora:
+        # Fail CLOSED — same posture as ``submit_script_file``. A
+        # manifest read that raises (corrupt JSON, permission-blocked
+        # path, FS error) used to flip ``staged_ok`` to True, turning
+        # the recall safety gate into a no-op on exactly the failure
+        # mode most likely to be deliberately corrupted. Treat
+        # manifest-unreadable as "not staged" and tell the caller to
+        # re-stage.
         try:
             from nora.file_provenance import is_known
             staged_ok = is_known(cwd, resolved_target.name)
-        except Exception:  # noqa: BLE001 — manifest must not break recall
-            staged_ok = True
+        except Exception:  # noqa: BLE001 — fail closed (see above)
+            staged_ok = False
         if not staged_ok:
             return _as_mcp_text({
                 "status": "rejected",
@@ -3928,6 +3943,23 @@ async def search_in_session_files(args: dict[str, Any]) -> dict[str, Any]:
     # cleaned by ``label_to_filename_stem``). Same-name de-dup
     # prefers the top-level cwd entry (researcher's file) over the
     # run-dir copy.
+    # Provenance gate (same posture as ``read_attached_file`` and
+    # ``submit_script_file``): top-level cwd files that aren't in the
+    # researcher-staged manifest don't get their bytes returned here.
+    # The sandbox at ``executor.py`` intentionally allows scripts to
+    # write to cwd, and ``search_in_session_files`` returns verbatim
+    # line excerpts for ``.py`` / ``.do`` / ``.r`` / ``.rmd`` — so a
+    # model script that writes raw rows into ``leak.py`` could
+    # otherwise round-trip those bytes through this tool's match
+    # excerpts, bypassing the SDC sanitizer that gates submit_script.
+    # Manifest reads that raise are treated as "not staged" (fail
+    # closed; matches the recall-path posture). Run-dir scripts
+    # (handled below) don't need this gate — those are Nora-written
+    # copies of the model's own submissions, not arbitrary cwd files.
+    try:
+        from nora.file_provenance import is_known as _is_known_provenance
+    except Exception:  # noqa: BLE001
+        _is_known_provenance = None  # type: ignore[assignment]
     search_entries: list[tuple[str, Path, str]] = []
     seen_names: set[str] = set()
     for child in sorted(children, key=lambda p: p.name):
@@ -3946,6 +3978,20 @@ async def search_in_session_files(args: dict[str, Any]) -> dict[str, Any]:
             continue
         name = safe_text(child.name)
         if not name or name in seen_names:
+            continue
+        # Drop unstaged top-level files silently rather than emitting
+        # a "skipped: not staged" entry. The denial reason would echo
+        # the model-authored basename back through the response,
+        # giving the model a free directory-listing channel into
+        # sandbox-output it isn't allowed to read. ``list_session_files``
+        # already advertises which files are listable.
+        staged_ok = True
+        if _is_known_provenance is not None:
+            try:
+                staged_ok = _is_known_provenance(cwd, child.name)
+            except Exception:  # noqa: BLE001 — fail closed
+                staged_ok = False
+        if not staged_ok:
             continue
         seen_names.add(name)
         search_entries.append((name, child, kind))
@@ -4181,6 +4227,23 @@ async def install_packages(args: dict[str, Any]) -> dict[str, Any]:
         for s in result.statuses
     ]
     if result.error:
+        # Scrub the raw subprocess output before forwarding. The
+        # invariant in ``docs/direction.md`` ("Raw stderr / stdout
+        # never reach the model") is preserved for ``submit_script``
+        # by ``error_summary.extract_debug_excerpt`` (language-
+        # anchored extraction + credential / path scrub). The
+        # install path skips the language anchor (pip / R / Stata
+        # install logs aren't tracebacks to extract from) but it
+        # MUST NOT skip the credential and path normalisation —
+        # otherwise a private pip index URL with embedded
+        # ``user:token@`` (echoed from pip.conf on every install),
+        # an AWS-style key dumped via ``echo $TOKEN``, or an
+        # internal absolute path would round-trip through this
+        # tool's error excerpt unredacted. The tail-slice cap
+        # bytes are picked first (stderr is more informative on
+        # failure) and the scrubber re-caps to the same budget
+        # after redactions.
+        from nora.error_summary import scrub_raw_output
         return _as_mcp_text({
             "status": "error",
             "language": result.language,
@@ -4188,11 +4251,12 @@ async def install_packages(args: dict[str, Any]) -> dict[str, Any]:
             "reason": result.error,
             "statuses": statuses,
             "duration_seconds": round(result.duration_seconds, 2),
-            # Truncate raw output so a noisy installer log doesn't
-            # blow the model's context. Stderr is more informative for
-            # failures than stdout, so we keep it longer.
-            "raw_stdout_excerpt": (result.raw_stdout or "")[-1500:],
-            "raw_stderr_excerpt": (result.raw_stderr or "")[-3000:],
+            "raw_stdout_excerpt": scrub_raw_output(
+                (result.raw_stdout or "")[-1500:], cap_bytes=1500,
+            ),
+            "raw_stderr_excerpt": scrub_raw_output(
+                (result.raw_stderr or "")[-3000:], cap_bytes=3000,
+            ),
         })
     # No ``raw_stdout_excerpt`` on success. pip's progress output
     # echoes the full index URL — including any token-bearing
