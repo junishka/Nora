@@ -360,10 +360,16 @@ def _render_linear_regression(p: dict[str, Any]) -> str | None:
     n = p.get("n")
     n_subj = p.get("n_subjects")
     n_fail = p.get("n_failures")
-    if isinstance(n_subj, int):
-        leg = f"subjects = {n_subj:,}"
-        if isinstance(n_fail, int):
-            leg += f" · events = {n_fail:,}"
+    # ``n_subjects`` / ``n_failures`` may arrive as a suppression-marker
+    # string ("<10") when small-cell coarsening fired in the sanitizer.
+    # Render those verbatim so the researcher sees the suppression
+    # rather than silently falling back to the records-only leg.
+    if isinstance(n_subj, (int, str)) and n_subj != "":
+        subj_str = f"{n_subj:,}" if isinstance(n_subj, int) else n_subj
+        leg = f"subjects = {subj_str}"
+        if isinstance(n_fail, (int, str)) and n_fail != "":
+            fail_str = f"{n_fail:,}" if isinstance(n_fail, int) else n_fail
+            leg += f" · events = {fail_str}"
         if isinstance(n, int) and n != n_subj:
             leg += f" (records = {n:,})"
         cap_parts.append(leg)

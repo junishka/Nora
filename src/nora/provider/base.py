@@ -130,8 +130,21 @@ class AuthFailure:
 
 @dataclass
 class TurnError:
-    """Something else went wrong. ``message`` is human-readable."""
+    """Something else went wrong. ``message`` is human-readable.
+
+    ``context_reset``: True iff the failure means the provider's
+    server-side conversation memory is gone and the next turn must
+    re-prime via the warm-start prefix. The OpenAI provider sets
+    this when ``previous_response_id`` expires; the Anthropic
+    provider doesn't currently need it (the SDK rebuilds context
+    from the on-disk transcript on every turn). The runner reads
+    this flag in the failure-restoration branch and re-arms
+    ``needs_context_prefix`` so the next turn doesn't silently
+    start with no recoverable context. Defaults to False so existing
+    error sites stay unchanged.
+    """
     message: str
+    context_reset: bool = False
 
 
 Event = Union[

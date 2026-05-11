@@ -4,8 +4,10 @@ Pins the contract ``read_attached_file`` and ``submit_script_file``
 rely on:
 
 * ``initialize`` snapshots the cwd's top-level files into the
-  manifest at session-open time AND merges with any existing manifest
-  (the upgrade path for sessions that pre-date this feature).
+  manifest at FIRST session-open time only. Subsequent re-opens
+  must NOT re-snapshot — otherwise sandbox-written files
+  accumulated between sessions silently become "researcher-
+  staged" and bypass the SDC guard.
 * ``mark_known`` is append-only; re-marking the same name is a no-op.
 * Path-traversal-shaped inputs (``foo/../bar.csv``) are basenamed
   defensively so they can't smuggle path-shaped keys into the
@@ -62,23 +64,29 @@ def test_initialize_skips_dotfiles_and_directories(tmp_path: Path) -> None:
     assert not is_known(tmp_path, "nested.csv")
 
 
-def test_initialize_is_idempotent_and_merges_existing(tmp_path: Path) -> None:
+def test_initialize_does_not_resnapshot_on_reopen(tmp_path: Path) -> None:
     """Re-running initialize on a session that already has a manifest
-    AND has new top-level files merges the two — the upgrade path
-    for sessions opened before this feature shipped."""
+    must NOT merge in newly-appeared top-level files. Those files
+    could be sandbox output from a prior session; the analysis
+    sandbox is allowed to write to cwd, so a model script could
+    drop ``smuggled.py`` and rely on the re-snapshot to promote
+    that file to "researcher-staged" on the next app start.
+    The manifest must stay authoritative across reopens; new
+    researcher additions arrive through the bridge's staging
+    endpoints (``mark_known``)."""
     (tmp_path / "old_data.csv").write_text("a\n")
     initialize(tmp_path)
     # Researcher adds a file via the bridge after open.
     mark_known(tmp_path, ["staged_via_bridge.dta"])
-    # Then a session is reopened with one new file appearing in
-    # cwd top-level.
-    (tmp_path / "new_data.parquet").write_text("")
+    # Between sessions, a sandbox-written script lands in cwd.
+    # That file MUST NOT become trusted by the reopen.
+    (tmp_path / "smuggled.py").write_text("# raw rows here\n")
     names = initialize(tmp_path)
     assert names == {
         "old_data.csv",
         "staged_via_bridge.dta",
-        "new_data.parquet",
     }
+    assert not is_known(tmp_path, "smuggled.py")
 
 
 def test_mark_known_is_append_only(tmp_path: Path) -> None:
@@ -114,18 +122,25 @@ def test_is_known_on_empty_manifest_returns_false(tmp_path: Path) -> None:
 def test_malformed_manifest_falls_back_to_empty(tmp_path: Path) -> None:
     """An externally-edited manifest that no longer parses as JSON
     must not crash the read — the gate degrades to ``False`` so the
-    user-facing surface still returns a clean rejection."""
+    user-facing surface still returns a clean rejection.
+
+    ``initialize`` over a malformed manifest must NOT overwrite the
+    on-disk file with a fresh snapshot. The cwd at corrupt-time may
+    contain sandbox output from before the corruption, and silently
+    re-seeding would promote that output to researcher-staged. The
+    safe behavior is to leave the corrupt manifest alone and return
+    empty so callers see "nothing is staged".
+    """
     nora_dir = tmp_path / ".nora"
     nora_dir.mkdir()
     (nora_dir / MANIFEST_FILENAME).write_text(
         "{this is not valid json", encoding="utf-8",
     )
     assert not is_known(tmp_path, "x.csv")
-    # ``initialize`` over a malformed manifest builds a fresh one
-    # from the cwd snapshot rather than crashing.
     (tmp_path / "data.csv").write_text("a\n")
     names = initialize(tmp_path)
-    assert names == {"data.csv"}
+    assert names == set()
+    assert not is_known(tmp_path, "data.csv")
 
 
 def test_manifest_round_trips_through_disk(tmp_path: Path) -> None:

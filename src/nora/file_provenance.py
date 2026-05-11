@@ -154,27 +154,44 @@ def _enumerate_cwd_top_level(cwd: Path) -> set[str]:
 
 
 def initialize(cwd: Path) -> set[str]:
-    """Snapshot cwd top-level files into the manifest at session-open.
+    """Snapshot cwd top-level files into the manifest at FIRST session-
+    open only.
 
-    Idempotent: if a manifest already exists, the union of its
-    contents and the current top-level snapshot is written back.
-    The merge is the upgrade path for sessions that existed before
-    this manifest was introduced — without it, a freshly-upgraded
-    Nora opening an old session would see the existing files and
-    refuse to read them. Calling ``initialize`` on every cwd open
-    keeps the manifest current without forcing the bridge to know
-    whether a session is new or resumed.
+    On the very first open the cwd snapshot is presumed researcher-
+    staged: the researcher dropped those files there before opening
+    Nora. Once a manifest exists, subsequent re-opens MUST NOT
+    re-snapshot — between sessions, the analysis sandbox may have
+    written its own files into cwd (``df.to_csv("out.csv")`` is
+    legitimate; ``open("smuggled.py", "w").write(...)`` from a
+    model-authored script is the gap). Merging those in on reopen
+    would silently promote sandbox output to "researcher-staged"
+    and let ``read_attached_file`` / ``submit_script_file`` /
+    ``search_in_session_files`` return their bytes — the same SDC
+    bypass the manifest exists to prevent. The provenance guard
+    must be effective across app restarts, not just within one
+    live session.
+
+    Backwards compatibility for sessions that pre-date this manifest:
+    when the manifest file does not yet exist, we snapshot once and
+    write it (the upgrade path). After that the manifest is the sole
+    authority; new files added via the bridge's staging endpoints
+    (``add_files`` / ``add_files_from_blobs`` / ``upload_files``)
+    extend it through ``mark_known``.
 
     Returns the resulting name set so callers can log it.
     """
     path = _manifest_path(cwd)
     with _lock_for(cwd):
-        existing = _read_names(path)
+        # ``read_names`` returns ``set()`` for missing OR corrupt
+        # manifests. We need to distinguish those: missing -> seed,
+        # corrupt -> leave alone (don't silently seed an empty
+        # manifest on top of a corrupt one and resnapshot whatever
+        # is in cwd right now). ``path.exists()`` is the gate.
+        if path.exists():
+            return _read_names(path)
         snapshot = _enumerate_cwd_top_level(cwd)
-        merged = existing | snapshot
-        if merged != existing:
-            _write_names(path, merged)
-        return merged
+        _write_names(path, snapshot)
+        return snapshot
 
 
 def mark_known(cwd: Path, names: Iterable[str]) -> set[str]:

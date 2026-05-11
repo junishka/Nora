@@ -64,7 +64,7 @@ def test_switch_session_rejects_sessions_root_itself(
     bridge = ui.NoraBridge()
     res = bridge.switch_session(str(fake_root))
     assert res["ok"] is False
-    assert "direct session directory" in res["reason"]
+    assert "session directory" in res["reason"]
 
 
 def test_switch_session_accepts_direct_child(
@@ -106,7 +106,7 @@ def test_switch_session_rejects_nested_path(
     bridge = ui.NoraBridge()
     res = bridge.switch_session(str(nested))
     assert res["ok"] is False
-    assert "direct session directory" in res["reason"]
+    assert "session directory" in res["reason"]
 
 
 def test_set_session_name_rejects_sessions_root(
@@ -124,7 +124,7 @@ def test_set_session_name_rejects_sessions_root(
     bridge = ui.NoraBridge()
     res = bridge.set_session_name(str(fake_root), "my name")
     assert res["ok"] is False
-    assert "direct session directory" in res["reason"]
+    assert "session directory" in res["reason"]
     # And no .nora/ directory was created at the root level.
     assert not (fake_root / ".nora").exists()
 

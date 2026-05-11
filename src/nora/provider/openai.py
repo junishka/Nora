@@ -445,18 +445,36 @@ class OpenAISession:
                         # (it's in chat_history.jsonl), it just
                         # won't be cached on the server side
                         # anymore.
+                        #
+                        # ``context_reset=True`` tells the runner to
+                        # re-arm ``needs_context_prefix`` so the
+                        # next turn re-injects the warm-start
+                        # prefix. Without that flag, the next turn
+                        # would send a fresh prompt with no
+                        # ``previous_response_id`` AND no context
+                        # prefix — the model would see this session
+                        # as brand new and forget every prior turn
+                        # until ``recall_conversation`` is invoked.
+                        # The chain-expiry path is rare but recovery
+                        # must be transparent: the researcher should
+                        # see "continuing the conversation" not
+                        # "model forgot everything".
                         self._last_response_id = None
-                        yield TurnError(message=(
-                            "OpenAI's server-side response chain has "
-                            "expired (the previous response is no "
-                            "longer retrievable). The session's chat "
-                            "history is preserved on disk; the next "
-                            "turn will start a new chain from a "
-                            "fresh root, and the model will see this "
-                            "session's prior turns through "
-                            "``recall_conversation`` as needed. "
-                            f"Underlying error: {msg}"
-                        ))
+                        yield TurnError(
+                            message=(
+                                "OpenAI's server-side response chain "
+                                "has expired (the previous response is "
+                                "no longer retrievable). The session's "
+                                "chat history is preserved on disk; "
+                                "the next turn will start a new chain "
+                                "from a fresh root, and the model will "
+                                "see this session's prior turns "
+                                "through the warm-start context prefix "
+                                "+ ``recall_conversation`` as needed. "
+                                f"Underlying error: {msg}"
+                            ),
+                            context_reset=True,
+                        )
                         return
                     yield TurnError(message=f"OpenAI request failed: {msg}")
                     return

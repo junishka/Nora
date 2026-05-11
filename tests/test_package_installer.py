@@ -92,6 +92,247 @@ def test_validate_names_rejects_overlong() -> None:
     assert len(rejected) == 1
 
 
+def test_python_remove_refuses_package_not_in_nora_target(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """SDC + safety closure: ``pip uninstall`` has no ``--target`` —
+    it resolves via ``sys.path`` and removes the first copy it
+    finds. If the requested package is NOT in Nora's managed Python
+    dir but IS in the researcher's system / user / venv
+    site-packages, pip would happily remove it from there. A model
+    that calls ``install_packages(action='remove', packages=['pandas'])``
+    when Nora never installed pandas to its own dir could yank
+    pandas from the researcher's broader Python environment —
+    breaking Nora itself.
+
+    The fix: before launching ``pip uninstall``, scan the Nora target
+    dir's ``*.dist-info`` and ``*.egg-info`` and refuse any package
+    name that isn't present there. The refusal surfaces as a
+    ``skipped`` per-package status; the subprocess never starts if
+    no eligible names remain.
+    """
+    import asyncio
+    monkeypatch.setenv(
+        "NORA_PYTHON_PKG_BASE", str(tmp_path / "nora-pkgs"),
+    )
+    from nora.package_installer import (
+        InstallResult,
+        install_packages,
+        nora_python_pkg_dir,
+    )
+    # Stub the env-detect to a Python that resolves to a real
+    # binary path (it never runs, since we'll intercept the
+    # subprocess).
+    import nora.env_detect as _env_detect
+    from nora.env_detect import Environment, Tool
+    fake_env = Environment(
+        python=Tool(
+            name="Python", binary="/usr/bin/python3",
+            version="Python 3.12.0",
+            missing_packages=(), optional_missing_packages=(),
+            extra_read_paths=(),
+        ),
+        r=None, stata=None, sandbox_exec=None,
+    )
+    monkeypatch.setattr(_env_detect, "detect_environment", lambda: fake_env)
+
+    # The Nora target dir EXISTS and contains ONE installed package
+    # (``managed``) but NOT the package the model is asking to
+    # remove (``site_only``).
+    target = nora_python_pkg_dir("/usr/bin/python3")
+    target.mkdir(parents=True, exist_ok=True)
+    (target / "managed-1.2.3.dist-info").mkdir()
+    (target / "managed-1.2.3.dist-info" / "METADATA").write_text(
+        "Name: managed\n", encoding="utf-8",
+    )
+
+    # Intercept subprocess.run and only record pip invocations.
+    # ``nora_python_pkg_dir`` also runs a small ``python -c "import
+    # sys; print(version)"`` probe through subprocess.run; we don't
+    # want that one polluting the leak-detection assertion.
+    pip_launched: list[list[str]] = []
+    import subprocess as _subprocess
+    real_run = _subprocess.run
+
+    def _fake_run(cmd, **kwargs):  # type: ignore[no-untyped-def]
+        is_pip = (
+            isinstance(cmd, list)
+            and len(cmd) >= 3
+            and cmd[1] == "-m"
+            and cmd[2] == "pip"
+        )
+        if is_pip:
+            pip_launched.append(list(cmd))
+            return _subprocess.CompletedProcess(
+                args=cmd, returncode=0, stdout="", stderr="",
+            )
+        return real_run(cmd, **kwargs)
+    monkeypatch.setattr(_subprocess, "run", _fake_run)
+
+    # Case 1: removing a package that ISN'T in Nora's target. The
+    # request must fail cleanly without pip ever being launched.
+    result = asyncio.run(install_packages(
+        language="Python", packages=["site_only"], action="remove",
+    ))
+    assert isinstance(result, InstallResult)
+    assert result.error is not None
+    assert pip_launched == [], (
+        "pip uninstall must NOT be launched for a package that "
+        "isn't in Nora's target dir — otherwise pip would remove "
+        "it from the researcher's broader Python environment"
+    )
+    statuses_by_name = {s.name: s for s in result.statuses}
+    assert "site_only" in statuses_by_name
+    assert statuses_by_name["site_only"].status == "skipped"
+
+    # Case 2: a MIX of eligible + non-eligible names. The eligible
+    # one goes through; the non-eligible one is skipped, never
+    # reaches pip.
+    pip_launched.clear()
+    result2 = asyncio.run(install_packages(
+        language="Python", packages=["managed", "site_only"],
+        action="remove",
+    ))
+    assert len(pip_launched) == 1
+    pip_argv = pip_launched[0]
+    assert "managed" in pip_argv
+    assert "site_only" not in pip_argv, (
+        "the non-eligible package leaked into the pip argv — that "
+        "would let pip uninstall it from site-packages"
+    )
+    statuses2_by_name = {s.name: s for s in result2.statuses}
+    assert statuses2_by_name["site_only"].status == "skipped"
+
+
+def test_python_remove_handles_pep503_name_normalization(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """pip normalises distribution names per PEP 503 — ``scikit_learn``
+    on disk is ``scikit-learn`` to the consumer, and vice versa. The
+    Nora-target presence check must match how pip wrote the dir, so
+    a remove request with the underscore form still matches the
+    dash form on disk (and vice versa).
+    """
+    monkeypatch.setenv(
+        "NORA_PYTHON_PKG_BASE", str(tmp_path / "nora-pkgs"),
+    )
+    from nora.package_installer import (
+        _python_packages_installed_in_nora_target,
+        nora_python_pkg_dir,
+    )
+    target = nora_python_pkg_dir("/usr/bin/python3")
+    target.mkdir(parents=True, exist_ok=True)
+    # On-disk: ``scikit_learn-1.0.dist-info`` (underscore form).
+    (target / "scikit_learn-1.0.dist-info").mkdir()
+    # Request uses the dash form.
+    found = _python_packages_installed_in_nora_target(
+        target, ["scikit-learn"],
+    )
+    assert found == {"scikit-learn"}
+    # And vice versa: dash on disk, underscore in request.
+    (target / "another-pkg-2.0.dist-info").mkdir()
+    found2 = _python_packages_installed_in_nora_target(
+        target, ["another_pkg"],
+    )
+    assert found2 == {"another_pkg"}
+
+
+def test_install_packages_tool_scrubs_credentials_from_raw_excerpts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """SDC closure: the ``install_packages`` MCP tool returns
+    ``raw_stdout_excerpt`` and ``raw_stderr_excerpt`` on failure so
+    the model can diagnose. The script-sandbox path runs everything
+    through ``error_summary.extract_debug_excerpt`` (language-
+    anchored extraction + credential/path scrub) — the install path
+    skips the language anchor but MUST NOT skip the scrub.
+
+    The headline leak we lock against is the private pip index URL
+    that pip echoes on every run from ``~/.pip/pip.conf`` (or
+    ``PIP_INDEX_URL``):
+
+        Looking in indexes: https://USER:TOKEN@private-pypi.acme.com/simple
+
+    Without the scrub, the embedded user:token rides the failure
+    response straight into the model's context. The fix pipes both
+    raw excerpts through ``error_summary.scrub_raw_output`` before
+    they reach the response payload.
+    """
+    import asyncio
+    import json
+
+    from nora.package_installer import InstallResult
+    from nora.tools import HANDLERS
+    import nora.tools as tools_mod
+
+    fake_result = InstallResult(
+        language="Python",
+        action="install",
+        statuses=(),
+        raw_stdout=(
+            "Looking in indexes: https://leaked_user:leaked_token@"
+            "private-pypi.acme.com/simple\n"
+            "Collecting pandas\n"
+        ),
+        raw_stderr=(
+            "ERROR: HTTPSConnectionPool(host='private-pypi.acme.com', "
+            "port=443): Max retries exceeded\n"
+            "OPENAI_KEY=sk-abcdefghijklmnopqrstuvwxyz1234567890\n"
+            "Failed at /Users/jdoe/.cache/pip/wheels/build.log\n"
+        ),
+        error="installer exited 1",
+        duration_seconds=0.5,
+    )
+
+    async def _fake_install(language, packages, action):  # type: ignore[no-untyped-def]
+        return fake_result
+
+    monkeypatch.setattr(
+        tools_mod,
+        "install_packages",
+        tools_mod.install_packages,
+    )
+    # Patch the module-level import target that the tool handler
+    # reaches for inside its body.
+    import nora.package_installer as pkg_mod
+    monkeypatch.setattr(pkg_mod, "install_packages", _fake_install)
+    # The tool now gates installs behind a researcher-side
+    # confirmation modal; stub the approval so the install runs and
+    # we can assert on the failure-path scrub behavior.
+    import nora.install_confirmation as ic_mod
+
+    async def _approve(**_kwargs):
+        return True
+    monkeypatch.setattr(ic_mod, "request_confirmation", _approve)
+
+    payload = asyncio.run(HANDLERS["install_packages"]({
+        "language": "Python",
+        "packages": ["pandas"],
+        "action": "install",
+    }))
+    body = json.loads(next(
+        b for b in payload["content"] if b.get("type") == "text"
+    )["text"])
+    assert body["status"] == "error"
+    stdout_excerpt = body["raw_stdout_excerpt"]
+    stderr_excerpt = body["raw_stderr_excerpt"]
+
+    # Embedded URL credentials are gone; scheme + host are preserved
+    # so a reader can still tell what was happening.
+    assert "leaked_user" not in stdout_excerpt
+    assert "leaked_token" not in stdout_excerpt
+    assert "[redacted-credential]" in stdout_excerpt
+    assert "https://" in stdout_excerpt
+
+    # OpenAI-style key in stderr is redacted.
+    assert "sk-abcdefghijklmnopqrstuvwxyz1234567890" not in stderr_excerpt
+    assert "[redacted-credential]" in stderr_excerpt
+
+    # Absolute path is reduced to its basename.
+    assert "/Users/jdoe" not in stderr_excerpt
+    assert "build.log" in stderr_excerpt
+
+
 def test_install_packages_caps_list_length() -> None:
     """A massive package list shouldn't launch a single multi-hour
     invocation the researcher can't easily interrupt. The per-call

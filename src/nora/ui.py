@@ -187,6 +187,67 @@ class NoraBridge:
 
     def attach(self, window: Any) -> None:
         self._window = window
+        # Register the install-confirmation emitter so the
+        # ``install_packages`` tool can surface a modal before the
+        # underlying installer runs. The tool's hard consent gate
+        # fails closed without an emitter, so attaching here is what
+        # makes the install path usable inside the running UI while
+        # still refusing the install for any process that loads the
+        # tools module without a window attached (headless servers,
+        # tests that haven't opted in).
+        try:
+            from nora.install_confirmation import set_request_emitter
+            set_request_emitter(self._emit_install_confirmation_request)
+        except Exception:  # noqa: BLE001 — never let registration block boot
+            pass
+
+    def _emit_install_confirmation_request(
+        self,
+        token: str,
+        language: str,
+        packages: list[str],
+        action: str,
+    ) -> None:
+        """Push an install-confirmation request to the page.
+
+        Sent through the same ``nora_event`` channel the chat
+        transcript uses so the page's existing event dispatcher
+        picks it up. The token round-trips back via
+        ``respond_install_confirmation`` to release the awaiting
+        future on the tool handler's loop.
+        """
+        if self._window is None:
+            return
+        payload = json.dumps({
+            "type": "install_confirmation_request",
+            "token": token,
+            "language": language,
+            "packages": list(packages),
+            "action": action,
+        })
+        try:
+            self._window.evaluate_js(f"window.nora_event({payload});")
+        except Exception:  # noqa: BLE001 — webview may be closing
+            # Emitter contract: failures are fatal for this request,
+            # not for the global emitter registration. ``request_confirmation``
+            # catches emitter exceptions and treats them as deny, so
+            # we just swallow here.
+            pass
+
+    def respond_install_confirmation(
+        self, token: str, approved: bool,
+    ) -> dict[str, Any]:
+        """JS calls this when the researcher clicks Approve or Deny.
+
+        ``token`` was issued by the awaiting tool handler; the bridge
+        forwards the decision to the install-confirmation registry,
+        which resolves the matching Future on the tool's loop.
+        Returns ``{ok}`` so the page can detect a stale token (e.g.
+        the modal was clicked AFTER the request timed out).
+        """
+        from nora.install_confirmation import respond
+        ok = respond(token, bool(approved))
+        return {"ok": ok}
 
     def list_busy_sessions(self) -> dict[str, Any]:
         """Return the set of session cwds whose runner currently has a
@@ -264,6 +325,20 @@ class NoraBridge:
         killed the turn)."""
         if self._loop is None:
             return
+        # Release any awaiting install-confirmation futures BEFORE
+        # the loop stops. Without this, a tool handler that's blocked
+        # on ``request_confirmation`` would wait its full timeout
+        # against a dead loop and lock the SDK client. ``cancel_all``
+        # resolves every pending request as deny.
+        try:
+            from nora.install_confirmation import (
+                cancel_all as _cancel_install_confirmations,
+                clear_request_emitter,
+            )
+            _cancel_install_confirmations()
+            clear_request_emitter()
+        except Exception:  # noqa: BLE001 — defensive
+            pass
         runners = list(self._runners.values())
 
         async def _close_all() -> None:
@@ -413,6 +488,12 @@ class NoraBridge:
 
         Returns ``{ok: True, ...ready_payload}`` or
         ``{ok: False, reason}``.
+
+        The chosen folder is recorded in the external-sessions
+        registry so it surfaces in the sidebar and is reachable via
+        ``switch_session`` after the researcher moves away. Without
+        that, picking a folder created a session that couldn't be
+        navigated back to without re-picking it through the dialog.
         """
         if self._window is None:
             return {"ok": False, "reason": "window not ready"}
@@ -433,10 +514,22 @@ class NoraBridge:
         # The user-driven file picker is the only entry point where a
         # researcher can hand Nora an arbitrary directory; staged
         # sessions land under SESSIONS_ROOT and ``switch_session``
-        # already enforces parent == SESSIONS_ROOT.
+        # already enforces parent == SESSIONS_ROOT. Run this check
+        # BEFORE registering the folder so a rejected path never
+        # ends up in the recent-folders sidebar.
         reason = _reject_dangerous_cwd(folder)
         if reason is not None:
             return {"ok": False, "reason": reason}
+        # Register before ``_set_cwd`` so a downstream failure (e.g.
+        # provenance init) doesn't leave the folder unreachable from
+        # the sidebar. The registry survives an app restart, so even
+        # if the page never re-renders the researcher can re-open
+        # the project from "Recent folders" next time.
+        try:
+            from nora.external_sessions import register
+            register(SESSIONS_ROOT, folder)
+        except Exception:  # noqa: BLE001 — registry must not block opens
+            pass
         return self._set_cwd(folder)
 
     def upload_files(
@@ -1358,6 +1451,17 @@ class NoraBridge:
             ],
         }
 
+    # Global byte budget for inline thumbnails returned by
+    # ``list_session_files``. The per-row cap (3 MB) bounds a single
+    # image, but a plot-heavy session can accumulate hundreds of plots
+    # under ``_nora_plots/`` and base64 expansion adds ~33% on top —
+    # without a global cap the bridge payload would balloon past the
+    # WebView's tolerance for ``evaluate_js`` and stall the panel
+    # render. 32 MB comfortably accommodates a normal working session
+    # (a dozen 1600px PNGs, a few PDF sidecars) while keeping
+    # pathological cases bounded.
+    _FILES_PANEL_TOTAL_THUMB_BUDGET = 32 * 1024 * 1024
+
     def list_session_files(self) -> dict[str, Any]:
         """Return every researcher-uploaded file in the active session
         cwd, grouped by kind, for the topbar Files panel.
@@ -1377,12 +1481,25 @@ class NoraBridge:
             include_data=True,
             include_run_scripts=True,
         )
+        # Running budget shared across all rows. Once exhausted, the
+        # remaining image / PDF rows still appear in the panel but
+        # ship without ``data`` — the UI falls back to a placeholder
+        # plus click-to-open, the same path used for over-cap singles.
+        bytes_used = [0]
         for row in rows:
-            self._enrich_files_panel_row(row)
+            self._enrich_files_panel_row(
+                row, budget_used=bytes_used,
+                budget_total=self._FILES_PANEL_TOTAL_THUMB_BUDGET,
+            )
         return {"ok": True, "files": rows}
 
     @staticmethod
-    def _enrich_files_panel_row(row: dict[str, Any]) -> None:
+    def _enrich_files_panel_row(
+        row: dict[str, Any],
+        *,
+        budget_used: list[int] | None = None,
+        budget_total: int | None = None,
+    ) -> None:
         """Add inline thumbnail bytes (``data`` + ``mime``) to image
         rows in the Files panel. PDF/EPS rows get a sips-rasterised
         PNG sidecar shipped instead. 3 MB cap matches the chat-
@@ -1390,26 +1507,55 @@ class NoraBridge:
         in the panel + lightbox; larger files still appear in the
         panel (with a placeholder + click-to-open) but their bytes
         don't ride through ``evaluate_js``.
+
+        ``budget_used`` is a single-element list acting as a shared
+        running total across rows; ``budget_total`` is the cap. Both
+        optional so single-row tests can call this without bookkeeping.
+        When the budget is exhausted, this row's ``data`` is skipped
+        and the row falls through to the placeholder/click-to-open
+        path on the UI side — same as a >3 MB single.
         """
         import base64 as _base64
 
         _IMAGE_THUMB_CAP = 3 * 1024 * 1024
-        _IMAGE_THUMB_EXTS = {".png", ".jpg", ".jpeg"}
+        # Match the composer-accepted set so a dropped WebP / GIF
+        # screenshot renders in the Files panel rather than appearing
+        # as a "?" placeholder despite being in the listing. All four
+        # raster formats render natively in WebView.
+        _IMAGE_THUMB_EXTS = {".png", ".jpg", ".jpeg", ".webp", ".gif"}
         _IMAGE_MIME = {
             ".png": "image/png",
             ".jpg": "image/jpeg",
             ".jpeg": "image/jpeg",
+            ".webp": "image/webp",
+            ".gif": "image/gif",
         }
+
+        def _within_budget(raw_size: int) -> bool:
+            # base64 expansion is 4/3; budget against the encoded size
+            # since that's what actually rides through ``evaluate_js``.
+            if budget_used is None or budget_total is None:
+                return True
+            projected = budget_used[0] + ((raw_size * 4 + 2) // 3)
+            return projected <= budget_total
+
+        def _charge(raw_size: int) -> None:
+            if budget_used is not None:
+                budget_used[0] += ((raw_size * 4 + 2) // 3)
 
         ext = row.get("ext", "")
         size = row.get("size", 0)
         path = Path(row["path"])
         if ext in _IMAGE_THUMB_EXTS and size <= _IMAGE_THUMB_CAP:
             try:
-                row["data"] = _base64.b64encode(path.read_bytes()).decode("ascii")
-                row["mime"] = _IMAGE_MIME.get(ext, "image/png")
+                raw = path.read_bytes()
             except OSError:
-                pass
+                return
+            if not _within_budget(len(raw)):
+                return
+            row["data"] = _base64.b64encode(raw).decode("ascii")
+            row["mime"] = _IMAGE_MIME.get(ext, "image/png")
+            _charge(len(raw))
         elif ext in (".pdf", ".eps"):
             from nora.plot_convert import png_for
             sidecar = png_for(path)
@@ -1420,12 +1566,14 @@ class NoraBridge:
                     sidecar_size = size
                 if sidecar_size <= _IMAGE_THUMB_CAP:
                     try:
-                        row["data"] = _base64.b64encode(
-                            sidecar.read_bytes()
-                        ).decode("ascii")
-                        row["mime"] = "image/png"
+                        raw = sidecar.read_bytes()
                     except OSError:
-                        pass
+                        return
+                    if not _within_budget(len(raw)):
+                        return
+                    row["data"] = _base64.b64encode(raw).decode("ascii")
+                    row["mime"] = "image/png"
+                    _charge(len(raw))
 
     def delete_session_file(self, path: str) -> dict[str, Any]:
         """Delete a file inside the active session.
@@ -1918,13 +2066,22 @@ class NoraBridge:
         if not res.get("ok"):
             return {**res, "auth": self._auth_status_payload()}
         # Close any IDLE runner that's bound to the now-unauthed
-        # provider. We deliberately leave busy runners alone — their
-        # turn will surface an auth_failure on the next request, but
-        # interrupting an in-flight stream is worse than letting it
-        # error out naturally. Closed runners reopen lazily on the
-        # next send (and will see the unauthed provider then too).
+        # provider. BUSY runners get marked for close-after-turn
+        # instead — interrupting the in-flight stream is worse than
+        # letting it complete, but we MUST evict the cached provider
+        # client once the turn finishes. Both the OpenAI and
+        # Anthropic SDKs capture ``api_key`` at client construction
+        # and reuse it until close, so without the deferred-close
+        # path a busy runner would keep authenticating with the
+        # deleted credential on every subsequent send in the same
+        # process — effectively making "Delete API key" a no-op for
+        # any session that happened to be mid-turn.
         for runner in list(self._runners.values()):
-            if runner.provider == provider and not runner.is_busy():
+            if runner.provider != provider:
+                continue
+            if runner.is_busy():
+                runner.mark_close_after_turn()
+            else:
                 self._run_on_loop(runner.close())
         # Anthropic specifically: ``_ensure_anthropic_env`` copies the
         # keyring credential into ``ANTHROPIC_API_KEY`` so the SDK
@@ -2105,23 +2262,31 @@ class NoraBridge:
         creation timestamp, the last-activity timestamp (drives sort),
         the names of the data files inside, and the on-disk size in
         bytes. Also flags the session that's currently loaded.
+
+        Folder-backed sessions (opened via ``choose_folder``) are
+        surfaced alongside the staged sessions with ``kind="folder"``
+        and the same ``last_activity``-driven sort. Without this the
+        sidebar can't navigate back to a project directory the
+        researcher opened earlier in the session, even though Nora
+        has been actively writing chat history and result rows inside
+        ``<folder>/.nora/``.
         """
         current = str(self.cwd.resolve()) if self.cwd else None
         entries: list[dict[str, Any]] = []
-        if not SESSIONS_ROOT.exists():
-            return {"ok": True, "sessions": entries, "current": current}
-
         from nora.schema import DATA_EXTENSIONS as _DATA_EXTS
-        for child in SESSIONS_ROOT.iterdir():
-            if not child.is_dir():
-                continue
+        seen_paths: set[str] = set()
+
+        def _build_entry(
+            child: Path, *, kind: str,
+        ) -> dict[str, Any] | None:
             try:
                 stat = child.stat()
             except OSError:
-                continue
-            # Timestamp parsing — dir names look like
+                return None
+            # Timestamp parsing — staged dir names look like
             # `20260422T160059Z_f13630f4`. Fall back to mtime if the
-            # prefix doesn't match (user manually renamed, etc.).
+            # prefix doesn't match (user-named folder-backed sessions
+            # almost never match the timestamp shape).
             ts = _parse_session_timestamp(child.name) or stat.st_mtime
             # Last activity = mtime of chat_history.jsonl (appended on
             # every turn), fallback to dir mtime, fallback to creation.
@@ -2152,16 +2317,52 @@ class NoraBridge:
             except Exception:  # noqa: BLE001
                 state = None
             custom = state.custom_name if state is not None else None
-            entries.append({
+            return {
                 "path": str(child.resolve()),
                 "name": child.name,
-                "timestamp": ts,  # epoch seconds (creation), JS formats
-                "last_activity": last_activity,  # epoch seconds, drives sort
+                "timestamp": ts,
+                "last_activity": last_activity,
                 "datasets": datasets,
                 "size": _dir_size(child),
                 "title": _session_title(child),
                 "custom_name": custom,
-            })
+                # ``kind`` distinguishes staged (under SESSIONS_ROOT)
+                # from folder-backed (registered via choose_folder).
+                # The page uses this to render a different icon /
+                # disable the delete-session affordance on folder-
+                # backed entries (deleting a project dir is not
+                # something the sidebar should offer).
+                "kind": kind,
+            }
+
+        if SESSIONS_ROOT.exists():
+            for child in SESSIONS_ROOT.iterdir():
+                if not child.is_dir():
+                    continue
+                entry = _build_entry(child, kind="staged")
+                if entry is None:
+                    continue
+                entries.append(entry)
+                seen_paths.add(entry["path"])
+
+        # Folder-backed sessions (opened via choose_folder). The
+        # registry stores absolute paths; ``list_entries`` filters out
+        # paths that no longer exist so a deleted project dir vanishes
+        # from the sidebar naturally.
+        try:
+            from nora.external_sessions import list_entries as _list_external
+            for ext_entry in _list_external(SESSIONS_ROOT):
+                folder = Path(ext_entry["path"])
+                entry = _build_entry(folder, kind="folder")
+                if entry is None:
+                    continue
+                if entry["path"] in seen_paths:
+                    continue
+                entries.append(entry)
+                seen_paths.add(entry["path"])
+        except Exception:  # noqa: BLE001 — registry is supplementary
+            pass
+
         entries.sort(key=lambda e: e["last_activity"], reverse=True)
         return {"ok": True, "sessions": entries, "current": current}
 
@@ -2278,25 +2479,39 @@ class NoraBridge:
             return {"ok": False, "reason": f"bad path: {e}"}
         if not target.is_dir():
             return {"ok": False, "reason": f"not a directory: {target}"}
-        # Only allow switching into paths we manage AND require a
-        # *direct* child of SESSIONS_ROOT — not the root itself, and
-        # not a nested directory inside a session. ``_is_within`` is
-        # too loose: it returns True for ``target == sessions_root``
-        # (relative_to of equal paths is ``Path('.')``) — cwd would
-        # then become the directory containing every session, which
-        # makes every other session a child of the active cwd and
-        # breaks the cross-session isolation gate. It also accepts
-        # any subdirectory beneath a session, which would spawn a
-        # runner whose cwd doesn't see the session's ``.nora/``
-        # state. ``parent == sessions_root`` is the narrow gate
-        # matching the check ``delete_session`` already uses.
+        # Two acceptable shapes for ``target``:
+        #
+        # 1. A direct child of SESSIONS_ROOT (staged sessions). Same
+        #    narrow gate ``delete_session`` uses; ``_is_within`` is
+        #    too loose (it accepts ``target == sessions_root``
+        #    itself, which would set cwd to the directory containing
+        #    every session and break cross-session isolation, and any
+        #    nested subdir beneath a session, which would spawn a
+        #    runner whose cwd doesn't see the session's ``.nora/``
+        #    state).
+        #
+        # 2. A folder registered via ``choose_folder``. Without this
+        #    second gate, the sidebar could surface a folder-backed
+        #    session (via ``list_sessions``) but clicking it returned
+        #    "must be a direct session directory" — a dead chip.
+        #    Registry membership is the durable record that the
+        #    researcher previously opened this folder as a session.
         sessions_root = SESSIONS_ROOT.resolve()
-        if target == sessions_root or target.parent != sessions_root:
+        is_staged_session = (
+            target != sessions_root and target.parent == sessions_root
+        )
+        is_registered_folder = False
+        try:
+            from nora.external_sessions import is_registered as _is_registered
+            is_registered_folder = _is_registered(SESSIONS_ROOT, target)
+        except Exception:  # noqa: BLE001 — registry is supplementary
+            is_registered_folder = False
+        if not (is_staged_session or is_registered_folder):
             return {
                 "ok": False,
                 "reason": (
-                    "must be a direct session directory under "
-                    "~/.nora-sessions/"
+                    "must be a session directory under ~/.nora-sessions/ "
+                    "or a folder previously opened via the picker"
                 ),
             }
 

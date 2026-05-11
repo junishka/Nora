@@ -494,6 +494,100 @@ def test_request_failure_does_not_advance_committed_response_id(
     )
 
 
+def test_previous_response_id_expiry_yields_context_reset_turn_error(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """Continuity closure: when OpenAI reports that the
+    ``previous_response_id`` we tried to chain on has expired (the
+    server-side retention window elapsed, or the response was
+    deleted), the provider:
+
+      1. Resets ``_last_response_id = None`` so the next user
+         message starts a fresh chain.
+      2. Yields a ``TurnError`` with ``context_reset=True``.
+
+    The flag is the signal to the runner that the provider's
+    server-side memory is gone and the next turn MUST re-prime via
+    the warm-start context prefix. Without it, an established
+    session that hits chain expiry would silently start a new chain
+    with no ``previous_response_id`` AND no context prefix — the
+    model would see the next user turn as the first message in a
+    brand-new conversation.
+
+    Earlier we set ``_last_response_id`` to a "stale" value to
+    simulate the situation where Nora believes it has a usable
+    chain pointer; the scripted server then refuses with a 404 /
+    "response not found" shape.
+    """
+    import asyncio
+
+    from nora.provider import openai as openai_provider
+    from nora.provider.base import TurnError
+    monkeypatch.setattr(openai_provider, "_resolve_api_key", lambda: "sk-test")
+
+    class _ExpiringResponsesAPI:
+        def __init__(self) -> None:
+            self.calls: list[dict[str, Any]] = []
+
+        async def create(self, **kwargs: Any) -> Any:
+            self.calls.append(kwargs)
+            raise RuntimeError(
+                "openai.NotFoundError: previous_response_id "
+                "'resp_expired' not found (404)"
+            )
+
+    class _ExpiringAsyncOpenAI:
+        def __init__(self, api_key: str | None = None) -> None:
+            self.api_key = api_key
+            self.responses = _ExpiringResponsesAPI()
+
+        async def close(self) -> None:
+            return None
+
+    import openai as openai_pkg
+    monkeypatch.setattr(
+        openai_pkg, "AsyncOpenAI", _ExpiringAsyncOpenAI, raising=True,
+    )
+
+    sess = OpenAISession(
+        cwd=tmp_path,
+        model="gpt-5.5",
+        system_prompt="you are nora",
+    )
+    # Simulate an established session — there's a committed
+    # response id from a prior turn that the server has since
+    # expired.
+    await_open = sess.open()
+    asyncio.run(await_open)
+    sess._last_response_id = "resp_expired"
+
+    events: list[Any] = []
+
+    async def _drive() -> None:
+        async for ev in sess.send("continue the analysis"):
+            events.append(ev)
+
+    asyncio.run(_drive())
+
+    # Provider must reset the committed pointer so the next turn
+    # starts a fresh chain.
+    assert sess._last_response_id is None, (
+        "chain-expiry handling must clear _last_response_id so the "
+        "next turn doesn't re-send the dead id"
+    )
+    # Locate the TurnError; it MUST carry context_reset=True so the
+    # runner re-arms ``needs_context_prefix`` for the next turn.
+    errors = [e for e in events if isinstance(e, TurnError)]
+    assert len(errors) == 1, (
+        f"expected exactly one TurnError; got {len(errors)}"
+    )
+    err = errors[0]
+    assert err.context_reset is True, (
+        "TurnError from chain expiry must set context_reset=True so "
+        "the runner re-arms needs_context_prefix for the next turn"
+    )
+
+
 def test_handler_exception_does_not_leak_message_to_model(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
 ) -> None:

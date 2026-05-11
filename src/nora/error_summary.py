@@ -487,6 +487,12 @@ _BARE_ABS_PATH_RE = re.compile(r"(?<![\w/])/[A-Za-z0-9_.\-/]{4,}")
 #                         the longer github_pat_ prefix
 #   - Slack tokens:       xoxb-/xoxp-/xoxa-/xoxr-/xoxs- + numeric + alnum
 #   - HuggingFace:        hf_ + 30+ alnum
+#   - URL userinfo:       scheme://user:token@host (pip echoes
+#                         ``Looking in indexes: https://USER:TOKEN@
+#                         private-pypi.acme.com/simple`` from
+#                         ~/.pip/pip.conf on every install, so the
+#                         token-bearing URL would otherwise leak
+#                         through ``install_packages``'s error path).
 _CRED_PATTERNS: tuple[re.Pattern[str], ...] = (
     re.compile(r"sk-(?:ant-)?[A-Za-z0-9_\-]{20,}"),
     re.compile(r"\bsk_(?:live|test)_[A-Za-z0-9]{20,}\b"),
@@ -499,6 +505,9 @@ _CRED_PATTERNS: tuple[re.Pattern[str], ...] = (
     re.compile(r"\bxox[abprs]-[A-Za-z0-9\-]{10,}\b"),
     re.compile(r"\bhf_[A-Za-z0-9]{30,}\b"),
 )
+_URL_USERINFO_RE = re.compile(
+    r"([a-zA-Z][a-zA-Z0-9+.\-]*://)[^/?#\s@]+:[^/?#\s@]+@",
+)
 _CRED_REDACTED = "[redacted-credential]"
 
 # Long quoted blobs in error messages - heuristic for "researcher
@@ -510,10 +519,49 @@ _LONG_QUOTED_RE = re.compile(
 )
 
 
+def scrub_raw_output(text: str, cap_bytes: int) -> str:
+    """Public wrapper around the credential / path scrubber for callers
+    that need to forward verbatim subprocess output to the model.
+
+    Use case: ``install_packages`` runs OUTSIDE the script sandbox
+    (it needs network) and returns ``raw_stdout`` / ``raw_stderr``
+    excerpts on failure so the model can diagnose. Those bytes
+    skipped the language-anchored extraction in ``extract_debug_excerpt``,
+    but they still must go through the same credential and path-
+    normalisation pass — otherwise a private pip index URL (with
+    embedded user:token), an AWS-style key dumped via ``echo``, or
+    an internal absolute path leaks through this side door.
+
+    ``cap_bytes`` overrides the default ``MAX_EXCERPT_BYTES`` cap
+    because install excerpts have their own tighter budgets (1500
+    for stdout, 3000 for stderr) — passing the cap explicitly keeps
+    the chokepoint honest about how much can cross.
+    """
+    if not text:
+        return text
+    scrubbed = _scrub_and_cap(text)
+    if len(scrubbed) > cap_bytes:
+        marker = "\n…[excerpt truncated]"
+        scrubbed = scrubbed[:cap_bytes - len(marker)].rstrip() + marker
+    return scrubbed
+
+
 def _scrub_and_cap(text: str) -> str:
     """Normalise paths, redact credentials, trim oversize quoted
     blobs, and cap the total to ``MAX_EXCERPT_BYTES``."""
     out = text
+
+    # URL-embedded userinfo (user:token@host) MUST come before path
+    # normalisation. The bare-abs-path regex matches the ``//USER``
+    # in ``https://USER:TOKEN@host`` (the lookbehind passes because
+    # the char before the first slash is ``:``, not ``/``) and
+    # replaces it with the basename ``USER``, destroying the ``://``
+    # anchor this regex relies on. Collapse the credentials first so
+    # the path pass only ever sees ``https://[redacted-credential]@``
+    # which the lookbehind correctly rejects.
+    out = _URL_USERINFO_RE.sub(
+        lambda m: f"{m.group(1)}{_CRED_REDACTED}@", out,
+    )
 
     # Path normalisation - quoted (Python tracebacks use these).
     def _quoted_basename(m: re.Match[str]) -> str:

@@ -1061,9 +1061,12 @@ def _sanitize_linear_regression(
     # in via the same payload type as OLS but aren't gated by
     # ``min_n_regression``. ``n_failures`` is the event count and is
     # commonly small on rare-outcome studies — "n=2000 records,
-    # 3 deaths" identifies those 3 individuals. Apply the same
+    # 3 deaths" identifies those 3 individuals. ``n_subjects`` can
+    # also fall below the gate when records are split-episode rows
+    # (stset can multiply rows per subject). The shared helper
+    # ``_coarsen_small_cox_counts`` applies the same
     # cell-suppression rule we use for ``missing_count`` so the
-    # disclosure floor is uniform.
+    # disclosure floor is uniform across surfaces.
     _coarsen_small_cox_counts(out, transformations, config)
 
     return SanitizerResult(

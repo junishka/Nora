@@ -254,6 +254,12 @@ def test_search_in_session_files_truncates_with_total_files_cap(
         (tmp_path / f"s{i:03d}.py").write_text(
             "TARGET_TOKEN here\n", encoding="utf-8",
         )
+    # Stage the files so the search tool's SDC gate treats them as
+    # researcher-known. In production the bridge runs ``initialize``
+    # at session-open; tests that exercise the search path through
+    # ``use_cwd`` bypass the bridge so do the same setup here.
+    from nora.file_provenance import initialize as _init_staged
+    _init_staged(tmp_path)
 
     with use_cwd(tmp_path):
         result = asyncio.run(HANDLERS["search_in_session_files"]({

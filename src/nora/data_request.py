@@ -391,11 +391,11 @@ def _numeric_bounds(series: Any, n_total: int) -> RequestResult:
     if n_effective < NUMERIC_BOUNDS_MIN_N:
         # Don't echo ``n_effective`` in the reason. The denial itself
         # already reveals that the non-missing N is below
-        # ``NUMERIC_BOUNDS_MIN_N``; spelling it out publishes the exact
-        # small subgroup size the suppression was meant to hide. The
-        # threshold is safe to disclose — it's a fixed configuration
-        # constant — the actual count is not. Same posture as
-        # ``_na_count`` above.
+        # ``NUMERIC_BOUNDS_MIN_N``; spelling out e.g. "3 non-missing
+        # observations" publishes the precise small subgroup size the
+        # suppression was meant to hide. The threshold is safe to
+        # disclose — it's a fixed configuration constant — the actual
+        # count is not. Same posture as ``_na_count`` above.
         return RequestResult(
             status="denied",
             reason=(
@@ -525,9 +525,9 @@ def _quartiles(series: Any, n_total: int) -> RequestResult:
     QUARTILES_MIN_N = 30
     if n_effective < QUARTILES_MIN_N:
         # Don't echo ``n_effective`` — see ``_numeric_bounds`` and
-        # ``_na_count`` above for the same lesson. The denial itself
-        # publishes "below the threshold"; the exact small count below
-        # is the disclosive part.
+        # ``_na_count`` above for the same lesson. The fact of the
+        # denial plus the disclosed threshold is enough for the model
+        # to back off; spelling the exact small N leaks it.
         return RequestResult(
             status="denied",
             reason=(
@@ -640,21 +640,24 @@ def _correlation_pair(
 
     pair = pd.concat([s1, s2], axis=1).dropna()
     n_complete = int(len(pair))
-    # Use the same threshold as the schema and na_count gates so the
-    # boundary "what counts as identifying" is consistent across SDC
-    # surfaces. The threshold itself is safe to name (fixed config);
-    # the actual ``n_complete`` is not — echoing it would publish the
-    # rare-pair size the suppression is meant to hide. Same posture
-    # as ``_numeric_bounds`` / ``_quartiles`` / ``_na_count`` above.
-    CORR_MIN_N = DEFAULT_CONFIG.cell_suppression_threshold
-    if n_complete < CORR_MIN_N:
+    # Same N floor as ``_numeric_bounds`` and ``_quartiles`` (30). The
+    # docstring above already commits to this posture ("the same
+    # minimum N as numeric_bounds"); the previous literal was 10,
+    # which let near-perfect r values at N=10-29 imply the
+    # coordinates of individual observations exactly as the comment
+    # warns. As with the other tail-statistics, the denial reason
+    # doesn't echo the exact ``n_complete`` — the fact of the denial
+    # plus the disclosed threshold is enough.
+    CORRELATION_MIN_N = 30
+    if n_complete < CORRELATION_MIN_N:
         return RequestResult(
             status="denied",
             reason=(
-                f"fewer than {CORR_MIN_N} row(s) have both variables "
-                f"observed — too few to publish a correlation without "
-                f"identifying individuals (a near-perfect r at small N "
-                f"usually just says 'these few points are collinear')."
+                f"fewer than {CORRELATION_MIN_N} rows with both "
+                f"variables observed — too few to publish a "
+                f"correlation without identifying individuals (a "
+                f"near-perfect r at small N usually just says 'these "
+                f"few points are collinear')."
             ),
         )
 

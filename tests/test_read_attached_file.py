@@ -130,6 +130,47 @@ def test_unstaged_cwd_script_rejected_as_sdc_bypass(tmp_path: Path) -> None:
     assert "123-45-6789" not in json.dumps(body)
 
 
+def test_corrupt_manifest_fails_closed_does_not_grant_recall(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """SDC closure: when ``file_provenance.is_known`` raises (corrupt
+    manifest, permission-blocked path, FS error), the gate must fail
+    CLOSED. The prior behaviour set ``staged_ok = True`` on any
+    exception — turning the safety check into a no-op on exactly
+    the failure mode most likely to be deliberately corrupted. The
+    fix flips the on-exception default to False so a manifest read
+    error rejects rather than letting bytes through.
+
+    We force the exception by monkeypatching ``is_known`` to raise.
+    Without the fix the call would succeed and return the file
+    bytes; with the fix it returns a clean rejection.
+    """
+    from nora.config import set_cwd as _set_cwd
+    _set_cwd(tmp_path)
+    (tmp_path / "data.csv").write_text("a\n1\n", encoding="utf-8")
+    (tmp_path / "looks_legit.py").write_text(
+        "secret_marker = 'should_not_appear'\n", encoding="utf-8",
+    )
+    # Stage the file so the only way for ``is_known`` to refuse
+    # would be a manifest read failure (which we're simulating).
+    from nora.file_provenance import initialize as _init_staged
+    _init_staged(tmp_path)
+    # Now make is_known raise on every call.
+    import nora.file_provenance as fp_mod
+    def _boom(cwd, name):  # type: ignore[no-untyped-def]
+        raise RuntimeError("simulated corrupt manifest")
+    monkeypatch.setattr(fp_mod, "is_known", _boom)
+
+    response = asyncio.run(read_attached_file.handler(
+        {"name": "looks_legit.py"},
+    ))
+    body = _text_payload(response)
+    assert body["status"] == "rejected"
+    # And no file bytes in the response payload.
+    assert "secret_marker" not in json.dumps(body)
+    assert "should_not_appear" not in json.dumps(body)
+
+
 def test_script_text_returned_inline(tmp_path: Path) -> None:
     set_cwd(tmp_path)
     (tmp_path / "regression.py").write_text(
