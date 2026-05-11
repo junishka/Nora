@@ -163,7 +163,16 @@ exe = EXE(
     # ``~/Library/Logs/Nora/`` for debugging.
     console=False,
     disable_windowed_traceback=False,
-    target_arch=None,
+    # Pin to arm64 so the bundle can never silently go Intel just
+    # because someone ran the build under a Rosetta-installed Python.
+    # ``None`` defers to the host interpreter's arch, which is fine on
+    # an arm64 uv/Python but means an Intel build sneaks through with
+    # no warning if the toolchain is mixed. PyInstaller will refuse to
+    # produce an arm64 binary from an x86_64 Python, surfacing the
+    # mismatch loudly at build time. release.sh's verify step also
+    # asserts the resulting Mach-O is arm64 as a belt-and-suspenders
+    # guard against future spec edits.
+    target_arch="arm64",
     codesign_identity=None,
     entitlements_file=None,
     icon=str(REPO_ROOT / "packaging" / "Nora.icns"),
