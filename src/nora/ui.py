@@ -4154,7 +4154,7 @@ def _session_title(cwd: Path) -> str:
     """Human-friendly title for a session. Preference order:
       0. A researcher-set ``custom_name`` from session_state.json.
       1. A single dataset's filename (most common case: one upload).
-      2. "<first> +N more" when multiple datasets live in the dir.
+      2. "<first> +N" when multiple datasets live in the dir.
       3. A "Session MMM DD, HH:MM" stamp derived from the dir name.
       4. The dir's basename as a last-resort fallback.
     The goal is that the topbar always shows something a researcher
@@ -4178,7 +4178,7 @@ def _session_title(cwd: Path) -> str:
     if len(datasets) == 1:
         return datasets[0]
     if len(datasets) > 1:
-        return f"{datasets[0]} +{len(datasets) - 1} more"
+        return f"{datasets[0]} +{len(datasets) - 1}"
 
     ts = _parse_session_timestamp(cwd.name)
     if ts is not None:
