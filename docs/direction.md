@@ -1,19 +1,17 @@
 # Nora — architectural direction
 
-Working document. Last substantive update **2026-04-27**, after
-the concurrent-session refactor (per-cwd `SessionRunner`, per-task
-cwd via `ContextVar`), plot vision (manifest-allowlisted helpers,
-no file-based escape hatch), Stata export reliability
-(PDF / PNG / EPS / .gph fallback, sips-based PDF→PNG conversion),
-runtime-environment probing in the system prompt, and the
-Files-panel polish (graphs first, copy/send/delete row actions,
-longer dropdown). Earlier in the same self-pilot cycle: Builder
-→ Nora rename, .app launches web UI, the memory stack
-(warm-start prefix + recall_conversation tool + durable
-session_state.json), the security-review fixes (env-var
-allowlist, per-cwd store, filename sanitization, OLS coefficient-
-key constraint, CI length, structural size caps), and the
-product-identity prompt rule. The core decision — stay with
+Working document. Last substantive update **2026-05-12**, after
+the release-readiness / documentation alignment pass: Nora is now
+documented as a multi-provider app (Anthropic or OpenAI), the
+model-facing surface is consistently fourteen MCP tools, supported
+data formats are consistently seven (`.csv`, `.tsv`, `.dta`,
+`.rds`, `.parquet`, `.jsonl`, `.ndjson`), install language treats
+R / Stata / Python as selectable analysis runtimes, and the `.dmg`
+is recorded as signed + notarized. Earlier self-pilot batches
+covered concurrent sessions, plot vision, Stata export reliability,
+runtime-environment probing, Files-panel polish, the Builder →
+Nora rename, the web UI `.app`, the memory stack, and the
+security-review fixes. The core decision — stay with
 script-submission ("Option A") rather than pivot to plan-submission
 with a bundled local LLM — still stands from 2026-04-20.
 
@@ -25,8 +23,9 @@ isn't, and why.
 
 ## The decision
 
-**Keep the current architecture.** Remaining work is hardening, UX,
-and real-researcher contact — not restructuring.
+**Keep the current architecture.** Remaining work is outside-pilot
+feedback, small consent/policy UX, and future deployment governance
+— not restructuring.
 
 A recent external reviewer proposed replacing the frontier model's
 direct script authorship with a plan-submission architecture where
@@ -70,7 +69,7 @@ researcher use case demands it.
 
 ## What's built
 
-As of 2026-04-25, the implementation covers:
+As of 2026-05-12, the implementation covers:
 
 - Spine + full SDK lockdown (14 MCP tools — get_schema, search_schema,
   request_data, submit_script, submit_script_file, expand_result,
@@ -78,24 +77,27 @@ As of 2026-04-25, the implementation covers:
   recall_conversation, read_attached_file, list_session_files,
   search_in_session_files, install_packages — every built-in disabled,
   four defense layers).
-- Schema extractor for `.csv` / `.dta` / `.rds` with four depth
-  tiers; default is `names_types_labels_summary`.
+- Schema extractor for `.csv`, `.tsv`, `.dta`, `.rds`,
+  `.parquet`, `.jsonl`, and `.ndjson` with four depth tiers;
+  default is `names_types_labels_summary`.
 - Executor with `(deny default)` subpath-allowlist sandbox AND an
   explicit subprocess env-var allowlist (PATH/HOME/LANG/LC_*/TMPDIR/
   USER/SHELL/R_LIBS — no ANTHROPIC_API_KEY, AWS creds, or other
-  shell secrets visible to scripts). Per-run HMAC token authenticates
-  payloads from the runtime library. Pure unit tests lock in the
-  SBPL profile shape; integration tests verify real sandbox behavior
-  (gated on `Rscript` + sandbox-apply preflight).
-- Sanitizer across six analysis families (linear regression,
-  t-test, descriptive, frequency table, crosstab, magnitude table)
-  with full R + Stata parity. OLS coefficient-key constraint
-  (inner keys must match declared predictors); confidence-interval
-  length constraint (must be exactly 2); structural size caps on
-  every dict / list payload field; filename + variable-name
-  sanitization at every prompt-injection surface.
-- Runtime libraries (R + five Stata `.ado` files) with
-  JSON-escaped labels and CR/LF/TAB handling.
+  shell secrets visible to scripts). The profile now uses narrow
+  `/private/etc` literals instead of a broad subtree read. Per-run
+  HMAC token authenticates payloads from the runtime library. Pure
+  unit tests lock in the SBPL profile shape; integration tests
+  verify real sandbox behavior (gated on installed runtimes +
+  sandbox-apply preflight).
+- Sanitizer across the supported analysis families, with runtime
+  emitters in R, Python, and Stata where applicable. OLS
+  coefficient-key constraint (inner keys must match declared
+  predictors); confidence-interval length constraint (must be
+  exactly 2); structural size caps on every dict / list payload
+  field; filename + variable-name sanitization at every
+  prompt-injection surface.
+- Runtime libraries for R, Python, and Stata with JSON-escaped
+  labels and CR/LF/TAB handling.
 - SQLite result store, keyed by resolved cwd (no cross-session leak
   in the same process).
 - Memory stack: every turn persisted to `.nora/chat_history.jsonl`
@@ -144,156 +146,48 @@ As of 2026-04-25, the implementation covers:
   support.
 - Packaging: `.app` launches the web UI directly (no Terminal popup);
   the release `.dmg` is signed and notarized.
-- 283 tests, ~3,600 Hypothesis-generated adversarial cases. Pushed
-  to [github.com/junishka/builder](https://github.com/junishka/builder).
+- 1121 pytest cases collected via `uv run pytest --collect-only -q`
+  on 2026-05-12, plus Hypothesis-generated adversarial cases.
+  Canonical repo: [github.com/junishka/Nora](https://github.com/junishka/Nora).
 
 ## What's remaining (prioritized)
 
-### 1. Security hardening (1–2 sessions)
+### 1. Outside pilot on real data
 
-- **Tighten `/private/etc` reads.** Current profile allows the
-  whole `/private/etc` subtree. R/Stata only actually need a small
-  set of config files (`hosts`, `localtime`, `resolv.conf`,
-  `protocols`). Replace the subpath with literals for those files.
-  Closes reads of `/etc/passwd` and similar through the
-  result-payload exfil channel.
-- **Runtime-library contract.** Today a malicious script can write
-  hand-crafted JSON directly to `NORA_RESULT_PATH`, bypassing
-  the runtime library. Fix options, ordered by the strength of
-  guarantee they actually provide:
-  - **(a) Stricter sanitizer structural checks** that reject
-    payloads without a runtime-library-shaped signature. Weakest:
-    a determined attacker can replicate the shape.
-  - **(b) Per-run token** the runtime library embeds in every
-    payload; executor validates. **Raises attacker cost** — the
-    trivial write-to-NORA_RESULT_PATH bypass stops working. Does
-    **not** provide a strong guarantee: R closures are
-    introspectable, so a script that knows the architecture can
-    find the token in the library's loaded environment. Useful
-    interim measure.
-  - **(c) Pre-opened fd** the subprocess inherits but can't
-    discover by path. Structural fix — the path the model's code
-    knows about simply isn't the fd the library writes through.
-    Significantly more work in R.
+The release path exists; the missing signal is a real outside
+researcher using Nora on real data. The user self-pilot is useful,
+but a colleague or two validates whether the install flow, model
+choice, runtime requirements, file upload, raw-output panels,
+policy chip, and result tables make sense to someone who did not
+build the system.
 
-  Plan: **ship (b) first** for the cost-raising benefit. Commit to
-  **(c) as the follow-on** if the runtime-authenticity concern
-  matters for researchers handling more sensitive data than
-  current pilots.
+### 2. First-open policy nudge
 
-### 2. Researcher consent UI for schema depth — *done*
+Schema depth is already explicit researcher policy in
+`<cwd>/.nora/policy.json`, with per-dataset ceilings and a
+composer Permission chip. The default is
+`names_types_labels_summary`; raw values, min, max, median, and
+individual observations remain unavailable at every schema tier.
+The remaining UX polish is an explicit first-open nudge for
+un-policy'd datasets so researchers understand the default before
+their first analysis.
 
-Schema depth is now an explicit researcher policy in
-`<cwd>/.nora/policy.json` rather than a code default. Each
-dataset has a per-file `max_depth` ceiling (or inherits
-`default_max_depth`); `get_schema` denies requests above the
-ceiling, annotates successful responses with the current
-`policy_max_depth` so the model knows the limit without probing.
-Malformed policy files fall back to the default silently — a
-broken file can't lock the researcher out.
+### 3. Runtime-authenticity follow-on, only if needed
 
-**Depths (least to most permissive):**
-- `names_only` — variable names only.
-- `names_types` — + a coarse type per variable.
-- `names_types_labels` — + variable labels and value labels.
-- `names_types_labels_summary` — + per-variable NA counts and
-  distinct-value counts for categoricals. **Default.** (The
-  default was raised from `names_types` once the per-dataset
-  Permission UI made it cheap for researchers to dial it down
-  for any dataset where the labels / counts are sensitive.)
+The implemented per-run token rejects trivial hand-crafted writes
+to `NORA_RESULT_PATH`; tests pin that behavior. It is a cost-raising
+measure, not a cryptographic proof against malicious code running
+inside the interpreter. A stronger pre-opened-fd design remains
+available if future pilots involve a threat model where runtime
+authenticity is load-bearing.
 
-Never at any depth: raw values, min, max, median, individual
-observations. Those belong to `request_data` (with its own SDC
-rules) and `submit_script` (sanitized via the result pipeline).
+### 4. Distribution-mode governance
 
-Interactive editing lives in the composer's compact "Policy" chip:
-click unfurls a popup with per-dataset dropdowns, changes write
-through the `set_dataset_policy` bridge method to
-`.nora/policy.json`. The JSON file remains the single source of
-truth, so a researcher who prefers hand-editing can keep doing that.
-Unknown depths / malformed entries silently fall back to the
-conservative default — a broken policy never locks anyone out.
-
-Also covered: ceiling annotation on successful responses (so
-the model learns the limit without probing), per-dataset
-independence (each dataset has its own ceiling), explicit-vs-
-default distinction in denial messages.
-
-Still on the list: automatic prompt on first-open of an
-un-policy'd dataset (currently the conservative default just
-applies silently and the chip reflects it).
-
-### 3. Packaging to `.dmg` — *done*
-
-The release path is a signed and notarized `.dmg`. The app bundles
-Nora's Python code and web assets, then invokes external analysis
-runtimes (R, Stata, Python) from the researcher's machine.
-
-### 4. One real researcher on real data
-
-The most important missing signal. The user (a quantitative
-researcher) is the cheapest researcher #1 — they have real data,
-real analytical questions, and they've built the thing so they can
-surface UX issues in a single afternoon. A colleague or two as #2
-and #3 validates whether the tool works for someone who *didn't*
-build it.
-
-### 5. Web UI polish — follow-ons from the first test run
-
-The pywebview shell ships. Still to do, ordered by how often the
-current friction bites:
-
-- **Drag-and-drop / file upload instead of picking a directory
-  path.** First researcher feedback: *"in the future we should be
-  just able to upload the data instead of choosing path."*
-  Implementation sketch: launch the app into a "no data yet" state
-  with a drop zone; on drop, copy the files into a managed dir
-  (e.g. `~/Library/Application Support/Nora/sessions/<id>/`)
-  and use that as cwd. Avoids the `~/Users/bb/…` path-expansion
-  class of mistake entirely, and doesn't expose a whole project
-  directory to the sandbox just to give the model two files.
-- **Markdown-rendered assistant text with tables and code blocks.**
-  *Done.* `src/nora/web/markdown.js` is an in-tree renderer that
-  covers paragraphs, headings, fenced code, inline code, bold /
-  italic, lists, blockquotes, HTTPS links, and GitHub-flavored
-  pipe tables (added after researcher feedback that coefficient
-  tables rendered as raw pipes). No CDN dependency — keeps
-  "nothing phones home" intact.
-- **Inline raw R/Stata output panel.** *Done.* `tool_result` events
-  carry the first 32 KB of `stdout.log` and `stderr.log`; the result
-  panel renders them above the collapsed sanitized JSON. Action
-  buttons ("Open output", "Open in Stata/R", "Show folder") let the
-  researcher launch the native app on the staged script with one
-  click.
-- **Policy editing in the UI.** *Done.* Compact "Policy" chip in
-  the composer footer unfurls a per-dataset dropdown popup,
-  writing through `set_dataset_policy` to `.nora/policy.json`.
-- **Dataset picker sidebar / session list.** *Done.* Left rail in
-  the web UI lists every session under `~/.nora-sessions/` with
-  timestamp + dataset label + on-disk size; click switches into
-  the session, the chat replays from `chat_history.jsonl`, and the
-  warm-start prefix injects the recent turns + recent results so
-  the model picks up where the conversation left off. Sidebar is
-  collapsible and drag-to-resize. Sessions are renameable: click
-  the topbar pill or the per-row `✎` button to set a custom name
-  (persisted in `session_state.json` as `custom_name`, preserved
-  across the per-turn snapshot rewrite); empty save reverts to the
-  auto-derived dataset/timestamp label.
-- **Bundling web assets into the PyInstaller `.app`.** *Done.*
-  The spec lists `src/nora/web/` (HTML / JS / CSS / Lottie / vendored
-  player) as data files; the .app's bundle entry is `__main__.py`
-  which calls `nora.ui:main`, so a double-click opens the pywebview
-  chat window directly with no Terminal popup.
-  Logs go to `~/Library/Logs/Nora/nora-YYYY-MM-DD.log` for
-  debugging when it fails to start. The release `.dmg` is signed
-  and notarized for distribution.
-- **Turn-state discipline in the web UI.** *Done* (after
-  feedback that the Send button was re-enabling too early). The
-  bridge's `send_message` is fire-and-forget by design; the web
-  UI now latches `turnInFlight` on submit and only clears it
-  when `turn_done` / `turn_error` / `auth_failure` arrives, so a
-  quick tester can't pipeline prompts that interleave in the
-  transcript.
+Cumulative inference, release ledgers, multi-tenant policy, and
+audit retention are real concerns for wider deployment. They are
+not blockers for the current mode: a researcher running Nora on
+their own machine, against their own data, with their own provider
+credential.
 
 ## Known-real, design-pending
 
@@ -370,8 +264,8 @@ datasets. Not urgent for pilot-scale public-ish research.
 - Every executor output passes through the sanitizer before
   reaching the model.
 - Raw stderr / stdout never reach the model.
-- Schema exposure is explicit researcher policy, conservative by
-  default.
+- Schema exposure is explicit researcher policy, bounded by the
+  per-dataset ceiling.
 - Researcher sees raw logs and sanitized output; the model sees
   sanitized output only.
 - **Plot vision is helper-allowlist gated.** Only files produced
@@ -403,15 +297,15 @@ datasets. Not urgent for pilot-scale public-ish research.
 
 - **Bundling a local LLM on the critical path.** 15–17 GB install
   footprint, requires 16 GB+ RAM, produces worse R/Stata than
-  frontier models — especially Stata, where the open training corpus is
-  thin. Privacy benefit is narrow (closes the
+  frontier models — especially Stata, where the open training corpus
+  is thin. Privacy benefit is narrow (closes the
   frontier-authored-code channel for adaptive attackers) but does
   not address cumulative-inference / adaptive-probing risks, which
   are inherent to interactive analysis regardless of authorship
   and are handled by session-level disclosure budgets and the
   SDC rules. Stays available as a future optional helper for:
-  error recovery using raw stderr (which the frontier model can't see),
-  text-data redaction so free-text values can flow through the
+  error recovery using raw stderr (which the frontier model can't
+  see), text-data redaction so free-text values can flow through the
   sanitizer, and quality improvements in specific edge cases.
   Re-enters the discussion when a real researcher's task actually
   needs one of these.
@@ -423,10 +317,11 @@ datasets. Not urgent for pilot-scale public-ish research.
   enforces conservative defaults and makes the choice visible; it
   doesn't enforce a ceiling.
 
-- **Language-specific hybrid (frontier model writes Stata, local model
-  writes R/Python).** The premise — that local models are weak on
-  Stata — is true, but Option A has the frontier model writing all three
-  languages directly. The hybrid solves a problem we don't have.
+- **Language-specific hybrid (frontier model writes Stata, local
+  model writes R/Python).** The premise — that local models are weak
+  on Stata — is true, but Option A has the frontier model writing
+  all three languages directly. The hybrid solves a problem we don't
+  have.
 
 - **A `register_plot(file, kind)` API for arbitrary plot files.**
   Tried in 2026-04-26 and removed days later: the kind label was
@@ -456,17 +351,17 @@ datasets. Not urgent for pilot-scale public-ish research.
 
 ## Open policy decisions
 
-- **Default schema depth.** names+types (safest) vs names+types+
-  labels (more useful). Labels are sometimes disclosive (rare
-  diagnosis codes, specific named conditions). Leaning:
-  names+types default, with an opt-in prompt for labels during
-  first-dataset-open.
-- **Packaging framework.** PyInstaller vs py2app vs Briefcase.
-  Decided when the packaging work actually starts.
+- **First-open schema-policy nudge.** The default is
+  `names_types_labels_summary`; decide whether first-open should
+  actively ask the researcher to confirm or lower that ceiling.
 - **When to revisit local LLM.** Rule of thumb: when a real
   researcher asks for something only a local model can provide
   (text-data analysis, stderr-based repair of a specific recurring
   failure mode). Not before.
+- **When to invest in pre-opened-fd result emission.** The current
+  per-run token blocks trivial hand-crafted payloads. A stronger fd
+  design should wait for a pilot or deployment threat model that
+  needs it.
 
 ## What must not happen
 
@@ -474,4 +369,4 @@ datasets. Not urgent for pilot-scale public-ish research.
 - Sandbox or sanitizer becomes conditional on a flag.
 - Raw stderr / stdout reaches the model.
 - Schema-exposure defaults widen silently.
-- Runtime-library bypass remains open indefinitely.
+- Trivial runtime-library bypass reopens.

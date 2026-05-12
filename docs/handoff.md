@@ -1,38 +1,23 @@
 # Nora — handoff
 
 Single-page entry point for picking this project up. Last
-substantive update **2026-05-03**, after a chat-UX polish batch:
-sessions are now researcher-renameable (click the topbar pill or
-the sidebar `✎` to type a custom name; persists in
-`session_state.json`, falls back to the auto-derived
-dataset/timestamp label when cleared); a long assistant reply now
-top-anchors so it's read from its first sentence rather than
-landing the researcher at the bottom (`scrollMessageToTop`,
-re-applied on `turn_done` after the cat removal shifts layout);
-list bullets in chat output replace the native `::marker` with a
-`::before` rendered inside the `<li>` content box (fixes a WebKit
-selection-paint leak that left thin colored bars in the marker
-gutter after a multi-bullet drag-select); the loading-indicator
-label rotation expanded with data-themed gerunds (`crunching`,
-`wrangling`, `reticulating splines`, …); sidebar arrow-nav no
-longer hijacks `Backspace` while the user is typing in the rename
-input. Previous batch (2026-04-30) was the multi-result wire-
-format pass: `submit_script` now emits one structured payload per
-helper call instead of one per script (24-spec batches no longer
-lose 23 of 24 results), with a partial-success surface for mid-
-loop aborts; per-result inline `payload` + `markdown` fields so
-the model doesn't have to call `expand_result` once per result;
-new `submit_script_file` and `search_schema` tools (10 total
-now); canonical-table renderer (`result_render.render_table`)
-exposed via `expand_result(view="markdown")` and inline on every
-ok-status result; UI renders Nora's canonical tables on the
-submit_script tool-result card; row-count audit cached once per
-call (was re-reading a 3 GB .dta on every iteration); plus a
-batch of audit fixes: `recall_conversation` AttributeError on
-multi-result tool calls, `list_results` newest-first + bounded,
-`session_state` user/assistant pairing for in-flight turns,
-read_attached_file path-prefix containment, composer image
-durability, and the silent attachment carry-back on cancel. If
+substantive update **2026-05-12**, after the release-readiness /
+documentation alignment pass: public copy now describes Nora as
+multi-provider (Anthropic or OpenAI) instead of Claude-only;
+install docs list R, Stata, and Python as analysis runtimes rather
+than treating Stata as optional; the tool surface is consistently
+documented as fourteen MCP tools including `install_packages`; the
+`.dmg` status is signed + notarized; GitHub URLs point at the
+canonical `junishka/Nora` repo; test counts were refreshed from
+pytest collection. The previous substantive batch (2026-05-03)
+was chat-UX polish: researcher-renameable sessions, top-anchored
+long assistant replies, WebKit list-marker selection fixes,
+expanded loading labels, and sidebar keyboard shortcut guards.
+The 2026-04-30 batch was the multi-result wire-format pass:
+append-mode JSONL result emission, partial-success semantics,
+inline compact result payloads, canonical markdown tables,
+`submit_script_file`, `search_schema`, row-count audit caching,
+and related recall/listing/session-state audit fixes. If
 something here disagrees with the code, trust the code and file a
 patch to this doc.
 
@@ -44,8 +29,8 @@ the scenes, without that data leaving the machine. From the
 researcher's point of view, Nora is one product they talk to — the
 underlying provider model is the engine, not exposed as the product.
 The model reaches the researcher's files through a narrow
-fourteen-tool MCP interface — no Bash, no filesystem, no network. Scripts
-run under `sandbox-exec` with network denied and a tight
+fourteen-tool MCP interface — no Bash, no filesystem, no network.
+Scripts run under `sandbox-exec` with network denied and a tight
 subpath-allowlist for reads; every output passes through a
 disclosure-control sanitizer (SDC rules from Eurostat / UK ONS
 guidance) before anything reaches the model. The researcher sees raw
@@ -65,7 +50,7 @@ keep streaming.
 | **Data-boundary architecture** — tool interface + sandbox + sanitizer | ✅ implemented and tested |
 | **Schema extraction** — `.csv`, `.tsv`, `.dta`, `.rds`, `.parquet`, `.jsonl` / `.ndjson`, four depth tiers | ✅ done; default tier `names_types_labels_summary` |
 | **Executor** — `(deny default)` sandbox, R + Stata + Python, runtime libraries, per-run token, env-var allowlist | ✅ done |
-| **Sanitizer** — six analysis families, SDC rules, text-safety, structural size caps | ✅ done; ~3,600 Hypothesis cases + helper-through-sanitizer end-to-end suite |
+| **Sanitizer** — supported analysis families, SDC rules, text-safety, structural size caps | ✅ done; Hypothesis cases + helper-through-sanitizer end-to-end suite |
 | **Result store** — SQLite, audit log, `expand_result`, per-cwd cache | ✅ done; cache rebinds on session switch |
 | **Permission policy** — per-dataset schema-depth ceiling, UI dropdowns | ✅ done |
 | **Filename / variable-name sanitization** at every prompt-injection surface | ✅ done |
@@ -124,9 +109,10 @@ keep streaming.
 | **Apple Developer Program signing + notarization for distributable .dmg** | ✅ done — release `.dmg` is signed (Developer ID Application) and notarized |
 | **Stata batch wrapper around `_cons` "omitted" edge case** | ⏭ named, low-priority |
 
-**758 tests passing**, 17 skipped (sandbox-exec / pandas-dependent).
-Coverage spans SDK lockdown (Anthropic) +
-OpenAI lockdown, schema for all six file formats, executor SBPL
+**1121 pytest cases collected** via `uv run pytest --collect-only -q`
+on 2026-05-12. Full pass/fail depends on local sandbox/runtime
+availability. Coverage spans SDK lockdown (Anthropic) +
+OpenAI lockdown, schema for all seven file formats, executor SBPL
 profile, Python executor end-to-end, helper-through-sanitizer
 round-trips for every `from_*` emitter, sanitizer property tests,
 policy, text-safety, row-count audit, stderr isolation, per-run
@@ -449,7 +435,7 @@ them by surprise.
 | `src/nora/runner.py` | `SessionRunner` — per-cwd execution unit. Owns provider session, lock, turn task, plot-vision capture, helper-error logging |
 | `src/nora/plot_convert.py` | macOS `sips`-based PDF/EPS → PNG conversion with mtime-cached sidecars. Used by both the runner (model vision) and the bridge (researcher thumbnails) |
 | `src/nora/runtime/nora.R` + `nora.py` + `nora_result_*.ado` + `nora_plot_*.ado` + `_nora_export_plot.ado` + `nora_safe_export.ado` | Runtime emitters: result helpers (`from_lm`, `from_t_test`, …) and plot helpers (`plot_residuals`, `plot_interaction`, `plot_coefficients`, `plot_estimate_comparison`). Stata fallback chain in `_nora_export_plot`; Stata ad-hoc safe wrapper in `nora_safe_export` |
-| `src/nora/schema.py` | Schema extractors for all six supported file formats |
+| `src/nora/schema.py` | Schema extractors for all seven supported file formats |
 | `src/nora/ui.py` | Web UI bridge: runners dict, focus-only `switch_session`, plot collection + diagnostic, Files panel endpoints, cache-busted index.html, `delete_session_file` |
 | `src/nora/chat_service.py` | Back-compat re-export shim for the Event types |
 | `src/nora/chat_history.py` | Turn-grouped reader; warm-start prefix renderer |
@@ -460,7 +446,7 @@ them by surprise.
 | `docs/overview.md` | Plain-language description for researchers |
 | `docs/install.md` | Researcher-facing install flow |
 | `docs/verification.md` | Manual smoke-test recipes (incl. Stata, which CI can't) |
-| `tests/` | 610 tests. `test_sanitizer.py` is the property-test backbone (now also covers vif / condition_number / vcov + correlation_matrix); `test_concurrent_sessions.py` pins the per-task ContextVar isolation; `test_plot_vision.py` pins the manifest-allowlist privacy gate; `test_run_dir_plots.py` covers thumbnail collection + PDF→PNG conversion + Stata export fallback chain; `test_openai_lockdown.py` pins the no-built-in-tools invariant; `test_cross_session_recall.py` pins the env-gated cross-session lookup + path-confinement defense; `test_bridge_lifecycle.py` covers active-session delete + landing-page navigation |
+| `tests/` | 1121 pytest cases collected as of 2026-05-12. `test_sanitizer.py` is the property-test backbone (now also covers vif / condition_number / vcov + correlation_matrix); `test_concurrent_sessions.py` pins the per-task ContextVar isolation; `test_plot_vision.py` pins the manifest-allowlist privacy gate; `test_run_dir_plots.py` covers thumbnail collection + PDF→PNG conversion + Stata export fallback chain; `test_openai_lockdown.py` pins the no-built-in-tools invariant; `test_cross_session_recall.py` pins the env-gated cross-session lookup + path-confinement defense; `test_bridge_lifecycle.py` covers active-session delete + landing-page navigation |
 
 ## Decisions worth not re-litigating
 
@@ -545,11 +531,10 @@ them by surprise.
   `nora_safe_export` wrapper handles ad-hoc exports outside
   helpers. Don't add a new helper that calls `graph export`
   directly.
-- **GitHub repo is still named `builder`** (URL:
-  github.com/junishka/builder). Renaming a GitHub repo is an
-  out-of-band action; URLs in install instructions still point
-  there. The local clone gets renamed at `git clone … nora` time
-  so the on-disk dir matches the product name.
+- **GitHub repo is `junishka/Nora`.** Older `junishka/builder`
+  URLs redirect, but docs should use the canonical repo name. The
+  local clone still gets renamed to `nora` in install snippets so
+  the on-disk dir matches the product name.
 
 ## Next concrete step
 

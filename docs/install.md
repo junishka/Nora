@@ -22,7 +22,7 @@ Download the latest `Nora.dmg`, open it, and drag `Nora.app` to `/Applications`.
 ## Path 2 — from source
 
 ```bash
-git clone https://github.com/junishka/builder.git nora
+git clone https://github.com/junishka/Nora.git nora
 cd nora
 uv sync --group dev
 uv run pytest
@@ -42,7 +42,7 @@ project folder.
 You can rebuild the bundle locally if you want to ship a custom variant or test packaging changes. The same scripts produce the released artifact when run with the right env vars set.
 
 ```bash
-git clone https://github.com/junishka/builder.git nora
+git clone https://github.com/junishka/Nora.git nora
 cd nora
 uv sync --group dev
 bash packaging/build_app.sh         # → dist/Nora.app  (~70 MB)

@@ -52,7 +52,7 @@ To build the `.dmg` yourself or run from source, see below.
 ## Run from source
 
 ```bash
-git clone https://github.com/junishka/builder.git nora
+git clone https://github.com/junishka/Nora.git nora
 cd nora
 uv sync --group dev
 uv run pytest
@@ -131,8 +131,9 @@ because Nora invokes them as subprocesses.
   - `provider/` for the Anthropic and OpenAI session adapters.
   - `chat_service.py` for the typed event stream the frontend
     consumes.
-- `tests/` for 775 tests. `test_sanitizer.py` is the property-test
-  backbone. `test_executor_*` cover the sandbox profile.
+- `tests/` for 1121 pytest cases collected as of 2026-05-12.
+  `test_sanitizer.py` is the property-test backbone.
+  `test_executor_*` cover the sandbox profile.
   `test_concurrent_sessions.py` covers multi-runner isolation.
 - `docs/` for handoff, overview, direction, install, verification.
 - `packaging/` for the PyInstaller spec and the `.app` / `.dmg`
