@@ -874,13 +874,13 @@ kbd {
 
 .sidebar {
   /* Left rail. Width is driven by the ``--sidebar-width`` custom
-   * property (defaults to 280px, persisted via localStorage when
+   * property (defaults to 308px, persisted via localStorage when
    * the researcher drags the right-edge handle). Triple-locking the
    * width via flex-basis / width / max-width protects the layout
    * from any nested flex item reporting a huge intrinsic min-width
    * (earlier versions ballooned to 80% of the window when a session
    * row had six comma-joined CSV filenames). */
-  --sidebar-width: 280px;
+  --sidebar-width: 308px;
   flex: 0 0 var(--sidebar-width);
   width: var(--sidebar-width);
   max-width: var(--sidebar-width);

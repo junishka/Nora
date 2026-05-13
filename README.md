@@ -1,7 +1,9 @@
 # Nora
 
-Local research assistant for sensitive data. The data stays on the
-researcher's machine. Nora can use Anthropic or OpenAI models.
+Research assistant for sensitive data. The data stays on the
+researcher's machine, and the frontier model never sees the raw
+data. It drives a complete analysis through sanitized summaries
+only. Nora can use Anthropic or OpenAI models.
 
 The model reaches the researcher's files through a fourteen-tool MCP
 interface. No Bash. No filesystem. No network. Scripts run under
