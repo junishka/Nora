@@ -1492,7 +1492,7 @@ def _stata_command(stata: str, lib_dir: Path, script_path: Path) -> list[str]:
     on the subprocess cwd being the scratch dir. Absolute paths don't
     work here — Stata's batch-mode argument parser tokenizes
     ``-b do <path>`` on spaces, so a researcher whose project lives
-    under ``~/IESE Dropbox/...`` would hit ``file /Users/bb/IESE.do
+    under ``~/Work Folder/...`` would hit ``file /Users/you/Work.do
     not found`` even though the shell passed a perfectly-quoted
     argument. See ``run_script`` for where subprocess_cwd is set to
     run_dir for Stata.

@@ -97,7 +97,7 @@ _FEEDBACK_MAX_MESSAGE_CHARS = 8000
 # This list captures the unambiguous cases. ``~/Documents`` /
 # ``~/Desktop`` / ``~/Downloads`` are intentionally NOT here:
 # they're plausible project parents (a researcher might keep a
-# study under ``~/Documents/IESE/dropout-2026/``), and rejecting
+# study under ``~/Documents/research/my-study/``), and rejecting
 # them would over-block real workflows. The check fires only on
 # roots so broad that no realistic project lives directly there.
 _DANGEROUS_CWD_LITERALS: frozenset[Path] = frozenset({
@@ -5444,7 +5444,7 @@ def _resolve_cwd(raw: str | None) -> Path | None:
         else:
             msg.append(
                 "  Hint: pass an absolute path (like "
-                "/Users/bb/Downloads) or a tilde path (~/Downloads), "
+                "/Users/you/Downloads) or a tilde path (~/Downloads), "
                 "or launch without a path and choose files from the "
                 "landing screen."
             )

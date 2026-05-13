@@ -7,7 +7,7 @@ classifiers = [
     "Development Status :: 4 - Beta",
     "Environment :: MacOS X",
     "Intended Audience :: Science/Research",
-    "License :: Other/Proprietary License",
+    "License :: OSI Approved :: Apache Software License",
     # Platform scope: `submit_script` relies on macOS `sandbox-exec` for
     # its privacy boundary. Non-macOS platforms can run the chat and
     # schema tools but scripts refuse to execute. Do not promise what

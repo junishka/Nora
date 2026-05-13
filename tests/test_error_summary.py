@@ -55,13 +55,13 @@ def test_python_traceback_path_is_basenamed() -> None:
     number does (which is what the model needs)."""
     stderr = (
         'Traceback (most recent call last):\n'
-        '  File "/Users/bb/.nora-sessions/2026/regression.py", line 42, in main\n'
+        '  File "/Users/you/.nora-sessions/2026/regression.py", line 42, in main\n'
         '    1 / 0\n'
         'ZeroDivisionError: division by zero\n'
     )
     excerpt = extract_debug_excerpt("", stderr, 1, "Python")
     assert excerpt is not None
-    assert "/Users/bb/.nora-sessions" not in excerpt
+    assert "/Users/you/.nora-sessions" not in excerpt
     assert '"regression.py"' in excerpt
     assert 'line 42' in excerpt
 

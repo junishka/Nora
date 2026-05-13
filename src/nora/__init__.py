@@ -1,7 +1,8 @@
-"""Nora — a thin local layer between a researcher and Claude.
+"""Nora — research assistant for sensitive data.
 
-Claude drives statistical analysis against data on the researcher's own machine.
-Data never leaves the machine.
+The data stays on the researcher's machine, and the frontier model
+never sees the raw data. It drives a complete analysis through
+sanitized summaries only. Anthropic and OpenAI models supported.
 """
 
 __version__ = "0.9.0"

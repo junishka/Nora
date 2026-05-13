@@ -539,7 +539,7 @@ def test_reject_dangerous_cwd_rejects_home_and_system_roots():
 
     Plausible project parents like ``~/Documents`` are intentionally
     NOT rejected — a researcher might keep studies under
-    ``~/Documents/IESE/dropout-2026/`` and over-blocking would harm
+    ``~/Documents/research/my-study/`` and over-blocking would harm
     real workflows. The check fires only on roots that no realistic
     project lives directly inside.
     """

@@ -736,7 +736,7 @@ function replayEvent(evt) {
 function formatCwd(raw) {
   /* Abbreviate the working-directory path for display in the topbar
    * chip. The full path —
-   * ``/Users/bb/.nora-sessions/20260422T160059Z_f13630f4`` —
+   * ``/Users/you/.nora-sessions/20260422T160059Z_f13630f4`` —
    * overflows the chip and the timestamp at the tail is the part
    * the researcher actually wants to see (which session). We
    * collapse ``/Users/<user>`` to ``~`` and cap at 40 chars with a
