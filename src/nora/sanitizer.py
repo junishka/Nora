@@ -58,6 +58,23 @@ to rediscover them.**
    model object (not free-form args) and derive predictor_variables
    from the model's `xlevels`.
 
+   **Partial mitigation in place.** Every variable-name-bearing field
+   (`response_variable`, `cluster_variable`, `predictor_variables[*]`,
+   `variable`, `row_variable`, `col_variable`, `value_variable`,
+   correlation `variables[*]`) is gated by an identifier-shape regex
+   (`_NAME_IDENT_RE`) before it reaches the model. Values that survive
+   `safe_text` / `safe_key` (control-char strip, whitespace flatten,
+   length cap) but don't match the column-name / coefficient-name
+   character class — spaces, quotes, commas, semicolons, brackets,
+   braces, equals, ampersand, slashes, dollar — are replaced with the
+   empty string (scalars) or filtered out of the list (list-valued
+   fields). This narrows the channel from "any 120-char arbitrary text"
+   to "identifier-alphabet only", which blocks the dominant raw-data
+   shapes (CSV rows, JSON dumps, error-message bodies). It does not
+   close the gap for adversarial column names that already match the
+   identifier shape — the runtime-library fix above is still the
+   right long-term answer.
+
 2. **`nora$result(...)` generic escape hatch.** The R and Stata
    runtime libraries expose a generic constructor that lets a script
    emit any supported-type payload with hand-crafted fields. Legit
@@ -771,6 +788,137 @@ def _coarsen_small_cox_counts(
 
 
 # ---------------------------------------------------------------------------
+# Identifier-shape gate for variable-name fields
+# ---------------------------------------------------------------------------
+#
+# Background. Allowlisted string fields (``response_variable``,
+# ``predictor_variables``, ``variable``, ``row_variable``,
+# ``value_variable``, ``col_variable``, correlation ``variables``) are
+# supposed to carry COLUMN NAMES — short identifiers chosen by the
+# researcher in their data file. ``safe_text`` / ``safe_key`` neutralise
+# prompt-injection text (control chars, newlines, length) but place no
+# constraint on the character class. After whitespace-flattening, a
+# value like ``"x SYSTEM: ignore previous"``, a CSV row
+# ``'"John Smith",25,"Boston, MA",50000'``, or a JSON dump
+# ``'{"id": 123, "ssn": "..."}'`` all survive ``safe_text`` and reach
+# the model verbatim through the allowlist.
+#
+# Documented "Known gap #1" at the top of this file is exactly this:
+# nothing ties these fields back to the dataset schema. The ideal fix
+# lives in the runtime library (require a model object, derive names
+# from ``xlevels``), but a partial sanitizer-side defence is cheap:
+# require these fields to MATCH AN IDENTIFIER SHAPE before they're
+# echoed back. The shape admits every character a legitimate column /
+# coefficient name could plausibly contain (letters, digits,
+# underscore, period for SQL/R/Python convention; parens, colon, hash,
+# caret for R / Stata formula operators like ``factor(x)Asia``,
+# ``I(age^2)``, ``age:sex``, ``c.age#c.sex``) and EXCLUDES the
+# characters that raw CSV rows / JSON dumps / error-message bodies
+# would carry (spaces, quotes, commas, semicolons, brackets, braces,
+# equals, ampersand, slashes, dollar, asterisk).
+#
+# Threat narrowed, not eliminated: a script that already controls the
+# dataset's column names (e.g. dataset prepared by the same hostile
+# upstream) can still encode bits in shapes that pass — but bandwidth
+# drops by an order of magnitude (40-char identifier alphabet vs.
+# 120-char arbitrary-text alphabet), and the most common raw-data
+# shapes (CSV rows, JSON, error bodies, secrets with ``=`` or ``-``
+# separators) are filtered out.
+#
+# When a value fails the gate, it's replaced with the empty string and
+# a transformation log entry records the drop. For LIST-valued fields
+# (``predictor_variables``, correlation ``variables``) non-conforming
+# entries are removed from the list — coefficient-dict keys are
+# already filtered through the resulting list elsewhere in this
+# module, so dropping a predictor here automatically drops its
+# coefficient / SE / t / p / vif entries.
+_NAME_IDENT_RE = re.compile(r"^[A-Za-z0-9_.(][A-Za-z0-9_.():^#]*$")
+
+# ``safe_text`` / ``safe_key`` append this marker when an input
+# exceeds the cap. A legitimate over-length identifier (rare but
+# valid — long column names in user datasets) lands here as
+# ``"<prefix>[TRUNCATED]"``; the bracket chars aren't in the regex
+# character class above, so we strip the suffix before matching.
+_TRUNCATION_TAIL = "[TRUNCATED]"
+
+
+def _is_identifier_shape(value: str) -> bool:
+    """True iff ``value`` matches the column-name / coefficient-name shape.
+
+    Empty string is treated as non-identifier (callers that legitimately
+    have already dropped a value should not re-enter this gate). The
+    trailing ``[TRUNCATED]`` marker emitted by ``safe_text`` / ``safe_key``
+    on over-length inputs is tolerated — the marker chars are not in
+    the identifier alphabet, but their presence on the suffix is a
+    sanitizer-controlled signal, not caller-controlled bytes.
+    """
+    if not value:
+        return False
+    body = (
+        value[: -len(_TRUNCATION_TAIL)]
+        if value.endswith(_TRUNCATION_TAIL)
+        else value
+    )
+    return bool(_NAME_IDENT_RE.fullmatch(body))
+
+
+def _enforce_identifier_string_fields(
+    out: dict[str, Any],
+    fields: frozenset[str],
+    transformations: list[str],
+    *,
+    type_label: str,
+) -> None:
+    """Replace non-identifier-shape string fields with the empty string.
+
+    Only fields actually present in ``out`` are checked. Mutates ``out``
+    in place. Logs one transformation line per dropped field, naming
+    the FIELD (which is sanitizer-controlled, not data-derived) and
+    withholding the rejected VALUE (which is caller-controlled).
+    """
+    for field in fields:
+        v = out.get(field)
+        if not isinstance(v, str) or not v:
+            continue
+        if not _is_identifier_shape(v):
+            out[field] = ""
+            transformations.append(
+                f"dropped {field!r} from {type_label} payload: value did "
+                f"not match the column-name / coefficient-name identifier "
+                f"shape (value withheld — caller-controlled)"
+            )
+
+
+def _enforce_identifier_list_field(
+    out: dict[str, Any],
+    field: str,
+    transformations: list[str],
+    *,
+    type_label: str,
+) -> None:
+    """Filter a list-of-strings field to entries matching the identifier shape.
+
+    Mutates ``out[field]`` in place. Logs a single transformation line
+    with the COUNT of dropped entries (names withheld — entries are
+    caller-controlled). If every entry is dropped the field becomes
+    an empty list; downstream ``_require_after_filter`` may then
+    reject the payload, which is the desired hard-fail behaviour.
+    """
+    raw_list = out.get(field)
+    if not isinstance(raw_list, list):
+        return
+    kept = [x for x in raw_list if isinstance(x, str) and _is_identifier_shape(x)]
+    dropped = len(raw_list) - len(kept)
+    if dropped:
+        out[field] = kept
+        transformations.append(
+            f"dropped {dropped} non-identifier-shape entry(ies) from "
+            f"{field!r} in {type_label} payload (names withheld — "
+            f"caller-controlled)"
+        )
+
+
+# ---------------------------------------------------------------------------
 # Linear regression sanitizer
 # ---------------------------------------------------------------------------
 
@@ -851,6 +999,26 @@ def _sanitize_linear_regression(
             ok=False, analysis_type="linear_regression",
             rejection_reason=missing_after_filter,
         )
+
+    # Identifier-shape gate. ``response_variable`` and
+    # ``cluster_variable`` carry single column names; each entry of
+    # ``predictor_variables`` carries a coefficient name. See
+    # ``_enforce_identifier_*`` above for the threat model. This gate
+    # runs BEFORE the categorical-contrast / cross-field-key checks so
+    # those downstream passes see the cleaned predictor list — a
+    # predictor dropped here automatically loses its coefficient / SE /
+    # t / p / vif entries because ``declared_predictors`` is recomputed
+    # from ``out["predictor_variables"]`` below.
+    _enforce_identifier_string_fields(
+        out,
+        frozenset(("response_variable", "cluster_variable")),
+        transformations,
+        type_label="linear_regression",
+    )
+    _enforce_identifier_list_field(
+        out, "predictor_variables", transformations,
+        type_label="linear_regression",
+    )
 
     # Disclosure-control gate: refuse formula-categorical coefficient
     # names. statsmodels / patsy formula fits encode raw categorical
@@ -1285,6 +1453,15 @@ def _sanitize_descriptive(
             rejection_reason=missing_after_filter,
         )
 
+    # Identifier-shape gate on ``variable`` (the single column name
+    # this descriptive stat describes). Non-conforming values are
+    # replaced with the empty string; see ``_enforce_identifier_*``
+    # for the threat model.
+    _enforce_identifier_string_fields(
+        out, frozenset(("variable",)), transformations,
+        type_label="descriptive",
+    )
+
     n = out["n"]
     for key in numeric_allowlist:
         if key in out:
@@ -1421,6 +1598,15 @@ def _sanitize_frequency_table(
             ok=False, analysis_type="frequency_table",
             rejection_reason=missing_after_filter,
         )
+
+    # Identifier-shape gate on ``variable`` (the column this table
+    # tabulates). LEVEL names in ``counts`` keys are data values, not
+    # identifiers, and remain governed by ``safe_key`` + the structural
+    # cell cap.
+    _enforce_identifier_string_fields(
+        out, frozenset(("variable",)), transformations,
+        type_label="frequency_table",
+    )
 
     # Primary cell suppression.
     primary = suppress_cells_below(
@@ -1674,6 +1860,15 @@ def _sanitize_crosstab(
             ok=False, analysis_type="crosstab",
             rejection_reason=missing_after_filter,
         )
+
+    # Identifier-shape gate on the row/col VARIABLE NAMES (column
+    # names of the two factors being crosstabbed). Cell LEVEL names
+    # in ``counts`` are data values and stay governed by ``safe_key``
+    # + the structural cell cap.
+    _enforce_identifier_string_fields(
+        out, frozenset(("row_variable", "col_variable")), transformations,
+        type_label="crosstab",
+    )
 
     # Primary suppression on the flat view, then reshape back to
     # nested with bucketing. Suppressed (row, col) labels themselves
@@ -1995,6 +2190,16 @@ def _sanitize_magnitude_table(
             rejection_reason=missing_after_filter,
         )
 
+    # Identifier-shape gate on the row/value VARIABLE NAMES. Cell
+    # GROUP labels (``cells`` keys) are data values and remain
+    # governed by ``safe_key`` + structural cell cap.
+    _enforce_identifier_string_fields(
+        out,
+        frozenset(("row_variable", "value_variable")),
+        transformations,
+        type_label="magnitude_table",
+    )
+
     threshold_n = config.cell_suppression_threshold
     dom_threshold = config.dominance_threshold
     marker_n = suppression_marker(threshold_n)
@@ -2252,6 +2457,16 @@ def _sanitize_correlation_matrix(
             ok=False, analysis_type="correlation_matrix",
             rejection_reason=missing_after_filter,
         )
+
+    # Identifier-shape gate on each entry of ``variables`` (column
+    # names being correlated). Entries that fail are dropped before
+    # ``declared`` is built — corresponding rows/cols in the
+    # ``correlations`` dict will then be dropped as "undeclared" by
+    # the cross-field validation below, with the same counters.
+    _enforce_identifier_list_field(
+        out, "variables", transformations,
+        type_label="correlation_matrix",
+    )
 
     # ``out["variables"]`` is the safe_key-transformed list (each
     # element passed through safe_key in _collect_allowed). The raw

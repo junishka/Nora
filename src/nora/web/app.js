@@ -280,7 +280,15 @@ function renderAuthScreen(authPayload) {
       row.classList.remove('configured');
       if (statusEl) {
         statusEl.classList.remove('ok');
-        statusEl.textContent = 'Not configured';
+        // Tri-state. ``keyring_unavailable`` is distinct from ``missing``:
+        // a locked or denied macOS Keychain prompt previously rendered
+        // identically to "no credential here", so a researcher might
+        // re-paste a key they already had (or dismiss the prompt
+        // thinking the credential was gone when it was still stored).
+        // Show a different message so they retry the prompt instead.
+        statusEl.textContent = info.status === 'keyring_unavailable'
+          ? 'Keychain unavailable — could not check'
+          : 'Not configured';
       }
     }
     if (forgetBtn) {

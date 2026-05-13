@@ -33,6 +33,8 @@ import json
 import re
 from pathlib import Path
 
+import pytest
+
 
 # ---------------------------------------------------------------------------
 # 1. install_packages confirmation gate
@@ -179,6 +181,91 @@ def test_install_packages_timeout_defaults_to_deny() -> None:
     finally:
         clear_request_emitter()
     assert result is False
+
+
+def test_install_packages_emitter_failure_denies_without_waiting_for_timeout() -> None:
+    """An emitter that RAISES (webview reloading or closing) must
+    deny immediately, NOT wait for the per-request timeout. The
+    ``request_confirmation`` body catches emitter exceptions and
+    returns False before the await — but only if the bridge's
+    emitter actually propagates the failure rather than swallowing
+    it.
+
+    Regression: the bridge's ``_emit_install_confirmation_request``
+    used to swallow ``evaluate_js`` failures with a misleading
+    comment about ``request_confirmation`` catching them. Because
+    no exception escaped, the await sat on the future until the
+    full timeout elapsed (default 5 minutes) — multi-minute UI
+    hangs on every install attempt during a webview close /
+    reload. This test asserts the emitter's exception path
+    short-circuits the wait.
+    """
+    import time
+
+    from nora.install_confirmation import (
+        clear_request_emitter,
+        request_confirmation,
+        set_request_emitter,
+    )
+
+    def emitter_raises(_token, _lang, _pkgs, _act):
+        # Mirrors what the real bridge's ``_emit_install_confirmation_request``
+        # now does when ``evaluate_js`` fails — let the exception
+        # propagate to ``request_confirmation``.
+        raise RuntimeError("webview disappeared mid-call")
+
+    set_request_emitter(emitter_raises)
+    # Generous timeout that we want to NOT hit. If the bridge
+    # regressed to swallowing emitter failures, this test would
+    # block ~2 seconds instead of resolving in microseconds.
+    timeout = 2.0
+    start = time.monotonic()
+    try:
+        result = asyncio.run(
+            request_confirmation(
+                "Python", ["pandas"], "install", timeout=timeout,
+            )
+        )
+    finally:
+        clear_request_emitter()
+    elapsed = time.monotonic() - start
+    assert result is False
+    # Generous margin against CI scheduler jitter. The real signal:
+    # we finished MUCH faster than the timeout, proving the deny
+    # came from the emitter-exception path, not the timeout path.
+    assert elapsed < timeout / 4, (
+        f"emitter exception should deny immediately, not after "
+        f"timeout — observed {elapsed:.3f}s of a {timeout}s timeout"
+    )
+
+
+def test_bridge_install_emitter_propagates_evaluate_js_failure() -> None:
+    """The bridge's ``_emit_install_confirmation_request`` must let
+    a failing ``evaluate_js`` raise. ``request_confirmation`` is the
+    one that catches the exception and resolves the future as
+    denied; if the bridge swallows the failure, the deny never
+    fires until timeout.
+
+    Regression: the bridge's ``try/except`` around ``evaluate_js``
+    used to ``pass`` with a comment claiming
+    ``request_confirmation`` would catch the exception — but with
+    the exception swallowed at the bridge, nothing reached
+    ``request_confirmation``.
+    """
+    from nora.ui import NoraBridge
+
+    class _FakeWindow:
+        def evaluate_js(self, _src):
+            raise RuntimeError("webview reloading")
+
+    bridge = NoraBridge.__new__(NoraBridge)
+    bridge._window = _FakeWindow()  # type: ignore[attr-defined]
+
+    with pytest.raises(RuntimeError, match="webview reloading"):
+        bridge._emit_install_confirmation_request(
+            token="tok", language="Python",
+            packages=["pandas"], action="install",
+        )
 
 
 # ---------------------------------------------------------------------------

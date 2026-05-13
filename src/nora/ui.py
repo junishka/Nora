@@ -238,14 +238,16 @@ class NoraBridge:
             "packages": list(packages),
             "action": action,
         })
-        try:
-            self._window.evaluate_js(f"window.nora_event({payload});")
-        except Exception:  # noqa: BLE001 — webview may be closing
-            # Emitter contract: failures are fatal for this request,
-            # not for the global emitter registration. ``request_confirmation``
-            # catches emitter exceptions and treats them as deny, so
-            # we just swallow here.
-            pass
+        # Let the exception propagate. ``request_confirmation`` in
+        # ``nora.install_confirmation`` wraps this call in a try/except
+        # that catches emitter exceptions and resolves the awaiting
+        # future as denied (see ``install_confirmation.py:147``). If we
+        # swallowed the failure here, that handler would never see it
+        # and the install request would block until the per-request
+        # timeout — minutes of UI hang on every install attempt while
+        # the webview is closing or reloading. Re-raise so the deny is
+        # immediate.
+        self._window.evaluate_js(f"window.nora_event({payload});")
 
     def respond_install_confirmation(
         self, token: str, approved: bool,
@@ -2584,12 +2586,28 @@ class NoraBridge:
         """Build the dict the JS side reads to render the auth screen
         and gate the model picker. ``method`` distinguishes API-key
         configs from the Anthropic CLI subscription path so the UI
-        can show the right "stored where?" copy."""
+        can show the right "stored where?" copy.
+
+        Every render is a fresh keyring read (``force_refresh=True``
+        on the FIRST per-provider lookup), so a credential the
+        researcher deleted directly in Keychain Access — outside
+        Nora — is noticed on the next page load instead of waiting
+        until process restart. The fresh read repopulates the
+        process-wide credential cache, so the SECOND and later
+        ``has_credential`` calls in the same render (``detect_auth``
+        and the Forget-button gate below) hit the cache and do NOT
+        re-prompt — the burst-suppression contract is preserved.
+        """
         from nora import auth as _auth
         from nora.provider import detect_auth as _detect
 
         providers: dict[str, dict[str, Any]] = {}
         for p in PROVIDER_DEFAULTS:
+            # Single fresh read per provider per render. Repopulates
+            # ``_CRED_CACHE`` so the subsequent ``_detect`` /
+            # ``has_credential`` calls in this loop don't re-hit the
+            # backend.
+            state = _auth.credential_state(p, force_refresh=True)
             mode = _detect(p)  # "subscription" | "api_key" | "unknown"
             providers[p] = {
                 "configured": mode != "unknown",
@@ -2598,6 +2616,21 @@ class NoraBridge:
                 # "Forget" only when there's actually something to
                 # forget (subscription auth has nothing to forget here).
                 "has_keyring_entry": _auth.has_credential(p),
+                # Tri-state status field for the auth screen. Lets the
+                # frontend distinguish "definitely no credential" from
+                # "keyring locked / denied / unavailable so we
+                # genuinely don't know." Without this, a denied
+                # Keychain prompt rendered as "Not configured" and the
+                # researcher might re-paste a key that's already
+                # present (or worse, dismiss the prompt thinking the
+                # credential was forgotten when it's actually still
+                # there). The boolean ``configured`` field above stays
+                # available for callers that only need yes/no routing.
+                "status": (
+                    _auth.AUTH_STATE_CONFIGURED
+                    if mode != "unknown"
+                    else state
+                ),
             }
         # The "active provider" surfaced to the auth screen is the
         # focused runner's provider, falling back to the bridge
