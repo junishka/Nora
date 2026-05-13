@@ -74,6 +74,18 @@ from nora.runner import SessionRunner
 SESSIONS_ROOT = Path.home() / ".nora-sessions"
 
 
+# Hard cap on the ``send_feedback`` message body. The textarea in
+# ``index.html`` carries the same ``maxlength`` and ``app.js`` mirrors
+# the value in its character counter so all three stay in lockstep —
+# bump them together when changing this. The cap is the privacy
+# guardrail on the feedback carve-out: the modal's "only this note
+# leaves your machine" claim only holds if "this note" stays
+# bounded. 8000 characters is comfortably more than any legitimate
+# bug report and much less than an accidentally-pasted log or
+# dataset chunk.
+_FEEDBACK_MAX_MESSAGE_CHARS = 8000
+
+
 # Cwd choices that are too broad to act as a sandbox root. The
 # sandbox profile grants ``file-read*`` and ``file-write*`` over the
 # entire ``cwd`` subtree (minus the narrow ``cwd/.nora`` carve-out),
@@ -1628,12 +1640,22 @@ class NoraBridge:
         # legitimate UI origin. We also accept the PDF/EPS sidecar
         # raster (``*.nora.png`` next to a listed PDF) because the
         # delete path below cleans those up implicitly.
+        #
+        # Enumeration MUST match the panel's enumeration in
+        # ``list_session_files`` (above) — same kwargs. Without that,
+        # the gate widens to files that aren't in the panel (run-dir
+        # scripts, helper plots, cwd files a script created or
+        # modified) and a page-JS call could touch what the panel
+        # intentionally hid. The "panel listing" framing only holds
+        # if both sides agree on what the panel shows.
         from nora.session_files import enumerate_session_files
         listing_paths: set[Path] = set()
         for row in enumerate_session_files(
             cwd_resolved,
             include_data=True,
-            include_run_scripts=True,
+            include_run_scripts=False,
+            include_run_plots=False,
+            exclude_script_writes=True,
         ):
             try:
                 listing_paths.add(Path(row["path"]).resolve())
@@ -1753,13 +1775,10 @@ class NoraBridge:
         text to put on the clipboard for a ``.dta`` or ``.gph``.
 
         Takes a full ``path`` rather than a basename (mirroring
-        :meth:`delete_session_file`) because :meth:`list_session_files`
-        surfaces ``submit_script``-written scripts from
-        ``.nora/runs/<id>/`` with rewritten display names like
-        ``script_a1b2c3d4.do``. A basename lookup against cwd would
-        miss every one of those — the file on disk is plain
-        ``script.do`` in a run dir. Containment in cwd is verified
-        before any read.
+        :meth:`delete_session_file`) so that a researcher-uploaded
+        ``script.do`` in cwd can be addressed unambiguously even if
+        the panel's display name differs from the disk name.
+        Containment in cwd is verified before any read.
 
         Size cap: 4 MB. The clipboard can hold more, but multi-MB
         log dumps don't paste cleanly into most editors and the
@@ -1788,12 +1807,25 @@ class NoraBridge:
         # (see executor.py's "raw .log files NEVER cross" comment),
         # so the panel never lists those files — and any request
         # naming one has no legitimate UI origin.
+        #
+        # Enumeration kwargs MUST match ``list_session_files``
+        # (above) — same researcher-facing view. Specifically:
+        # run-dir scripts, helper plots, and cwd files that a
+        # ``submit_script`` run created or modified are hidden from
+        # the panel by design (they're already represented on the
+        # script's result card), so reading them through this
+        # bridge endpoint has no legitimate UI origin. The cwd-
+        # writes case is the load-bearing one: a sandbox script
+        # that wrote raw rows into ``out.log`` would be reachable
+        # through here with the prior, broader enumeration.
         from nora.session_files import enumerate_session_files
         listing_paths: set[Path] = set()
         for row in enumerate_session_files(
             cwd_resolved,
             include_data=True,
-            include_run_scripts=True,
+            include_run_scripts=False,
+            include_run_plots=False,
+            exclude_script_writes=True,
         ):
             try:
                 listing_paths.add(Path(row["path"]).resolve())
@@ -2229,6 +2261,33 @@ class NoraBridge:
         text = (message or "").strip()
         if not text:
             return {"ok": False, "reason": "empty feedback"}
+        # Backend cap mirrors the textarea's ``maxlength`` in
+        # ``index.html`` AND the JS counter's ``FEEDBACK_MESSAGE_CAP``.
+        # The UI side stops normal typing at the same limit; this
+        # is the defence-in-depth path for any caller that reaches
+        # the bridge endpoint directly (page JS bypassing the
+        # textarea constraint, a future automation, etc.).
+        #
+        # The cap is generous for legitimate use — 8000 characters
+        # is several thick paragraphs of bug report — but tight
+        # enough that an accidental "paste my whole log / dataset
+        # / .env" mishap is rejected at the door rather than
+        # forwarded to web3forms.com. The privacy carve-out for
+        # feedback is bounded by the rule "only this note leaves
+        # your machine"; an uncapped textarea quietly widens that
+        # bound to "whatever the researcher happened to paste".
+        if len(text) > _FEEDBACK_MAX_MESSAGE_CHARS:
+            return {
+                "ok": False,
+                "reason": (
+                    f"feedback is too long ({len(text)} characters); "
+                    f"the limit is {_FEEDBACK_MAX_MESSAGE_CHARS}. "
+                    f"Please don't paste raw data, full logs, or "
+                    f"large outputs into feedback — describe what "
+                    f"you saw and the maintainer can ask for "
+                    f"specifics if needed."
+                ),
+            }
 
         # Embedded Web3Forms access key. Bound to the maintainer's
         # inbox; extraction grants no capability beyond filling

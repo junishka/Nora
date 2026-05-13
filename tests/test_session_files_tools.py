@@ -487,6 +487,15 @@ def test_search_kinds_default_is_script_and_log(populated_session: Path):
     (populated_session / "main.do").write_text(
         "use mydata.dta, clear\nTARGET label\n"
     )
+    # The fixture staged ``main.do`` with its original content; we
+    # just rewrote it. Re-stage so the new fingerprint is recorded —
+    # otherwise the provenance gate (correctly) treats this as a
+    # mid-session file modification and filters main.do out of the
+    # search results. In production the bridge calls mark_known on
+    # every researcher drop / paste / picker event; here we
+    # simulate that explicitly.
+    from nora.file_provenance import mark_known as _mark
+    _mark(populated_session, ["main.do"])
     out = _search({"query": "TARGET"})
     names = {r["name"] for r in out["results"]}
     assert names == {"main.do"}

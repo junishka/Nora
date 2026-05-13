@@ -454,11 +454,36 @@ def _write_cwd_writes_manifest(
     """Diff cwd top-level against ``pre_snapshot`` and write a JSON
     manifest of files this run created or modified.
 
-    Manifest format: a list of ``{"name", "mtime", "size"}`` rows.
-    The Files-panel filter de-tags a row when the on-disk file's
-    (mtime, size) no longer matches — so a researcher overwriting,
-    replacing, or deleting then re-uploading a script-written file
-    makes it visible in the panel again.
+    Manifest format: a list of ``{"name", "mtime", "size", "created"}``
+    rows. ``created`` distinguishes the two cases:
+
+      * ``created: true`` — the file was absent before the run.
+        Its bytes are entirely the script's output. The Files panel
+        filter hides these because they already appear on the
+        script's result card (duplicating them in the panel is
+        noise, and reading them through bridge endpoints is the
+        same SDC-bypass concern as run-dir scripts).
+
+      * ``created: false`` — the file existed before the run and
+        the run changed it (mtime or size differs). These are
+        audit-relevant: a script that overwrote a researcher's
+        source dataset or hand-authored script needs to stay
+        visible so the change is noticeable. Hiding modified
+        files masks accidental overwrites, which is exactly the
+        case where visibility matters most.
+
+    The Files-panel filter (``script_written_cwd_files`` in
+    ``session_files.py``) reads this distinction and hides only
+    ``created`` rows; ``modified`` rows stay in the panel. Both
+    kinds still de-tag automatically when the on-disk file's
+    (mtime, size) no longer matches the manifest — so a
+    researcher who edits a script-created file makes it visible
+    in the panel again.
+
+    Backwards compatibility: ``created`` defaults to ``True`` in
+    the reader for old-format rows that lack the field, preserving
+    the pre-fix "hide everything tagged" behaviour for sessions
+    whose manifests predate this change.
 
     Best-effort: any I/O failure here is silent. The fallback is
     "this run's writes don't get tagged", which means the panel
@@ -473,8 +498,20 @@ def _write_cwd_writes_manifest(
     rows: list[dict[str, Any]] = []
     for name, (mtime, size) in post.items():
         prev = pre_snapshot.get(name)
-        if prev is None or prev != (mtime, size):
-            rows.append({"name": name, "mtime": mtime, "size": size})
+        if prev is None:
+            rows.append({
+                "name": name,
+                "mtime": mtime,
+                "size": size,
+                "created": True,
+            })
+        elif prev != (mtime, size):
+            rows.append({
+                "name": name,
+                "mtime": mtime,
+                "size": size,
+                "created": False,
+            })
     if not rows:
         return
     manifest_path = run_dir / CWD_WRITES_MANIFEST_NAME

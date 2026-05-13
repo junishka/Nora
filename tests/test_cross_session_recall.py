@@ -320,6 +320,173 @@ def test_expand_result_rejects_nested_path_under_session(
     assert not (nested / ".nora").exists()
 
 
+# ---------------------------------------------------------------------------
+# Folder-backed sessions — opened via ``choose_folder``, registered in
+# ``external_sessions``. The cross-session recall surface must include
+# these or researchers using "Choose folder" get a silent "result
+# doesn't exist" the next time they ask for an older row.
+# ---------------------------------------------------------------------------
+
+
+def test_list_results_global_includes_folder_backed_session(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A folder-backed session registered through ``choose_folder``
+    lives outside ``~/.nora-sessions/`` but is a real Nora session.
+    ``list_results_global`` must surface its rows; otherwise an
+    older result the researcher genuinely stored shows up as
+    "doesn't exist" when they ask for it cross-session."""
+    monkeypatch.setenv("NORA_ALLOW_CROSS_SESSION_RECALL", "1")
+    sessions_root = tmp_path / "sessions"
+    sessions_root.mkdir()
+    _patch_sessions_root(monkeypatch, sessions_root)
+
+    current = sessions_root / "current"
+    current.mkdir()
+
+    # A registered project folder, outside SESSIONS_ROOT, with a
+    # stored result.
+    project_folder = tmp_path / "research_project"
+    project_folder.mkdir()
+    _insert_fake_result(project_folder, label="folder-backed row")
+    from nora import external_sessions
+    external_sessions.register(sessions_root, project_folder)
+
+    with use_cwd(current):
+        res = asyncio.run(HANDLERS["list_results_global"]({"query": ""}))
+    body = _mcp_text(res)
+    assert body["status"] == "ok"
+    labels = [r["label"] for r in body["results"]]
+    assert "folder-backed row" in labels
+    # And the session_path the row publishes points at the folder
+    # itself — that's the same path the model will pass back via
+    # ``expand_result(session_path=...)``.
+    folder_rows = [
+        r for r in body["results"] if r["label"] == "folder-backed row"
+    ]
+    assert len(folder_rows) == 1
+    assert Path(folder_rows[0]["session_path"]) == project_folder.resolve()
+
+
+def test_expand_result_accepts_registered_folder_backed_session(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``expand_result(session_path=<folder>)`` must succeed when
+    ``<folder>`` is a registered folder-backed session, even
+    though it isn't a direct child of SESSIONS_ROOT."""
+    monkeypatch.setenv("NORA_ALLOW_CROSS_SESSION_RECALL", "1")
+    sessions_root = tmp_path / "sessions"
+    sessions_root.mkdir()
+    _patch_sessions_root(monkeypatch, sessions_root)
+
+    current = sessions_root / "current"
+    current.mkdir()
+    project_folder = tmp_path / "research_project"
+    project_folder.mkdir()
+    row = _insert_fake_result(project_folder, label="folder-backed row")
+    from nora import external_sessions
+    external_sessions.register(sessions_root, project_folder)
+
+    with use_cwd(current):
+        res = asyncio.run(HANDLERS["expand_result"]({
+            "result_id": row.id,
+            "session_path": str(project_folder),
+        }))
+    body = _mcp_text(res)
+    assert body["status"] == "ok"
+    assert body["label"] == "folder-backed row"
+
+
+def test_expand_result_rejects_unregistered_external_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A path OUTSIDE SESSIONS_ROOT that ISN'T in the
+    ``external_sessions`` registry must still be denied — the gate
+    only opens for paths the researcher explicitly opened via the
+    picker. Otherwise the registry-aware fix would silently widen
+    the surface to any arbitrary directory on the machine."""
+    monkeypatch.setenv("NORA_ALLOW_CROSS_SESSION_RECALL", "1")
+    sessions_root = tmp_path / "sessions"
+    sessions_root.mkdir()
+    _patch_sessions_root(monkeypatch, sessions_root)
+
+    current = sessions_root / "current"
+    current.mkdir()
+    # An external folder that LOOKS like a session (has a results
+    # db planted) but was never registered.
+    unregistered = tmp_path / "unregistered_folder"
+    unregistered.mkdir()
+    _insert_fake_result(unregistered, label="should be invisible")
+
+    with use_cwd(current):
+        res = asyncio.run(HANDLERS["expand_result"]({
+            "result_id": "M1",
+            "session_path": str(unregistered),
+        }))
+    body = _mcp_text(res)
+    assert body["status"] == "denied"
+
+
+def test_list_results_global_omits_unregistered_external_folder(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``list_results_global`` must NOT pick up an external folder
+    just because it has a ``.nora/results.db``; only registered
+    folder-backed sessions qualify. Symmetric to the
+    expand_result rejection above."""
+    monkeypatch.setenv("NORA_ALLOW_CROSS_SESSION_RECALL", "1")
+    sessions_root = tmp_path / "sessions"
+    sessions_root.mkdir()
+    _patch_sessions_root(monkeypatch, sessions_root)
+
+    current = sessions_root / "current"
+    current.mkdir()
+    unregistered = tmp_path / "unregistered_folder"
+    unregistered.mkdir()
+    _insert_fake_result(unregistered, label="ghost row")
+
+    with use_cwd(current):
+        res = asyncio.run(HANDLERS["list_results_global"]({"query": ""}))
+    body = _mcp_text(res)
+    labels = [r["label"] for r in body["results"]]
+    assert "ghost row" not in labels
+
+
+def test_list_results_global_skips_folder_backed_when_path_gone(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A registered folder-backed session whose path no longer
+    exists on disk (researcher deleted the directory, transient
+    unmount, etc.) must be skipped without crashing the scan.
+    ``external_sessions.list_entries`` already filters stale
+    paths, so the scan never even visits them."""
+    monkeypatch.setenv("NORA_ALLOW_CROSS_SESSION_RECALL", "1")
+    sessions_root = tmp_path / "sessions"
+    sessions_root.mkdir()
+    _patch_sessions_root(monkeypatch, sessions_root)
+
+    current = sessions_root / "current"
+    legit = sessions_root / "20260101T000000Z_legit"
+    for d in (current, legit):
+        d.mkdir()
+    _insert_fake_result(legit, label="staged row")
+
+    # Register a folder, then delete it.
+    transient = tmp_path / "popped_drive_project"
+    transient.mkdir()
+    from nora import external_sessions
+    external_sessions.register(sessions_root, transient)
+    import shutil
+    shutil.rmtree(transient)
+
+    with use_cwd(current):
+        res = asyncio.run(HANDLERS["list_results_global"]({"query": ""}))
+    body = _mcp_text(res)
+    assert body["status"] == "ok"
+    labels = [r["label"] for r in body["results"]]
+    assert "staged row" in labels
+
+
 def test_list_results_global_skips_symlink_escape(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:

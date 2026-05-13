@@ -1988,14 +1988,28 @@ async def submit_script_file(args: dict[str, Any]) -> dict[str, Any]:
         # corruption. Treat manifest-unreadable as "not staged" and
         # tell the caller to re-stage.
         try:
-            from nora.file_provenance import is_known
+            from nora.file_provenance import is_known, known_names
             staged_ok = is_known(cwd_for_check, resolved_target.name)
+            name_in_manifest = (
+                resolved_target.name in known_names(cwd_for_check)
+            ) if not staged_ok else False
         except Exception:  # noqa: BLE001 — fail closed (see above)
             staged_ok = False
+            name_in_manifest = False
         if not staged_ok:
-            return _as_mcp_text(_with_zero_phase_metadata({
-                "status": "rejected",
-                "reason": (
+            if name_in_manifest:
+                reason = (
+                    f"{safe_name!r} appears in this session's staged-"
+                    f"files manifest, but its current on-disk content "
+                    f"does not match what was staged. A script may "
+                    f"have rewritten it (the sandbox permits writes "
+                    f"to your cwd) or you edited it outside Nora. "
+                    f"Re-attach it via the chat composer to authorise "
+                    f"the new content, or paste its contents inline "
+                    f"with submit_script."
+                )
+            else:
+                reason = (
                     f"{safe_name!r} is not in this session's staged-"
                     f"files manifest, so I cannot run it. The "
                     f"analysis sandbox intentionally lets scripts "
@@ -2006,7 +2020,10 @@ async def submit_script_file(args: dict[str, Any]) -> dict[str, Any]:
                     f"paste it into the message box) to mark it as "
                     f"researcher-staged, or paste its contents "
                     f"inline with submit_script."
-                ),
+                )
+            return _as_mcp_text(_with_zero_phase_metadata({
+                "status": "rejected",
+                "reason": reason,
             }, language=None))
 
     ext = target.suffix.lower()
@@ -2108,32 +2125,57 @@ def _cross_session_enabled() -> bool:
 def _resolve_cross_session_cwd(session_path: str) -> Path | None:
     """Validate a researcher-supplied session_path and return its
     resolved Path, or None if it isn't a concrete Nora session
-    directly under ``~/.nora-sessions/``.
+    the researcher has opened.
 
-    Require a *direct* child of SESSIONS_ROOT — not the root itself
-    and not an arbitrary descendant. ``_is_within`` alone is too
-    loose: it accepts the sessions root (cwd would then point at
-    the directory that contains every session) and any nested
-    sub-path beneath a session. Either case lets the caller direct
-    ``get_store(target_cwd)`` at a location it would then *create*
-    a ``.nora/results.db`` inside — turning the read-side recall
-    path into an arbitrary-directory write under the sessions root.
-    The narrow gate ``target.parent == SESSIONS_ROOT.resolve()``
-    matches the equivalent fix in ``ui.switch_session`` /
-    ``ui.delete_session``.
+    Two acceptable shapes:
+
+      1. Direct child of SESSIONS_ROOT — staged sessions created
+         through Nora's own session-open path. The narrow "direct
+         child" rule (not the root itself, not an arbitrary
+         descendant) avoids the failure mode where the caller
+         points the recall at a sub-path inside another session —
+         ``get_store(target_cwd)`` would then *create* a
+         ``.nora/results.db`` inside that sub-path, turning the
+         read-side recall path into an arbitrary-directory write
+         under the sessions root.
+
+      2. A path registered via ``external_sessions`` — folder-
+         backed sessions opened through ``choose_folder``. The
+         registry only contains paths the researcher explicitly
+         opened via the picker, so accepting them here mirrors
+         the trust the rest of the UI already extends. Without
+         this branch, every folder-backed session is silently
+         excluded from cross-session recall even though
+         ``list_sessions`` surfaces it and the model can read its
+         current ``list_results`` while the session is active.
+
+    Same gate matches the discipline in ``ui.switch_session`` /
+    ``ui.delete_session`` (which also accept either shape).
     """
     from nora.ui import SESSIONS_ROOT
+    from nora import external_sessions
 
     try:
         target = Path(session_path).expanduser().resolve()
     except OSError:
         return None
     sessions_root = SESSIONS_ROOT.resolve()
-    if target == sessions_root or target.parent != sessions_root:
+    if target == sessions_root:
         return None
     if not target.is_dir():
         return None
-    return target
+    # Staged-session path: direct child of SESSIONS_ROOT.
+    if target.parent == sessions_root:
+        return target
+    # Folder-backed path: registered via choose_folder. The registry
+    # is researcher-curated state (picker writes only), so trusting
+    # it here is the same trust the active-session UI already extends.
+    try:
+        if external_sessions.is_registered(sessions_root, target):
+            return target
+    except Exception:  # noqa: BLE001 — registry is best-effort
+        pass
+    return None
 
 
 @tool("expand_result")
@@ -2178,8 +2220,9 @@ async def expand_result(args: dict[str, Any]) -> dict[str, Any]:
             return _as_mcp_text({
                 "status": "denied",
                 "reason": (
-                    "session_path must be a directory inside "
-                    "~/.nora-sessions/"
+                    "session_path must be either a directory inside "
+                    "~/.nora-sessions/ or a folder-backed session "
+                    "previously opened via the 'Choose folder' picker"
                 ),
             })
     else:
@@ -2679,20 +2722,31 @@ async def list_results_global(args: dict[str, Any]) -> dict[str, Any]:
         })
 
     rows_out: list[dict[str, Any]] = []
-    # Iterate every session dir under ~/.nora-sessions/. Skip the
-    # current session here because the model already has list_results
-    # for that — cross-session is the value-add. Including it would
-    # double-list and waste tokens.
     current_cwd = get_cwd().resolve()
     sessions_root_resolved = SESSIONS_ROOT.resolve()
+
+    # Build the list of session dirs to scan. Two sources, deduped
+    # by resolved path:
+    #
+    #   1. Direct children of SESSIONS_ROOT — staged sessions.
+    #   2. Folder-backed sessions registered via choose_folder.
+    #      Without this, ``list_results_global`` silently omitted
+    #      every session opened through the picker; researchers
+    #      using folder-backed sessions would ask for an older
+    #      result and Nora would act like it doesn't exist.
+    #
+    # Symlink escape defence: for the SESSIONS_ROOT walk, resolve
+    # each entry and re-check that the resolved target's parent is
+    # still SESSIONS_ROOT — a symlink in ``~/.nora-sessions/``
+    # pointing at an arbitrary directory would otherwise let this
+    # scan open a results.db under attacker-controlled paths.
+    # Folder-backed entries don't need that re-check because the
+    # registry only contains paths the researcher explicitly
+    # opened, and ``external_sessions.list_entries`` already
+    # filters paths whose target is no longer a directory.
+    session_dirs: list[Path] = []
+    seen_dirs: set[Path] = set()
     for child in sorted(SESSIONS_ROOT.iterdir()):
-        # ``is_dir()`` follows symlinks, so a symlink in
-        # ~/.nora-sessions/ pointing at an arbitrary directory
-        # outside the sessions root would otherwise pass and let
-        # this scan open a results.db under attacker-controlled
-        # paths. Resolve and re-check that the target is still a
-        # direct child of SESSIONS_ROOT — same discipline the
-        # bridge's session-management paths enforce.
         try:
             resolved_child = child.resolve()
         except (OSError, RuntimeError):
@@ -2700,8 +2754,34 @@ async def list_results_global(args: dict[str, Any]) -> dict[str, Any]:
         if not resolved_child.is_dir():
             continue
         if resolved_child.parent != sessions_root_resolved:
-            # Symlink escape (or otherwise not a direct child).
             continue
+        if resolved_child in seen_dirs:
+            continue
+        seen_dirs.add(resolved_child)
+        session_dirs.append(resolved_child)
+    try:
+        from nora import external_sessions
+        for entry in external_sessions.list_entries(sessions_root_resolved):
+            raw = entry.get("path")
+            if not isinstance(raw, str):
+                continue
+            try:
+                ext_resolved = Path(raw).resolve()
+            except (OSError, RuntimeError):
+                continue
+            if not ext_resolved.is_dir():
+                continue
+            if ext_resolved in seen_dirs:
+                continue
+            seen_dirs.add(ext_resolved)
+            session_dirs.append(ext_resolved)
+    except Exception:  # noqa: BLE001 — registry is best-effort
+        pass
+
+    # Skip the current session below: the model already has the
+    # per-session ``list_results`` for it — cross-session is the
+    # value-add. Including it would double-list and waste tokens.
+    for resolved_child in session_dirs:
         if resolved_child == current_cwd:
             continue
         db_path = resolved_child / ".nora" / "results.db"
@@ -3330,14 +3410,33 @@ async def read_attached_file(args: dict[str, Any]) -> dict[str, Any]:
         # manifest-unreadable as "not staged" and tell the caller to
         # re-stage.
         try:
-            from nora.file_provenance import is_known
+            from nora.file_provenance import is_known, known_names
             staged_ok = is_known(cwd, resolved_target.name)
+            # Disambiguate "never staged" vs. "staged-but-content-
+            # changed" so the rejection message points at the right
+            # fix. The two cases need the same recovery action
+            # (re-stage via the bridge) but the cause is different,
+            # and the content-changed case is also the legitimate
+            # "I edited the file outside Nora" flow.
+            name_in_manifest = (
+                resolved_target.name in known_names(cwd)
+            ) if not staged_ok else False
         except Exception:  # noqa: BLE001 — fail closed (see above)
             staged_ok = False
+            name_in_manifest = False
         if not staged_ok:
-            return _as_mcp_text({
-                "status": "rejected",
-                "reason": (
+            if name_in_manifest:
+                reason = (
+                    f"{safe_name!r} appears in this session's staged-"
+                    f"files manifest, but its current on-disk content "
+                    f"does not match what was staged. Either the file "
+                    f"was overwritten by an earlier script (the "
+                    f"sandbox permits writes to your cwd), or you "
+                    f"edited it outside Nora. Re-attach it via the "
+                    f"chat composer to authorise the new content."
+                )
+            else:
+                reason = (
                     f"{safe_name!r} is not in this session's staged-"
                     f"files manifest, so I (the model) cannot read it. "
                     f"This guard exists because the analysis sandbox "
@@ -3349,7 +3448,10 @@ async def read_attached_file(args: dict[str, Any]) -> dict[str, Any]:
                     f"please re-attach it via the chat composer "
                     f"(drop or paste it into the message box) so the "
                     f"bridge marks it as researcher-staged."
-                ),
+                )
+            return _as_mcp_text({
+                "status": "rejected",
+                "reason": reason,
             })
 
     ext = target.suffix.lower()
