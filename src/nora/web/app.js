@@ -3427,11 +3427,11 @@ function buildFilesRow(kind, f) {
     leftAction.innerHTML = iconSvg('copy');
     leftAction.addEventListener('click', (ev) => {
       ev.stopPropagation();
-      // Pass the full path (not just f.name): submit_script-written
-      // scripts surface here with rewritten display names like
-      // ``script_a1b2c3d4.do`` while the actual file lives at
-      // ``.nora/runs/<id>/script.do`` — a basename-only lookup
-      // against cwd would 404 for every one of them.
+      // Pass the full path (not just f.name) so the bridge gate
+      // can verify membership in the panel listing by absolute
+      // path. The Files panel surfaces researcher-uploaded
+      // scripts and logs (run-dir scripts are hidden by design
+      // — they already render on the result card).
       copySessionFileText(f.path || f.name, f.name);
     });
     primaryConfigured = true;
@@ -3888,12 +3888,11 @@ async function copySessionFileText(path, displayName) {
    * it into another chat or an external editor. Sister of
    * copyImageToClipboard for non-image kinds.
    *
-   * Takes the full ``path`` (not just a name) so it works for
-   * both top-level uploads and run-dir scripts surfaced from
-   * ``.nora/runs/<id>/script.do`` under rewritten display names.
-   * ``displayName`` is what appears in the toast — the rewritten
-   * label, not the on-disk path — so the confirmation matches
-   * the row the researcher just clicked.
+   * Takes the full ``path`` (not just a name) so the bridge can
+   * verify the row in the panel listing — the bridge enforces
+   * the gate against the Files-panel enumeration, so passing a
+   * disk path the panel never lists comes back as a refusal.
+   * ``displayName`` is the row label shown in the toast.
    *
    * The bridge enforces the size cap and the script/log
    * extension allowlist; on the JS side we just relay the result
@@ -5169,10 +5168,43 @@ const feedbackSubmitBtn = document.getElementById('feedback-submit');
 const feedbackSubjectEl = document.getElementById('feedback-subject');
 const feedbackMessageEl = document.getElementById('feedback-message');
 const feedbackEmailEl = document.getElementById('feedback-email');
+const feedbackMessageCounterEl = document.getElementById(
+  'feedback-message-counter',
+);
+
+// Must match the textarea's ``maxlength`` AND the backend cap in
+// ``ui.send_feedback``. The backend rejects anything over this so
+// the cap is enforced server-side too — the UI counter is the
+// helpful affordance, the backend is the defence in depth.
+const FEEDBACK_MESSAGE_CAP = 8000;
+
+function updateFeedbackMessageCounter() {
+  /* Live character count under the textarea. Switches to a warning
+   * tone in the last ~10% and to an error tone at the cap, so the
+   * researcher notices before submit. The counter element itself
+   * is ``aria-live=polite`` so screen readers also get the cue. */
+  if (!feedbackMessageEl || !feedbackMessageCounterEl) return;
+  const len = (feedbackMessageEl.value || '').length;
+  feedbackMessageCounterEl.textContent = `${len} / ${FEEDBACK_MESSAGE_CAP}`;
+  feedbackMessageCounterEl.classList.toggle(
+    'near-limit',
+    len >= Math.floor(FEEDBACK_MESSAGE_CAP * 0.9) && len < FEEDBACK_MESSAGE_CAP,
+  );
+  feedbackMessageCounterEl.classList.toggle(
+    'at-limit',
+    len >= FEEDBACK_MESSAGE_CAP,
+  );
+}
+if (feedbackMessageEl) {
+  feedbackMessageEl.addEventListener('input', updateFeedbackMessageCounter);
+}
 
 function openFeedback() {
   if (!feedbackOverlay) return;
   feedbackOverlay.classList.remove('hidden');
+  // Sync the counter to whatever's currently in the textarea
+  // (e.g. a partially-typed message kept across opens).
+  updateFeedbackMessageCounter();
   // Focus the subject line — that's the natural starting field
   // (write the headline, then expand into the body). Landing the
   // caret in the body box first forced the researcher to tab
@@ -5193,6 +5225,7 @@ function resetFeedback() {
   if (feedbackSubjectEl) feedbackSubjectEl.value = '';
   if (feedbackMessageEl) feedbackMessageEl.value = '';
   if (feedbackEmailEl) feedbackEmailEl.value = '';
+  updateFeedbackMessageCounter();
 }
 
 if (feedbackBtn) feedbackBtn.addEventListener('click', openFeedback);

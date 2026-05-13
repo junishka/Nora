@@ -425,8 +425,14 @@
           id="feedback-message"
           class="feedback-textarea"
           rows="6"
+          maxlength="8000"
           placeholder="Indoor thoughts welcome here"
         ></textarea>
+        <div class="feedback-message-meta">
+          <span id="feedback-message-counter" class="feedback-message-counter" aria-live="polite">
+            0 / 8000
+          </span>
+        </div>
 
         <label for="feedback-email" class="feedback-label">
           Your email (optional)

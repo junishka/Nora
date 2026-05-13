@@ -161,23 +161,43 @@ def visible_run_dir_names(cwd: Path) -> set[str] | None:
 
 def script_written_cwd_files(cwd: Path) -> set[str]:
     """Return the set of cwd top-level filenames currently tagged as
-    written or modified by a ``submit_script`` run.
+    CREATED by a ``submit_script`` run.
 
     Reads every ``<cwd>/.nora/runs/<id>/cwd_writes.json`` manifest
     (written by the executor) and unions the rows whose on-disk file
-    still matches the manifest's ``(mtime, size)`` snapshot. A tag
-    de-applies when the file diverges — researcher overwriting,
+    still matches the manifest's ``(mtime, size)`` snapshot AND
+    whose ``created`` field is True. A tag de-applies when the
+    file diverges from its snapshot — researcher overwriting,
     deleting then re-uploading, or replacing the file makes it
     visible in the Files panel again, even though a prior run was
     tagged as having created it.
 
-    Used by the Files-panel filter to hide script-produced clutter
-    (intermediate plots, scratch datasets, raw exports) from the
-    researcher's view. Those files are already represented in the
-    script's result card; the panel doesn't need to duplicate them.
-    The model-facing ``list_session_files`` tool does NOT call this
-    — the model still needs visibility into everything to reason
-    about prior work.
+    Created vs. modified — why only "created" hides:
+
+      * Script-created files (``created=True``) are entirely
+        script output. They already appear on the run's result
+        card, so duplicating them in the Files panel is just
+        noise. Hiding them is the original cwd_writes design.
+
+      * Script-modified files (``created=False``) existed before
+        the run; the script changed bytes that researcher work
+        already committed to. The most audit-relevant case is an
+        accidental overwrite of a source dataset or hand-authored
+        script. Hiding those masks the very mistake the researcher
+        would want to see. We therefore include them in the panel
+        listing (i.e. do NOT add them to this set) so the row
+        stays visible.
+
+    Backwards compatibility: rows from manifests that predate the
+    ``created`` field default to ``created=True`` — those legacy
+    rows keep being hidden, matching the pre-fix behaviour for
+    sessions that already exist. New rows from the post-fix
+    executor carry the field explicitly.
+
+    Used by the Files-panel filter. The model-facing
+    ``list_session_files`` tool does NOT call this — the model
+    still needs visibility into everything to reason about prior
+    work.
     """
     import json
 
@@ -207,6 +227,16 @@ def script_written_cwd_files(cwd: Path) -> set[str]:
                 if not isinstance(name, str) or not name:
                     continue
                 if not isinstance(m, (int, float)) or not isinstance(s, int):
+                    continue
+                # ``created`` is the post-fix field; default True for
+                # legacy rows so existing sessions keep their old
+                # "hide everything tagged" behaviour.
+                created = row.get("created", True)
+                if not isinstance(created, bool):
+                    created = True
+                if not created:
+                    # Modified-but-pre-existing files stay visible
+                    # in the panel — audit-relevant signal.
                     continue
                 target = cwd / name
                 try:

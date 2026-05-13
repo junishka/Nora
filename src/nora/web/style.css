@@ -325,6 +325,31 @@ body {
   line-height: 1.5;
 }
 
+/* Meta row that sits directly under the message textarea —
+ * carries the live character counter. ``justify-content: flex-end``
+ * right-aligns the counter to match the visual weight of the
+ * textarea's bottom-right corner. The counter turns warning-
+ * coloured as the user approaches the cap — see the JS handler
+ * in app.js. */
+.feedback-message-meta {
+  display: flex;
+  justify-content: flex-end;
+  margin-top: 6px;
+  font-size: 11px;
+  line-height: 1.45;
+  color: var(--text-dim);
+}
+.feedback-message-counter {
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+.feedback-message-counter.near-limit {
+  color: var(--accent, #d49000);
+}
+.feedback-message-counter.at-limit {
+  color: var(--error, #c0392b);
+}
+
 .feedback-footer {
   display: flex;
   justify-content: flex-end;

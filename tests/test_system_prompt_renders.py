@@ -171,6 +171,88 @@ def test_no_stale_stata_unimplemented_claims() -> None:
     assert "nora_plot_interaction" in rendered
 
 
+def test_plot_residuals_marked_researcher_only_in_prompt() -> None:
+    """``plot_residuals`` is NOT on ``runner._PLOT_KIND_ALLOWLIST``;
+    the runner produces the image on disk for the researcher but
+    deliberately withholds it from the model's vision. The prompt
+    therefore must NOT list it alongside the model-visible
+    helpers, and SHOULD surface the researcher-only nature so the
+    model doesn't plan around inspecting the image.
+
+    Regression test for the prompt-vs-implementation disagreement
+    where ``plot_residuals`` sat under the "model-visible plots
+    ONLY" header — the model would expect to see residual plots,
+    none would arrive, and the model would either wait, retry, or
+    misreport what it had access to."""
+    rendered = build_system_prompt(Path("/tmp"), "nora")
+    # Find the model-visible block (split by language prefix is
+    # noisy — anchor on the two section markers we wrote).
+    visible_start = rendered.find("Model-visible helpers")
+    researcher_start = rendered.find("Researcher-only helpers")
+    assert visible_start != -1, (
+        "prompt is missing the 'Model-visible helpers' section "
+        "header — split between visible and researcher-only must "
+        "stay explicit"
+    )
+    assert researcher_start != -1, (
+        "prompt is missing the 'Researcher-only helpers' section "
+        "header"
+    )
+    assert researcher_start > visible_start, (
+        "researcher-only section must come AFTER the model-visible "
+        "section (ordering matters for the 'You see only sanctioned "
+        "model-visible helper plots' rule below)"
+    )
+    visible_block = rendered[visible_start:researcher_start]
+    # The model-visible block must NOT contain plot_residuals.
+    # Check all three language prefixes for completeness.
+    for spelling in (
+        "nora$plot_residuals",
+        "nora_plot_residuals",
+        "nora.plot_residuals",
+    ):
+        assert spelling not in visible_block, (
+            f"{spelling!r} is in the model-visible helpers block "
+            f"but ``_PLOT_KIND_ALLOWLIST`` excludes 'residuals' — "
+            f"the prompt would mislead the model into expecting "
+            f"to see residual plots"
+        )
+    # And the researcher-only block DOES contain them. Cut at the
+    # next section header so a downstream mention of plot_residuals
+    # (e.g. in a future rules block) doesn't accidentally satisfy
+    # this assertion.
+    researcher_block = rendered[researcher_start:]
+    next_section = researcher_block.find("\nPlot rules:")
+    if next_section != -1:
+        researcher_block = researcher_block[:next_section]
+    for spelling in (
+        "nora$plot_residuals",
+        "nora_plot_residuals",
+        "nora.plot_residuals",
+    ):
+        assert spelling in researcher_block, (
+            f"researcher-only block is missing {spelling!r} — "
+            f"the model needs to know the helper exists and can be "
+            f"called, just that the image is researcher-visible only"
+        )
+
+
+def test_plot_residuals_consistent_with_runner_allowlist() -> None:
+    """Defence-in-depth: the prompt's split between model-visible
+    and researcher-only helpers must agree with the runtime gate
+    at ``runner._PLOT_KIND_ALLOWLIST``. If a future contributor
+    moves ``residuals`` onto the runtime allowlist OR moves any
+    of the visible kinds off it, this test surfaces the prompt
+    that needs updating."""
+    from nora.runner import _PLOT_KIND_ALLOWLIST, _PLOT_KIND_RESEARCHER_ONLY
+    # Every kind tracked by the runner is on exactly one of the
+    # two sets — sanity check, not specific to this fix.
+    assert _PLOT_KIND_ALLOWLIST.isdisjoint(_PLOT_KIND_RESEARCHER_ONLY)
+    # The fix's invariant: residuals are researcher-only at runtime.
+    assert "residuals" in _PLOT_KIND_RESEARCHER_ONLY
+    assert "residuals" not in _PLOT_KIND_ALLOWLIST
+
+
 def test_formatting_rules_sit_at_end_of_prompt(tmp_path: Path) -> None:
     """Formatting rules drift after long contexts — by the time the
     model is generating a multi-result analytical response, the

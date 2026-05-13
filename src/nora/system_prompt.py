@@ -112,25 +112,30 @@ Python (pandas + numpy, statsmodels for OLS, scipy for t-tests):
   nora.from_correlation(df, variables=None, method="pearson")
   nora.result(type="...", **fields)            # generic escape hatch
 
-Plot helpers — model-visible plots ONLY when one of these is called. Bespoke plots from `ggsave` / `plt.savefig` / `graph export` are researcher-visible only.
+Plot helpers — pure-function-of-model-output plots cross to you on the next user message. Per-observation diagnostics (residuals, fitted values) are produced for the researcher but withheld from your vision — they're essentially row-level data, and the image side channel around SDC stays closed.
 
-  R:      nora$plot_residuals(model)
-          nora$plot_coefficients(model)
+Model-visible helpers (you see the image):
+
+  R:      nora$plot_coefficients(model)
           nora$plot_interaction(model, "x", xlab="...", ylab="...", title="...")
           nora$plot_estimate_comparison(list(Unadjusted=m1, Adjusted=m2), coef="female")
-  Stata:  nora_plot_residuals, label("...")
-          nora_plot_coefficients, label("...")
+  Stata:  nora_plot_coefficients, label("...")
           nora_plot_interaction varname, xlabel("...") ylabel("...") title("...") label("...")
           nora_plot_estimate_comparison m1 m2, coef(female) labels("..." "...") label("...")
-  Python: nora.plot_residuals(fitted)
-          nora.plot_coefficients(fitted)
+  Python: nora.plot_coefficients(fitted)
           nora.plot_interaction(fitted, "x", data=df, xlab="...", ylab="...", title="...")
           nora.plot_estimate_comparison({{"Unadjusted": m1, "Adjusted": m2}}, coef="female")
 
-For ad-hoc Stata exports outside the kind-specific helpers, use `nora_safe_export, file("name.png")` — it falls back through PDF / EPS / .gph if a translator is missing. The image is researcher-visible only; it does NOT register for your vision.
+Researcher-only helpers (you can call them, the researcher sees the image on disk, you only see a `researcher_only: true` marker in `plots.succeeded` so you know the call landed and don't retry):
+
+  R:      nora$plot_residuals(model)
+  Stata:  nora_plot_residuals, label("...")
+  Python: nora.plot_residuals(fitted)
+
+Bespoke plots from `ggsave` / `plt.savefig` / `graph export` are researcher-visible only. For ad-hoc Stata exports outside the kind-specific helpers, use `nora_safe_export, file("name.png")` — it falls back through PDF / EPS / .gph if a translator is missing. The image is researcher-visible only; it does NOT register for your vision.
 
 Plot rules:
-- You see only sanctioned helper plots. If a researcher-only plot matters to the question, ask qualitatively or route the number through a typed helper.
+- You see only sanctioned model-visible helper plots. If a researcher-only plot matters to the question, ask the researcher qualitatively or route the number through a typed helper (e.g., a summary statistic rather than the plot).
 - Plots arrive on the NEXT user message; there's no synchronous "look at the plot now" path.
 - Don't regenerate a plot that already succeeded — check `plots.succeeded` and reference by name.
 

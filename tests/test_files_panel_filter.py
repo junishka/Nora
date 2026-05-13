@@ -318,3 +318,165 @@ def test_executor_diff_no_writes_no_manifest(tmp_path: Path) -> None:
     _write_cwd_writes_manifest(cwd, run_dir, pre)
 
     assert not (run_dir / "cwd_writes.json").exists()
+
+
+# ---------------------------------------------------------------------------
+# Created vs modified — audit-visibility split
+# ---------------------------------------------------------------------------
+#
+# Both cases get a row in ``cwd_writes.json``, but the panel's
+# treatment differs: ``created=True`` files are hidden (already on
+# the result card, panel duplication is noise), ``created=False``
+# files stay visible (a script overwrote pre-existing researcher
+# work, which the panel must surface so accidental clobbering is
+# obvious).
+
+
+def test_executor_diff_distinguishes_created_vs_modified(tmp_path: Path) -> None:
+    """``_write_cwd_writes_manifest`` tags each row with ``created``:
+    True for absent-before files, False for modified-but-pre-existing
+    files. The Files-panel filter uses the field to decide which
+    side of the audit split each row falls on."""
+    from nora.executor import _snapshot_cwd_top_level, _write_cwd_writes_manifest
+
+    cwd = tmp_path / "session"
+    cwd.mkdir()
+    pre_existing = cwd / "panel.csv"
+    pre_existing.write_text("col\n1\n", encoding="utf-8")
+    pre = _snapshot_cwd_top_level(cwd)
+    # Sleep just enough to make sure mtime moves; on filesystems with
+    # second-resolution mtime, a write within the same second wouldn't
+    # be detected as a change even though the bytes differ. The size
+    # change below also covers us.
+    import time
+    time.sleep(0.01)
+
+    run_dir = cwd / ".nora" / "runs" / "r1"
+    run_dir.mkdir(parents=True)
+
+    # Script case 1: NEW file appears in cwd.
+    (cwd / "fresh.png").write_bytes(b"\x89PNG" + b"\x00" * 50)
+    # Script case 2: existing file gets rewritten with different
+    # contents. Size delta ensures the diff catches it.
+    pre_existing.write_text("col\n1\n2\n3\nlonger\n", encoding="utf-8")
+
+    _write_cwd_writes_manifest(cwd, run_dir, pre)
+
+    rows = json.loads((run_dir / "cwd_writes.json").read_text(encoding="utf-8"))
+    by_name = {r["name"]: r for r in rows}
+    assert "fresh.png" in by_name
+    assert "panel.csv" in by_name
+    assert by_name["fresh.png"]["created"] is True
+    assert by_name["panel.csv"]["created"] is False
+
+
+def test_script_written_helper_excludes_modified_files(tmp_path: Path) -> None:
+    """A row with ``created=False`` does NOT enter the
+    ``script_written_cwd_files`` set — i.e. the panel filter
+    treats modified pre-existing files as researcher-visible.
+    This is the audit-visibility fix: accidental overwrites of
+    source data stay in the panel rather than vanishing into the
+    "script wrote it, you saw it on the result card" category."""
+    cwd = tmp_path / "session"
+    cwd.mkdir()
+    f = cwd / "panel.csv"
+    f.write_text("col\n1\n2\n", encoding="utf-8")
+    st = f.stat()
+    # Build the manifest by hand so we control the ``created`` field.
+    run_dir = cwd / ".nora" / "runs" / "r1"
+    run_dir.mkdir(parents=True)
+    (run_dir / "cwd_writes.json").write_text(
+        json.dumps([{
+            "name": "panel.csv",
+            "mtime": st.st_mtime,
+            "size": st.st_size,
+            "created": False,  # script modified, didn't create
+        }]),
+        encoding="utf-8",
+    )
+
+    written = script_written_cwd_files(cwd)
+    assert "panel.csv" not in written, (
+        "modified pre-existing files must stay visible in the panel"
+    )
+    # And via the panel-shape enumeration: the row IS visible.
+    names = [
+        f["name"] for f in enumerate_session_files(
+            cwd,
+            include_data=True,
+            include_run_scripts=False,
+            include_run_plots=False,
+            exclude_script_writes=True,
+        )
+    ]
+    assert "panel.csv" in names
+
+
+def test_script_written_helper_legacy_rows_default_to_created(tmp_path: Path) -> None:
+    """Manifest rows that predate the ``created`` field (rows
+    written by the pre-fix executor) default to ``created=True``
+    on read. Sessions opened before the fix keep their old
+    behaviour — every tagged file stays hidden — so the upgrade
+    doesn't suddenly dump a pile of previously-hidden rows into
+    the panel."""
+    cwd = tmp_path / "session"
+    cwd.mkdir()
+    f = cwd / "legacy_tagged.png"
+    f.write_bytes(b"\x89PNG" + b"\x00" * 30)
+    st = f.stat()
+    run_dir = cwd / ".nora" / "runs" / "r1"
+    run_dir.mkdir(parents=True)
+    # Legacy row: no ``created`` field.
+    (run_dir / "cwd_writes.json").write_text(
+        json.dumps([{
+            "name": "legacy_tagged.png",
+            "mtime": st.st_mtime,
+            "size": st.st_size,
+        }]),
+        encoding="utf-8",
+    )
+
+    written = script_written_cwd_files(cwd)
+    assert "legacy_tagged.png" in written, (
+        "legacy rows (missing ``created``) must default to created=True "
+        "so existing sessions keep the pre-fix hide-all behaviour"
+    )
+
+
+def test_panel_surfaces_modified_file_in_enumeration(tmp_path: Path) -> None:
+    """End-to-end through the executor: when a run modifies a pre-
+    existing file in cwd, the panel-mode ``enumerate_session_files``
+    includes the row even though the file is tagged in
+    ``cwd_writes.json``. Without the created/modified split this
+    file would silently disappear from the panel — exactly the
+    "accidental overwrite is invisible" failure mode."""
+    from nora.executor import _snapshot_cwd_top_level, _write_cwd_writes_manifest
+
+    cwd = tmp_path / "session"
+    cwd.mkdir()
+    src = cwd / "source_data.csv"
+    src.write_text("id,val\n1,10\n", encoding="utf-8")
+    pre = _snapshot_cwd_top_level(cwd)
+    import time
+    time.sleep(0.01)
+    # The script overwrites the researcher's source data. Bad day
+    # at the office — but a recoverable one IF the panel surfaces
+    # the change.
+    src.write_text("id,val\n", encoding="utf-8")  # truncated content
+
+    run_dir = cwd / ".nora" / "runs" / "r1"
+    run_dir.mkdir(parents=True)
+    _write_cwd_writes_manifest(cwd, run_dir, pre)
+
+    rows = enumerate_session_files(
+        cwd,
+        include_data=True,
+        include_run_scripts=False,
+        include_run_plots=False,
+        exclude_script_writes=True,
+    )
+    names = [r["name"] for r in rows]
+    assert "source_data.csv" in names, (
+        "a modified pre-existing data file must remain in the panel — "
+        "hiding it would mask accidental overwrites"
+    )
