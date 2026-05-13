@@ -77,8 +77,8 @@ bash packaging/build_dmg.sh         # → dist/Nora.dmg   (~35 MB)
 open dist/Nora.app                  # smoke test
 ```
 
-A bare local build is unsigned — fine for testing on the same
-machine. To produce a release-grade signed + notarized `.dmg`, set
+A bare local build is unsigned. Fine for testing on the same
+machine. To produce a release-grade signed and notarized `.dmg`, set
 `NORA_SIGN_IDENTITY` (Developer ID Application certificate) before
 `build_app.sh` and `NORA_NOTARIZE_PROFILE` (notarytool keychain
 profile) before `build_dmg.sh`. The build scripts skip those steps
@@ -115,7 +115,7 @@ because Nora invokes them as subprocesses.
 ## Layout
 
 - `src/nora/`
-  - `__main__.py` — entry-point shim that calls `nora.ui.main`.
+  - `__main__.py`: entry-point shim that calls `nora.ui.main`.
   - `ui.py` and `web/` for the pywebview shell and the HTML, CSS,
     JS frontend.
   - `tools.py` for the fourteen MCP tools the model sees.
@@ -171,4 +171,10 @@ would not add on top of these layers, lives in
 
 ## License
 
-Proprietary. Not yet open-sourced.
+Apache License 2.0. See [`LICENSE`](LICENSE) for the full text. Auditing
+the privacy claim against the implementation is encouraged.
+
+## Reporting a vulnerability
+
+See [`SECURITY.md`](SECURITY.md). For a privacy/security tool, the
+disclosure path matters; please use it rather than public issues.
