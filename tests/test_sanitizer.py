@@ -1863,3 +1863,204 @@ def test_ols_missing_predictor_variables_rejects_payload():
     r = sanitize(payload)
     assert not r.ok
     assert "predictor_variables" in (r.rejection_reason or "")
+
+
+# ---------------------------------------------------------------------------
+# Identifier-shape gate. Variable-name fields (``response_variable``,
+# ``predictor_variables[*]``, ``variable``, ``row_variable``,
+# ``col_variable``, ``value_variable``, correlation ``variables[*]``)
+# carry COLUMN NAMES — short identifiers chosen by the researcher.
+# ``safe_text`` / ``safe_key`` neutralise prompt-injection text but
+# don't constrain the character class. A whitespace-flattened raw row
+# like ``'"Boston, MA",50000,...'`` previously survived through these
+# fields. The gate at ``_NAME_IDENT_RE`` rejects values that don't
+# match the identifier character class. These tests lock in the new
+# narrowing.
+# ---------------------------------------------------------------------------
+
+def test_ols_response_variable_csv_row_dropped():
+    """A whitespace-flattened CSV row in ``response_variable`` is
+    replaced with the empty string by the identifier-shape gate."""
+    r = sanitize({
+        "type": "linear_regression",
+        "n": 1000,
+        # After safe_text: whitespace flattened, but quotes / commas
+        # remain. Fails the identifier shape.
+        "response_variable": '"Boston, MA",50000,"acct: SK-XXX"',
+        "predictor_variables": ["x"],
+        "coefficients": {"(Intercept)": 1.0, "x": 2.0},
+        "standard_errors": {"(Intercept)": 0.1, "x": 0.2},
+    })
+    assert r.ok
+    assert r.sanitized["response_variable"] == ""
+    assert any(
+        "did not match the column-name / coefficient-name identifier "
+        "shape" in t
+        for t in r.transformations
+    )
+
+
+def test_ols_predictor_variables_non_identifier_entries_dropped():
+    """Each entry of ``predictor_variables`` is gated independently.
+    Identifier-shape entries survive; raw-data entries are dropped
+    from the list (and their coefficient / SE / t / p entries are
+    then dropped by the existing cross-field key validation)."""
+    r = sanitize({
+        "type": "linear_regression",
+        "n": 1000,
+        "response_variable": "y",
+        # Mix of legit predictor names (R formula shapes) and raw
+        # data shapes. The latter are stripped.
+        "predictor_variables": [
+            "age",                  # plain
+            "I(age^2)",             # R polynomial — allowed
+            "factor(region)Asia",   # R factor expansion — allowed
+            "age:sex",              # R interaction — allowed
+            "c.age#c.sex",          # Stata interaction — allowed
+            '"John Smith",25',      # CSV row — REJECTED
+            "secret=sk-abc-12345",  # equals sign — REJECTED
+            "value with spaces",    # spaces — REJECTED
+        ],
+        "coefficients": {
+            "(Intercept)": 1.0,
+            "age": 2.0,
+            "I(age^2)": 3.0,
+            "factor(region)Asia": 4.0,
+            "age:sex": 5.0,
+            "c.age#c.sex": 6.0,
+            '"John Smith",25': 7.0,           # smuggled
+            "secret=sk-abc-12345": 8.0,       # smuggled
+            "value with spaces": 9.0,         # smuggled
+        },
+        "standard_errors": {
+            "(Intercept)": 0.1, "age": 0.1, "I(age^2)": 0.1,
+            "factor(region)Asia": 0.1, "age:sex": 0.1,
+            "c.age#c.sex": 0.1,
+        },
+    })
+    assert r.ok
+    surviving = r.sanitized["predictor_variables"]
+    assert "age" in surviving
+    assert "I(age^2)" in surviving
+    assert "factor(region)Asia" in surviving
+    assert "age:sex" in surviving
+    assert "c.age#c.sex" in surviving
+    # Raw-data shapes withheld.
+    assert '"John Smith",25' not in surviving
+    assert "secret=sk-abc-12345" not in surviving
+    assert "value with spaces" not in surviving
+    # Smuggled coefficient entries are also gone (the existing
+    # cross-field key filter rejects keys not in
+    # ``predictor_variables`` ∪ intercept aliases).
+    coefs = r.sanitized["coefficients"]
+    assert '"John Smith",25' not in coefs
+    assert "secret=sk-abc-12345" not in coefs
+    assert "value with spaces" not in coefs
+    # Transformation log records the drop count without naming.
+    log = " ".join(r.transformations)
+    assert "non-identifier-shape entry(ies)" in log
+    assert '"John Smith"' not in log
+    assert "secret=" not in log
+
+
+def test_descriptive_variable_non_identifier_dropped():
+    r = sanitize({
+        "type": "descriptive",
+        # Looks like a JSON dump. Fails identifier shape.
+        "variable": '{"id":123,"ssn":"000-12-3456"}',
+        "n": 1000,
+        "mean": 1.0,
+        "sd": 1.0,
+        "missing_count": 0,
+    })
+    assert r.ok
+    assert r.sanitized["variable"] == ""
+
+
+def test_frequency_table_variable_non_identifier_dropped():
+    r = sanitize({
+        "type": "frequency_table",
+        "variable": "Q1: How likely are you to recommend?",
+        "counts": {"a": 100, "b": 200},
+        "n": 300,
+        "missing_count": 0,
+    })
+    assert r.ok
+    assert r.sanitized["variable"] == ""
+
+
+def test_crosstab_row_col_variables_non_identifier_dropped():
+    r = sanitize({
+        "type": "crosstab",
+        "row_variable": "Likert: 1=strongly disagree",  # raw data shape
+        "col_variable": "good_col",                       # plain
+        "counts": {
+            "a": {"x": 100, "y": 50},
+            "b": {"x": 60, "y": 80},
+        },
+    })
+    assert r.ok
+    assert r.sanitized["row_variable"] == ""
+    assert r.sanitized["col_variable"] == "good_col"
+
+
+def test_magnitude_table_variables_non_identifier_dropped():
+    r = sanitize({
+        "type": "magnitude_table",
+        "row_variable": "raw row: 1,2,3",
+        "value_variable": "income",
+        "aggregation": "sum",
+        "cells": {
+            "grp1": {"value": 1000.0, "n": 50, "max_share": 0.1},
+            "grp2": {"value": 2000.0, "n": 50, "max_share": 0.1},
+        },
+        "_via_helper": "from_magnitude_table",
+    })
+    assert r.ok
+    assert r.sanitized["row_variable"] == ""
+    assert r.sanitized["value_variable"] == "income"
+
+
+def test_correlation_matrix_non_identifier_variables_dropped():
+    r = sanitize({
+        "type": "correlation_matrix",
+        "n": 1000,
+        "method": "pearson",
+        "variables": ["age", "income", '"raw, csv"'],
+        "correlations": {
+            "age": {"age": 1.0, "income": 0.5, '"raw, csv"': 0.3},
+            "income": {"age": 0.5, "income": 1.0, '"raw, csv"': 0.4},
+            '"raw, csv"': {"age": 0.3, "income": 0.4, '"raw, csv"': 1.0},
+        },
+    })
+    assert r.ok
+    surviving = r.sanitized["variables"]
+    assert surviving == ["age", "income"]
+    # Correlation rows / cols keyed by the non-identifier are dropped
+    # by the downstream cross-field validation.
+    assert '"raw, csv"' not in r.sanitized["correlations"]
+    for inner in r.sanitized["correlations"].values():
+        assert '"raw, csv"' not in inner
+
+
+def test_identifier_shape_tolerates_truncation_marker():
+    """A legitimate over-length identifier is truncated by ``safe_key``
+    to ``"<prefix>[TRUNCATED]"`` — the brackets are sanitizer-emitted
+    and must NOT cause the identifier gate to reject the name. This is
+    a regression test for the gate's truncation-marker awareness."""
+    long_name = "very_long_coefficient_name_that_exceeds_the_safe_key_cap_xxxx"
+    assert len(long_name) > 40  # would be truncated by safe_key
+    r = sanitize({
+        "type": "linear_regression",
+        "n": 1000,
+        "response_variable": "y",
+        "predictor_variables": [long_name, "x"],
+        "coefficients": {"(Intercept)": 1.0, long_name: 2.0, "x": 3.0},
+        "standard_errors": {"(Intercept)": 0.1, long_name: 0.1, "x": 0.1},
+    })
+    assert r.ok
+    # The truncated long name survives — gate strips ``[TRUNCATED]``
+    # before regex-matching.
+    surviving = r.sanitized["predictor_variables"]
+    assert any(p.endswith("[TRUNCATED]") for p in surviving)
+    assert "x" in surviving

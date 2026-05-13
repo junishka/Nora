@@ -85,12 +85,16 @@ _STYLE_RIDER = (
     "\n\n[Reply formatting reminder. These rules bind the response "
     "you are about to produce. Hold them through every paragraph, "
     "not just the opening.\n"
-    "1. No em-dashes (—) or en-dashes (–). Use periods, semicolons, "
-    "commas, parentheses, or colons.\n"
-    "2. One idea per sentence. Split long compound sentences.\n"
-    "3. Open with the analytic point. No preamble, no restating the "
+    "1. No em-dashes (—) or en-dashes (–). Use periods, commas, or "
+    "parentheses.\n"
+    "2. Never use semicolons. Break the clause into two sentences "
+    "with a period.\n"
+    "3. Use colons only to introduce a list. For an explanation or "
+    "apposition, start a new sentence.\n"
+    "4. One idea per sentence. Split long compound sentences.\n"
+    "5. Open with the analytic point. No preamble, no restating the "
     "question, no meta-commentary on what the table shows.\n"
-    "4. Reader is an applied-stats colleague. Be concise.]"
+    "6. Reader is an applied-stats colleague. Be concise.]"
 )
 
 

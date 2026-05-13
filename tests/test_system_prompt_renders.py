@@ -481,6 +481,43 @@ def test_openai_prompt_is_smaller_than_anthropic(tmp_path: Path) -> None:
     assert len(o) < len(a)
 
 
+# ---------------------------------------------------------------------------
+# Anthropic per-turn style rider. The system prompt's PUNCTUATION RULE
+# forbids ``;`` and reserves ``:`` for list introductions. The rider
+# sits adjacent to the generation cursor on Anthropic turns and used
+# to explicitly re-allow ``semicolons, ... colons`` — a quiet
+# contradiction that cut a hole in the house punctuation rule whenever
+# the rider's tokens carried more weight than the cached system
+# prompt. These tests lock in the corrected rider.
+# ---------------------------------------------------------------------------
+
+def test_style_rider_forbids_semicolons() -> None:
+    from nora.provider.anthropic import _STYLE_RIDER
+    # Must not re-allow semicolons.
+    assert "semicolons, " not in _STYLE_RIDER
+    assert ", semicolons" not in _STYLE_RIDER
+    # Must explicitly forbid them.
+    assert "Never use semicolons" in _STYLE_RIDER
+
+
+def test_style_rider_restricts_colon_to_list_introduction() -> None:
+    from nora.provider.anthropic import _STYLE_RIDER
+    # Must not re-allow broad colon use that contradicts the system
+    # prompt rule. The old rider had "parentheses, or colons" — that
+    # phrase signaled colons as a general punctuation option.
+    assert "or colons." not in _STYLE_RIDER
+    assert "only to introduce a list" in _STYLE_RIDER
+
+
+def test_style_rider_preserves_em_dash_ban() -> None:
+    from nora.provider.anthropic import _STYLE_RIDER
+    # The original purpose of the rider — banning em/en dashes near
+    # the generation cursor where Anthropic's tokens carry the most
+    # weight — must not regress.
+    assert "No em-dashes" in _STYLE_RIDER
+    assert "en-dashes" in _STYLE_RIDER
+
+
 def test_stata_plot_coefficients_writes_to_run_dir() -> None:
     """The helper resolves run_dir from ``NORA_RESULT_PATH`` and
     writes ``coefficients.png`` + manifest into

@@ -66,14 +66,27 @@ _CRED_ERROR_AT: dict[str, float] = {}
 _ERROR_BACKOFF_SECONDS = 5.0
 
 
-def get_credential(provider: str) -> str | None:
+def get_credential(provider: str, *, force_refresh: bool = False) -> str | None:
     """Return the stored API key for ``provider``, or ``None`` if no
     credential is stored or the keyring backend is unavailable.
+
+    ``force_refresh=True`` drops the cached entry and re-reads from
+    the OS keyring. Use it from the auth-screen render path so a
+    credential that was deleted directly in Keychain Access (outside
+    Nora) is noticed on the next page load instead of waiting until
+    the next process start. Default behavior preserves the burst-
+    suppression cache the auth-screen render relies on.
 
     Never raises — auth lookup must always have a definite answer
     (set / unset) so callers can route to the right UI without a
     try/except dance.
     """
+    if force_refresh:
+        # Drop the cached value AND any stale backoff for this provider
+        # so we actually re-hit the backend. The cache will be
+        # rewritten below with whatever the fresh read produces.
+        _CRED_CACHE.pop(provider, None)
+        _CRED_ERROR_AT.pop(provider, None)
     if provider in _CRED_CACHE:
         return _CRED_CACHE[provider]
     if _keyring is None:
@@ -109,6 +122,44 @@ def get_credential(provider: str) -> str | None:
     resolved = value if value else None
     _CRED_CACHE[provider] = resolved
     return resolved
+
+
+# Status tokens returned by ``credential_state``. Boolean-only
+# ``has_credential`` cannot distinguish "definitely no credential" from
+# "keyring is locked / denied / unavailable, so we don't know": the
+# auth screen would render the same "Not configured" badge for both,
+# and a researcher whose Keychain prompt was denied would re-paste a
+# key that's already present (or worse, dismiss the prompt thinking
+# the credential was forgotten when it's actually still there). The
+# tri-state separates those cases so the UI can render the right copy.
+AUTH_STATE_CONFIGURED = "configured"
+AUTH_STATE_MISSING = "missing"
+AUTH_STATE_KEYRING_UNAVAILABLE = "keyring_unavailable"
+
+
+def credential_state(
+    provider: str, *, force_refresh: bool = False,
+) -> str:
+    """Tri-state credential check. Returns one of
+    ``"configured"``, ``"missing"``, ``"keyring_unavailable"``.
+
+    Callers that need to render an auth surface — and only those —
+    should use this. Internal hot-path callers (``provider/openai``,
+    ``provider/anthropic``, the model picker) can stay on
+    ``has_credential`` since they only need the boolean.
+
+    The third state fires when the most recent keyring read raised
+    an exception within the backoff window. Outside the window, a
+    transient backend recovery resets the state — the UI is meant
+    to reflect "I can't currently tell" rather than "definitely
+    gone."
+    """
+    value = get_credential(provider, force_refresh=force_refresh)
+    if value is not None:
+        return AUTH_STATE_CONFIGURED
+    if provider in _CRED_ERROR_AT:
+        return AUTH_STATE_KEYRING_UNAVAILABLE
+    return AUTH_STATE_MISSING
 
 
 def set_credential(provider: str, api_key: str) -> dict[str, object]:

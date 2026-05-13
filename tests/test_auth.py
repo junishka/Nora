@@ -287,3 +287,111 @@ def test_delete_credential_during_backoff_returns_error(
     res = auth.delete_credential("openai")
     assert res["ok"] is False
     assert "unavailable" in res["reason"]
+
+
+# ---------------------------------------------------------------------------
+# Cache freshness (``force_refresh=True``). The auth-screen render
+# path needs to notice credentials that were deleted directly in
+# Keychain Access (outside Nora) between launches, otherwise the
+# in-process credential cache keeps showing the provider as
+# configured until the next process start.
+# ---------------------------------------------------------------------------
+
+def test_get_credential_force_refresh_picks_up_external_deletion(
+    fake_keyring: _FakeKeyring,
+) -> None:
+    """A researcher who deletes the keyring entry via Keychain Access
+    (or another tool, bypassing Nora's bridge) must have that
+    deletion reflected on the next auth-screen render. Without
+    ``force_refresh``, the in-process cache would keep returning the
+    stale value for the rest of the process — and the docstring on
+    ``ui_ready`` claims the opposite, so the bug surfaces as the auth
+    screen continuing to show a provider as configured even though
+    the credential is gone from the OS store."""
+    auth.set_credential("openai", "sk-stored")
+    # First read populates the cache.
+    assert auth.get_credential("openai") == "sk-stored"
+    # External deletion: bypass ``auth.delete_credential`` entirely,
+    # mirroring "researcher used Keychain Access directly."
+    del fake_keyring.store[(auth.KEYRING_SERVICE, "openai")]
+    # Cached value still surfaces on a normal call.
+    assert auth.get_credential("openai") == "sk-stored"
+    # ``force_refresh`` drops the cache and re-reads from the
+    # backend — now sees the empty store.
+    assert auth.get_credential("openai", force_refresh=True) is None
+    # And the cache is updated, so the next plain call also returns
+    # None (no need to keep passing ``force_refresh``).
+    assert auth.get_credential("openai") is None
+
+
+def test_force_refresh_clears_stale_error_backoff(
+    monkeypatch: pytest.MonkeyPatch, fake_keyring: _FakeKeyring,
+) -> None:
+    """``force_refresh`` should not be blocked by a stale error
+    backoff: the caller is explicitly asking for a fresh read, and
+    the backoff window's job is burst-suppression, not recovery
+    suppression."""
+    fake_keyring.store[(auth.KEYRING_SERVICE, "openai")] = "sk-real"
+
+    calls = {"n": 0}
+    real_get = fake_keyring.get_password
+
+    def _flaky(service: str, username: str) -> str | None:
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise RuntimeError("backend locked")
+        return real_get(service, username)
+
+    monkeypatch.setattr(fake_keyring, "get_password", _flaky)
+    # First call errors; backoff is set.
+    assert auth.get_credential("openai") is None
+    assert "openai" in auth._CRED_ERROR_AT
+    # Plain call within the backoff window does NOT re-hit the
+    # backend.
+    assert auth.get_credential("openai") is None
+    assert calls["n"] == 1
+    # ``force_refresh`` ignores the backoff and recovers.
+    assert auth.get_credential("openai", force_refresh=True) == "sk-real"
+    assert calls["n"] == 2
+
+
+# ---------------------------------------------------------------------------
+# Tri-state credential state. Boolean ``has_credential`` cannot
+# distinguish "no credential" from "keyring locked / denied". The
+# auth screen rendered both as "Not configured" before, leading a
+# researcher whose Keychain prompt was denied to re-paste a key that
+# was already stored (or to assume the credential was gone). The
+# tri-state distinguishes the two cases for UI rendering.
+# ---------------------------------------------------------------------------
+
+def test_credential_state_configured(fake_keyring: _FakeKeyring) -> None:
+    auth.set_credential("openai", "sk-1")
+    assert auth.credential_state("openai") == auth.AUTH_STATE_CONFIGURED
+
+
+def test_credential_state_missing(fake_keyring: _FakeKeyring) -> None:
+    assert auth.credential_state("openai") == auth.AUTH_STATE_MISSING
+
+
+def test_credential_state_keyring_unavailable(
+    monkeypatch: pytest.MonkeyPatch, fake_keyring: _FakeKeyring,
+) -> None:
+    """When the keyring backend raises, ``credential_state`` must
+    report the third state — not silently downgrade to ``missing``."""
+    def _raise(*_a: Any, **_kw: Any) -> None:
+        raise RuntimeError("backend locked")
+
+    monkeypatch.setattr(fake_keyring, "get_password", _raise)
+    assert auth.credential_state("openai") == auth.AUTH_STATE_KEYRING_UNAVAILABLE
+
+
+def test_credential_state_keyring_none_is_missing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """If ``_keyring`` itself is ``None`` (the package failed to
+    import), no backend errors fire and the state is plain ``missing``.
+    The auth screen for that case routes to "paste a key" — there's
+    no Keychain prompt to retry, so ``keyring_unavailable`` would be
+    misleading."""
+    monkeypatch.setattr(auth, "_keyring", None)
+    assert auth.credential_state("openai") == auth.AUTH_STATE_MISSING
