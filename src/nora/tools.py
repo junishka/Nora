@@ -4570,6 +4570,6 @@ def build_server() -> dict[str, Any]:
     """Construct the in-process MCP server with all Nora tools registered."""
     return create_sdk_mcp_server(
         name=SERVER_NAME,
-        version="0.9.0",
+        version="0.9.1",
         tools=list(REGISTERED_TOOLS),
     )
