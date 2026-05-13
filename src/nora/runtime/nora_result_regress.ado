@@ -350,6 +350,22 @@ program define nora_result_regress
     * symeigen on that. Non-estimable / dropped / base columns drop
     * out cleanly and the resulting eigenvalue spectrum reflects the
     * actual design.
+    *
+    * Restricted to classical OLS. The "eigenvalues of e(V) ratio
+    * equals the Belsley-Kuh-Welsch condition index of X'X"
+    * argument relies on e(V) being proportional to (X'X)^-1 —
+    * which only holds for ``regress`` without a robust / cluster
+    * VCE. With ``vce(robust)`` or ``vce(cluster ...)``, e(V) is
+    * the sandwich/cluster-robust covariance and its eigenvalues
+    * are NOT the design-matrix eigenvalues. For GLMs
+    * (logit/probit/Poisson) e(V) comes from the score Hessian,
+    * also unrelated to (X'X)^-1. Publishing
+    * ``condition_number`` in either case would silently report
+    * the wrong number rather than omit. ``e(vce)`` is empty for
+    * plain ``regress`` and "ols" if vce(ols) was explicit; both
+    * forms count as classical.
+    local _classical_ols = ("`e(cmd)'" == "regress") & ///
+        (("`e(vce)'" == "") | ("`e(vce)'" == "ols"))
     local _kest = 0
     forvalues i = 1/`k' {
         if !missing(`Vmat'[`i', `i']) & `Vmat'[`i', `i'] > 0 {
@@ -357,7 +373,7 @@ program define nora_result_regress
             local _eidx`_kest' = `i'
         }
     }
-    if `_kest' >= 1 {
+    if `_classical_ols' & `_kest' >= 1 {
         tempname _Vsub
         matrix `_Vsub' = J(`_kest', `_kest', 0)
         forvalues a = 1/`_kest' {
@@ -389,7 +405,13 @@ program define nora_result_regress
         }
     }
 
-    if "`e(cmd)'" == "regress" & "`e(rmse)'" != "" & !missing(`=e(rmse)') & `=e(rmse)' > 0 {
+    * VIF: same restriction as condition_number. ``SE_j² · TSS_j /
+    * σ²`` reproduces ``estat vif`` only when e(V) = σ² (X'X)^-1.
+    * Under vce(robust) or vce(cluster ...), e(V) is the sandwich
+    * covariance and the diagonal entries no longer factor as
+    * ``σ² / (1 - R²_j) / TSS_j``. Omit VIF in those cases rather
+    * than publish a wrong number.
+    if `_classical_ols' & "`e(rmse)'" != "" & !missing(`=e(rmse)') & `=e(rmse)' > 0 {
         local _rmse2 = `=e(rmse)'^2
         * Build the field even if every predictor falls through to
         * "skip"; the renderer is happy with an empty dict and

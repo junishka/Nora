@@ -226,14 +226,13 @@ class NoraBridge:
             "packages": list(packages),
             "action": action,
         })
-        try:
-            self._window.evaluate_js(f"window.nora_event({payload});")
-        except Exception:  # noqa: BLE001 — webview may be closing
-            # Emitter contract: failures are fatal for this request,
-            # not for the global emitter registration. ``request_confirmation``
-            # catches emitter exceptions and treats them as deny, so
-            # we just swallow here.
-            pass
+        # Propagate evaluate_js failures (webview closing, transient
+        # bridge error, etc.). ``request_confirmation`` catches emitter
+        # exceptions and immediately resolves to deny; swallowing here
+        # would defeat that path and force the waiter to sit on the
+        # 5-minute timeout. The emitter contract is: raise on failure,
+        # the caller handles the deny.
+        self._window.evaluate_js(f"window.nora_event({payload});")
 
     def respond_install_confirmation(
         self, token: str, approved: bool,

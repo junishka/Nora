@@ -336,6 +336,18 @@ def _format_bad_lines_summary(bad_lines: list[str], payload_count: int) -> str:
 _BAD_LINES_TAIL_CAP = 20
 
 
+class PlotManifestUnsanitizable(RuntimeError):
+    """Raised when ``_filter_plot_manifest`` cannot neutralize the
+    on-disk manifest (rewrite, unlink, AND rename all failed).
+
+    The caller must treat this as a hard run failure: the on-disk
+    file may still contain entries the script wrote bypassing the
+    helper library, and downstream consumers gate on ``kind`` only,
+    so letting the run continue would let those entries flow to
+    ``_capture_plots`` / the recall path as legitimate.
+    """
+
+
 def _filter_plot_manifest(run_dir: Path, run_token: str) -> int:
     """Drop manifest entries whose ``_token`` is missing or wrong, and
     strip the field from the rest. Returns the number of entries
@@ -345,7 +357,7 @@ def _filter_plot_manifest(run_dir: Path, run_token: str) -> int:
     the disclosure-control allowlist for vision attachment: anything
     listed there with a ``kind`` in ``_PLOT_KIND_ALLOWLIST`` rides
     the next turn as an image. The manifest file itself sits inside
-    the per-run directory, which the analysis script can write —
+    the per-run directory, which the analysis script can write, so
     nothing structural prevents a script from saving a raw-data plot
     under ``_nora_plots/`` and appending a hand-crafted manifest line
     that labels it ``coefficients``. That would slip a row-level
@@ -355,8 +367,18 @@ def _filter_plot_manifest(run_dir: Path, run_token: str) -> int:
     it before any consumer sees the file. A determined script can
     still introspect the runtime library's loaded module state to
     recover the token, but doing so requires explicit code in the
-    script the researcher reviews — same trust model as the
-    result-payload validation.
+    script the researcher reviews, same trust model as the result-
+    payload validation.
+
+    Fail-closed posture: the sanitized rewrite can fail (the script
+    can ``chmod 0o444`` the manifest before exiting to leave its
+    forged entries on disk). Downstream consumers gate on ``kind``
+    not ``_token``, so a surviving forged entry succeeds. When the
+    rewrite raises, fall back to ``unlink`` then ``rename`` so no
+    untrusted entry survives. If all three fail (the parent dir or
+    file has been made fully immutable, e.g. ``chflags uchg`` on
+    macOS), raise ``PlotManifestUnsanitizable`` so the caller fails
+    the run rather than letting forged entries flow on.
     """
     import json
 
@@ -389,12 +411,6 @@ def _filter_plot_manifest(run_dir: Path, run_token: str) -> int:
             continue
         cleaned = {k: v for k, v in entry.items() if k != RESULT_TOKEN_FIELD}
         kept.append(cleaned)
-    if dropped == 0:
-        # Every line validated; manifest content is unchanged except
-        # for the ``_token`` field, which downstream consumers don't
-        # otherwise care about. Rewrite anyway to strip it so the
-        # field never reaches the runner / tools / Files panel.
-        pass
     try:
         manifest_path.write_text(
             "".join(
@@ -402,14 +418,47 @@ def _filter_plot_manifest(run_dir: Path, run_token: str) -> int:
             ),
             encoding="utf-8",
         )
+        return dropped
     except OSError:
-        # Best-effort: if we can't rewrite, leave the original file
-        # in place. Consumers that read ``_token``-bearing entries
-        # treat them as opaque (they don't gate on it), so the
-        # runner's allowlist still bounds what's attached — but the
-        # forged-entry filter is bypassed in this rare case.
         pass
-    return dropped
+    # Rewrite blocked. Neutralize the on-disk file so consumers'
+    # ``manifest.jsonl`` ``is_file()`` check fails and the forged
+    # entries cannot flow on. ``unlink`` needs write on the parent
+    # dir, not the file, so a ``chmod 0o444`` on the file alone does
+    # not block it. The trade-off: we lose the legitimate entries
+    # from this run too, but the script chose to engineer the write
+    # failure, so dropping the whole run's plots is the correct
+    # posture.
+    try:
+        manifest_path.unlink()
+        return dropped + len(kept)
+    except OSError:
+        pass
+    try:
+        manifest_path.rename(
+            manifest_path.with_name("manifest.jsonl.unsanitized")
+        )
+        return dropped + len(kept)
+    except OSError:
+        pass
+    # File-level ops blocked (eg ``chflags uchg`` on the file, which
+    # an unprivileged macOS user can set). Try renaming the parent
+    # ``_nora_plots/`` directory instead: that modifies the run
+    # dir's directory entry, not the immutable file, so it succeeds
+    # even when the file itself is locked.
+    try:
+        plots_dir = manifest_path.parent
+        plots_dir.rename(plots_dir.with_name("_nora_plots.unsanitized"))
+        return dropped + len(kept)
+    except OSError:
+        pass
+    raise PlotManifestUnsanitizable(
+        "plot manifest at "
+        f"{manifest_path} could not be sanitized; the on-disk file "
+        "may contain entries the script wrote bypassing the helper "
+        "library, and every neutralization attempt (write / unlink "
+        "/ rename file / rename dir) failed"
+    )
 
 
 # Filename of the per-run manifest recording top-level cwd files this
@@ -1005,16 +1054,30 @@ def run_script(
     # ``_capture_plots``, ``submit_script``'s ``_summarize_plot_helpers``,
     # the recall path's allowlist check) reads it. Any entry whose
     # ``_token`` is missing or doesn't match the per-run token gets
-    # dropped — that's the script-injected entries gone. Done here
-    # rather than at every consumer so there's exactly one trust
-    # boundary.
-    dropped_manifest = _filter_plot_manifest(run_dir, run_token)
+    # dropped (script-injected entries gone). Done here rather than
+    # at every consumer so there's exactly one trust boundary, and
+    # because the recall path runs later when the per-run token is
+    # no longer available to revalidate.
+    try:
+        dropped_manifest = _filter_plot_manifest(run_dir, run_token)
+    except PlotManifestUnsanitizable as exc:
+        # Hard failure: the script blocked write, unlink, AND rename
+        # of the manifest, so we cannot guarantee what consumers
+        # will read. Mark the run failed; do not return payloads.
+        dropped_manifest = 0
+        ok = False
+        if error is None:
+            error = str(exc)
+        else:
+            error = f"{error}; also: {exc}"
+        payloads = []
     if dropped_manifest:
         warnings.append(
             f"dropped {dropped_manifest} plot manifest entr"
             f"{'y' if dropped_manifest == 1 else 'ies'} "
-            f"with missing or invalid authenticity token — likely "
-            f"hand-crafted by the script bypassing the helper library"
+            f"with missing or invalid authenticity token, "
+            f"likely hand-crafted by the script bypassing the "
+            f"helper library"
         )
 
     return ExecutionResult(

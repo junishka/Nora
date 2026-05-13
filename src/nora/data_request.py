@@ -540,8 +540,41 @@ def _quartiles(series: Any, n_total: int) -> RequestResult:
             ),
         )
 
-    q25 = float(non_na.quantile(0.25))
-    q75 = float(non_na.quantile(0.75))
+    # pandas' default linear quantile returns the EXACT sorted
+    # observation at position ``p = q*(n-1)`` whenever ``p`` is an
+    # integer (n=33, 37, 41, ... for q=0.25, and the same set for
+    # q=0.75 since (n-1)*0.75 is integer iff (n-1)*0.25 is). After
+    # 2-sigfig rounding, exact-individual values for ages, years,
+    # Likert scores, and small counts pass through unchanged. The
+    # N>=30 floor was meant to put 1.5-2.5 observations either side
+    # of the percentile (forcing interpolation), but at integer
+    # positions no interpolation happens at all. Force a midpoint
+    # blend with the neighbouring sorted observation in that case so
+    # every published quartile is the average of two distinct
+    # observations rather than one of them verbatim.
+    def _blended_quartile(values_sorted: list[float], q: float) -> float:
+        n_eff = len(values_sorted)
+        if n_eff == 0:
+            return float("nan")
+        pos = q * (n_eff - 1)
+        lo = int(pos)
+        hi = min(lo + 1, n_eff - 1)
+        frac = pos - lo
+        if frac == 0.0:
+            # Position lands exactly on sorted[lo]. Average with the
+            # next observation (or the previous, at the upper edge)
+            # so the published quartile is never an exact single
+            # observation.
+            if lo + 1 < n_eff:
+                return 0.5 * (values_sorted[lo] + values_sorted[lo + 1])
+            if lo - 1 >= 0:
+                return 0.5 * (values_sorted[lo - 1] + values_sorted[lo])
+            return float(values_sorted[lo])
+        return (1.0 - frac) * values_sorted[lo] + frac * values_sorted[hi]
+
+    sorted_vals = sorted(float(v) for v in non_na.tolist())
+    q25 = _blended_quartile(sorted_vals, 0.25)
+    q75 = _blended_quartile(sorted_vals, 0.75)
     # Compute the published IQR by SUBTRACTING the rounded quartiles
     # rather than independently rounding ``q75 - q25``. Independently
     # rounded triples over-determine the system: comparing

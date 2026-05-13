@@ -40,11 +40,19 @@ set -euo pipefail
 # either exist or don't. Order matters: user-scope paths come before
 # system-scope so a per-user override wins over a system install.
 #
-# Anything beyond this list (asdf, mise, exotic prefixes) the user can
-# add by exporting PATH from ~/.zshenv (loaded for non-interactive
-# shells); the launcher reads PATH from the environment, so an export
-# there flows through.
-_NORA_EXTRA_PATH="$HOME/.local/bin:$HOME/.npm-global/bin:$HOME/.volta/bin:$HOME/.bun/bin:/opt/homebrew/bin:/usr/local/bin"
+# The list covers Homebrew (Apple Silicon + Intel), Volta, Bun, the
+# default npm-global prefix, ``~/.local/bin``, and the two common
+# shell-shim managers (asdf, mise). Anything else (exotic prefixes,
+# custom ``$PREFIX`` builds) needs intervention beyond this launcher
+# — neither ``~/.zshrc`` nor ``~/.zshenv`` is sourced from a Finder/
+# launchd launch (the shebang above is bash, and launchd does not run
+# shell init files for .app launches), so editing those files will
+# NOT change the PATH this script sees. Researchers in that case
+# should either (a) symlink the missing tool into one of the listed
+# directories, (b) set the PATH via ``launchctl setenv PATH ...``
+# from a LaunchAgent, or (c) launch Nora from a terminal session
+# where the shell init has already assembled PATH.
+_NORA_EXTRA_PATH="$HOME/.local/bin:$HOME/.npm-global/bin:$HOME/.volta/bin:$HOME/.bun/bin:$HOME/.asdf/shims:$HOME/.local/share/mise/shims:/opt/homebrew/bin:/usr/local/bin"
 export PATH="$_NORA_EXTRA_PATH:${PATH:-/usr/bin:/bin:/usr/sbin:/sbin}"
 
 # Resolve the .app's own path from wherever macOS launched us.

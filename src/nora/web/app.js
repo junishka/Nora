@@ -4399,12 +4399,21 @@ function showInstallConfirmationModal(evt) {
   });
   const onKey = (e) => {
     if (e.key === 'Escape') respond(false);
-    if (e.key === 'Enter' && !e.shiftKey) respond(true);
+    // Do NOT map Enter globally to respond(true). The document-level
+    // listener fires on the bubble phase, so a global ``Enter ->
+    // respond(true)`` mapping approves even when Deny has focus
+    // (the document handler runs before the focused button's
+    // default-click default action fires, and by then ``resolved``
+    // is already true). Native ``<button>`` Enter behavior is the
+    // right defense: pressing Enter while a button is focused
+    // fires that button's click. Tab cycles between Deny and
+    // Approve. Esc denies regardless of focus, which is safe.
   };
   document.addEventListener('keydown', onKey);
   document.body.appendChild(overlay);
-  // Focus Deny by default so an absent-minded Enter doesn't approve;
-  // researcher must move to Approve deliberately.
+  // Focus Deny by default so an absent-minded Enter denies (the
+  // button's native Enter handler clicks it); the researcher must
+  // Tab to Approve before Enter approves.
   denyBtn.focus();
 }
 

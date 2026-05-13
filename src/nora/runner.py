@@ -506,6 +506,20 @@ class SessionRunner:
         except OSError:
             return
 
+        # Defense in depth against the executor's filter not having
+        # run successfully. ``_filter_plot_manifest`` strips the
+        # ``_token`` field from every entry it validates and drops
+        # entries with missing / wrong tokens. If we observe ANY
+        # entry still carrying ``_token`` here, the filter didn't
+        # complete its sweep (eg the rare PlotManifestUnsanitizable
+        # path where every neutralization attempt failed), and the
+        # forged entries the filter would have dropped are still on
+        # disk. Refuse the whole manifest in that case — the runner-
+        # side allowlist only gates on ``kind``, so trusting any
+        # entry would let the forgery slip through.
+        if any("_token" in e for e in entries):
+            return
+
         # Cap how many plots can flow per turn. Take the most recent.
         if len(entries) > _PLOT_MAX_PER_TURN:
             entries = entries[-_PLOT_MAX_PER_TURN:]

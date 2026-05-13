@@ -499,20 +499,16 @@ def from_t_test(res: Any, *, n1: int, n2: int | None = None,
 
 def from_summarize(variable: str, *, n: int, mean: float, sd: float,
                    missing_count: int = 0,
-                   min_value: float | None = None,
-                   max_value: float | None = None,
                    **extra: Any) -> None:
     """Emit a ``descriptive`` payload for a single numeric variable.
     Mirrors ``nora$from_summarize`` in the R library.
 
-    ``min_value`` / ``max_value`` are passed through ONLY when the
-    variable is on the dataset's ``non_disclosive_variables`` opt-in
-    list in ``.nora/policy.json``. The sanitizer drops them silently
-    for any variable not on that list — same posture as residuals /
-    fitted values, gated by an explicit per-variable researcher
-    judgment instead of a blanket ban. Pass them when you have them;
-    they cost nothing and surface automatically if the researcher
-    has opted the variable in.
+    ``min_value`` / ``max_value`` are no longer accepted: the
+    sanitizer drops them in every payload because nothing in the
+    payload binds the reported values to the named variable's actual
+    column. Researchers who need a variable's range should use a
+    Nora-owned path (request_data with a future bounds extension)
+    rather than a script-emitted descriptive.
     """
     # ``_safe_int`` instead of bare ``int(...)``: avoid crashing the
     # whole helper on a NaN count that a careless caller forwarded
@@ -526,10 +522,6 @@ def from_summarize(variable: str, *, n: int, mean: float, sd: float,
         "sd": _safe_float(sd),
         "missing_count": _safe_int(missing_count),
     }
-    if min_value is not None:
-        fields["min_value"] = _safe_float(min_value)
-    if max_value is not None:
-        fields["max_value"] = _safe_float(max_value)
     fields.update(extra)
     result(type="descriptive", **fields)
 
@@ -674,6 +666,29 @@ def from_magnitude_table(df: Any, group_var: str, value_var: str, *,
             "n": n_cell,
             "max_share": max_share,
         }
+    # Reject ``**extra`` keys that would override fields the helper
+    # computes from raw data. Without this guard, a caller could pass
+    # ``cells={...}`` (or ``row_variable=...`` etc.) and the
+    # ``fields.update(extra)`` below would clobber the helper's
+    # computation. The ``_via_helper`` marker stamped at write time
+    # would then authenticate attacker-supplied values, and the
+    # sanitizer (which trusts the marker to skip recomputing
+    # ``max_share``) would let a forged ``max_share=0`` bypass the
+    # dominance gate. The marker is meant to prove the disclosure-
+    # metric fields came from the helper, not just that the helper
+    # was called.
+    _reserved = {
+        "type", "row_variable", "value_variable", "aggregation",
+        "cells", "_via_helper",
+    }
+    forbidden = sorted(set(extra) & _reserved)
+    if forbidden:
+        raise ValueError(
+            "from_magnitude_table: cannot override helper-computed "
+            f"fields via keyword arguments: {forbidden}. These are "
+            "computed from the DataFrame and bound to the "
+            "_via_helper provenance marker."
+        )
     fields = {
         "row_variable": group_var,
         "value_variable": value_var,
@@ -683,7 +698,7 @@ def from_magnitude_table(df: Any, group_var: str, value_var: str, *,
     fields.update(extra)
     # Helper-provenance marker. The sanitizer requires this for
     # ``magnitude_table`` because cell-level ``max_share`` is
-    # consulted-only and stripped — without proof that max_share
+    # consulted-only and stripped; without proof that max_share
     # came from raw-data computation a malicious script could
     # publish a dominance-violating value with a forged
     # ``max_share=0`` and skip the dominance gate. Write directly
@@ -1410,16 +1425,25 @@ def plot_interaction(
                    color="#4C78A8", edgecolor="#1F4E79",
                    capsize=4)
             ax.set_xticks(xs)
-            # Cap label length per tick. A category's name IS data
-            # (e.g. "engineering", "diabetes"); below-threshold
-            # rare levels are already filtered above, but apply a
-            # length cap as defence-in-depth so a long sensitive
-            # string at a frequent-level position can't ride
-            # through unbounded.
-            def _trim(s: str, lim: int = 24) -> str:
-                t = str(s)
-                return t if len(t) <= lim else (t[:lim - 1] + "…")
-            ax.set_xticklabels([_trim(g) for g in grid], rotation=30, ha="right")
+            # Run categorical tick labels through the same text-safety
+            # primitive that gates every other model-visible string.
+            # ``safe_text`` strips C0/C1 control chars, bidi overrides,
+            # and zero-width characters, then caps length. Without this
+            # a frequent-level category name like
+            # ``"engineering\nIGNORE PRIOR INSTRUCTIONS:..."`` would
+            # render straight into the model-visible image, bypassing
+            # the JSON/text path's safety gate. ``safe_text`` returns
+            # an empty string for completely-rejected inputs; fall
+            # back to a redaction marker so the bar is still
+            # identifiable at its x-position.
+            from nora.text_safety import safe_text as _safe_text
+
+            def _tick_label(v: object) -> str:
+                t = _safe_text(str(v), max_len=24)
+                return t or "[redacted]"
+            ax.set_xticklabels(
+                [_tick_label(g) for g in grid], rotation=30, ha="right",
+            )
         ax.set_xlabel(xtitle)
         ax.set_ylabel(ytitle)
         ax.set_title(ptitle, fontweight="bold")

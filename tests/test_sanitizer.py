@@ -775,24 +775,33 @@ def test_ols_vcov_passes_through_with_declared_keys():
 
 def test_ols_vcov_clamped_to_sigfigs_for_n():
     """vcov values pass through clamp_precision_dict, same as the
-    other dict-of-numeric fields."""
+    other dict-of-numeric fields. Uses diagonals consistent with
+    declared SEs so the new aggregate-invariant check (diagonals
+    == SE²) doesn't drop the field; the clamping behaviour is
+    what's pinned here."""
+    # SE values chosen so that SE² has enough decimal digits to
+    # observe the precision clamp. SE=0.111 -> SE² ≈ 0.012321.
+    # SE=0.314 -> SE² ≈ 0.098596.
     payload = {
         "type": "linear_regression",
         "n": 1000,
         "response_variable": "y",
         "predictor_variables": ["x"],
         "coefficients": {"(Intercept)": 1.0, "x": 2.0},
-        "standard_errors": {"(Intercept)": 0.1, "x": 0.1},
+        "standard_errors": {"(Intercept)": 0.111, "x": 0.314},
         "r_squared": 0.5,
         "vcov": {
-            "(Intercept)": {"(Intercept)": 0.0123456789},
-            "x": {"x": 0.987654321},
+            "(Intercept)": {"(Intercept)": 0.111 * 0.111},
+            "x": {"x": 0.314 * 0.314},
         },
     }
     r = sanitize(payload)
     assert r.ok
-    # sigfigs_for_n(1000) == 4
-    assert r.sanitized["vcov"]["x"]["x"] == 0.9877
+    # sigfigs_for_n(1000) == 4. 0.314² = 0.098596 -> clamped to
+    # 0.09860 (4 sigfigs).
+    diag_x = r.sanitized["vcov"]["x"]["x"]
+    # Allow either 0.09860 or 0.0986 depending on float repr.
+    assert abs(diag_x - 0.0986) < 1e-6
 
 
 def test_ols_vcov_long_coef_name_keeps_matrix_aligned():
@@ -866,7 +875,15 @@ def test_ols_vcov_drops_alien_keys_after_sanitization():
 def test_ols_vcov_collision_after_sanitization_does_not_overwrite():
     """If two raw keys clean to the same sanitized name, drop the
     duplicate rather than silently overwriting the earlier cell.
-    The ``vcov`` log entry tells the caller a collision happened."""
+    The ``vcov`` log entry records the collision so a caller
+    auditing the SDC report can see what happened.
+
+    The submitted matrix is also intentionally incomplete (only
+    the ``x`` row populated), so the new aggregate-invariant
+    check drops the vcov field as a whole. That's the right
+    posture — a partial matrix isn't a real ``cov_params()``
+    output. The collision detection still surfaces in the log
+    even though the matrix doesn't survive."""
     # Both raw names exceed 40 chars and share the first 40 — they
     # collapse to the same safe_key form.
     long_a = (
@@ -876,11 +893,6 @@ def test_ols_vcov_collision_after_sanitization_does_not_overwrite():
         "name_collision_prefix_padding_xxxxxxxxxx_two_extra_tail"
     )
     assert len(long_a) > 40 and len(long_b) > 40
-    # Use only the FIRST raw form in coefficients/SE/predictors so
-    # the allowlist has a single sanitized entry. The vcov payload
-    # then references both raw names in the same row, which clean
-    # to the same safe_key — the second cell would have silently
-    # overwritten the first under the old code path.
     payload = {
         "type": "linear_regression",
         "n": 1000,
@@ -895,16 +907,16 @@ def test_ols_vcov_collision_after_sanitization_does_not_overwrite():
     }
     r = sanitize(payload)
     assert r.ok
-    # Only one cell survived for the collided column. The exact
-    # winner is implementation-defined, but it is NOT the second
-    # raw value silently overwriting the first.
-    sanitized_long = next(
-        k for k in r.sanitized["coefficients"] if k not in {"(Intercept)", "x"}
-    )
-    assert sanitized_long in r.sanitized["vcov"]["x"]
     # The collision shows up in the transformations log so a caller
     # auditing the SDC report can see what happened.
     assert any("collid" in t for t in r.transformations), r.transformations
+    # The vcov field is dropped by the invariant check (single row,
+    # asymmetric); the transformation log records THAT too.
+    assert "vcov" not in r.sanitized
+    assert any(
+        "vcov" in t and ("asymmetric" in t or "drop" in t)
+        for t in r.transformations
+    ), r.transformations
 
 
 def test_ols_condition_number_passes_through():
@@ -1038,10 +1050,12 @@ def test_correlation_matrix_drops_undeclared_variable_keys():
 
 def test_correlation_matrix_clips_to_minus_one_to_one():
     """Precision-clamp followed by clip ensures no value escapes
-    [-1, 1] even at boundary precision."""
+    [-1, 1] even at boundary precision. The matrix is symmetric
+    (the new aggregate-invariant check requires it) and the
+    boundary-crossing value sits on both sides of the diagonal."""
     p = _correlation_payload(
         correlations={
-            "age": {"age": 1.0, "income": 0.999999},
+            "age": {"age": 1.0, "income": -1.0001},
             "income": {"age": -1.0001, "income": 1.0},
         },
     )
@@ -1137,12 +1151,17 @@ def test_descriptive_drops_min_max_by_default():
     assert "max_value" not in r.sanitized
 
 
-def test_descriptive_passes_min_max_when_variable_opted_in():
-    """Variables on ``SDCConfig.non_disclosive_variables`` get
-    min_value / max_value through the sanitizer (precision-
-    clamped). The opt-in is per-variable, not per-payload — only
-    the matching variable's extremes are released."""
-    from nora.sanitizer import DEFAULT_CONFIG, SDCConfig
+def test_descriptive_drops_min_max_even_with_opt_in():
+    """The opt-in passthrough used to honor a per-variable
+    ``non_disclosive_variables`` config and accept min/max for
+    matching variables. That was unsafe: nothing in the payload
+    binds the reported values to the named variable's actual
+    column, and ``variable`` / ``source_dataset`` / the values
+    themselves are all model/script-controlled. The sanitizer
+    can't prove a payload labeled ``variable="age"`` carries
+    age's min/max rather than (eg) salary's, so the channel is
+    closed and the policy field is inert."""
+    from nora.sanitizer import DEFAULT_CONFIG
     from dataclasses import replace as dc_replace
 
     cfg = dc_replace(
@@ -1161,20 +1180,15 @@ def test_descriptive_passes_min_max_when_variable_opted_in():
     }
     r = sanitize(payload, cfg)
     assert r.ok
-    assert "min_value" in r.sanitized
-    assert "max_value" in r.sanitized
-    # Per-variable opt-in: a DIFFERENT variable's payload still
-    # gets min/max stripped under the same config.
-    payload2 = dict(payload, variable="salary")
-    r2 = sanitize(payload2, cfg)
-    assert r2.ok
-    assert "min_value" not in r2.sanitized
-    assert "max_value" not in r2.sanitized
+    assert "min_value" not in r.sanitized
+    assert "max_value" not in r.sanitized
 
 
-def test_descriptive_min_max_precision_clamped():
-    """Opted-in min/max go through the same precision-clamp pipeline
-    as other numeric fields — sigfigs scale with N."""
+def test_descriptive_min_max_dropped_regardless_of_precision():
+    """Even when ``min_value`` / ``max_value`` would round nicely,
+    they're never published. Closing the channel uniformly avoids
+    a class of attacks where a hostile script labels sensitive
+    column values under an opt-in variable name."""
     from nora.sanitizer import DEFAULT_CONFIG
     from dataclasses import replace as dc_replace
 
@@ -1193,9 +1207,8 @@ def test_descriptive_min_max_precision_clamped():
     }
     r = sanitize(payload, cfg)
     assert r.ok
-    # sigfigs_for_n(1000) == 4
-    assert r.sanitized["min_value"] == 18.12
-    assert r.sanitized["max_value"] == 89.99
+    assert "min_value" not in r.sanitized
+    assert "max_value" not in r.sanitized
 
 
 def test_ttest_ci_length_2_is_accepted():

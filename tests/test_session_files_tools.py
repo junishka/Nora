@@ -487,6 +487,13 @@ def test_search_kinds_default_is_script_and_log(populated_session: Path):
     (populated_session / "main.do").write_text(
         "use mydata.dta, clear\nTARGET label\n"
     )
+    # The fixture's ``initialize`` captured the original fingerprints;
+    # the modifications above legitimately change the on-disk content
+    # so the provenance manifest needs a refresh. In production the
+    # researcher would re-stage through the bridge; here we call
+    # mark_known directly to model that path.
+    from nora.file_provenance import mark_known
+    mark_known(populated_session, ["fig.png", "main.do"])
     out = _search({"query": "TARGET"})
     names = {r["name"] for r in out["results"]}
     assert names == {"main.do"}

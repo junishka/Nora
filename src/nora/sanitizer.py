@@ -283,16 +283,21 @@ _DESC_REQUIRED: frozenset[str] = frozenset(
 
 # Default-allowed numerics: mean and sd — pure aggregates, never
 # disclosive at row level. min / max are individual observations and
-# are gated by ``SDCConfig.non_disclosive_variables`` (researcher-side
-# per-variable opt-in via ``.nora/policy.json``); when the variable
-# is in that set, ``min_value`` and ``max_value`` are also accepted.
-# Median / quartiles remain forbidden in this payload type — use
-# ``request_data`` ``quartiles`` (which omits the median exactly
-# because at odd N it IS an individual observation).
+# are NEVER accepted in this payload type. The opt-in path that
+# previously let an explicitly-listed variable's min/max pass through
+# was unsafe under the threat model: ``source_dataset``, ``variable``,
+# and the values themselves are all model/script-controlled, and the
+# sanitizer cannot prove that a payload labeled ``variable="age"``
+# carries age's min/max rather than (eg) salary's. A typed helper
+# stamping a provenance marker doesn't close it either — the marker
+# only proves the helper was called; the caller still chooses which
+# column to summarize and what to label it. Closing the channel
+# requires a Nora-owned dataset-load path, which is out of scope here.
+# The ``non_disclosive_variables`` policy field stays for documented
+# intent and forward compatibility, but is inert in this sanitizer.
+# Median / quartiles remain forbidden too — use ``request_data``
+# ``quartiles`` for those (which is Nora-owned and IQR-clamped).
 _DESC_ALLOWED_NUMERIC_FIELDS: frozenset[str] = frozenset(("mean", "sd"))
-_DESC_OPTIONAL_NUMERIC_FIELDS: frozenset[str] = frozenset(
-    ("min_value", "max_value")
-)
 _DESC_ALLOWED_INT_FIELDS: frozenset[str] = frozenset(
     ("n", "missing_count", "distinct_count")
 )
@@ -698,6 +703,149 @@ def _collect_allowed(
     return out
 
 
+def _correlation_invariants_hold(
+    corr: dict[str, dict[str, float]],
+    declared: set[str],
+) -> tuple[bool, str]:
+    """Verify the aggregate invariants of a real correlation matrix.
+
+    A correlation matrix from ``df.corr()`` is square, symmetric,
+    has 1s on the main diagonal, and (Pearson) is bounded in
+    [-1, 1]. The per-cell checks already clip to [-1, 1]; this
+    function adds:
+
+    * **Completeness**: every declared variable has a row whose
+      columns cover every other declared variable. A partial matrix
+      could otherwise be used to thread free cells past the
+      declared-variables cap.
+    * **Diagonals = 1**: a real Pearson / Spearman / Kendall
+      diagonal is exactly 1 (or, with float round-trip noise,
+      within a small epsilon of 1). Any other value indicates a
+      hand-crafted matrix.
+    * **Symmetry**: ``corr[i][j] == corr[j][i]`` within a small
+      tolerance. Halves the bandwidth attacker-engineered values
+      could otherwise use.
+
+    Returns ``(ok, reason)``. ``reason`` is suitable for the
+    sanitizer's ``rejection_reason``; it does not echo any specific
+    correlation value back to the model (just structural facts).
+    """
+    REL_TOL = 1e-3
+    ABS_TOL = 1e-9
+    # Completeness: every declared variable must have its own row,
+    # and that row must cover every other declared variable.
+    for var in declared:
+        row = corr.get(var)
+        if row is None:
+            return (False, f"missing row for declared variable {var!r}")
+        for other in declared:
+            if other not in row:
+                return (
+                    False,
+                    f"row {var!r} missing column {other!r} "
+                    f"(declared but unreported correlation)"
+                )
+    # Diagonals = 1.
+    for var in declared:
+        diag = corr[var][var]
+        if abs(diag - 1.0) > ABS_TOL + REL_TOL:
+            return (
+                False,
+                f"diagonal not 1.0: corr[{var!r}][{var!r}]={diag!r}"
+            )
+    # Symmetry.
+    for row_var in declared:
+        row = corr[row_var]
+        for col_var in declared:
+            if col_var == row_var:
+                continue
+            val = row[col_var]
+            partner = corr[col_var][row_var]
+            diff = abs(val - partner)
+            scale = max(abs(val), abs(partner), 1.0)
+            if diff > ABS_TOL + REL_TOL * scale:
+                return (
+                    False,
+                    f"asymmetric: corr[{row_var!r}][{col_var!r}]={val!r} "
+                    f"!= corr[{col_var!r}][{row_var!r}]={partner!r}"
+                )
+    return (True, "")
+
+
+def _vcov_invariants_hold(
+    vcov: dict[str, dict[str, float]],
+    standard_errors: dict[str, float],
+) -> tuple[bool, str]:
+    """Verify the aggregate invariants of a variance-covariance matrix.
+
+    Returns ``(ok, reason)``. A real cov matrix from σ²·(X'X)^-1 is
+    symmetric (``vcov[i][j] == vcov[j][i]``) and its diagonals are
+    the squared standard errors. Anything emitted through the
+    generic ``result(type="linear_regression", vcov=...)`` escape
+    hatch can carry arbitrary numeric cells; without these checks a
+    hostile payload smuggles up to N² scalar values to the model
+    through ``expand_result``. The checks reject the whole matrix
+    rather than per-cell so an attacker can't slip a small number
+    of inconsistent cells through.
+
+    Tolerance: symmetry is checked against a small relative epsilon
+    that accommodates float round-trip noise from JSON. Diagonals
+    compare ``vcov[i][i]`` against ``standard_errors[i]**2`` with a
+    similarly relaxed bound so legitimately-fit models with
+    ill-conditioned designs still pass.
+    """
+    REL_TOL = 1e-3
+    ABS_TOL = 1e-9
+    # Symmetry: every off-diagonal cell must have a partner across
+    # the main diagonal with a near-equal value.
+    for row, inner in vcov.items():
+        for col, val in inner.items():
+            if row == col:
+                continue
+            partner_inner = vcov.get(col)
+            if partner_inner is None or row not in partner_inner:
+                return (
+                    False,
+                    f"asymmetric: vcov[{row!r}][{col!r}] present but "
+                    f"vcov[{col!r}][{row!r}] missing"
+                )
+            partner = partner_inner[row]
+            diff = abs(val - partner)
+            scale = max(abs(val), abs(partner), 1.0)
+            if diff > ABS_TOL + REL_TOL * scale:
+                return (
+                    False,
+                    f"asymmetric: vcov[{row!r}][{col!r}]={val!r} "
+                    f"!= vcov[{col!r}][{row!r}]={partner!r}"
+                )
+    # Diagonals match SE². Intercept aliases in ``standard_errors``
+    # may use a different name than the vcov diagonal key (the
+    # sanitizer accepts a few intercept aliases); skip the check
+    # when no matching SE entry exists rather than over-reject.
+    for row, inner in vcov.items():
+        diag = inner.get(row)
+        if diag is None:
+            continue
+        if diag < 0:
+            return (
+                False,
+                f"negative variance: vcov[{row!r}][{row!r}]={diag!r}"
+            )
+        se = standard_errors.get(row)
+        if se is None:
+            continue
+        expected = float(se) ** 2
+        diff = abs(diag - expected)
+        scale = max(abs(diag), abs(expected), 1.0)
+        if diff > ABS_TOL + REL_TOL * scale:
+            return (
+                False,
+                f"diagonal mismatch: vcov[{row!r}][{row!r}]={diag!r} "
+                f"!= standard_errors[{row!r}]**2={expected!r}"
+            )
+    return (True, "")
+
+
 def _coarsen_small_missing_count(
     out: dict[str, Any],
     transformations: list[str],
@@ -1026,7 +1174,25 @@ def _sanitize_linear_regression(
                 + (" …" if len(collisions) > 5 else "")
             )
         if sanitized_vcov:
-            out["vcov"] = sanitized_vcov
+            # Aggregate-consistency check. A real variance-covariance
+            # matrix from σ²·(X'X)^-1 is symmetric and its diagonals
+            # are SE². Generic ``result(type="linear_regression",
+            # vcov={...})`` bypasses the typed helper and can carry
+            # arbitrary numeric cells; the key + finiteness checks
+            # above don't catch that. Reject the whole vcov if either
+            # invariant fails — a real model never produces such a
+            # matrix, and accepting it would let the script smuggle
+            # up to N² cells of attacker-shaped numeric data through
+            # to the model via expand_result.
+            vcov_ok, reject_reason = _vcov_invariants_hold(
+                sanitized_vcov, out.get("standard_errors") or {},
+            )
+            if vcov_ok:
+                out["vcov"] = sanitized_vcov
+            else:
+                transformations.append(
+                    f"dropped vcov entirely: {reject_reason}"
+                )
 
     # Precision clamp every numeric field and every dict-of-numeric
     # field. Clamp AFTER the cross-field key filter above so we only
@@ -1227,20 +1393,14 @@ def _sanitize_descriptive(
         )
 
     transformations: list[str] = []
-    # Per-variable opt-in for min / max. When the researcher has
-    # added this variable to the dataset's ``non_disclosive_variables``
-    # list (via .nora/policy.json), ``min_value`` and ``max_value``
-    # join the numeric allowlist for THIS payload only. Default
-    # empty set → behaves exactly as before.
-    variable_name = raw.get("variable")
-    extra_numeric: frozenset[str] = frozenset()
-    if (
-        isinstance(variable_name, str)
-        and variable_name in config.non_disclosive_variables
-    ):
-        extra_numeric = _DESC_OPTIONAL_NUMERIC_FIELDS
-
-    numeric_allowlist = _DESC_ALLOWED_NUMERIC_FIELDS | extra_numeric
+    # min_value / max_value are NEVER passed through here — see the
+    # comment on ``_DESC_ALLOWED_NUMERIC_FIELDS`` for why. The opt-in
+    # mechanism the prior code implemented (per-variable allowance
+    # via ``config.non_disclosive_variables``) was unsafe because
+    # nothing in the payload binds the reported values to the named
+    # variable's actual column. Researchers who need a variable's
+    # range should use a Nora-owned path (eg ``request_data``).
+    numeric_allowlist = _DESC_ALLOWED_NUMERIC_FIELDS
     out = _collect_allowed(
         raw,
         numeric=numeric_allowlist,
@@ -1267,12 +1427,6 @@ def _sanitize_descriptive(
     for key in numeric_allowlist:
         if key in out:
             out[key] = clamp_precision(out[key], n)
-    if extra_numeric and any(k in out for k in extra_numeric):
-        transformations.append(
-            f"min_value / max_value passed through (variable "
-            f"{variable_name!r} is on the dataset's "
-            f"non_disclosive_variables opt-in list)"
-        )
     _coarsen_small_missing_count(out, transformations, config)
     transformations.append(
         f"clamped numeric fields to {sigfigs_for_n(n)} significant "
@@ -2219,6 +2373,35 @@ def _sanitize_correlation_matrix(
                 "row/column key was either not in the declared "
                 "``variables`` list or had a non-finite value. The "
                 "payload likely has a variables/correlations mismatch."
+            ),
+        )
+
+    # Aggregate invariants for a real correlation matrix. The
+    # per-cell checks above (declared keys, finiteness, clip to
+    # [-1, 1]) don't catch a matrix that's asymmetric, has
+    # off-diagonal cells without their transpose partner, or has
+    # diagonals != 1. A real ``df.corr()`` always produces these
+    # invariants; an attacker emitting through generic
+    # ``result(type="correlation_matrix", ...)`` to smuggle numeric
+    # values is the only realistic origin of a violation.
+    #
+    # Reject the whole payload rather than the matrix alone: unlike
+    # vcov (which sits alongside coefficients/SE/etc.), the
+    # correlations field IS the payload, and a correlation_matrix
+    # without correlations is meaningless.
+    invariants_ok, reject_reason = _correlation_invariants_hold(
+        sanitized_corr, declared,
+    )
+    if not invariants_ok:
+        return SanitizerResult(
+            ok=False, analysis_type="correlation_matrix",
+            rejection_reason=(
+                f"correlation matrix failed aggregate-invariant check: "
+                f"{reject_reason}. Real correlation matrices are "
+                f"symmetric with 1s on the diagonal; a violation here "
+                f"means the payload didn't come from a ``df.corr()``-"
+                f"shaped computation, which is required by the SDC "
+                f"posture for this result type."
             ),
         )
     out["correlations"] = sanitized_corr
