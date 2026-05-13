@@ -12,9 +12,8 @@ Preferred channel: GitHub's private vulnerability reporting. Open the
 This routes a private advisory to the maintainer; the issue stays out
 of public view until disclosure is coordinated.
 
-Alternatively, email the maintainer at `<TODO: set a contact email
-before publishing this file>`. Please do not file public issues for
-security reports.
+Alternatively, email the maintainer at jbyun@iese.edu. Please do not
+file public issues for security reports.
 
 Please include:
 
