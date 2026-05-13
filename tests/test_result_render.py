@@ -1348,7 +1348,7 @@ def test_compose_layout_against_real_24_result_run() -> None:
     the regression pin for the design proposal that motivated the
     feature."""
     fixture = Path(
-        "/Users/bb/.nora-sessions/20260501T032851Z_be5f2a77/.nora/runs/"
+        "/Users/you/.nora-sessions/20260501T032851Z_be5f2a77/.nora/runs/"
         "20260501T032915Z_69914fb1/result.json"
     )
     if not fixture.exists():
