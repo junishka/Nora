@@ -2002,7 +2002,15 @@ async def submit_script_file(args: dict[str, Any]) -> dict[str, Any]:
         is_under_nora = resolved_target.is_relative_to(nora_subdir)
     except (ValueError, OSError):
         is_under_nora = False
-    if not is_under_nora:
+    ext = target.suffix.lower()
+    inferred_language = _SCRIPT_FILE_LANGUAGES.get(ext)
+    # Provenance only matters for files this tool would actually
+    # run. Non-script extensions are rejected below by the
+    # extension check with a more useful error than "not staged";
+    # checking provenance first would mask that message and force
+    # the user through a re-staging dance for a file that wouldn't
+    # have been runnable either way.
+    if not is_under_nora and inferred_language is not None:
         # Fail CLOSED: a manifest read that raises (corrupt JSON,
         # permission-blocked path, FS error) used to flip
         # ``staged_ok`` to True and let the call through. That
@@ -2049,9 +2057,6 @@ async def submit_script_file(args: dict[str, Any]) -> dict[str, Any]:
                 "status": "rejected",
                 "reason": reason,
             }, language=None))
-
-    ext = target.suffix.lower()
-    inferred_language = _SCRIPT_FILE_LANGUAGES.get(ext)
     if inferred_language is None:
         return _as_mcp_text(_with_zero_phase_metadata({
             "status": "error",
@@ -3155,6 +3160,16 @@ def _manifest_allowed_plot_kinds(plots_dir: Path, basename: str) -> str | None:
     researcher-only because residual values are individual
     observations) MUST NOT be recallable as image bytes either,
     or the disclosure-control posture is undone via this side door.
+
+    No re-validation of ``_token`` here: the executor's
+    ``_filter_plot_manifest`` has already sanitized the manifest
+    on-disk by the time this function runs. Either the file
+    contains only validated entries (filter succeeded) or the
+    file has been neutralized (unlink / rename) so the
+    ``manifest.is_file()`` check below returns False. The token
+    validation lives at the in-session paths (``_capture_plots`` /
+    ``_summarize_plot_helpers``); the recall path runs later and
+    only needs the post-sanitization state.
     """
     manifest = plots_dir / "manifest.jsonl"
     if not manifest.is_file():
@@ -3425,7 +3440,21 @@ async def read_attached_file(args: dict[str, Any]) -> dict[str, Any]:
         is_under_nora = resolved_target.is_relative_to(nora_subdir)
     except (ValueError, OSError):
         is_under_nora = False
-    if not is_under_nora:
+    ext = target.suffix.lower()
+    # Provenance only matters for extensions this tool would
+    # actually return bytes for. Non-recallable extensions
+    # (datasets, unknown types) are rejected below with extension-
+    # specific guidance ("use get_schema", "unsupported type"); the
+    # provenance gate would mask those messages with a less useful
+    # "not staged" reason and force the user to re-attach a file
+    # the tool wouldn't have returned anyway.
+    _recallable_exts = (
+        _RECALL_SCRIPT_EXTS
+        | _RECALL_NOTEBOOK_EXTS
+        | _RECALL_RASTERIZE_EXTS
+        | frozenset(_RECALL_IMAGE_MIMES.keys())
+    )
+    if not is_under_nora and ext in _recallable_exts:
         # Fail CLOSED — same posture as ``submit_script_file``. A
         # manifest read that raises (corrupt JSON, permission-blocked
         # path, FS error) used to flip ``staged_ok`` to True, turning
@@ -3477,8 +3506,6 @@ async def read_attached_file(args: dict[str, Any]) -> dict[str, Any]:
                 "status": "rejected",
                 "reason": reason,
             })
-
-    ext = target.suffix.lower()
 
     # ----- notebook branch ---------------------------------------------
     # ``list_session_files`` advertises ``.ipynb`` as a script-kind
@@ -4231,34 +4258,76 @@ async def search_in_session_files(args: dict[str, Any]) -> dict[str, Any]:
         # can locate matches without seeing raw rows / cell outputs.
         # See the disclosure-control note in the tool docstring.
         excerpts_allowed = ext in _SEARCH_FILES_EXCERPT_EXTS
+        # Per-file budget: stop scanning the moment a global cap
+        # would be breached by appending the next match. The pre-
+        # loop ``total_matches >= cap`` / ``rendered_chars >= cap``
+        # gates above test the budgets BEFORE this file is touched,
+        # but with ``max_per_file=50`` and the 200-match global
+        # cap, the previous file could leave us at 199; appending
+        # 50 more from THIS file would push us to 249. Enforce
+        # both caps as hard caps by checking remaining budget per
+        # match rather than per file.
+        remaining_matches = (
+            _SEARCH_FILES_TOTAL_MATCHES_CAP - total_matches
+        )
+        remaining_chars = _SEARCH_FILES_TOTAL_CHARS_CAP - rendered_chars
         matches: list[dict[str, Any]] = []
+        added_chars = 0
+        file_truncated = False
         for lineno, line in enumerate(text.splitlines(), start=1):
-            if needle in line.lower():
-                if excerpts_allowed:
-                    excerpt = line.strip()
-                    if len(excerpt) > _SEARCH_FILES_LINE_EXCERPT_CAP:
-                        excerpt = excerpt[:_SEARCH_FILES_LINE_EXCERPT_CAP] + "…"
-                    matches.append({"line": lineno, "text": safe_text(excerpt)})
-                else:
-                    matches.append({"line": lineno})
-                if len(matches) >= max_per_file:
-                    break
+            if needle not in line.lower():
+                continue
+            if excerpts_allowed:
+                excerpt = line.strip()
+                if len(excerpt) > _SEARCH_FILES_LINE_EXCERPT_CAP:
+                    excerpt = excerpt[:_SEARCH_FILES_LINE_EXCERPT_CAP] + "…"
+                match_entry: dict[str, Any] = {
+                    "line": lineno, "text": safe_text(excerpt),
+                }
+                match_cost = 12 + len(match_entry["text"])
+            else:
+                match_entry = {"line": lineno}
+                match_cost = 12
+            # Refuse the match if either global budget would be
+            # blown by adding it. ``response_truncated`` gets set
+            # below if the per-file cap or a global cap halts the
+            # scan early.
+            if len(matches) >= remaining_matches:
+                file_truncated = True
+                break
+            if added_chars + match_cost > remaining_chars:
+                file_truncated = True
+                break
+            matches.append(match_entry)
+            added_chars += match_cost
+            if len(matches) >= max_per_file:
+                file_truncated = True
+                break
         if matches:
             total_matches += len(matches)
+            rendered_chars += added_chars
             row = {
                 "name": name,
                 "kind": kind,
                 "excerpts": excerpts_allowed,
                 "matches": matches,
-                "truncated": len(matches) >= max_per_file,
+                "truncated": file_truncated,
             }
             results.append(row)
-            # Approximate char cost of the row's match payload. Excerpts
-            # dominate; line-only entries add a fixed ~12 chars each.
-            # Used purely for the global-char-cap test on the next
-            # iteration — undercount is fine, overcount is fine.
-            for m in matches:
-                rendered_chars += 12 + len(m.get("text", ""))
+        if total_matches >= _SEARCH_FILES_TOTAL_MATCHES_CAP:
+            response_truncated = True
+            response_truncated_reason = (
+                f"hit the {_SEARCH_FILES_TOTAL_MATCHES_CAP}-match "
+                f"response cap; narrow the query"
+            )
+            break
+        if rendered_chars >= _SEARCH_FILES_TOTAL_CHARS_CAP:
+            response_truncated = True
+            response_truncated_reason = (
+                f"hit the {_SEARCH_FILES_TOTAL_CHARS_CAP}-char response "
+                f"payload cap; narrow the query"
+            )
+            break
 
     response: dict[str, Any] = {
         "status": "ok",

@@ -37,8 +37,19 @@ so the audit trail is preserved, but only the current on-disk
 sha256 needs to match SOMETHING in the recorded set for
 ``is_known`` to return True.
 
+Recallable-only fingerprinting: only files whose extension matches
+a recall surface (scripts, logs, graphs — the set
+``read_attached_file`` / ``submit_script_file`` /
+``search_in_session_files`` would actually return bytes for) are
+fingerprinted. Data files (``.csv``, ``.dta``, ``.parquet``, ...)
+cannot have their bytes returned by any recall path regardless of
+provenance state, so spending I/O to hash a multi-GB dataset at
+session-open is wasteful and never gains security. A 3 GB ``.dta``
+in cwd would otherwise block folder-open for seconds on SSD and
+much longer on network mounts.
+
 The manifest lives under ``<cwd>/.nora/`` which the analysis sandbox
-already deny-reads/writes — a model script can't read or tamper
+already deny-reads/writes, so a model script can't read or tamper
 with it. Writes are atomic via tempfile + ``os.replace`` so a crash
 mid-write leaves either the prior snapshot intact or the new one
 fully written, never a half-truncated JSON.
@@ -50,7 +61,11 @@ Schema versions:
     upgrade carry these. v1 entries are read for the ``known_names``
     diagnostic but ``is_known`` returns False for them (no
     fingerprint to verify) — the researcher re-stages via the
-    bridge to upgrade those entries to v2.
+    bridge to upgrade those entries to v2. We deliberately do NOT
+    silently re-fingerprint v1 entries on read: doing so would
+    promote whatever content is currently on disk to "the trusted
+    fingerprint", which is exactly what an attacker would want if
+    they'd already overwritten a staged file.
   * v2 (current): ``{"version": 2, "entries": [{"name": ...,
     "sha256": ..., "size_bytes": ...}, ...]}`` — multiple
     fingerprints per name are allowed (legitimate re-stage of an
@@ -82,6 +97,35 @@ MANIFEST_VERSION = 2
 # Python loop overhead is negligible vs. the hash work, small
 # enough that we never hold a researcher's multi-GB CSV in memory.
 _FINGERPRINT_CHUNK_BYTES = 64 * 1024
+
+
+def _is_recallable_basename(name: str) -> bool:
+    """Whether a file with this basename could have its bytes
+    returned to the model through any recall surface.
+
+    Only such files need a content fingerprint. The provenance
+    manifest exists to defend against "script overwrites a staged
+    file with raw rows, then recalls it as bytes." Data files
+    (``.csv``, ``.dta``, ``.rds``, ``.parquet``, ``.jsonl``, ...)
+    are rejected by ``read_attached_file``, ``submit_script_file``,
+    and ``search_in_session_files`` regardless of provenance state
+    — they cannot be recalled as bytes at all. Hashing them at
+    session-open does no security work and reads multi-GB datasets
+    end-to-end before the UI is usable.
+
+    The recallable set is the union of script / log / graph
+    extensions from ``session_files`` — that's the single source
+    of truth for what the recall tools surface. If a new
+    extension becomes recallable there, it picks up provenance
+    binding automatically through this gate.
+    """
+    # Import lazily so this module stays light-weight and avoids
+    # circulars with ``session_files`` if it ever grows imports
+    # from here.
+    from nora.session_files import GRAPH_EXTS, LOG_EXTS, SCRIPT_EXTS
+    ext = Path(name).suffix.lower()
+    return ext in SCRIPT_EXTS or ext in LOG_EXTS or ext in GRAPH_EXTS
+
 
 # Per-cwd lock so the bridge's file-staging endpoints (which can fire
 # concurrently when the researcher drops a folder of files) don't
@@ -264,6 +308,12 @@ def initialize(cwd: Path) -> set[str]:
     later sandbox-script overwrite shows up as a fingerprint
     mismatch in ``is_known``.
 
+    Recallable-only: only files whose extension can have their
+    bytes returned by a recall surface (scripts, logs, graphs) are
+    fingerprinted. Data files don't need fingerprints because no
+    recall path returns their bytes anyway, and a 3 GB ``.dta``
+    would otherwise block folder-open while we hashed it.
+
     Once a manifest exists, subsequent re-opens MUST NOT re-snapshot
     — between sessions, the analysis sandbox may have written its
     own files into cwd (``df.to_csv("out.csv")`` is legitimate;
@@ -288,8 +338,6 @@ def initialize(cwd: Path) -> set[str]:
     they'd already overwritten a staged file. v1 entries fail
     closed in ``is_known``; researcher re-stages via the bridge to
     upgrade them.
-
-    Returns the resulting name set so callers can log it.
     """
     path = _manifest_path(cwd)
     with _lock_for(cwd):
@@ -300,13 +348,17 @@ def initialize(cwd: Path) -> set[str]:
         # is in cwd right now). ``path.exists()`` is the gate.
         if path.exists():
             return {e["name"] for e in _read_entries(path)}  # type: ignore[misc]
-        # First open: fingerprint each top-level file. ``_fingerprint``
-        # returns ``None`` on read failure; in that case we still
-        # record the name (so ``known_names`` matches the directory
-        # listing) but without a fingerprint — those entries fail
-        # closed in ``is_known``.
+        # First open: fingerprint each top-level file whose extension
+        # is recallable. Non-recallable extensions (data files) are
+        # skipped — see the module docstring. ``_fingerprint`` returns
+        # ``None`` on read failure; in that case we still record the
+        # name (so ``known_names`` matches the directory listing) but
+        # without a fingerprint — those entries fail closed in
+        # ``is_known``.
         entries: list[dict[str, object]] = []
         for name in _enumerate_cwd_top_level(cwd):
+            if not _is_recallable_basename(name):
+                continue
             entry: dict[str, object] = {"name": name}
             fp = _fingerprint(cwd / name)
             if fp is not None:
@@ -325,7 +377,13 @@ def mark_known(cwd: Path, names: Iterable[str]) -> set[str]:
     callers should already be passing basenames, but a stray
     ``/foo/bar.csv`` wouldn't smuggle a path-shaped key in.
 
-    For each input:
+    Recallable-only: non-recallable extensions (data files) are
+    skipped silently. The bridge endpoints call ``mark_known`` after
+    every staging event; a researcher dropping a folder of mixed
+    files should not pay the cost of hashing each dataset, and the
+    provenance gate doesn't apply to data files anyway.
+
+    For each remaining input:
 
       * If the file exists at ``cwd/name`` and is readable, its
         sha256+size are computed and added as a new entry. A
@@ -344,7 +402,7 @@ def mark_known(cwd: Path, names: Iterable[str]) -> set[str]:
         diagnostic visibility but don't authorise reads.
     """
     cleaned = [Path(n).name for n in names if n]
-    cleaned = [n for n in cleaned if n]
+    cleaned = [n for n in cleaned if n and _is_recallable_basename(n)]
     if not cleaned:
         return {e["name"] for e in _read_entries(_manifest_path(cwd))}  # type: ignore[misc]
     path = _manifest_path(cwd)
@@ -393,6 +451,15 @@ def is_known(cwd: Path, name: str) -> bool:
     Refuses path-traversal-shaped inputs by basenaming first; a
     caller that passed ``foo/../bar.csv`` gets the same answer as if
     they passed ``bar.csv``.
+
+    Symlink rejection: if the on-disk file at the basename is a
+    symlink, ``is_known`` returns False. The manifest fingerprint
+    is meaningless against a symlink target the attacker controls,
+    and the original staging path only records regular files.
+
+    No lock needed for reads — the writer's atomic ``os.replace``
+    means readers see either the old manifest or the new one,
+    never a partial state.
     """
     safe = Path(name).name
     if not safe:
@@ -410,7 +477,13 @@ def is_known(cwd: Path, name: str) -> bool:
         # without a fingerprint (legacy / missing file). Either
         # way: not verifiable.
         return False
-    fp = _fingerprint(cwd / safe)
+    target = cwd / safe
+    # Refuse symlink substitution: a staged regular file replaced
+    # with a symlink (eg pointing at a sensitive file outside cwd)
+    # would bypass the recorded-fingerprint check if we followed it.
+    if target.is_symlink() or not target.is_file():
+        return False
+    fp = _fingerprint(target)
     if fp is None:
         return False
     return fp["sha256"] in fingerprints_for_name
