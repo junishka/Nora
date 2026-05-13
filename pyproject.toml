@@ -2,6 +2,11 @@
 name = "nora"
 version = "0.9.0"
 description = "Local privacy layer letting frontier LLMs (Anthropic, OpenAI) drive statistical analysis on a researcher's own machine (macOS-only at this stage)"
+authors = [
+    {name = "Junishka Byun", email = "jbyun@iese.edu"},
+]
+readme = "README.md"
+license = {file = "LICENSE"}
 requires-python = ">=3.10"
 classifiers = [
     "Development Status :: 4 - Beta",
@@ -24,7 +29,7 @@ dependencies = [
     "claude-agent-sdk>=0.1.61",
     # Schema extractors (step 3).
     # pyreadstat: .dta (Stata) with variable labels, value labels, types.
-    # pyreadr: .rds / .rda / .RData (R) — pure-Python port, no R needed.
+    # pyreadr: .rds / .rda / .RData (R), pure-Python port, no R needed.
     # pandas: type inference for .csv and the DataFrame lingua franca that
     # pyreadstat/pyreadr return. Heavy dep, but pyreadstat requires it anyway.
     "pyreadstat>=1.2",
@@ -36,18 +41,18 @@ dependencies = [
     # ``.parquet`` file. Also enables ``.feather`` if we add it later.
     "pyarrow>=15",
     # UI shell (`nora` entry point). pywebview wraps a native WKWebView
-    # window on macOS — no Chromium bundled, ~25 MB added to the .app
-    # rather than ~120 MB for Electron.
+    # window on macOS, so no Chromium is bundled. ~25 MB added to the
+    # .app rather than ~120 MB for Electron.
     "pywebview>=5.0",
     # Multi-provider auth: ``keyring`` brokers credentials through the
     # OS-native secret store (macOS Keychain). API keys never touch
-    # disk in cleartext — Nora reads via ``auth.get_credential`` and
+    # disk in cleartext: Nora reads via ``auth.get_credential`` and
     # writes via ``auth.set_credential``. The Claude CLI subscription
     # path bypasses keyring (uses its own ``~/.claude.json`` token);
     # only API-key creds (Anthropic, OpenAI) flow through keyring.
     "keyring>=24",
     # OpenAI provider. Used only when the researcher picks an OpenAI
-    # model in the picker — ``provider/openai.py`` lazy-imports it so
+    # model in the picker; ``provider/openai.py`` lazy-imports it so
     # an Anthropic-only install doesn't pay the dep cost at startup.
     "openai>=1.50",
 ]
