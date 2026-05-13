@@ -87,21 +87,28 @@ RUNTIME_DATAS = [
 ]
 
 # Web UI assets (HTML + JS + CSS + the bundled Lottie player + the
-# cat-loading animation JSON). The UI shell loads these from
+# cat-loading animation JSON + the locally-hosted Lexend woff2 files
+# under web/fonts/). The UI shell loads these from
 # ``Path(__file__).parent / "web"`` at runtime — see ui.py near
 # `webview.create_window`. PyInstaller's static import scan can't see
 # static asset files; without an explicit datas entry the bundle
 # ships without the UI.
 #
-# Globbed dynamically so anything dropped into web/ (a future asset,
-# a different Lottie animation, etc.) gets bundled without spec
-# edits — the rule is "everything in web/ goes into web/ in the
-# bundle". Hidden files (``.DS_Store`` etc.) are skipped.
+# rglob walks subdirectories so anything dropped into web/ (a future
+# asset, an additional font weight, a different Lottie animation,
+# etc.) gets bundled without spec edits — the rule is "everything
+# under web/ goes into web/ in the bundle, preserving subpaths".
+# Hidden files (``.DS_Store`` etc.) and dot-prefixed dirs are skipped.
+# The destination keeps the asset's relative path under web/ so
+# CSS references like ``url('fonts/Lexend-VF-latin.woff2')`` resolve
+# the same in the bundle as they do from source.
 WEB_DIR = REPO_ROOT / "src" / "nora" / "web"
 WEB_DATAS = [
-    (str(p), "nora/web")
-    for p in sorted(WEB_DIR.iterdir())
-    if p.is_file() and not p.name.startswith(".")
+    (str(p), str(Path("nora/web") / p.relative_to(WEB_DIR).parent))
+    for p in sorted(WEB_DIR.rglob("*"))
+    if p.is_file()
+    and not p.name.startswith(".")
+    and not any(part.startswith(".") for part in p.relative_to(WEB_DIR).parts)
 ]
 
 # Hidden imports — things PyInstaller's static scan may miss because

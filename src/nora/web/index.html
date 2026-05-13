@@ -14,14 +14,15 @@
   <meta http-equiv="Pragma" content="no-cache" />
   <meta http-equiv="Expires" content="0" />
   <title>Nora</title>
-  <!-- System UI font stack only. Earlier builds pulled Lexend from
-       Google Fonts (preconnect + stylesheet to fonts.googleapis.com /
-       fonts.gstatic.com), but Nora positions itself as a local
-       privacy-layer for sensitive analysis — a first-launch network
-       call to Google for fonts contradicts that posture, even though
-       it's metadata-only. Using the platform's native UI face keeps
-       launches offline-clean and avoids a connection a security-
-       minded reviewer would flag. -->
+  <!-- Lexend (research-backed face designed for reading proficiency)
+       is bundled locally under web/fonts/ and wired up via @font-face
+       in style.css. An older build loaded it from fonts.googleapis.com;
+       that was dropped for the v0.9.0 audit because a first-launch
+       network call to Google contradicts Nora's local-privacy posture
+       (and the IP-transfer-to-US concern behind the GDPR rulings on
+       Google Fonts embeds). Self-hosting the woff2 files restores the
+       typeface with zero network at launch — offline-clean and
+       audit-friendly. -->
   <link rel="stylesheet" href="style.css" />
 </head>
 <body>
