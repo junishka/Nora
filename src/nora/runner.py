@@ -1090,8 +1090,8 @@ class SessionRunner:
                             "type": "turn_error",
                             "message": (
                                 "the provider stream ended without a "
-                                "result — try again, or use Stop and "
-                                "resend if the chat feels stuck"
+                                "result. Try again, or use Stop and "
+                                "resend if the chat feels stuck."
                             ),
                         })
                     if turn_failed_event:

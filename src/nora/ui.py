@@ -32,6 +32,7 @@ import argparse
 import asyncio
 import json
 import os
+import re
 import shutil
 import sys
 import threading
@@ -1478,10 +1479,18 @@ class NoraBridge:
             return {"ok": True, "files": []}
         from nora.session_files import enumerate_session_files
 
+        # Files panel uses the researcher-facing view: hide things
+        # that already render on a result card (run-dir scripts,
+        # ``_nora_plots/`` helper outputs) and hide files in cwd
+        # that a ``submit_script`` run produced (per its
+        # ``cwd_writes.json`` manifest). The model-facing
+        # ``list_session_files`` tool keeps the full view.
         rows = enumerate_session_files(
             self.cwd,
             include_data=True,
-            include_run_scripts=True,
+            include_run_scripts=False,
+            include_run_plots=False,
+            exclude_script_writes=True,
         )
         # Running budget shared across all rows. Once exhausted, the
         # remaining image / PDF rows still appear in the panel but
@@ -2151,28 +2160,41 @@ class NoraBridge:
 
     def list_mentionable_files(self) -> dict[str, Any]:
         """Return every session-resident file the @-mention dropdown
-        can offer, as a flat list with no thumbnails. Sister of
-        :meth:`list_session_files` but lighter (no base64 image
-        bytes; the dropdown only needs name + kind for filtering and
-        rendering).
+        can offer, as a flat list with no thumbnails.
+
+        The @-mention dropdown is a re-attachment workflow: the
+        researcher types ``@`` to find a prior script, plot, or
+        upload and feed it back to Nora. It needs the FULL view
+        — including ``<run_dir>/script.{do,R,py}`` files and
+        ``<run_dir>/_nora_plots/`` outputs — so old scripts and
+        helper plots stay reachable for re-attachment. The Files
+        chip popup uses the tighter :meth:`list_session_files`
+        view (panel-mode) for browsability, but mention is
+        action-oriented and wants the full surface.
 
         The shape matches what the dropdown's filter/render code
         wants: ``[{name, kind, ext, mtime, size, path}]`` sorted by
         kind priority (data first, then scripts, graphs, logs) and
-        mtime within each kind. Files in ``.nora/runs/<id>/_nora_plots/``
-        are included so a researcher can mention helper-produced
-        plots by name (``residuals_lm1.png``) the same way they'd
-        mention a top-level upload.
+        mtime within each kind.
         """
         if self.cwd is None:
             return {"ok": True, "files": []}
-        listing = self.list_session_files()
-        files: list[dict[str, Any]] = []
-        for entry in listing.get("files", []):
-            files.append({
-                k: v for k, v in entry.items()
-                if k not in ("data", "mime")
-            })
+        from nora.session_files import enumerate_session_files
+
+        rows = enumerate_session_files(
+            self.cwd,
+            include_data=True,
+            include_run_scripts=True,
+            include_run_plots=True,
+        )
+        # The dropdown doesn't need base64 thumbnails — those only
+        # ride for the Files panel render. Strip if any leaked in
+        # (the enumeration helper doesn't add them, but keep the
+        # filter defensively in case future enrichment shows up).
+        files: list[dict[str, Any]] = [
+            {k: v for k, v in entry.items() if k not in ("data", "mime")}
+            for entry in rows
+        ]
         return {"ok": True, "files": files}
 
     def send_feedback(
@@ -4464,7 +4486,17 @@ def _is_within(child: Path, parent: Path) -> bool:
 # un-truncated bytes — that file is the model's warm-start source.
 # These caps only bound what crosses ``evaluate_js`` for the visible
 # replay cards.
-_REPLAY_RAW_OUTPUT_CAP = 16 * 1024       # raw_stdout / raw_stderr per tool_result
+#
+# ``_REPLAY_TEXT_ENVELOPE_CAP`` MUST be larger than the maximum
+# sanitized envelope a ``submit_script`` tool result can carry, or
+# else a moderately complex regression card's JSON gets truncated on
+# warm-start replay → ``renderCanonicalResultTables`` can't parse it
+# → the result table renders blank. The tool side caps the inline
+# payload at ``_INLINE_PAYLOAD_BUDGET + _INLINE_MARKDOWN_BUDGET``
+# ≈ 42 KB (see ``tools.py``); 64 KB gives ~50% headroom for JSON
+# overhead and small fields, so cards never disappear on reload.
+_REPLAY_TEXT_ENVELOPE_CAP = 64 * 1024    # tool_result ``text`` JSON envelope
+_REPLAY_RAW_OUTPUT_CAP = 1 * 1024 * 1024  # raw_stdout / raw_stderr per tool_result
 _REPLAY_THINKING_CAP = 8 * 1024          # assistant_thinking text
 _REPLAY_TOOL_INPUT_CAP = 8 * 1024        # tool_call input fields (script code)
 
@@ -4493,18 +4525,26 @@ def _trim_event_for_replay(evt: dict[str, Any]) -> dict[str, Any]:
     t = evt.get("type")
     if t == "tool_result":
         out = dict(evt)
+        # ``raw_stdout`` / ``raw_stderr`` carry the researcher's
+        # full audit surface — they ride at ~1 MB / stream, far
+        # above what normal regressions print, so the cap is a
+        # safety belt against a runaway log, not a routine
+        # trimmer. The model never sees these fields (stripped
+        # from model-facing projections in ``context_count``).
         for field in ("raw_stdout", "raw_stderr"):
             if field in out:
                 out[field] = _trim_str_for_replay(
                     out[field], _REPLAY_RAW_OUTPUT_CAP
                 )
-        # The ``text`` field is the JSON tool-result envelope —
-        # already small for sanitized payloads, but a malformed /
-        # oversize entry should still be capped so a single bad
-        # event can't drown the WebView.
+        # The ``text`` field is the JSON tool-result envelope.
+        # Capping it too tightly breaks ``renderCanonicalResultTables``
+        # on warm-start replay (truncated JSON → parse fail → blank
+        # card). The cap here MUST exceed the worst-case sanitized
+        # envelope produced by ``submit_script``; see the comment
+        # on ``_REPLAY_TEXT_ENVELOPE_CAP``.
         if "text" in out:
             out["text"] = _trim_str_for_replay(
-                out["text"], _REPLAY_RAW_OUTPUT_CAP
+                out["text"], _REPLAY_TEXT_ENVELOPE_CAP
             )
         return out
     if t == "tool_call":
@@ -4654,56 +4694,141 @@ def _disambiguate_target(directory: Path, name: str) -> Path:
     )
 
 
+# R-stderr boilerplate patterns. R uses ``stderr`` for warnings AND
+# for package-load chatter — keeping it all dumps "Attaching package"
+# banners, masked-objects lists, and tidyverse decorations into every
+# regression card. The filter drops those while letting ``Warning``
+# and ``Error`` lines through; the on-disk ``stderr.log`` is
+# untouched for audit.
+_R_PACKAGE_LOAD_RE = re.compile(
+    r"^(Loading required package:|Attaching package:|Loading namespace:)"
+)
+_R_MASKED_HEADER_RE = re.compile(r"^The following objects? (is|are) masked")
+# Tidyverse banners use either em-dash or Unicode horizontal-line
+# decorations around "Attaching" / "Conflicts" labels.
+_TIDYVERSE_BANNER_RE = re.compile(
+    r"^[─━—]+\s*(Attaching core tidyverse|Conflicts)"
+)
+_TIDYVERSE_TICK_RE = re.compile(r"^[✔✖]\s")
+
+
+def _filter_stderr_boilerplate(text: str) -> str:
+    """Drop R package-load chatter while keeping statistically
+    meaningful diagnostics. Returns input unchanged for empty stderr
+    or streams without recognised boilerplate.
+
+    Removed:
+    - ``Loading required package:`` / ``Attaching package:`` /
+      ``Loading namespace:`` lines.
+    - ``The following object(s) is/are masked …`` header AND the
+      indented symbol list that follows it (until the next
+      non-indented non-blank line).
+    - Tidyverse decorated banners (``── Attaching core tidyverse``,
+      ``── Conflicts``, the ``✔`` / ``✖`` tick lines).
+
+    Kept:
+    - ``Warning message:`` / ``Warning:`` and continuation context
+      (convergence, rank deficiency, singular fit, NA coercion).
+    - ``Error in`` / ``Error:`` and surrounding context.
+    - Anything that doesn't match a boilerplate pattern.
+    """
+    if not text:
+        return text
+    out: list[str] = []
+    in_masked_block = False
+    for line in text.splitlines(keepends=True):
+        stripped = line.rstrip("\r\n")
+        if in_masked_block:
+            # Block continues across blanks and indented symbol-list
+            # lines. The first non-indented non-blank line ends it —
+            # but we don't consume that line; fall through so it can
+            # be classified normally (it may start another masked
+            # block or be real content).
+            if not stripped.strip() or stripped[:1] in (" ", "\t"):
+                continue
+            in_masked_block = False
+        if _R_MASKED_HEADER_RE.match(stripped):
+            in_masked_block = True
+            continue
+        if _R_PACKAGE_LOAD_RE.match(stripped):
+            continue
+        if _TIDYVERSE_BANNER_RE.match(stripped):
+            continue
+        if _TIDYVERSE_TICK_RE.match(stripped):
+            continue
+        out.append(line)
+    # Collapse leading blank lines left behind by filtering so the
+    # card doesn't open with whitespace.
+    while out and not out[0].strip():
+        out.pop(0)
+    return "".join(out)
+
+
+# Per-stream ceiling on raw logs shipped to the WebView. Normal R /
+# Stata / Python regression output sits comfortably in the low
+# hundreds of KB; this cap is a safety belt against pathological
+# runaway logs (a stuck loop printing megabytes a second) rather
+# than a routine trimmer. Head+tail truncation with a marker
+# preserves the call/data-shape context up top AND any final
+# warnings or errors at the bottom; the on-disk ``stderr.log`` /
+# ``stdout.log`` always carries the full bytes for audit.
+_RAW_LOG_STREAM_CAP = 1 * 1024 * 1024  # 1 MB per stream
+
+
 def _read_raw_logs(run_dir: str | None) -> tuple[str, str]:
     """Read ``stdout.log`` and ``stderr.log`` from a run dir, if they
-    exist. Returns empty strings when the dir is missing or the files
-    haven't been written.
+    exist. Returns empty strings when the dir is missing or the
+    files haven't been written.
 
-    Content is capped at 32 KB per stream — enough to show a full
-    regression table, short of letting a runaway log blow up the
-    browser. The full log is still on disk at ``run_dir`` for audit.
+    Each stream is capped at ``_RAW_LOG_STREAM_CAP`` (1 MB). For
+    normal regression traces the cap is far above what scripts
+    produce, so content passes through untouched. Pathological logs
+    keep their head (75%) and tail (25%) with a truncation marker
+    pointing at the full on-disk log.
 
-    Truncation keeps **both ends** rather than just the tail. For
-    exploratory scripts like ``df.head(10)`` on a wide dataset, the
-    start carries what the researcher actually needs (shape, dtypes,
-    column-named first rows of the table); the runtime helpers
-    (``nora.from_lm``, etc.) print their summary at the end. A
-    tail-only cap dropped the column names every time and showed
-    only trailing rows whose context was lost.
+    The raw stream is local-only — it never crosses to the model
+    (see ``_trim_event_for_replay``, which leaves these fields out
+    of the model-facing projection in ``context_count``). Cost is
+    WebView memory, not inference tokens.
+
+    ``stderr`` is filtered through ``_filter_stderr_boilerplate`` to
+    drop R package-load chatter (loading banners, masked-objects
+    blocks, tidyverse decorations) so the card stays readable.
+    Warnings and errors pass through. ``stdout`` is returned
+    verbatim.
     """
     if not run_dir:
         return "", ""
-    stdout_text = ""
-    stderr_text = ""
-    cap = 32 * 1024
-    # 75/25 head/tail split. Empirically the start is more useful for
-    # exploratory scripts and the very end is where helper-printed
-    # summaries live; the middle is usually repetitive (pandas'
-    # wrapped to_string continuation blocks, dtypes-per-column
-    # listings) and the cheapest to drop.
+    cap = _RAW_LOG_STREAM_CAP
+    # 75/25 head/tail split. The start carries call lines and data
+    # shape; the end is where helper-printed summaries and trailing
+    # warnings live. The middle is the cheapest stretch to drop.
     head_cap = (cap * 3) // 4
     tail_cap = cap - head_cap
-    for name, bucket in (("stdout.log", "stdout"), ("stderr.log", "stderr")):
+
+    def _read_one(name: str) -> str:
         try:
             content = Path(run_dir, name).read_text(
                 encoding="utf-8", errors="replace"
             )
         except OSError:
-            continue
-        if len(content) > cap:
-            head = content[:head_cap]
-            tail = content[-tail_cap:]
-            dropped = len(content) - len(head) - len(tail)
-            content = (
-                f"{head}\n"
-                f"[… {dropped} bytes truncated from the middle; "
-                f"full log at {run_dir}/{name} …]\n"
-                f"{tail}"
-            )
-        if bucket == "stdout":
-            stdout_text = content
-        else:
-            stderr_text = content
+            return ""
+        if len(content) <= cap:
+            return content
+        head = content[:head_cap]
+        tail = content[-tail_cap:]
+        dropped = len(content) - len(head) - len(tail)
+        return (
+            f"{head}\n"
+            f"[… {dropped} bytes truncated from the middle; "
+            f"full log at {run_dir}/{name} …]\n"
+            f"{tail}"
+        )
+
+    stdout_text = _read_one("stdout.log")
+    stderr_text = _read_one("stderr.log")
+    if stderr_text:
+        stderr_text = _filter_stderr_boilerplate(stderr_text)
     return stdout_text, stderr_text
 
 

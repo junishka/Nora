@@ -1,10 +1,14 @@
-"""Tests for ``NoraBridge.list_session_files``.
+"""Tests for ``NoraBridge.list_session_files`` and the
+``enumerate_session_files`` walk it delegates to.
 
-The Files chip in the topbar reads from this endpoint. Without it,
-only data files showed up (the chip was previously fed from
-``policy.datasets``, which only covers schemas) — researchers who
-dropped a ``.py`` or ``.gph`` saw the count stay flat and silently
-worried the upload had failed.
+The Files chip in the topbar reads from the bridge endpoint. The
+bridge runs in researcher-mode: it hides files that already render
+on a result card (run-dir scripts, ``_nora_plots/`` helper outputs)
+and files that a ``submit_script`` run produced in cwd (per its
+``cwd_writes.json`` manifest). The underlying walk preserves a
+full-view mode for the model-facing tool and for tests that pin
+labeling / traversal behavior — those call ``enumerate_session_files``
+directly with ``include_run_scripts=True, include_run_plots=True``.
 """
 
 from __future__ import annotations
@@ -13,7 +17,22 @@ from pathlib import Path
 
 import pytest
 
+from nora.session_files import enumerate_session_files
 from nora.ui import NoraBridge
+
+
+def _full_view(cwd: Path) -> list[dict]:
+    """Listing with run-dir scripts and helper-plot traversal —
+    matches what the model sees and what the bridge USED to show
+    before the panel filter. Tests that pin the labeling / traversal
+    contract use this so a tighter panel default doesn't break them.
+    """
+    return enumerate_session_files(
+        cwd,
+        include_data=True,
+        include_run_scripts=True,
+        include_run_plots=True,
+    )
 
 
 def _bridge_with_files(tmp_path: Path, names: list[str]) -> NoraBridge:
@@ -182,19 +201,19 @@ def test_list_session_files_includes_pngs_in_session_cwd(tmp_path: Path) -> None
     assert row["kind"] == "graph"
 
 
-def test_list_session_files_walks_run_dir_nora_plots(tmp_path: Path) -> None:
+def test_enumerate_walks_run_dir_nora_plots_in_full_view(tmp_path: Path) -> None:
     """Helper-produced plots live in
     ``<cwd>/.nora/runs/<id>/_nora_plots/`` — outside the session-cwd
-    top-level scan. The Files panel walks those subdirs too so the
-    panel is the persistent gallery for every plot the analysis ever
-    produced."""
+    top-level scan. The full-view enumeration (model-facing tool,
+    audit paths) walks those subdirs so the analysis-wide plot
+    gallery is reachable. The Files panel itself sets
+    ``include_run_plots=False`` because those plots already render
+    on their result cards."""
     cwd = tmp_path / "session"
     plots_dir = cwd / ".nora" / "runs" / "r0001" / "_nora_plots"
     plots_dir.mkdir(parents=True)
     (plots_dir / "residuals.png").write_bytes(b"\x89PNG\r\n\x1a\n" + b"\x00" * 200)
-    bridge = NoraBridge(cwd=cwd)
-    res = bridge.list_session_files()
-    names = [f["name"] for f in res["files"]]
+    names = [f["name"] for f in _full_view(cwd)]
     assert "residuals.png" in names
 
 
@@ -227,9 +246,7 @@ def test_list_session_files_surfaces_script_with_label(tmp_path: Path) -> None:
         script_run_id="run-aaaaaaaa",
     )
 
-    bridge = NoraBridge(cwd=cwd)
-    res = bridge.list_session_files()
-    names = [f["name"] for f in res["files"]]
+    names = [f["name"] for f in _full_view(cwd)]
     assert (
         "reg_v12 2v common sample: op_margin + ln_employees only.do" in names
     ), names
@@ -267,12 +284,10 @@ def test_list_session_files_label_lookup_survives_resolved_cwd(
         raw_log_path=str(run_dir),  # resolved cwd
         script_run_id="run-cccccccc",
     )
-    # ...but list via the symlinked cwd. The bridge would otherwise
+    # ...but list via the symlinked cwd. A naive walk would otherwise
     # see "/tmp/.../session_link/.nora/runs/<id>" which doesn't match
     # the stored "/tmp/.../real/.nora/runs/<id>".
-    bridge = NoraBridge(cwd=link_cwd)
-    res = bridge.list_session_files()
-    names = [f["name"] for f in res["files"]]
+    names = [f["name"] for f in _full_view(link_cwd)]
     assert "H2 panel main.do" in names, names
 
 
@@ -317,9 +332,7 @@ def test_list_session_files_prefers_run_dir_label_txt_over_per_helper(
             script_run_id="run-eeeeeeee",
         )
 
-    bridge = NoraBridge(cwd=cwd)
-    res = bridge.list_session_files()
-    names = [f["name"] for f in res["files"]]
+    names = [f["name"] for f in _full_view(cwd)]
     # Forward slashes in the umbrella label collapse to spaces under
     # ``label_to_filename_stem`` (path-character hygiene) — that's
     # expected. The umbrella structure survives, which is what the
@@ -362,9 +375,7 @@ def test_list_session_files_falls_back_to_store_when_no_label_txt(
         script_run_id="run-ffffffff",
     )
 
-    bridge = NoraBridge(cwd=cwd)
-    res = bridge.list_session_files()
-    names = [f["name"] for f in res["files"]]
+    names = [f["name"] for f in _full_view(cwd)]
     assert "OLS log salary on female.do" in names, names
 
 
@@ -402,9 +413,7 @@ def test_list_session_files_skips_only_truly_empty_labels_for_first_pick(
             script_run_id="run-dddddddd",
         )
 
-    bridge = NoraBridge(cwd=cwd)
-    res = bridge.list_session_files()
-    names = [f["name"] for f in res["files"]]
+    names = [f["name"] for f in _full_view(cwd)]
     assert "H1a Path A: op margin, FP-only.do" in names, names
 
 
@@ -436,9 +445,7 @@ def test_list_session_files_disambiguates_label_collisions(
             script_run_id=sid,
         )
 
-    bridge = NoraBridge(cwd=cwd)
-    res = bridge.list_session_files()
-    names = sorted(f["name"] for f in res["files"])
+    names = sorted(f["name"] for f in _full_view(cwd))
     assert names == ["H1 panel (aaaaaaaa).do", "H1 panel (bbbbbbbb).do"], names
 
 

@@ -1691,6 +1691,33 @@ kbd {
    * by the per-element rules below (``pre`` gets its own internal
    * ``overflow-x: auto`` scroll, tables go into ``.md-table``). */
   min-width: 0;
+  /* Soft reveal: each new message fades up from blurred + translucent
+   * to crisp. Beats an abrupt DOM insert (which reads as a pop-in)
+   * and avoids the typewriter trope, which forces the reader to
+   * watch words land instead of reading them. Replayed history bubbles
+   * also animate once on first paint — visually fine because they
+   * appear in a single batch, not as a long cascade. The animation
+   * is short enough not to slow reading. */
+  animation: message-fade-in 0.28s ease-out both;
+}
+
+@keyframes message-fade-in {
+  from {
+    opacity: 0;
+    filter: blur(3px);
+  }
+  to {
+    opacity: 1;
+    filter: blur(0);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  /* Respect researcher accessibility preference. Skip the reveal
+   * animation entirely; the bubble appears immediately. */
+  .message {
+    animation: none;
+  }
 }
 
 .message-body {
