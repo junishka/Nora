@@ -3569,26 +3569,26 @@ const ICON_SVG = {
     'd="M9 2h5v5M14 2L7 9M3 4h3M3 4v9h9v-3"/>' +
     '</svg>'
   ),
-  // Pushpin glyphs — paired so pinned vs unpinned read distinctly at
-  // a glance in the sidebar. ``pin`` is the outlined "click to pin"
-  // affordance (only the cap stroke + the needle line). ``pinFilled``
-  // is the engaged state — same silhouette but solid, so it carries
-  // visual weight against the row's body text and the researcher can
-  // spot which sessions are pinned without reading hover titles.
+  // Pin glyphs — minimalist circle-head + needle. ``pin`` is the
+  // outlined "click to pin" affordance (hollow head). ``pinFilled``
+  // shares the same silhouette with a solid head so the engaged
+  // state reads at a glance without needing an accent color: the
+  // filled head plus the row's position at the top of the list is
+  // enough to spot pinned sessions.
   pin: (
     '<svg viewBox="0 0 24 24" width="14" height="14" fill="none" ' +
-    'stroke="currentColor" stroke-width="1.8" stroke-linecap="round" ' +
+    'stroke="currentColor" stroke-width="1.5" stroke-linecap="round" ' +
     'stroke-linejoin="round" aria-hidden="true">' +
-    '<path d="M9 3h6v4l3 4H6l3-4V3z"></path>' +
-    '<line x1="12" y1="11" x2="12" y2="20"></line>' +
+    '<circle cx="12" cy="8" r="3.5"></circle>' +
+    '<line x1="12" y1="11.5" x2="12" y2="20"></line>' +
     '</svg>'
   ),
   pinFilled: (
-    '<svg viewBox="0 0 24 24" width="14" height="14" ' +
-    'fill="currentColor" stroke="currentColor" stroke-width="1.8" ' +
-    'stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">' +
-    '<path d="M9 3h6v4l3 4H6l3-4V3z"></path>' +
-    '<line x1="12" y1="11" x2="12" y2="20"></line>' +
+    '<svg viewBox="0 0 24 24" width="14" height="14" fill="none" ' +
+    'stroke="currentColor" stroke-width="1.5" stroke-linecap="round" ' +
+    'stroke-linejoin="round" aria-hidden="true">' +
+    '<circle cx="12" cy="8" r="3.5" fill="currentColor"></circle>' +
+    '<line x1="12" y1="11.5" x2="12" y2="20"></line>' +
     '</svg>'
   ),
 };
