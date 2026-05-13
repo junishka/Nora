@@ -1935,16 +1935,25 @@ def test_correlation_matrix_rejects_sanitized_variable_collisions():
     per-row collision check below could drop or merge entries.
     Reject at the declared-variables level so the script must
     disambiguate at the source.
+
+    The whitespace-collision shape (``"A B"`` vs ``"A\\nB"``) is now
+    pre-empted by the identifier-shape gate (space is not in the
+    identifier character class), so this test uses two identifier-
+    shape names that collide once ``safe_key`` truncates them to the
+    same 40-char prefix.
     """
-    # ``A B`` and ``A\nB`` both sanitize to ``A B``.
+    # Two distinct identifier-shape names that share their first
+    # 40 chars, so safe_key collapses both to the same truncated form.
+    a = "variable_name_that_is_pretty_long_aaa_aaa_alpha"
+    b = "variable_name_that_is_pretty_long_aaa_aaa_beta"
     payload = {
         "type": "correlation_matrix",
         "n": 1000,
         "method": "pearson",
-        "variables": ["A B", "A\nB", "C"],
+        "variables": [a, b, "C"],
         "correlations": {
-            "A B": {"A B": 1.0, "C": 0.3},
-            "C": {"A B": 0.3, "C": 1.0},
+            a: {a: 1.0, "C": 0.3},
+            "C": {a: 0.3, "C": 1.0},
         },
     }
     r = sanitize(payload)
@@ -1954,7 +1963,8 @@ def test_correlation_matrix_rejects_sanitized_variable_collisions():
         f"{r.rejection_reason!r}"
     )
     # The colliding names must NOT appear in the reason (data-derived).
-    assert "A\nB" not in (r.rejection_reason or "")
+    assert a not in (r.rejection_reason or "")
+    assert b not in (r.rejection_reason or "")
 
 
 def test_correlation_matrix_accepts_distinct_sanitized_variables():
