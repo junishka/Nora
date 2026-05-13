@@ -386,13 +386,21 @@ def _extract_stata(stdout: str) -> Optional[str]:
         return f"[command body redacted]\nr({rc_code});"
 
     cmd_text = cmd_matches[-1].group("cmd").strip()
-    # First whitespace-separated token is the command verb. Cap at
-    # 32 chars as a defense-in-depth against an attacker-chosen
-    # ``capture noisily`` prefix that combines the verb with an
-    # inline data argument before whitespace. Stata verbs are short
-    # identifiers; anything longer than 32 chars in the first token
-    # almost certainly is an attempt to push data through.
-    verb = cmd_text.split(None, 1)[0] if cmd_text else ""
+    # Stata's modifier prefixes (``capture``, ``quietly``, ``noisily``)
+    # wrap another command. Keeping the first token verbatim makes a
+    # form like ``capture noisily regress y x_missing`` summarize as
+    # ``capture`` — useless. The model needs to know the kind of the
+    # failing command (``regress``), not that it was wrapped. Strip
+    # known prefixes iteratively before picking the verb. The list
+    # is exhaustive for the Stata wrapper modifiers; anything outside
+    # it stays put. The 32-char cap on the chosen verb is still
+    # defense-in-depth against an attacker-chosen first token that
+    # tries to push data through.
+    tokens = cmd_text.split() if cmd_text else []
+    _STATA_MODIFIER_PREFIXES = {"capture", "cap", "quietly", "qui", "noisily", "noi"}
+    while tokens and tokens[0].lower() in _STATA_MODIFIER_PREFIXES:
+        tokens.pop(0)
+    verb = tokens[0] if tokens else ""
     verb = verb[:32]
     # Validate against Stata's verb alphabet (lowercase letters and
     # underscores). If it doesn't match, redact entirely rather than

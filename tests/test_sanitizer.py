@@ -1842,6 +1842,127 @@ def test_magnitude_table_rejects_over_cell_cap():
     assert "structural cap" in (r.rejection_reason or "")
 
 
+def test_frequency_table_rejects_null_n_from_runtime():
+    """The Python runtime's ``from_table`` previously did
+    ``_safe_int(n) or 0``, so a NaN / non-finite ``n`` from the
+    caller serialized as ``"n": 0`` — a valid-looking sanitizer
+    payload that hid the upstream undefined-count problem. The
+    runtime now preserves ``None``; this test pins that ``n=None``
+    on the sanitizer side rejects (the channel works end to end)."""
+    payload = {
+        "type": "frequency_table",
+        "variable": "color",
+        "counts": {"red": 50, "blue": 60},
+        "n": None,
+        "missing_count": 0,
+    }
+    r = sanitize(payload)
+    assert not r.ok
+    assert "n" in (r.rejection_reason or ""), (
+        f"sanitizer should reject when ``n`` is missing after "
+        f"type filtering; got: {r.rejection_reason!r}"
+    )
+
+
+def test_frequency_table_rejects_null_missing_count_from_runtime():
+    """Same channel for ``missing_count``. A NaN missing_count must
+    not silently become 0 — the runtime sends ``None`` and the
+    sanitizer rejects."""
+    payload = {
+        "type": "frequency_table",
+        "variable": "color",
+        "counts": {"red": 50, "blue": 60},
+        "n": 110,
+        "missing_count": None,
+    }
+    r = sanitize(payload)
+    assert not r.ok
+    assert "missing_count" in (r.rejection_reason or "")
+
+
+def test_crosstab_drops_null_missing_count_from_runtime():
+    """For crosstab, ``missing_count`` is optional in the required
+    set, so a ``None`` value gets DROPPED by ``_collect_allowed``
+    rather than triggering rejection. The important property: it
+    does NOT silently appear as ``"missing_count": 0`` (which is
+    what the old ``_safe_int(...) or 0`` produced from NaN
+    inputs), and the drop is recorded in transformations so the
+    researcher's audit log shows the upstream defect."""
+    payload = {
+        "type": "crosstab",
+        "row_variable": "treatment",
+        "col_variable": "outcome",
+        "counts": {
+            "treated": {"success": 50, "fail": 20},
+            "control": {"success": 30, "fail": 40},
+        },
+        "missing_count": None,
+    }
+    r = sanitize(payload)
+    assert r.ok, r.rejection_reason
+    # The fake-zero must NOT appear in the sanitized output. The
+    # old behavior silently published ``"missing_count": 0``;
+    # the fix removes the field entirely so downstream consumers
+    # see the absence rather than a misleading zero.
+    assert "missing_count" not in r.sanitized, (
+        f"missing_count silently survived as a fake zero: "
+        f"{r.sanitized!r}"
+    )
+    # The drop is auditable.
+    assert any(
+        "missing_count" in t for t in r.transformations
+    ), f"drop not recorded in transformations: {r.transformations!r}"
+
+
+def test_correlation_matrix_rejects_sanitized_variable_collisions():
+    """Two raw variable names that ``safe_key`` collapses to the
+    same value used to silently merge into one declared label via
+    ``set(...)``. The matrix that resulted was ambiguous: one
+    sanitized name represented two source variables, and the
+    per-row collision check below could drop or merge entries.
+    Reject at the declared-variables level so the script must
+    disambiguate at the source.
+    """
+    # ``A B`` and ``A\nB`` both sanitize to ``A B``.
+    payload = {
+        "type": "correlation_matrix",
+        "n": 1000,
+        "method": "pearson",
+        "variables": ["A B", "A\nB", "C"],
+        "correlations": {
+            "A B": {"A B": 1.0, "C": 0.3},
+            "C": {"A B": 0.3, "C": 1.0},
+        },
+    }
+    r = sanitize(payload)
+    assert not r.ok
+    assert "sanitize" in (r.rejection_reason or "").lower(), (
+        f"expected a sanitization-collision rejection, got: "
+        f"{r.rejection_reason!r}"
+    )
+    # The colliding names must NOT appear in the reason (data-derived).
+    assert "A\nB" not in (r.rejection_reason or "")
+
+
+def test_correlation_matrix_accepts_distinct_sanitized_variables():
+    """Negative regression: variables with distinct sanitized names
+    still pass — the collision check only fires on actual
+    duplicates."""
+    payload = {
+        "type": "correlation_matrix",
+        "n": 1000,
+        "method": "pearson",
+        "variables": ["x", "y", "z"],
+        "correlations": {
+            "x": {"x": 1.0, "y": 0.5, "z": 0.3},
+            "y": {"x": 0.5, "y": 1.0, "z": 0.1},
+            "z": {"x": 0.3, "y": 0.1, "z": 1.0},
+        },
+    }
+    r = sanitize(payload)
+    assert r.ok, r.rejection_reason
+
+
 def test_ols_missing_predictor_variables_rejects_payload():
     """``predictor_variables`` is a required field; omitting it
     rejects the payload outright. This test documents that we

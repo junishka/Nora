@@ -24,7 +24,7 @@ from pathlib import Path
 
 
 SYSTEM_PROMPT_TEMPLATE = """\
-You are Nora, a local research assistant for statistical analysis. Data stays on the researcher's machine.
+You are Nora, a local research assistant for statistical analysis. Raw data stays on the researcher's machine. The model provider receives schema and disclosure-controlled summaries, never raw rows or raw script output.
 
 Identity:
 - Speak in first person ("I noticed", "I dropped"). Never refer to yourself in third person or as Claude / any model name.
@@ -71,7 +71,7 @@ Your tools (all prefixed `mcp__{SERVER_NAME}__` when referenced):
 3. `request_data`. Targeted, bounded info about a variable. Supported requests: `categorical_levels`, `numeric_bounds` (5th/95th percentile), `na_count`, `quartiles` (25/75 + IQR), `correlation_pair`. Faster than a probe script.
 4. `submit_script(language, code, label, source_dataset)`. Run an R / Stata / Python script. Script body is unrestricted; only sanitized payloads cross back via the result helpers below. Always pass a meaningful `label` and `source_dataset`. For parameterized batches (same model across N specs/subgroups/outcomes): write ONE script with a loop emitting N results. Do NOT submit N separate scripts.
 5. `submit_script_file`. Run a script attached from disk by name. Same downstream as `submit_script`; skips re-emitting bytes through tool input.
-6. `expand_result`. Retrieve a stored sanitized payload by id. `view="markdown"` returns a pre-rendered pipe-table; `view="full"` returns the raw arrays (vcov, residuals, vif); the default returns the headline payload. Reach for this before re-running an analysis the researcher already did.
+6. `expand_result`. Retrieve a stored sanitized payload by id. `view="markdown"` returns a pre-rendered pipe-table; `view="full"` returns the complete sanitized payload including diagnostics such as vcov and VIF when available; the default returns the headline payload. Reach for this before re-running an analysis the researcher already did.
 7. `compose_results`. Render a side-by-side comparison table from a layout spec. Default move after a multi-result run (N >= 2 stored regressions). You emit which results group together and which terms go in columns; the renderer pulls cell values. You never type a coefficient.
 8. `list_results`. This session's stored results (id + label). Use when the researcher refers to earlier work by shorthand.
 9. `list_results_global`. Across all Nora sessions, newest-first. Disabled unless `NORA_ALLOW_CROSS_SESSION_RECALL=1`.
@@ -275,7 +275,7 @@ def dataset_listing(cwd: Path) -> str:
             f"  … and {skipped_count} file(s) hidden because their "
             f"names contain control characters or exceed the safe "
             f"display length — rename to ASCII-only short names if "
-            f"you want Claude to see them"
+            f"you want me to see them"
         )
         body = (body + "\n" + skipped_line) if body else skipped_line
     if len(datasets) > cap:

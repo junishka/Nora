@@ -92,15 +92,29 @@ def _python_version_tag(binary: str) -> str:
     """Return a ``"3.11"`` / ``"3.12"`` tag for the given interpreter,
     or ``"unknown"`` if the probe fails. Used to namespace the install
     directory so wheels with C extensions don't collide across
-    interpreter versions."""
+    interpreter versions.
+
+    ``-I`` (isolated mode) + filtered env: the probe runs OUTSIDE
+    the analysis sandbox. Without ``-I``, an inherited
+    ``PYTHONPATH`` pointing at an attacker-controlled
+    ``sitecustomize.py`` / ``usercustomize.py`` would execute code
+    during the probe. The probe only reads ``sys.version_info``,
+    which is populated by the interpreter itself before site.py
+    runs, so ``-I`` is safe here. The filtered env strips
+    parent-process secrets (``ANTHROPIC_API_KEY``, AWS creds)
+    before the subprocess inherits them, matching the executor's
+    posture for scripts.
+    """
+    from nora.executor import _filter_env
     try:
         out = subprocess.run(
             [
-                binary, "-c",
+                binary, "-I", "-c",
                 "import sys; print(f'{sys.version_info.major}."
                 "{sys.version_info.minor}')",
             ],
             capture_output=True, text=True, timeout=5,
+            env=_filter_env(dict(os.environ)),
         )
     except (OSError, subprocess.TimeoutExpired):
         return "unknown"
@@ -371,8 +385,21 @@ async def install_packages(
     language: str,
     packages: list[str],
     action: str = "install",
+    proc_register: Any = None,
 ) -> InstallResult:
-    """Run install / remove / reinstall for a list of packages."""
+    """Run install / remove / reinstall for a list of packages.
+
+    ``proc_register`` is an optional callable that receives the
+    spawned ``subprocess.Popen`` object. The tool layer passes
+    ``runtime.turn_context.register_turn_process`` so a Stop fired
+    during the install kills the whole subprocess tree via the
+    runner's per-turn registry. Without it, ``subprocess.run``'s
+    timeout only killed the direct child (the language wrapper —
+    Rscript, python, stata), letting pip's compile / R's
+    configure / Stata's ado-update grandchildren keep mutating the
+    machine after the researcher hit Stop. ``start_new_session=True``
+    + ``os.killpg`` covers the grandchild tree.
+    """
     if action not in _VALID_ACTIONS:
         return InstallResult(
             language=language,  # type: ignore[arg-type]
@@ -534,32 +561,24 @@ async def install_packages(
         cmd_pair = _stata_command(env.stata.binary, valid, action)  # type: ignore[arg-type]
         cmd, proc_stdin = cmd_pair  # type: ignore[assignment]
 
-    # Run the subprocess in a thread so we don't block the asyncio
-    # loop. ``subprocess.run`` with capture_output is plenty here —
-    # we don't need streaming output for a one-shot install.
+    # Spawn the installer via Popen with ``start_new_session=True``
+    # so the subprocess and every descendant (pip's build / R's
+    # configure / Stata's ado-update grandchildren) share a process
+    # group we can ``killpg`` on Stop or timeout. ``subprocess.run``
+    # only kills the direct child on timeout — pip / R compile
+    # steps spawn their own grandchildren that would otherwise keep
+    # mutating the researcher's machine after Stop.
+    import signal as _signal
     started = time.monotonic()
     try:
-        completed = await asyncio.to_thread(
-            subprocess.run,
+        proc = subprocess.Popen(
             cmd,
-            input=proc_stdin,
-            capture_output=True,
+            stdin=subprocess.PIPE if proc_stdin is not None else subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
             text=True,
-            timeout=_INSTALL_TIMEOUT_SECONDS,
             env=subprocess_env,
-        )
-    except subprocess.TimeoutExpired as e:
-        return InstallResult(
-            language=language,  # type: ignore[arg-type]
-            action=action,  # type: ignore[arg-type]
-            statuses=tuple(rejected) + tuple(
-                PackageStatus(name=p, status="failed", detail="install timed out")
-                for p in valid
-            ),
-            raw_stdout=(e.stdout or "") if isinstance(e.stdout, str) else "",
-            raw_stderr=(e.stderr or "") if isinstance(e.stderr, str) else "",
-            duration_seconds=time.monotonic() - started,
-            error=f"install timed out after {_INSTALL_TIMEOUT_SECONDS}s",
+            start_new_session=True,
         )
     except OSError as e:
         return InstallResult(
@@ -570,6 +589,90 @@ async def install_packages(
             duration_seconds=time.monotonic() - started,
             error=f"could not launch installer: {e}",
         )
+
+    # Register with the runner's per-turn registry so a Stop fired
+    # mid-install reaches into the process group via killpg. If Stop
+    # fired BEFORE register lands, the runner's register call kills
+    # ``proc`` synchronously (same race the executor's
+    # ``register_turn_process`` closes).
+    if proc_register is not None:
+        try:
+            proc_register(proc)
+        except Exception:  # noqa: BLE001 — registration is advisory, never fatal
+            pass
+
+    def _killpg_quietly() -> None:
+        try:
+            os.killpg(os.getpgid(proc.pid), _signal.SIGKILL)
+        except (ProcessLookupError, PermissionError, OSError):
+            try:
+                proc.kill()
+            except Exception:  # noqa: BLE001
+                pass
+
+    try:
+        completed_stdout, completed_stderr = await asyncio.to_thread(
+            proc.communicate,
+            input=proc_stdin,
+            timeout=_INSTALL_TIMEOUT_SECONDS,
+        )
+    except subprocess.TimeoutExpired as e:
+        # Kill the whole subtree, then drain so file descriptors
+        # don't leak. ``communicate`` after kill is short-lived; the
+        # 2s cap matches the executor's timeout-recovery posture.
+        _killpg_quietly()
+        try:
+            drain_out, drain_err = await asyncio.to_thread(
+                proc.communicate, timeout=2,
+            )
+        except subprocess.TimeoutExpired:
+            drain_out, drain_err = "", ""
+        return InstallResult(
+            language=language,  # type: ignore[arg-type]
+            action=action,  # type: ignore[arg-type]
+            statuses=tuple(rejected) + tuple(
+                PackageStatus(name=p, status="failed", detail="install timed out")
+                for p in valid
+            ),
+            raw_stdout=(
+                (e.stdout if isinstance(e.stdout, str) else "")
+                or drain_out
+                or ""
+            ),
+            raw_stderr=(
+                (e.stderr if isinstance(e.stderr, str) else "")
+                or drain_err
+                or ""
+            ),
+            duration_seconds=time.monotonic() - started,
+            error=f"install timed out after {_INSTALL_TIMEOUT_SECONDS}s",
+        )
+    except asyncio.CancelledError:
+        # Researcher hit Stop. Kill the whole subprocess group before
+        # propagating so grandchildren (pip's compile / R's configure)
+        # don't outlive the cancelled task and keep mutating the
+        # researcher's machine. Re-raise so the caller's cancel
+        # branch fires — we DON'T return an InstallResult, because
+        # cancelled work never produces a tool response.
+        _killpg_quietly()
+        # Best-effort drain so file descriptors close.
+        try:
+            proc.communicate(timeout=2)
+        except (subprocess.TimeoutExpired, OSError):
+            try:
+                proc.kill()
+            except Exception:  # noqa: BLE001
+                pass
+        raise
+
+    # Mirror the prior ``subprocess.run`` shape so the rest of the
+    # function reads unchanged.
+    class _Completed:
+        pass
+    completed = _Completed()
+    completed.stdout = completed_stdout or ""  # type: ignore[attr-defined]
+    completed.stderr = completed_stderr or ""  # type: ignore[attr-defined]
+    completed.returncode = proc.returncode  # type: ignore[attr-defined]
 
     duration = time.monotonic() - started
     statuses = list(rejected)

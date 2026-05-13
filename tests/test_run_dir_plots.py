@@ -348,14 +348,18 @@ def test_capture_plots_sanitizes_label_via_safe_text(tmp_path: Path) -> None:
     # extra-long payload, and quote marks. ``safe_text`` should
     # collapse these into something boring (or empty).
     bad_label = "evil\nlabel\ttext\x00<script>" + ("X" * 500)
+    from nora.executor import register_run_token, RESULT_TOKEN_FIELD
+    token = "test-sanitize-label-token"
     (plots / "manifest.jsonl").write_text(
         _json.dumps({
             "file": "coefficients.png",
             "kind": "coefficients",
             "label": bad_label,
+            RESULT_TOKEN_FIELD: token,
         }) + "\n",
         encoding="utf-8",
     )
+    register_run_token(run, token)
 
     runner = SessionRunner(
         cwd=tmp_path, provider="anthropic", model="claude-sonnet-4-6[1m]",
@@ -385,14 +389,18 @@ def test_capture_plots_sanitizes_filename(tmp_path: Path) -> None:
     # what they write); we just verify the staging dict's ``name``
     # field is run through safe_text rather than passed through raw.
     (plots / "coefficients.png").write_bytes(_png())
+    from nora.executor import register_run_token, RESULT_TOKEN_FIELD
+    token = "test-sanitize-filename-token"
     (plots / "manifest.jsonl").write_text(
         _json.dumps({
             "file": "coefficients.png",
             "kind": "coefficients",
             "label": "ok",
+            RESULT_TOKEN_FIELD: token,
         }) + "\n",
         encoding="utf-8",
     )
+    register_run_token(run, token)
     runner = SessionRunner(
         cwd=tmp_path, provider="anthropic", model="claude-sonnet-4-6[1m]",
     )
@@ -589,17 +597,21 @@ def test_summarize_plot_helpers_lists_succeeded(tmp_path: Path) -> None:
     model sees what plots were produced."""
     import json as _json
     from nora.tools import _summarize_plot_helpers
+    from nora.executor import register_run_token, RESULT_TOKEN_FIELD
     run = tmp_path / "run"
     plots = run / "_nora_plots"
     plots.mkdir(parents=True)
+    token = "test-summarize-token"
     (plots / "manifest.jsonl").write_text(
         _json.dumps({
             "file": "residuals.png",
             "kind": "residuals",
             "label": "Residual diagnostics",
+            RESULT_TOKEN_FIELD: token,
         }) + "\n",
         encoding="utf-8",
     )
+    register_run_token(run, token)
     summary = _summarize_plot_helpers(run)
     assert summary is not None
     assert summary["succeeded"][0]["file"] == "residuals.png"
@@ -950,19 +962,23 @@ def test_runner_capture_plots_handles_pdf_via_sidecar(tmp_path: Path) -> None:
     from pathlib import Path as _P
     from nora.runner import SessionRunner
 
+    from nora.executor import register_run_token, RESULT_TOKEN_FIELD
     run = tmp_path / "run"
     plots = run / "_nora_plots"
     plots.mkdir(parents=True)
     (plots / "coefficients.pdf").write_bytes(b"%PDF-1.4 fake")
+    token = "test-pdf-sidecar-token"
     (plots / "manifest.jsonl").write_text(
         _json.dumps({
             "file": "coefficients.pdf",
             "kind": "coefficients",
             "label": "test",
             "format": "pdf",
+            RESULT_TOKEN_FIELD: token,
         }) + "\n",
         encoding="utf-8",
     )
+    register_run_token(run, token)
 
     # Patch png_for so we don't depend on sips actually running in
     # CI. Returns a fake PNG sidecar with the right shape.
@@ -997,17 +1013,21 @@ def test_runner_capture_plots_logs_failure_when_pdf_conversion_fails(
     from unittest.mock import patch
     from nora.runner import SessionRunner
 
+    from nora.executor import register_run_token, RESULT_TOKEN_FIELD
     run = tmp_path / "run"
     plots = run / "_nora_plots"
     plots.mkdir(parents=True)
     (plots / "coefficients.pdf").write_bytes(b"%PDF-1.4")
+    token = "test-pdf-fail-token"
     (plots / "manifest.jsonl").write_text(
         _json.dumps({
             "file": "coefficients.pdf", "kind": "coefficients",
             "label": "x", "format": "pdf",
+            RESULT_TOKEN_FIELD: token,
         }) + "\n",
         encoding="utf-8",
     )
+    register_run_token(run, token)
     with patch("nora.plot_convert.png_for", return_value=None):
         runner = SessionRunner(
             cwd=tmp_path, provider="anthropic",
@@ -1183,19 +1203,23 @@ def test_runner_capture_plots_handles_eps(tmp_path: Path) -> None:
     from unittest.mock import patch
     from nora.runner import SessionRunner
 
+    from nora.executor import register_run_token, RESULT_TOKEN_FIELD
     run = tmp_path / "run"
     plots = run / "_nora_plots"
     plots.mkdir(parents=True)
     (plots / "coefficients.eps").write_bytes(b"%!PS-Adobe-3.0")
+    token = "test-eps-token"
     (plots / "manifest.jsonl").write_text(
         _json.dumps({
             "file": "coefficients.eps",
             "kind": "coefficients",
             "label": "test",
             "format": "eps",
+            RESULT_TOKEN_FIELD: token,
         }) + "\n",
         encoding="utf-8",
     )
+    register_run_token(run, token)
     fake_png = plots / "coefficients.nora.png"
     fake_png.write_bytes(b"\x89PNG" + b"\x00" * 200)
 

@@ -722,8 +722,32 @@ def _summarize_plot_helpers(run_dir: Any) -> dict[str, Any] | None:
             or bytes_used + extra > _PLOT_HELPER_MAX_BYTES
         )
 
+    # Authenticity gate. Same posture as the runner's
+    # ``_capture_plots``: each entry must carry a ``_token`` that
+    # matches the executor-registered per-run token. The on-disk
+    # rewrite in ``_filter_plot_manifest`` is best-effort (the
+    # manifest lives in script-writable territory and the rewrite
+    # CAN fail), so this surface re-validates rather than implicitly
+    # trusting the on-disk file. Forged entries are dropped silently
+    # so the model never sees "I plotted evil.png succeeded" for an
+    # entry the runner refused to attach as vision.
+    from nora.executor import get_run_token, RESULT_TOKEN_FIELD
+    import secrets as _secrets
+    expected_token = get_run_token(Path(run_dir))
+
+    def _entry_authentic(entry: dict[str, Any]) -> bool:
+        if expected_token is None:
+            return False
+        got = entry.get(RESULT_TOKEN_FIELD)
+        return (
+            isinstance(got, str)
+            and _secrets.compare_digest(got, expected_token)
+        )
+
     if manifest.is_file():
         for entry in _read_jsonl(manifest):
+            if not _entry_authentic(entry):
+                continue
             raw_file = entry.get("file", "?")
             raw_kind = entry.get("kind", "?")
             raw_label = entry.get("label", "")
@@ -4322,7 +4346,18 @@ async def install_packages(args: dict[str, Any]) -> dict[str, Any]:
             "packages": list(packages_arg),
         })
 
-    result = await _do_install(language, list(packages_arg), action)
+    # Register the installer subprocess with the runner's per-turn
+    # registry so a Stop fired during install kills the whole
+    # process group (pip's compile-step grandchildren, R's
+    # ``configure``, Stata's ado-update children). Without this,
+    # cancel only stopped the asyncio task while the install kept
+    # running in the background, continuing to mutate the
+    # researcher's environment after Stop.
+    from nora.runtime.turn_context import register_turn_process
+    result = await _do_install(
+        language, list(packages_arg), action,
+        proc_register=register_turn_process,
+    )
 
     statuses = [
         {"name": s.name, "status": s.status, "detail": s.detail}

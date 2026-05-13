@@ -318,6 +318,18 @@ body {
   cursor: pointer;
 }
 
+.feedback-counter {
+  margin-top: 4px;
+  font-size: 11px;
+  color: var(--text-dim);
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+
+.feedback-counter.feedback-counter-warn {
+  color: #c44;
+}
+
 .feedback-note {
   margin: 14px 0 0;
   font-size: 12px;

@@ -45,25 +45,45 @@ def _png_bytes(size: int = 200) -> bytes:
     return b"\x89PNG\r\n\x1a\n" + b"\x00" * size
 
 
+_TEST_RUN_TOKEN = "test-run-token-plot-vision"
+
+
 def _seed_run(
     cwd: Path, manifest_lines: list[dict[str, Any]],
     extra_files: dict[str, bytes] | None = None,
 ) -> Path:
     """Stand-in for a finished script run: write a run dir
-    structure with a manifest and plot files."""
+    structure with a manifest and plot files.
+
+    Stamps every entry with the per-run authenticity token and
+    registers it in the executor's in-process registry so the
+    runner's ``_capture_plots`` and ``_summarize_plot_helpers``
+    re-validate it the same way they would after a real run.
+    """
+    from nora.executor import register_run_token, RESULT_TOKEN_FIELD
+
     run_dir = cwd / ".nora" / "runs" / "r0001"
     plots = run_dir / "_nora_plots"
     plots.mkdir(parents=True, exist_ok=True)
+    stamped: list[dict[str, Any]] = []
     for entry in manifest_lines:
         f = entry.get("file")
         if isinstance(f, str):
             (plots / f).write_bytes(_png_bytes())
+        # Inject the token on every entry that doesn't already
+        # carry one. Tests that intentionally probe the
+        # missing-/forged-token paths can pre-set _token to a
+        # different value.
+        if RESULT_TOKEN_FIELD not in entry:
+            entry = {**entry, RESULT_TOKEN_FIELD: _TEST_RUN_TOKEN}
+        stamped.append(entry)
     (plots / "manifest.jsonl").write_text(
-        "\n".join(json.dumps(e) for e in manifest_lines) + "\n",
+        "\n".join(json.dumps(e) for e in stamped) + "\n",
         encoding="utf-8",
     )
     for name, content in (extra_files or {}).items():
         (plots / name).write_bytes(content)
+    register_run_token(run_dir, _TEST_RUN_TOKEN)
     return run_dir
 
 
@@ -160,11 +180,14 @@ def test_capture_refuses_path_traversal(tmp_path: Path) -> None:
     (run_dir / "secret.png").write_bytes(_png_bytes())
 
     # Add a malicious manifest entry pointing outside _nora_plots.
+    # Stamp it with the test token so the new authenticity gate
+    # doesn't pre-empt the path-traversal gate we're actually
+    # testing here — we want the path check to be what refuses it.
     plots = run_dir / "_nora_plots"
     with (plots / "manifest.jsonl").open("a", encoding="utf-8") as f:
         f.write(json.dumps({
             "file": "../secret.png", "kind": "coefficients",
-            "label": "evil",
+            "label": "evil", "_token": _TEST_RUN_TOKEN,
         }) + "\n")
 
     runner = _runner(tmp_path)

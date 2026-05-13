@@ -2259,6 +2259,15 @@ class NoraBridge:
         affordance. If attachment support is needed later,
         upgrading the plan or swapping endpoints is a localised
         change.
+
+        Length cap: the message is truncated at 12k chars before
+        leaving the machine. The modal's textarea enforces the
+        same cap client-side (``maxlength="12000"``) and warns the
+        researcher as they approach it, so this server-side cap is
+        defense in depth against a paste that slips past the UI.
+        Truncate rather than reject so a researcher who hits the
+        cap mid-paste doesn't lose their note; the trailing marker
+        tells the maintainer what happened.
         """
         text = (message or "").strip()
         if not text:

@@ -34,15 +34,26 @@ from nora.session_files import (
 def _make_cwd_writes_manifest(
     cwd: Path,
     run_id: str,
-    entries: list[tuple[str, float, int]],
+    entries: list[tuple[str, float, int] | tuple[str, float, int, bool]],
 ) -> Path:
     """Write a fake ``cwd_writes.json`` under a synthetic run dir.
-    Each entry is ``(name, mtime, size)`` — the same shape the
-    executor's ``_write_cwd_writes_manifest`` produces.
+    Each entry is ``(name, mtime, size)`` (legacy shape, no
+    ``created`` field) or ``(name, mtime, size, created)`` (current
+    shape). The legacy shape exercises the backwards-compat path
+    where missing ``created`` defaults to True.
     """
     run_dir = cwd / ".nora" / "runs" / run_id
     run_dir.mkdir(parents=True, exist_ok=True)
-    rows = [{"name": n, "mtime": m, "size": s} for n, m, s in entries]
+    rows: list[dict[str, object]] = []
+    for entry in entries:
+        if len(entry) == 4:
+            n, m, s, created = entry
+            rows.append({
+                "name": n, "mtime": m, "size": s, "created": created,
+            })
+        else:
+            n, m, s = entry
+            rows.append({"name": n, "mtime": m, "size": s})
     (run_dir / "cwd_writes.json").write_text(
         json.dumps(rows), encoding="utf-8"
     )
@@ -300,6 +311,134 @@ def test_executor_diff_writes_manifest_for_new_files(tmp_path: Path) -> None:
     assert "existing.csv" not in names, (
         "unchanged files don't enter the manifest"
     )
+
+
+def test_executor_diff_tags_created_vs_modified(tmp_path: Path) -> None:
+    """The manifest carries ``created=True`` for files that didn't
+    exist before the run and ``created=False`` for pre-existing
+    files the script overwrote. The Files-panel filter consults
+    this so modifications to researcher uploads stay visible.
+    """
+    from nora.executor import _snapshot_cwd_top_level, _write_cwd_writes_manifest
+
+    cwd = tmp_path / "session"
+    cwd.mkdir()
+    # Researcher uploaded ``source.csv`` before the run.
+    src = cwd / "source.csv"
+    src.write_text("x\n1\n", encoding="utf-8")
+    pre = _snapshot_cwd_top_level(cwd)
+
+    run_dir = cwd / ".nora" / "runs" / "r1"
+    run_dir.mkdir(parents=True)
+
+    # Script creates a new file AND overwrites the pre-existing one.
+    (cwd / "scratch.png").write_bytes(b"\x89PNG" + b"\x00" * 50)
+    src.write_text("x\n1\n2\n", encoding="utf-8")
+    _write_cwd_writes_manifest(cwd, run_dir, pre)
+
+    rows = json.loads(
+        (run_dir / "cwd_writes.json").read_text(encoding="utf-8")
+    )
+    by_name = {r["name"]: r for r in rows}
+    assert by_name["scratch.png"]["created"] is True
+    assert by_name["source.csv"]["created"] is False
+
+
+def test_script_written_filter_keeps_modified_preexisting_files(
+    tmp_path: Path,
+) -> None:
+    """A pre-existing file the script *modified* (created=False) stays
+    visible in the Files panel — it's audit evidence, not clutter.
+    Only files the script *created* (created=True) get hidden.
+    """
+    cwd = tmp_path / "session"
+    cwd.mkdir()
+    # Researcher uploaded source.csv; script then ran `save ..., replace`.
+    src = cwd / "source.csv"
+    src.write_text("x\n1\n2\n", encoding="utf-8")
+    st = src.stat()
+    _make_cwd_writes_manifest(
+        cwd, "r1",
+        [("source.csv", st.st_mtime, st.st_size, False)],
+    )
+
+    names = [
+        f["name"] for f in enumerate_session_files(
+            cwd,
+            include_data=True,
+            include_run_scripts=False,
+            include_run_plots=False,
+            exclude_script_writes=True,
+        )
+    ]
+    assert "source.csv" in names, (
+        "modified pre-existing files must stay visible — they're not clutter"
+    )
+
+
+def test_script_written_filter_hides_only_created_files(
+    tmp_path: Path,
+) -> None:
+    """Files explicitly tagged ``created=True`` are hidden in the
+    panel. Files tagged ``created=False`` are not.
+    """
+    cwd = tmp_path / "session"
+    cwd.mkdir()
+    scratch = cwd / "scratch.png"
+    scratch.write_bytes(b"\x89PNG" + b"\x00" * 100)
+    sa = scratch.stat()
+    modified = cwd / "input.csv"
+    modified.write_text("x\n1\n", encoding="utf-8")
+    sb = modified.stat()
+    _make_cwd_writes_manifest(
+        cwd, "r1",
+        [
+            ("scratch.png", sa.st_mtime, sa.st_size, True),
+            ("input.csv", sb.st_mtime, sb.st_size, False),
+        ],
+    )
+
+    names = [
+        f["name"] for f in enumerate_session_files(
+            cwd,
+            include_data=True,
+            include_run_scripts=False,
+            include_run_plots=False,
+            exclude_script_writes=True,
+        )
+    ]
+    assert "scratch.png" not in names
+    assert "input.csv" in names
+
+
+def test_script_written_filter_treats_legacy_manifest_as_created(
+    tmp_path: Path,
+) -> None:
+    """Manifests written before the ``created`` field existed default
+    to ``created=True`` so old sessions don't suddenly start showing
+    every previously-hidden file. The legacy shape (no ``created``
+    key) is the backwards-compat path.
+    """
+    cwd = tmp_path / "session"
+    cwd.mkdir()
+    f = cwd / "legacy.png"
+    f.write_bytes(b"\x89PNG" + b"\x00" * 80)
+    st = f.stat()
+    # 3-tuple shape → no ``created`` field in the row.
+    _make_cwd_writes_manifest(
+        cwd, "r1", [("legacy.png", st.st_mtime, st.st_size)],
+    )
+
+    names = [
+        f["name"] for f in enumerate_session_files(
+            cwd,
+            include_data=True,
+            include_run_scripts=False,
+            include_run_plots=False,
+            exclude_script_writes=True,
+        )
+    ]
+    assert "legacy.png" not in names
 
 
 def test_executor_diff_no_writes_no_manifest(tmp_path: Path) -> None:
