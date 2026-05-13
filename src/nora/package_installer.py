@@ -495,6 +495,49 @@ async def install_packages(
                 duration_seconds=0.0,
                 error="python3 not found on this machine",
             )
+        # Refuse to install ``nora`` from PyPI. The Python runtime
+        # helpers (``nora.from_lm``, ``nora.result``, ``nora.plot_*``)
+        # are staged into every script's sys.path by the executor
+        # preamble at ``executor._write_script``, so the model can
+        # ``import nora`` directly with no install step. The literal
+        # name ``nora`` on PyPI is an unrelated empty placeholder
+        # (~1 KB, no module code) owned by a different author;
+        # installing it doesn't help and confuses downstream import
+        # diagnostics. Match with PEP 503 normalisation so ``Nora``,
+        # ``NORA``, ``nora.`` etc. all hit the guard.
+        _blocked_nora: list[PackageStatus] = []
+        _remaining_valid: list[str] = []
+        for _n in valid:
+            if re.sub(r"[-_.]+", "-", _n).lower() == "nora":
+                _blocked_nora.append(PackageStatus(
+                    name=_n, status="skipped",
+                    detail=(
+                        "the Nora Python runtime helpers are preloaded "
+                        "into every script by the executor; just write "
+                        "`import nora` and call `nora.from_lm(...)` / "
+                        "`nora.result(...)` / `nora.plot_*(...)`. The "
+                        "`nora` distribution on PyPI is an unrelated "
+                        "empty placeholder by another author and will "
+                        "not provide these helpers."
+                    ),
+                ))
+            else:
+                _remaining_valid.append(_n)
+        if _blocked_nora:
+            rejected.extend(_blocked_nora)
+            valid = _remaining_valid
+            if not valid:
+                return InstallResult(
+                    language="Python", action=action,  # type: ignore[arg-type]
+                    statuses=tuple(rejected),
+                    raw_stdout="", raw_stderr="",
+                    duration_seconds=0.0,
+                    error=(
+                        "refused to install `nora` from PyPI; the "
+                        "runtime helpers are already available via "
+                        "`import nora` inside every script"
+                    ),
+                )
         # ``pip uninstall`` has no ``--target``; it locates the
         # package via ``sys.path`` and removes the first copy it
         # finds — which may be the user's site-packages, a venv, or
