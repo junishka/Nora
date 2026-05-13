@@ -300,8 +300,11 @@ def test_attach_session_file_resolves_run_dir_display_name(
     }), encoding="utf-8")
 
     bridge = NoraBridge(cwd=tmp_path)
-    # Replicate what the mention dropdown shows the user.
-    listing = bridge.list_session_files()
+    # Replicate what the mention dropdown shows the user. The
+    # dropdown calls ``list_mentionable_files`` (which keeps the
+    # full view), NOT ``list_session_files`` (which is panel-mode
+    # and hides run-dir scripts now).
+    listing = bridge.list_mentionable_files()
     display_names = [r["name"] for r in listing["files"]]
     # The display name should be in the list.
     matches = [n for n in display_names if n.endswith(".do")]

@@ -159,11 +159,74 @@ def visible_run_dir_names(cwd: Path) -> set[str] | None:
     return names
 
 
+def script_written_cwd_files(cwd: Path) -> set[str]:
+    """Return the set of cwd top-level filenames currently tagged as
+    written or modified by a ``submit_script`` run.
+
+    Reads every ``<cwd>/.nora/runs/<id>/cwd_writes.json`` manifest
+    (written by the executor) and unions the rows whose on-disk file
+    still matches the manifest's ``(mtime, size)`` snapshot. A tag
+    de-applies when the file diverges — researcher overwriting,
+    deleting then re-uploading, or replacing the file makes it
+    visible in the Files panel again, even though a prior run was
+    tagged as having created it.
+
+    Used by the Files-panel filter to hide script-produced clutter
+    (intermediate plots, scratch datasets, raw exports) from the
+    researcher's view. Those files are already represented in the
+    script's result card; the panel doesn't need to duplicate them.
+    The model-facing ``list_session_files`` tool does NOT call this
+    — the model still needs visibility into everything to reason
+    about prior work.
+    """
+    import json
+
+    out: set[str] = set()
+    runs_root = cwd / ".nora" / "runs"
+    if not runs_root.is_dir():
+        return out
+    try:
+        for run_dir in runs_root.iterdir():
+            if not run_dir.is_dir() or run_dir.is_symlink():
+                continue
+            manifest = run_dir / "cwd_writes.json"
+            if not manifest.is_file():
+                continue
+            try:
+                rows = json.loads(manifest.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                continue
+            if not isinstance(rows, list):
+                continue
+            for row in rows:
+                if not isinstance(row, dict):
+                    continue
+                name = row.get("name")
+                m = row.get("mtime")
+                s = row.get("size")
+                if not isinstance(name, str) or not name:
+                    continue
+                if not isinstance(m, (int, float)) or not isinstance(s, int):
+                    continue
+                target = cwd / name
+                try:
+                    st = target.stat()
+                except OSError:
+                    continue
+                if st.st_mtime == m and st.st_size == s:
+                    out.add(name)
+    except OSError:
+        pass
+    return out
+
+
 def enumerate_session_files(
     cwd: Path,
     *,
     include_data: bool = True,
     include_run_scripts: bool = True,
+    include_run_plots: bool = True,
+    exclude_script_writes: bool = False,
     visible_run_dirs: set[str] | None = None,
 ) -> list[dict[str, Any]]:
     """Walk a session cwd and return one dict per known file.
@@ -174,12 +237,24 @@ def enumerate_session_files(
       1. ``cwd`` itself — researcher uploads, Stata's ``graph export``
          writes, direct ``ggsave`` / ``plt.savefig`` with bare names.
       2. Each ``cwd/.nora/runs/<id>/_nora_plots/`` — helper-produced
-         plots; listing them here lets the Files panel act as a
-         session-wide gallery regardless of which run wrote each plot.
+         plots. Skipped when ``include_run_plots`` is False (Files
+         panel mode: the plots already render inline in their result
+         cards, so duplicating them in the panel just adds noise).
 
     When ``include_run_scripts`` is True, also surfaces the script
     Nora wrote on each ``submit_script`` (lives at
     ``<run_dir>/script.{do,R,py,ipynb}``) under its analytic label.
+    Skipped when False (Files panel mode: same logic — the script is
+    visible on its result card).
+
+    When ``exclude_script_writes`` is True, files in cwd that a
+    ``submit_script`` run created or modified (per its
+    ``cwd_writes.json`` manifest) are dropped from the listing.
+    The Files panel sets this so script-produced clutter (e.g.,
+    ``ggsave("debug.png")`` outputs, ``write.csv`` intermediates)
+    doesn't compete with researcher uploads. The model-facing
+    ``list_session_files`` tool leaves this False so the model still
+    sees everything.
 
     Each entry carries: ``name`` (display name; rewritten to the
     analytic label for run-dir scripts), ``kind`` (one of script /
@@ -200,9 +275,18 @@ def enumerate_session_files(
 
     rows: list[dict[str, Any]] = []
     seen_paths: set[Path] = set()
+    script_written = (
+        script_written_cwd_files(cwd) if exclude_script_writes else set()
+    )
 
-    def _add(child: Path) -> None:
+    def _add(child: Path, *, allow_script_write_filter: bool = True) -> None:
         if child.name.endswith(".nora.png"):
+            return
+        # ``script_written`` is keyed by top-level filename; only the
+        # cwd-scan loop should consult it. Plot files under
+        # ``<run_dir>/_nora_plots/`` have their own filtering (run-dir
+        # plots are gated on ``include_run_plots``, not on this set).
+        if allow_script_write_filter and child.name in script_written:
             return
         ext = child.suffix.lower()
         kind = classify_ext(ext, include_data=include_data)
@@ -258,12 +342,14 @@ def enumerate_session_files(
                 if (visible_run_dirs is not None
                         and run_dir.name not in visible_run_dirs):
                     continue
+                if not include_run_plots:
+                    continue
                 plots_dir = run_dir / "_nora_plots"
                 if plots_dir.is_dir() and not plots_dir.is_symlink():
                     try:
                         for plot in plots_dir.iterdir():
                             if plot.is_file() and not plot.is_symlink():
-                                _add(plot)
+                                _add(plot, allow_script_write_filter=False)
                     except OSError:
                         pass
         except OSError:

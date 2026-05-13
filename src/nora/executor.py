@@ -412,6 +412,81 @@ def _filter_plot_manifest(run_dir: Path, run_token: str) -> int:
     return dropped
 
 
+# Filename of the per-run manifest recording top-level cwd files this
+# run created or modified. The Files panel reads these manifests
+# across all runs and excludes the listed files from the researcher's
+# view — they're already represented in the script's result card, so
+# duplicating them in the panel just adds noise.
+CWD_WRITES_MANIFEST_NAME = "cwd_writes.json"
+
+
+def _snapshot_cwd_top_level(cwd: Path) -> dict[str, tuple[float, int]]:
+    """Snapshot top-level cwd files as a dict of name → (mtime, size).
+
+    Excludes the ``.nora/`` subtree (run dirs, the store, the session
+    config), other dotfiles (``.DS_Store``), symlinks, and non-files.
+    Failure returns an empty dict — the diff downstream just won't
+    tag anything as script-written, which fails open (more files
+    visible in the panel, not fewer).
+    """
+    snapshot: dict[str, tuple[float, int]] = {}
+    try:
+        for child in cwd.iterdir():
+            if child.name.startswith("."):
+                continue
+            if child.is_symlink() or not child.is_file():
+                continue
+            try:
+                stat = child.stat()
+            except OSError:
+                continue
+            snapshot[child.name] = (stat.st_mtime, stat.st_size)
+    except OSError:
+        return {}
+    return snapshot
+
+
+def _write_cwd_writes_manifest(
+    cwd: Path,
+    run_dir: Path,
+    pre_snapshot: dict[str, tuple[float, int]],
+) -> None:
+    """Diff cwd top-level against ``pre_snapshot`` and write a JSON
+    manifest of files this run created or modified.
+
+    Manifest format: a list of ``{"name", "mtime", "size"}`` rows.
+    The Files-panel filter de-tags a row when the on-disk file's
+    (mtime, size) no longer matches — so a researcher overwriting,
+    replacing, or deleting then re-uploading a script-written file
+    makes it visible in the panel again.
+
+    Best-effort: any I/O failure here is silent. The fallback is
+    "this run's writes don't get tagged", which means the panel
+    shows them — acceptable as a graceful degradation.
+    """
+    import json
+
+    try:
+        post = _snapshot_cwd_top_level(cwd)
+    except Exception:  # noqa: BLE001 — snapshot is best-effort
+        return
+    rows: list[dict[str, Any]] = []
+    for name, (mtime, size) in post.items():
+        prev = pre_snapshot.get(name)
+        if prev is None or prev != (mtime, size):
+            rows.append({"name": name, "mtime": mtime, "size": size})
+    if not rows:
+        return
+    manifest_path = run_dir / CWD_WRITES_MANIFEST_NAME
+    try:
+        manifest_path.write_text(
+            json.dumps(rows, ensure_ascii=False),
+            encoding="utf-8",
+        )
+    except OSError:
+        pass
+
+
 def _parse_result_jsonl(
     text: str, run_token: str
 ) -> tuple[list[dict[str, Any]], list[str], bool]:
@@ -717,6 +792,14 @@ def run_script(
         RUN_TOKEN_ENV_VAR: run_token,
     }
 
+    # Snapshot cwd top-level BEFORE the subprocess runs so the diff
+    # downstream can identify exactly which top-level files this run
+    # created or modified. The Files panel uses this to hide script-
+    # produced clutter (``ggsave("p.png")``, ``write.csv("tmp.csv")``,
+    # etc.) from the researcher's view — those files are already
+    # represented in the result card.
+    cwd_pre_snapshot = _snapshot_cwd_top_level(cwd)
+
     start = time.monotonic()
     # Popen + communicate (instead of subprocess.run) so the async
     # caller can register the proc handle and ``proc.kill()`` it
@@ -786,6 +869,10 @@ def run_script(
         except subprocess.TimeoutExpired:
             stdout, stderr = "", ""
         duration = time.monotonic() - start
+        # Tag any cwd files this run created before the timeout —
+        # a script that wrote a half-finished dataset before getting
+        # killed still produced clutter the panel should hide.
+        _write_cwd_writes_manifest(cwd, run_dir, cwd_pre_snapshot)
         return ExecutionResult(
             ok=False, language=language,
             raw_stdout=stdout or "",
@@ -798,6 +885,10 @@ def run_script(
 
     duration = time.monotonic() - start
     exit_code = proc.returncode
+    # Tag cwd files this run created or modified. Runs after the
+    # subprocess has fully finished writing; before any consumer
+    # (Files panel) reads the manifest.
+    _write_cwd_writes_manifest(cwd, run_dir, cwd_pre_snapshot)
 
     # 5. Collect output. For Stata batch mode, real output lives in a
     # .log file next to the .do script rather than stdout.
