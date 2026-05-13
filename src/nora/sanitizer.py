@@ -938,10 +938,25 @@ def _sanitize_linear_regression(
             else:
                 dropped.append(k)
         if dropped:
+            # Names withheld by design: ``dropped`` contains keys
+            # the caller-authored script put into the result dict
+            # (coefficient / SE / t / p / vif keys originate from
+            # the regression's design matrix column names, which
+            # the script chooses freely). Echoing those names back
+            # gives a script that ran on raw data ~30 strings ×
+            # ~40 chars per submit_script call of attacker-chosen
+            # content through the transformations log — a covert
+            # channel for small high-value values (numeric IDs,
+            # ZIP codes, salaries) that's both well-bounded enough
+            # to fit in the safe_key cap and far easier than the
+            # legitimate model-context channels. ``_collect_allowed``
+            # uses this same "names withheld" treatment for unknown
+            # top-level fields and for malformed inner dict values;
+            # this matches it.
             transformations.append(
                 f"dropped {len(dropped)} undeclared key(s) from "
-                f"{dict_field!r}: {sorted(dropped)[:5]}"
-                + (" …" if len(dropped) > 5 else "")
+                f"{dict_field!r} (names withheld — keys are caller-"
+                f"controlled and could carry raw data bytes)"
             )
         out[dict_field] = kept
 
@@ -1014,16 +1029,23 @@ def _sanitize_linear_regression(
                     continue
                 sanitized_vcov[safe_row] = sanitized_row
         if dropped_vcov:
+            # Names withheld for the same reason as the
+            # ``dict_numeric`` log entry above — vcov row / col
+            # keys originate in the regression's predictor names
+            # and are caller-controlled bytes.
             transformations.append(
                 f"dropped {len(dropped_vcov)} undeclared key(s) from "
-                f"'vcov': {sorted(dropped_vcov)[:5]}"
-                + (" …" if len(dropped_vcov) > 5 else "")
+                f"'vcov' (names withheld — keys are caller-controlled "
+                f"and could carry raw data bytes)"
             )
         if collisions:
+            # Collision labels are data-derived (two raw names that
+            # both safe_key-cleaned to the same string). Withhold
+            # them too: a script could craft colliding names whose
+            # collision pattern itself encodes a payload.
             transformations.append(
                 f"dropped {len(collisions)} 'vcov' cell(s) whose "
-                f"sanitized keys collided: {sorted(collisions)[:5]}"
-                + (" …" if len(collisions) > 5 else "")
+                f"sanitized keys collided (names withheld)"
             )
         if sanitized_vcov:
             out["vcov"] = sanitized_vcov
@@ -1668,12 +1690,95 @@ def _sanitize_crosstab(
     # The structural cap on table size keeps this loop cheap.
     threshold = config.cell_suppression_threshold
     marker = suppression_marker(threshold)
+
+    # Primary status per cell: True == suppressed (below threshold).
+    suppressed_status: dict[tuple[str, str], bool] = {
+        key: v < threshold for key, v in clean_counts.items()
+    }
+    primary_count = sum(1 for s in suppressed_status.values() if s)
+
+    # Secondary suppression to defend against per-row / per-column
+    # back-calc when the model has an externally-known marginal.
+    #
+    # The attack: the model issues a separate ``request_data``
+    # frequency_table on the row (or column) variable. That table
+    # publishes per-level counts for visible levels — i.e. the row
+    # / column marginal N_R (or N_C) of this crosstab. Then:
+    #
+    #   * If a surviving row R has exactly ONE suppressed cell, the
+    #     row publishes a ``[suppressed]`` bucket whose sum equals
+    #     ``N_R - sum(visible in R)`` — recovering the lone cell
+    #     exactly.
+    #   * Symmetrically for columns: the model sums visible cells
+    #     in column C across the output and computes ``N_C -
+    #     sum(visible in C)``. If exactly one cell in column C is
+    #     hidden (suppressed in a surviving row, since dropped rows
+    #     also have their column-C cell suppressed), that cell is
+    #     recovered.
+    #
+    # Remedy is the standard SDC choice (ONS / Eurostat guidance):
+    # promote additional visible cells to suppressed until every row
+    # and every column with any suppression has either 0 or >=2
+    # suppressed cells. Iterate to a fixed point — a row-side fix
+    # can create a column-side violation and vice versa. The loop
+    # is bounded by the total cell count.
+    #
+    # Victim choice: the smallest visible cell. This is the standard
+    # data-utility-minimising choice — losing the smallest value
+    # costs the least information to legitimate downstream
+    # analysis. Ties broken by key for determinism (tests need
+    # reproducibility).
+    sorted_rows = sorted({r for (r, _) in clean_counts})
+    sorted_cols = sorted({c for (_, c) in clean_counts})
+    secondary_count = 0
+    while True:
+        target: tuple[str, str] | None = None
+        # Row pass first.
+        for r in sorted_rows:
+            in_row = [c for c in sorted_cols if (r, c) in clean_counts]
+            if not in_row:
+                continue
+            n_supp = sum(1 for c in in_row if suppressed_status[(r, c)])
+            if n_supp != 1:
+                continue
+            visible = [
+                (c, clean_counts[(r, c)]) for c in in_row
+                if not suppressed_status[(r, c)]
+            ]
+            if not visible:
+                continue
+            victim_c, _ = min(visible, key=lambda cv: (cv[1], cv[0]))
+            target = (r, victim_c)
+            break
+        # Column pass if row pass found nothing.
+        if target is None:
+            for c in sorted_cols:
+                in_col = [r for r in sorted_rows if (r, c) in clean_counts]
+                if not in_col:
+                    continue
+                n_supp = sum(1 for r in in_col if suppressed_status[(r, c)])
+                if n_supp != 1:
+                    continue
+                visible = [
+                    (r, clean_counts[(r, c)]) for r in in_col
+                    if not suppressed_status[(r, c)]
+                ]
+                if not visible:
+                    continue
+                victim_r, _ = min(visible, key=lambda rv: (rv[1], rv[0]))
+                target = (victim_r, c)
+                break
+        if target is None:
+            break
+        suppressed_status[target] = True
+        secondary_count += 1
+
     nested_raw: dict[str, dict[str, int | str]] = {}
     suppressed_cell_count = 0
     for (r, c), v in clean_counts.items():
         if r not in nested_raw:
             nested_raw[r] = {}
-        if v < threshold:
+        if suppressed_status[(r, c)]:
             nested_raw[r][c] = marker
             suppressed_cell_count += 1
         else:
@@ -1696,11 +1801,26 @@ def _sanitize_crosstab(
             visible_cols["[suppressed]"] = marker
         nested[row_label] = visible_cols
 
-    if suppressed_cell_count:
+    if primary_count:
         transformations.append(
-            f"primary suppression: {suppressed_cell_count} cell(s) "
+            f"primary suppression: {primary_count} cell(s) "
             f"with count < {threshold} (cell labels withheld — "
             f"bucketed under '[suppressed]')"
+        )
+    if secondary_count:
+        # Secondary cells were >= threshold originally but got
+        # promoted to suppressed to defend against per-row /
+        # per-column back-calc from an externally-known marginal
+        # (a separate request_data on the row or column variable
+        # publishes its level totals). The published bucket marker
+        # stays ``<threshold`` for compactness; this log line is
+        # the authoritative statement that some bucket entries do
+        # NOT actually fall below threshold.
+        transformations.append(
+            f"secondary suppression: {secondary_count} additional "
+            f"cell(s) promoted to '[suppressed]' to prevent "
+            f"per-row/column back-calc when an external marginal "
+            f"is known (smallest visible cells chosen)"
         )
     if suppressed_row_count:
         transformations.append(

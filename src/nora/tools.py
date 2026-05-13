@@ -1988,14 +1988,28 @@ async def submit_script_file(args: dict[str, Any]) -> dict[str, Any]:
         # corruption. Treat manifest-unreadable as "not staged" and
         # tell the caller to re-stage.
         try:
-            from nora.file_provenance import is_known
+            from nora.file_provenance import is_known, known_names
             staged_ok = is_known(cwd_for_check, resolved_target.name)
+            name_in_manifest = (
+                resolved_target.name in known_names(cwd_for_check)
+            ) if not staged_ok else False
         except Exception:  # noqa: BLE001 — fail closed (see above)
             staged_ok = False
+            name_in_manifest = False
         if not staged_ok:
-            return _as_mcp_text(_with_zero_phase_metadata({
-                "status": "rejected",
-                "reason": (
+            if name_in_manifest:
+                reason = (
+                    f"{safe_name!r} appears in this session's staged-"
+                    f"files manifest, but its current on-disk content "
+                    f"does not match what was staged. A script may "
+                    f"have rewritten it (the sandbox permits writes "
+                    f"to your cwd) or you edited it outside Nora. "
+                    f"Re-attach it via the chat composer to authorise "
+                    f"the new content, or paste its contents inline "
+                    f"with submit_script."
+                )
+            else:
+                reason = (
                     f"{safe_name!r} is not in this session's staged-"
                     f"files manifest, so I cannot run it. The "
                     f"analysis sandbox intentionally lets scripts "
@@ -2006,7 +2020,10 @@ async def submit_script_file(args: dict[str, Any]) -> dict[str, Any]:
                     f"paste it into the message box) to mark it as "
                     f"researcher-staged, or paste its contents "
                     f"inline with submit_script."
-                ),
+                )
+            return _as_mcp_text(_with_zero_phase_metadata({
+                "status": "rejected",
+                "reason": reason,
             }, language=None))
 
     ext = target.suffix.lower()
@@ -3330,14 +3347,33 @@ async def read_attached_file(args: dict[str, Any]) -> dict[str, Any]:
         # manifest-unreadable as "not staged" and tell the caller to
         # re-stage.
         try:
-            from nora.file_provenance import is_known
+            from nora.file_provenance import is_known, known_names
             staged_ok = is_known(cwd, resolved_target.name)
+            # Disambiguate "never staged" vs. "staged-but-content-
+            # changed" so the rejection message points at the right
+            # fix. The two cases need the same recovery action
+            # (re-stage via the bridge) but the cause is different,
+            # and the content-changed case is also the legitimate
+            # "I edited the file outside Nora" flow.
+            name_in_manifest = (
+                resolved_target.name in known_names(cwd)
+            ) if not staged_ok else False
         except Exception:  # noqa: BLE001 — fail closed (see above)
             staged_ok = False
+            name_in_manifest = False
         if not staged_ok:
-            return _as_mcp_text({
-                "status": "rejected",
-                "reason": (
+            if name_in_manifest:
+                reason = (
+                    f"{safe_name!r} appears in this session's staged-"
+                    f"files manifest, but its current on-disk content "
+                    f"does not match what was staged. Either the file "
+                    f"was overwritten by an earlier script (the "
+                    f"sandbox permits writes to your cwd), or you "
+                    f"edited it outside Nora. Re-attach it via the "
+                    f"chat composer to authorise the new content."
+                )
+            else:
+                reason = (
                     f"{safe_name!r} is not in this session's staged-"
                     f"files manifest, so I (the model) cannot read it. "
                     f"This guard exists because the analysis sandbox "
@@ -3349,7 +3385,10 @@ async def read_attached_file(args: dict[str, Any]) -> dict[str, Any]:
                     f"please re-attach it via the chat composer "
                     f"(drop or paste it into the message box) so the "
                     f"bridge marks it as researcher-staged."
-                ),
+                )
+            return _as_mcp_text({
+                "status": "rejected",
+                "reason": reason,
             })
 
     ext = target.suffix.lower()

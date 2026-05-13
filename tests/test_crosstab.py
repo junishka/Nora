@@ -191,29 +191,239 @@ def test_crosstab_rejects_missing_required_fields():
 
 
 def test_crosstab_happy_path():
+    """A row with one rare cell would let an attacker recover that
+    cell exactly from a separately-queried row-variable marginal
+    (``N_row - sum(visible) = the lone suppressed cell``). Secondary
+    suppression promotes the smallest visible cell in any row /
+    column with exactly one suppressed cell. The third row
+    (``very_old``) keeps the ``rare_event`` column from going
+    vulnerable on the column-side check (two primary suppressions
+    already in that column means no further column-side cascade
+    reaches ``very_old``)."""
     r = sanitize({
         "type": "crosstab",
         "row_variable": "age",
-        "col_variable": "sex",
+        "col_variable": "outcome",
         "counts": {
-            "young": {"M": 50, "F": 40},
-            "old":   {"M": 30, "F": 5},
+            "young":    {"recovered": 200, "died": 150, "rare_event": 7},   # 1 cell < 10
+            "old":      {"recovered": 100, "died":  80, "rare_event": 5},   # 1 cell < 10
+            "very_old": {"recovered":  50, "died":  40, "rare_event": 30},  # 0 cells < 10
         },
     })
     assert r.ok
-    # 'old' had an above-threshold cell (M=30) so the row label
-    # survives; the suppressed F cell is bucketed under the row's
-    # ``[suppressed]`` entry. The 'F' column label is hidden because
-    # leaving it would tell the model "old/F is the rare cell".
-    old = r.sanitized["counts"]["old"]
-    assert old["M"] == 30
-    assert "F" not in old
+    counts = r.sanitized["counts"]
+    # ``very_old`` is untouched — no row-wise vulnerability, and the
+    # ``rare_event`` column already has two primary suppressions
+    # (young, old) so the column-side check sees >=2 suppressed
+    # and skips it.
+    assert counts["very_old"] == {"recovered": 50, "died": 40, "rare_event": 30}
+    # ``young`` row had exactly one primary suppression. Secondary
+    # promoted the smallest visible cell (``died`` = 150, smaller
+    # than ``recovered`` = 200) so the bucket holds two cells and
+    # the marginal can't recover either.
+    young = counts["young"]
+    assert young["recovered"] == 200
+    assert "died" not in young
+    assert "rare_event" not in young
+    assert young["[suppressed]"] == "<10"
+    # Same shape for ``old`` — smallest visible (``died`` = 80) was
+    # the one promoted.
+    old = counts["old"]
+    assert old["recovered"] == 100
+    assert "died" not in old
+    assert "rare_event" not in old
     assert old["[suppressed]"] == "<10"
-    # Visible cells unchanged.
-    assert r.sanitized["counts"]["young"]["M"] == 50
-    assert r.sanitized["counts"]["young"]["F"] == 40
+    # Accounting: 2 primary (young/rare, old/rare) + 2 secondary
+    # (young/died, old/died) = 4. No row was fully dropped.
+    assert r.sanitized["suppressed_cell_count"] == 4
+    assert r.sanitized.get("suppressed_row_count", 0) == 0
+    # Transformation log distinguishes the two stages so a
+    # researcher auditing the SDC trail can see what was promoted
+    # for back-calc protection vs. dropped for being below
+    # threshold.
+    log = " ".join(r.transformations)
+    assert "primary suppression: 2 cell" in log
+    assert "secondary suppression: 2" in log
+    # And no margins, ever.
     assert "n" not in r.sanitized
     assert "grand_total" not in r.sanitized
+
+
+# ---------------------------------------------------------------------------
+# Secondary suppression — cross-query back-calc defence
+# ---------------------------------------------------------------------------
+#
+# These tests close the gap left explicit in ``sdc.enforce_back_calc_safety``
+# ("NOT a full secondary-suppression algorithm — 2D tables with row +
+# column margins require linear programming"). For Nora's threat model
+# the 2D defence doesn't need τ-ARGUS-grade optimality; it just needs
+# to make per-row and per-column back-calc from an externally-known
+# marginal infeasible. The chosen heuristic — iteratively promote the
+# smallest visible cell in any row or column with exactly one
+# suppressed cell — is the standard ONS / Eurostat starting point.
+
+
+@given(raw=crosstab_payloads())
+def test_property_no_published_row_has_single_cell_bucket(raw):
+    """Across every well-formed input the sanitizer accepts: if a
+    surviving row publishes a ``[suppressed]`` bucket, that bucket
+    aggregates at least two cells from the input. This is the load-
+    bearing invariant the secondary pass guarantees — a single-cell
+    bucket is back-calc-recoverable from an externally-known row
+    marginal."""
+    result = sanitize(raw)
+    assume(result.ok)
+    counts = result.sanitized.get("counts", {})
+    raw_counts = raw["counts"]
+    from nora.text_safety import safe_key
+    for row_label, row_cells in counts.items():
+        if "[suppressed]" not in row_cells:
+            continue
+        # Find the matching raw row: row_label is safe_key'd, so
+        # invert by scanning. The shape generator guarantees no
+        # safe_key collisions because levels are drawn unique.
+        raw_row = None
+        for raw_label, raw_row_cells in raw_counts.items():
+            if safe_key(raw_label) == row_label:
+                raw_row = raw_row_cells
+                break
+        assert raw_row is not None, (
+            f"published row {row_label!r} has no matching raw input"
+        )
+        n_visible = sum(1 for c in row_cells if c != "[suppressed]")
+        n_bucketed = len(raw_row) - n_visible
+        assert n_bucketed >= 2, (
+            f"row {row_label!r} ended with a {n_bucketed}-cell "
+            f"bucket — back-calc invariant violated. "
+            f"row_cells={row_cells}, raw_row={raw_row}"
+        )
+
+
+def test_secondary_no_row_publishes_single_cell_bucket():
+    """Invariant the secondary pass guarantees: every surviving row
+    that emits a ``[suppressed]`` bucket has at least TWO suppressed
+    cells in that row. A bucket with one cell would let the model
+    recover the cell's exact count from an externally-queried row
+    marginal (``N_row - sum(visible) = the lone cell``)."""
+    r = sanitize({
+        "type": "crosstab",
+        "row_variable": "age",
+        "col_variable": "outcome",
+        "counts": {
+            "young":    {"recovered": 200, "died": 150, "rare": 7},
+            "old":      {"recovered": 100, "died":  80, "rare": 5},
+            "very_old": {"recovered":  50, "died":  40, "rare": 30},
+        },
+    })
+    assert r.ok
+    counts = r.sanitized["counts"]
+    threshold = DEFAULT_CONFIG.cell_suppression_threshold
+    marker = suppression_marker(threshold)
+    # For every surviving row that has a bucket, at least two
+    # columns must be missing from its dict (= bucketed). The
+    # marker is the bucket value; visible cells are ints.
+    raw_counts = {
+        "young":    {"recovered": 200, "died": 150, "rare": 7},
+        "old":      {"recovered": 100, "died":  80, "rare": 5},
+        "very_old": {"recovered":  50, "died":  40, "rare": 30},
+    }
+    for row_label, row_cells in counts.items():
+        if "[suppressed]" not in row_cells:
+            continue
+        assert row_cells["[suppressed]"] == marker
+        visible_columns = {c for c in row_cells if c != "[suppressed]"}
+        n_bucketed = len(raw_counts[row_label]) - len(visible_columns)
+        assert n_bucketed >= 2, (
+            f"row {row_label!r} bucket has {n_bucketed} cell(s); "
+            f"single-cell bucket is back-calc-recoverable from N_row"
+        )
+
+
+def test_secondary_handles_column_side_back_calc():
+    """Even when every row has at most one suppressed cell BEFORE
+    secondary, a column with exactly one suppressed cell across
+    surviving rows is recoverable from the column marginal
+    (``N_col - sum(visible_in_col) = the lone cell``). The column
+    pass fires the same promotion in that case.
+
+    Setup: row ``r1`` has one suppression at ``c2``. Row ``r2`` has
+    a small visible cell at ``c2`` (value 40, well above threshold)
+    and visible cells elsewhere. After primary, column ``c2`` has
+    exactly one suppressed cell — vulnerable. Secondary must
+    promote ``r2``'s ``c2`` (=40, the smallest visible in column
+    ``c2``) so ``c2`` ends with 2 suppressed cells.
+    """
+    r = sanitize({
+        "type": "crosstab",
+        "row_variable": "region",
+        "col_variable": "category",
+        "counts": {
+            "r1": {"c1": 200, "c2":   3, "c3": 100, "c4": 80},  # 1 sup (c2)
+            "r2": {"c1":  90, "c2":  40, "c3":  60, "c4": 70},  # 0 sup
+            "r3": {"c1":  50, "c2":  35, "c3":  45, "c4": 55},  # 0 sup
+        },
+    })
+    assert r.ok
+    counts = r.sanitized["counts"]
+    # ``r1`` had one primary suppression and three visible cells;
+    # row-side secondary promotes the smallest visible (``c4`` = 80)
+    # so ``r1`` ends with a 2-cell bucket.
+    assert "c2" not in counts["r1"]
+    assert "c4" not in counts["r1"]
+    assert counts["r1"]["c1"] == 200
+    assert counts["r1"]["c3"] == 100
+    assert counts["r1"]["[suppressed]"] == "<10"
+    # After row-side: column ``c2`` has one suppressed cell (r1)
+    # and two visible (r2, r3). Column-side secondary promotes the
+    # smallest visible in c2 (r3's c2 = 35, smaller than r2's = 40).
+    # That makes ``r3`` row-vulnerable in turn — its smallest
+    # visible (``c3`` = 45) gets promoted, leaving r3 with c1=50
+    # visible. The same cascade propagates to r2.
+    log = " ".join(r.transformations)
+    assert "secondary suppression" in log
+    # Whatever the exact cascade pattern, the published output must
+    # satisfy: no row has a single-cell bucket.
+    raw_per_row_columns = {
+        "r1": 4, "r2": 4, "r3": 4,
+    }
+    for row_label, row_cells in counts.items():
+        if "[suppressed]" not in row_cells:
+            continue
+        n_bucketed = raw_per_row_columns[row_label] - (len(row_cells) - 1)
+        assert n_bucketed >= 2, (
+            f"row {row_label!r} ended with single-cell bucket"
+        )
+
+
+def test_secondary_drops_row_when_only_one_visible_cell_left():
+    """If a row had exactly one primary suppression AND only one
+    visible cell, the row-side promotion takes that visible cell
+    too — leaving the row fully suppressed. The row label is then
+    dropped (same path as a fully-naturally-suppressed row).
+    Better to lose the row's label than to publish a label whose
+    sole visible cell can be flipped through the marginal."""
+    r = sanitize({
+        "type": "crosstab",
+        "row_variable": "diagnosis",
+        "col_variable": "outcome",
+        "counts": {
+            # Sparse row: 1 visible, 1 suppressed. Secondary
+            # promotes the visible cell and the row is dropped.
+            "sparse_dx": {"recovered": 50, "rare_o": 3},
+            # Padding rows that share the columns so the column-
+            # side check doesn't propagate further into them.
+            "common_a":  {"recovered": 100, "rare_o": 5},
+            "common_b":  {"recovered": 200, "rare_o": 4},
+        },
+    })
+    assert r.ok
+    counts = r.sanitized["counts"]
+    log = " ".join(r.transformations)
+    # ``sparse_dx`` should be entirely gone from the published
+    # output AND from the transformations log.
+    response_text = str(r.sanitized) + log
+    assert "sparse_dx" not in response_text
+    assert r.sanitized.get("suppressed_row_count", 0) >= 1
 
 
 def test_crosstab_forbidden_margins_dropped_and_logged():

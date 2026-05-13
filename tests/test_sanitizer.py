@@ -677,7 +677,11 @@ def test_ols_drops_undeclared_coefficient_keys():
     """Keys not on the declared predictor list (+ intercept aliases)
     are dropped. Regression test for the exfil path where Claude
     emits ``coefficients: {leak1: 0.001, leak2: 0.002}`` in addition
-    to the real predictors — the leak keys must not survive."""
+    to the real predictors — the leak keys must not survive AND
+    their names must not appear in the transformations log (the log
+    crosses back to the model, so echoing names would re-open the
+    exact covert channel the drop is meant to close).
+    """
     payload = _ols_base({
         "(Intercept)": 0.5,
         "x1": 1.0,
@@ -697,8 +701,66 @@ def test_ols_drops_undeclared_coefficient_keys():
     assert "leak_bit_0" not in r.sanitized["standard_errors"]
     assert "leak_bit_0" not in r.sanitized["t_statistics"]
     assert "leak_bit_0" not in r.sanitized["p_values"]
-    # Transformation log records the drop so the researcher can see it.
-    assert any("undeclared key" in t for t in r.transformations)
+    # Transformation log records the drop so the researcher can see
+    # it, but names are WITHHELD — the model only learns a count.
+    log_text = " ".join(r.transformations)
+    assert "undeclared key" in log_text
+    assert "leak_bit_0" not in log_text
+    assert "leak_bit_1" not in log_text
+
+
+def test_ols_dropped_key_names_never_appear_in_transformations():
+    """Direct exfil-channel test: a script puts data-derived bytes
+    as coefficient / SE / t / p / vif keys. Each is dropped as
+    undeclared — but the transformations log must NOT echo any of
+    them. Up to 5 names × up to 5 dict fields × 40 chars per name
+    was the pre-fix covert-channel bandwidth per submit_script call."""
+    sensitive_names = [
+        "ssn_123_45_6789",          # would be a real SSN
+        "salary_142000",            # would be a salary
+        "zip_94306",                # ZIP code
+        "patient_id_A8421",         # study ID
+        "addr_47_brook_st",         # partial address
+    ]
+    # Build a payload that puts these strings as keys across every
+    # dict_numeric field plus vcov rows and cols.
+    coef = {
+        "(Intercept)": 1.0,
+        "x1": 2.0,
+        **{name: 0.001 for name in sensitive_names},
+    }
+    payload = {
+        "type": "linear_regression",
+        "n": 1000,
+        "response_variable": "y",
+        "predictor_variables": ["x1"],
+        "coefficients": coef,
+        "standard_errors": {**coef},
+        "t_statistics": {**coef},
+        "p_values": {**coef},
+        "vif": {**coef},
+        "r_squared": 0.5,
+        "vcov": {
+            "(Intercept)": {"(Intercept)": 0.01, "x1": 0.001},
+            "x1": {"(Intercept)": 0.001, "x1": 0.01,
+                   **{name: 9.9 for name in sensitive_names}},
+            **{name: {"x1": 9.9} for name in sensitive_names},
+        },
+    }
+    r = sanitize(payload)
+    assert r.ok
+    log_text = " ".join(r.transformations)
+    sanitized_text = str(r.sanitized)
+    # None of the attacker-chosen names appear anywhere the model
+    # would see.
+    for name in sensitive_names:
+        assert name not in log_text, (
+            f"sensitive key {name!r} leaked through transformations "
+            f"log: {log_text!r}"
+        )
+        assert name not in sanitized_text, (
+            f"sensitive key {name!r} leaked through sanitized payload"
+        )
 
 
 def test_ols_accepts_stata_cons_intercept():
@@ -1379,42 +1441,70 @@ def test_crosstab_suppressed_cell_labels_bucketed() -> None:
     """Crosstab: suppressed columns within a row are collapsed under
     a single ``[suppressed]`` column. A row whose every cell is
     suppressed has its row label dropped entirely (the row's
-    existence at this rarity is itself disclosive)."""
+    existence at this rarity is itself disclosive).
+
+    The input is shaped so secondary suppression doesn't cascade
+    past common_condition: each column where ``rare_diagnosis_Z``
+    contributes a primary suppression already has another primary
+    suppression from ``another_common``, so the column-side back-
+    calc check is satisfied without further promotions. Without
+    this padding the secondary suppression would propagate and drop
+    additional rows — see ``test_crosstab_secondary_suppression_*``
+    for that behaviour."""
     result = sanitize({
         "type": "crosstab",
         "row_variable": "diagnosis",
         "col_variable": "outcome",
         "counts": {
+            # Common row with one rare cell. Secondary will promote
+            # its smallest visible cell (``died`` = 150) so the
+            # bucket holds two cells.
             "common_condition": {"recovered": 200, "died": 150, "rare_outcome": 2},
-            "another_common": {"recovered": 50, "died": 30, "rare_outcome": 1},
-            "rare_diagnosis_Z": {"recovered": 1, "died": 1, "rare_outcome": 1},
+            # Two primary suppressions in this row prevent column-
+            # side cascade through ``recovered`` / ``died``. The
+            # ``rare_outcome`` cell is large here.
+            "another_common":   {"recovered":   3, "died":   5, "rare_outcome": 80},
+            # All cells suppressed -> row dropped entirely.
+            "rare_diagnosis_Z": {"recovered":   1, "died":   1, "rare_outcome":  1},
         },
     })
     assert result.ok
     nested = result.sanitized["counts"]
     # ``rare_diagnosis_Z`` had every cell suppressed — its row label
-    # MUST NOT appear anywhere.
+    # MUST NOT appear anywhere in the response.
     response_text = str(result.sanitized) + " ".join(result.transformations)
     assert "rare_diagnosis_Z" not in response_text
+    # ``common_condition``: primary-suppressed ``rare_outcome`` cell
+    # plus secondary-promoted ``died`` both live under the bucket;
+    # ``recovered`` stays visible.
     assert "rare_outcome" not in nested.get("common_condition", {})
-    # The surviving rows have their suppressed-column count bucketed.
+    assert "died" not in nested.get("common_condition", {})
     assert nested["common_condition"]["[suppressed]"] == "<10"
-    assert "rare_outcome" not in response_text or "[suppressed]" in response_text
+    # ``another_common``: two primary suppressions in this row, no
+    # secondary needed. The above-threshold ``rare_outcome`` cell
+    # (=80) survives.
+    assert nested["another_common"]["[suppressed]"] == "<10"
+    assert nested["another_common"]["rare_outcome"] == 80
+    # Exactly one row was dropped — ``rare_diagnosis_Z``.
     assert result.sanitized["suppressed_row_count"] == 1
 
 
-def test_crosstab_strips_missing_count_when_single_cell_suppressed() -> None:
-    """Cross-query back-calc closure: when exactly one cell is
-    suppressed and no row was fully dropped, the surviving row's
-    ``[suppressed]`` bucket carries that single cell's count alone.
-    The model can ask a separate ``descriptive`` query for ``N``,
-    then compute ``bucket = (N - missing_count) - sum(visible)`` and
-    recover the suppressed cell exactly. ``missing_count`` is the
-    only handle the model has into the crosstab's grand total (``n``
-    is already in ``_XTAB_FORBIDDEN_MARGIN_FIELDS``), so the fix is
-    to drop ``missing_count`` in this configuration. Mirrors the
-    freq-table guard that strips ``n`` and ``missing_count`` for the
-    in-payload version of the same trivial back-calc.
+def test_crosstab_single_primary_suppression_triggers_secondary() -> None:
+    """The configuration that USED to require stripping ``missing_count``
+    — exactly one cell suppressed below threshold, no row dropped —
+    is now defused at an earlier layer. Secondary suppression in
+    ``_sanitize_crosstab`` promotes additional cells until no row /
+    column has exactly one suppressed cell, so the bucket can no
+    longer be reduced to a single value by ``N_row - sum(visible)``
+    on its own. ``missing_count`` therefore stays — its presence
+    only constrains the bucket SUM, which is now over >=2 cells.
+
+    The ``missing_count`` strip at the bottom of ``_sanitize_crosstab``
+    is still in place as defence-in-depth (its preconditions
+    ``suppressed_cell_count == 1 and suppressed_row_count == 0``
+    are now unreachable under correct secondary-suppression
+    behaviour) and this test is the regression check that the
+    earlier secondary layer is doing its job.
     """
     result = sanitize({
         "type": "crosstab",
@@ -1422,9 +1512,7 @@ def test_crosstab_strips_missing_count_when_single_cell_suppressed() -> None:
         "col_variable": "outcome",
         "missing_count": 12,
         "counts": {
-            # Exactly one cell below threshold; row is otherwise
-            # fully visible, so the row label and column structure
-            # are published intact.
+            # Exactly one cell below threshold in the original input.
             "common_condition": {
                 "recovered": 200, "died": 150, "rare_outcome": 3,
             },
@@ -1434,16 +1522,21 @@ def test_crosstab_strips_missing_count_when_single_cell_suppressed() -> None:
         },
     })
     assert result.ok
-    assert result.sanitized["suppressed_cell_count"] == 1
-    # No row was fully suppressed — the unsafe configuration.
+    # Secondary suppression has fired — the published count is the
+    # post-secondary total, which is greater than the original
+    # single primary suppression.
+    assert result.sanitized["suppressed_cell_count"] > 1
+    # No row was fully dropped — secondary promotes cells but
+    # leaves at least one visible per row in this scenario.
     assert result.sanitized.get("suppressed_row_count", 0) == 0
-    # missing_count must be gone from the published payload.
-    assert "missing_count" not in result.sanitized
-    # And the transformation log must explain why so the researcher
-    # can audit the SDC step in the run summary.
+    # ``missing_count`` is kept: the bucket is now multi-cell and
+    # the SUM identity only bounds the sum, not any individual cell.
+    assert result.sanitized.get("missing_count") == 12
+    # Transformation log surfaces the secondary stage explicitly so
+    # a researcher can audit which cells were promoted (the cell
+    # names themselves are withheld; counts only).
     log_text = " ".join(result.transformations)
-    assert "missing_count" in log_text
-    assert "back-calculable" in log_text or "back-calc" in log_text
+    assert "secondary suppression" in log_text
 
 
 def test_crosstab_keeps_missing_count_when_no_suppression() -> None:
@@ -1474,7 +1567,17 @@ def test_crosstab_keeps_missing_count_when_multi_cell_suppressed_in_one_row() ->
     individual cells underdetermined. The back-calc strip stays
     off; ``missing_count`` is kept for utility. (Above-threshold
     value used so the orthogonal small-missingness coarsen gate
-    doesn't shadow what we're testing here.)"""
+    doesn't shadow what we're testing here.)
+
+    Note on the count: the secondary-suppression pass added in
+    ``_sanitize_crosstab`` will also promote ``another_condition``'s
+    ``rare_x`` (=25) and ``rare_y`` (=30) cells because each of
+    those columns has exactly one primary suppression (in
+    ``common_condition``) and otherwise one visible cell — the
+    column-side back-calc check fires. The final count is 4, not 2;
+    the test name still describes the test's INTENT (multi-cell
+    bucket preserves ``missing_count``) which is what matters.
+    """
     result = sanitize({
         "type": "crosstab",
         "row_variable": "diagnosis",
@@ -1488,7 +1591,10 @@ def test_crosstab_keeps_missing_count_when_multi_cell_suppressed_in_one_row() ->
         },
     })
     assert result.ok
-    assert result.sanitized["suppressed_cell_count"] == 2
+    # 2 primary (common's rare_x, rare_y) + 2 secondary
+    # (another's rare_x, rare_y promoted because those columns
+    # had exactly one suppressed cell after primary).
+    assert result.sanitized["suppressed_cell_count"] == 4
     # Multi-cell bucket, missing_count safe to expose.
     assert result.sanitized.get("missing_count") == 40
 
