@@ -82,7 +82,7 @@
   --border: #e8cdd4;        /* soft pink-mauve edge */
   --code-bg: var(--burgundy);
   --code-text: var(--pink-light);
-  --max-width: 1080px;
+  --max-width: 1188px;
   --radius: 12px;
 
   --font-sans: 'Lexend', system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
@@ -954,7 +954,7 @@ kbd {
    * from any nested flex item reporting a huge intrinsic min-width
    * (earlier versions ballooned to 80% of the window when a session
    * row had six comma-joined CSV filenames). */
-  --sidebar-width: 308px;
+  --sidebar-width: 339px;
   flex: 0 0 var(--sidebar-width);
   width: var(--sidebar-width);
   max-width: var(--sidebar-width);
@@ -1150,7 +1150,6 @@ kbd {
 
 .session-pin.is-pinned {
   opacity: 1;
-  color: var(--accent);
 }
 
 .session-row:hover .session-pin,
@@ -1164,22 +1163,10 @@ kbd {
   background: rgba(0, 0, 0, 0.05);
 }
 
-.session-pin.is-pinned:hover {
-  color: var(--accent);
-}
-
 @media (prefers-color-scheme: dark) {
   .session-pin:hover {
     background: rgba(255, 255, 255, 0.05);
   }
-}
-
-/* Pinned rows get a soft tint so the pinned group reads as a
- * visually distinct cluster at the top of the panel even before the
- * eye lands on the icon. Subtle enough not to compete with the
- * active-row tint. */
-.session-row.pinned:not(.active) {
-  background: var(--accent-soft);
 }
 
 /* Busy dot — visible only when a turn is in flight for this
