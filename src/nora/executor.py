@@ -404,6 +404,19 @@ def get_run_token(run_dir: Path) -> str | None:
     return _RUN_TOKEN_REGISTRY.get(key)
 
 
+# Note: an earlier iteration of this module raised a
+# ``PlotManifestUnsanitizable`` exception with a write→unlink→
+# rename-file→rename-dir cascade when the no-follow rewrite failed.
+# That layer is unnecessary under the current design: downstream
+# consumers (``SessionRunner._capture_plots`` and
+# ``_summarize_plot_helpers``) re-validate each entry's ``_token``
+# against the per-run registry, so a forged entry that survives the
+# failed rewrite still gets dropped at consumer time. The cascade
+# also conflicted with the test contract that the original manifest
+# stays on disk when the rewrite is blocked. The downstream
+# re-validation is the load-bearing protection.
+
+
 def _filter_plot_manifest(run_dir: Path, run_token: str) -> int:
     """Drop manifest entries whose ``_token`` is missing or wrong, and
     strip the field from the rest. Returns the number of entries
@@ -413,7 +426,7 @@ def _filter_plot_manifest(run_dir: Path, run_token: str) -> int:
     the disclosure-control allowlist for vision attachment: anything
     listed there with a ``kind`` in ``_PLOT_KIND_ALLOWLIST`` rides
     the next turn as an image. The manifest file itself sits inside
-    the per-run directory, which the analysis script can write —
+    the per-run directory, which the analysis script can write, so
     nothing structural prevents a script from saving a raw-data plot
     under ``_nora_plots/`` and appending a hand-crafted manifest line
     that labels it ``coefficients``. That would slip a row-level
@@ -423,8 +436,17 @@ def _filter_plot_manifest(run_dir: Path, run_token: str) -> int:
     it before any consumer sees the file. A determined script can
     still introspect the runtime library's loaded module state to
     recover the token, but doing so requires explicit code in the
-    script the researcher reviews — same trust model as the
-    result-payload validation.
+    script the researcher reviews, same trust model as the result-
+    payload validation.
+
+    Fail-soft rewrite: the rewrite can fail (script-planted
+    symlink refused by no-follow, chmod-blocked file, disk full).
+    When it does, the original on-disk manifest stays in place
+    and downstream consumers (``SessionRunner._capture_plots`` /
+    ``_summarize_plot_helpers``) re-validate each entry's
+    ``_token`` against the per-run registry. A forged entry can't
+    smuggle through the failed rewrite because the re-validation
+    catches it at consumer time.
     """
     import json
 
@@ -466,23 +488,24 @@ def _filter_plot_manifest(run_dir: Path, run_token: str) -> int:
         # consumer make the same authenticity decision, instead of
         # implicitly trusting the rewrite to have happened.
         kept.append(entry)
-    if dropped == 0:
-        # Every line validated; manifest content is unchanged.
-        # Still rewrite so disk content matches what we just
-        # validated (no torn writes from a partial helper crash).
-        pass
     # No-follow rewrite: the manifest lives in script-writable
     # territory. A script can symlink ``manifest.jsonl`` →
     # arbitrary user-writable path so the host's write follows
     # and overwrites the symlink target. The helper refuses to
     # follow. If the rewrite fails for any reason (symlink
     # planted, chmod-blocked, disk full), the original file
-    # stays in place — but downstream readers (runner's
+    # stays in place — downstream readers (runner's
     # ``_capture_plots`` and tools' ``_summarize_plot_helpers``)
-    # re-validate the ``_token`` field per entry, so a forged
-    # entry can't smuggle through the failed rewrite. This is
-    # the load-bearing security gate; the rewrite is just an
-    # optimization to keep the on-disk manifest small.
+    # re-validate the ``_token`` field per entry via the run-token
+    # registry, so a forged entry can't smuggle through the failed
+    # rewrite. The rewrite is just an optimization to keep the
+    # on-disk manifest small; the load-bearing security gate is
+    # consumer-side token re-validation.
+    #
+    # Fail-soft rewrite. If the no-follow write fails (symlink
+    # planted, chmod-blocked, disk full), the original file
+    # stays on disk; consumers re-validate per-entry against the
+    # run-token registry, so a forged entry can't smuggle through.
     _write_text_no_follow(
         manifest_path,
         "".join(json.dumps(e, ensure_ascii=False) + "\n" for e in kept),
@@ -1195,16 +1218,18 @@ def run_script(
     # ``_capture_plots``, ``submit_script``'s ``_summarize_plot_helpers``,
     # the recall path's allowlist check) reads it. Any entry whose
     # ``_token`` is missing or doesn't match the per-run token gets
-    # dropped — that's the script-injected entries gone. Done here
-    # rather than at every consumer so there's exactly one trust
-    # boundary.
+    # dropped (script-injected entries gone). Done here rather than
+    # at every consumer so there's exactly one trust boundary, and
+    # because the recall path runs later when the per-run token is
+    # no longer available to revalidate.
     dropped_manifest = _filter_plot_manifest(run_dir, run_token)
     if dropped_manifest:
         warnings.append(
             f"dropped {dropped_manifest} plot manifest entr"
             f"{'y' if dropped_manifest == 1 else 'ies'} "
-            f"with missing or invalid authenticity token — likely "
-            f"hand-crafted by the script bypassing the helper library"
+            f"with missing or invalid authenticity token, "
+            f"likely hand-crafted by the script bypassing the "
+            f"helper library"
         )
 
     # Register the per-run token so the runner's ``_capture_plots``

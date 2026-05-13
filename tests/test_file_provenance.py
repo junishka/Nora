@@ -8,7 +8,21 @@ rely on:
   must NOT re-snapshot — otherwise sandbox-written files
   accumulated between sessions silently become "researcher-
   staged" and bypass the SDC guard.
-* ``mark_known`` is append-only; re-marking the same name is a no-op.
+* ``initialize`` and ``mark_known`` only fingerprint recallable
+  extensions (scripts, logs, graphs). Data files (``.csv`` /
+  ``.dta`` / ``.parquet`` / ...) cannot have their bytes returned
+  by any recall path, so spending I/O to hash a multi-GB dataset
+  at session-open is wasteful and never gains security.
+* ``mark_known`` records a content fingerprint (sha256 + size) for
+  each named file. Re-staging the same name with identical content
+  is a no-op (dedup on (name, sha256)); re-staging with new content
+  appends a fresh fingerprint alongside the existing entries
+  (audit trail preserved, both are valid for ``is_known``).
+* ``is_known`` verifies the current on-disk content matches a
+  recorded fingerprint — overwriting a staged file with different
+  bytes (the model-script SDC bypass attack) is detected and
+  rejected. v1 (name-only) entries fail closed: there's no
+  fingerprint to verify against.
 * Path-traversal-shaped inputs (``foo/../bar.csv``) are basenamed
   defensively so they can't smuggle path-shaped keys into the
   manifest or ``is_known`` lookup.
@@ -33,15 +47,20 @@ from nora.file_provenance import (
 
 
 def test_initialize_snapshots_cwd_top_level(tmp_path: Path) -> None:
-    """A fresh cwd with three top-level files turns into a manifest
-    listing those three. Subsequent ``is_known`` calls return True
-    for them."""
-    (tmp_path / "data.csv").write_text("a,b\n1,2\n")
+    """A fresh cwd with recallable top-level files turns into a
+    manifest listing them. Subsequent ``is_known`` calls return True.
+
+    Only files whose extension matches a recall surface (scripts,
+    logs, graphs) are fingerprinted: data files can't have their
+    bytes returned by any recall path, so spending I/O to hash a
+    multi-GB dataset at session-open is wasteful and never gains
+    security."""
     (tmp_path / "analysis.R").write_text("# r script\n")
     (tmp_path / "screenshot.png").write_bytes(b"")
+    (tmp_path / "diagnostics.log").write_text("ok\n")
 
     names = initialize(tmp_path)
-    assert names == {"data.csv", "analysis.R", "screenshot.png"}
+    assert names == {"analysis.R", "screenshot.png", "diagnostics.log"}
     for n in names:
         assert is_known(tmp_path, n)
 
@@ -52,16 +71,16 @@ def test_initialize_skips_dotfiles_and_directories(tmp_path: Path) -> None:
     at top level — symlinks too are skipped because the bridge stages
     by basename and a symlink target couldn't go through a legitimate
     add path."""
-    (tmp_path / "data.csv").write_text("a\n")
+    (tmp_path / "analysis.py").write_text("import pandas\n")
     (tmp_path / ".env").write_text("SECRET=x\n")
     (tmp_path / "subdir").mkdir()
-    (tmp_path / "subdir" / "nested.csv").write_text("a\n")
+    (tmp_path / "subdir" / "nested.py").write_text("import pandas\n")
 
     names = initialize(tmp_path)
-    assert names == {"data.csv"}
+    assert names == {"analysis.py"}
     assert not is_known(tmp_path, ".env")
     assert not is_known(tmp_path, "subdir")
-    assert not is_known(tmp_path, "nested.csv")
+    assert not is_known(tmp_path, "nested.py")
 
 
 def test_initialize_does_not_resnapshot_on_reopen(tmp_path: Path) -> None:
@@ -74,33 +93,38 @@ def test_initialize_does_not_resnapshot_on_reopen(tmp_path: Path) -> None:
     The manifest must stay authoritative across reopens; new
     researcher additions arrive through the bridge's staging
     endpoints (``mark_known``)."""
-    (tmp_path / "old_data.csv").write_text("a\n")
+    (tmp_path / "old_analysis.R").write_text("# r\n")
     initialize(tmp_path)
-    # Researcher adds a file via the bridge after open.
-    mark_known(tmp_path, ["staged_via_bridge.dta"])
+    # Researcher adds a recallable file via the bridge after open.
+    (tmp_path / "staged_via_bridge.do").write_text("* stata\n")
+    mark_known(tmp_path, ["staged_via_bridge.do"])
     # Between sessions, a sandbox-written script lands in cwd.
     # That file MUST NOT become trusted by the reopen.
     (tmp_path / "smuggled.py").write_text("# raw rows here\n")
     names = initialize(tmp_path)
     assert names == {
-        "old_data.csv",
-        "staged_via_bridge.dta",
+        "old_analysis.R",
+        "staged_via_bridge.do",
     }
     assert not is_known(tmp_path, "smuggled.py")
 
 
-def test_mark_known_is_append_only(tmp_path: Path) -> None:
-    """Marking the same name twice is a no-op. The manifest doesn't
-    grow on repeat events; it doesn't shrink ever."""
+def test_mark_known_records_fingerprint(tmp_path: Path) -> None:
+    """``mark_known`` fingerprints the files that exist at
+    ``cwd/name``. Identical re-stages dedup on (name, sha256).
+    Names whose files don't exist are recorded without a
+    fingerprint and fail closed in ``is_known``."""
     initialize(tmp_path)
-    mark_known(tmp_path, ["x.csv"])
-    mark_known(tmp_path, ["x.csv"])
-    mark_known(tmp_path, ["x.csv", "y.csv"])
-    assert known_names(tmp_path) == {"x.csv", "y.csv"}
+    (tmp_path / "x.py").write_text("# 1\n")
+    (tmp_path / "y.py").write_text("# 2\n")
+    mark_known(tmp_path, ["x.py"])
+    mark_known(tmp_path, ["x.py"])  # idempotent for same content
+    mark_known(tmp_path, ["x.py", "y.py"])
+    assert known_names(tmp_path) == {"x.py", "y.py"}
 
 
 def test_mark_known_basenames_path_traversal_input(tmp_path: Path) -> None:
-    """Inputs that look like paths (``../escape.csv``) get basenamed
+    """Inputs that look like paths (``../escape.py``) get basenamed
     before storage. ``known_names`` answers under the basename, and
     ``is_known`` answers under the basename when the file also
     exists at ``cwd/<basename>`` with matching fingerprint.
@@ -112,17 +136,18 @@ def test_mark_known_basenames_path_traversal_input(tmp_path: Path) -> None:
     """
     initialize(tmp_path)
     # Pre-create the files at their BASENAMED locations so that
-    # mark_known can fingerprint them.
-    (tmp_path / "escape.csv").write_text("escape\n")
-    (tmp_path / "bar.csv").write_text("bar\n")
-    mark_known(tmp_path, ["../../escape.csv", "foo/bar.csv"])
-    assert "escape.csv" in known_names(tmp_path)
-    assert "bar.csv" in known_names(tmp_path)
+    # mark_known can fingerprint them. Use recallable extensions
+    # so the entries survive the recallable-only filter.
+    (tmp_path / "escape.py").write_text("escape\n")
+    (tmp_path / "bar.py").write_text("bar\n")
+    mark_known(tmp_path, ["../../escape.py", "foo/bar.py"])
+    assert "escape.py" in known_names(tmp_path)
+    assert "bar.py" in known_names(tmp_path)
     # Files exist with matching fingerprints — gate passes.
-    assert is_known(tmp_path, "escape.csv")
-    assert is_known(tmp_path, "bar.csv")
+    assert is_known(tmp_path, "escape.py")
+    assert is_known(tmp_path, "bar.py")
     # Path-shaped lookups also get basenamed before the gate check.
-    assert is_known(tmp_path, "/abs/escape.csv")
+    assert is_known(tmp_path, "/abs/escape.py")
 
 
 def test_is_known_on_empty_manifest_returns_false(tmp_path: Path) -> None:
@@ -151,10 +176,10 @@ def test_malformed_manifest_falls_back_to_empty(tmp_path: Path) -> None:
         "{this is not valid json", encoding="utf-8",
     )
     assert not is_known(tmp_path, "x.csv")
-    (tmp_path / "data.csv").write_text("a\n")
+    (tmp_path / "data.py").write_text("a\n")
     names = initialize(tmp_path)
     assert names == set()
-    assert not is_known(tmp_path, "data.csv")
+    assert not is_known(tmp_path, "data.py")
 
 
 # ---------------------------------------------------------------------------
@@ -195,6 +220,20 @@ def test_overwriting_a_staged_file_revokes_is_known(tmp_path: Path) -> None:
     assert "analysis.py" in known_names(tmp_path)
 
 
+def test_overwrite_with_same_size_different_bytes_is_caught(
+    tmp_path: Path,
+) -> None:
+    """Length-equal overwrite must also be rejected — a cheap
+    size short-circuit alone wouldn't be enough. SHA-256 is the
+    authority. (Same-size collisions are easy if the attacker has
+    read access to the original; SHA-256 collisions are not.)"""
+    (tmp_path / "a.py").write_bytes(b"X = 42\nY = 0\n")
+    initialize(tmp_path)
+    assert is_known(tmp_path, "a.py")
+    (tmp_path / "a.py").write_bytes(b"X = 99\nY = 1\n")  # same length
+    assert not is_known(tmp_path, "a.py")
+
+
 def test_re_staging_with_updated_content_authorises_new_content(tmp_path: Path) -> None:
     """The legitimate path: researcher edits a script outside Nora
     and drops it back into the chat. The bridge calls ``mark_known``
@@ -222,13 +261,13 @@ def test_re_staging_with_identical_content_is_noop(tmp_path: Path) -> None:
     """Re-staging the SAME content under the same name doesn't grow
     the manifest. The dedup key is (name, sha256), so identical
     re-stages collapse to a single entry."""
-    (tmp_path / "x.csv").write_text("a,b\n1,2\n")
+    (tmp_path / "x.py").write_text("# 1\n")
     initialize(tmp_path)
-    mark_known(tmp_path, ["x.csv"])
-    mark_known(tmp_path, ["x.csv"])
+    mark_known(tmp_path, ["x.py"])
+    mark_known(tmp_path, ["x.py"])
     raw = (tmp_path / ".nora" / MANIFEST_FILENAME).read_text(encoding="utf-8")
     data = json.loads(raw)
-    matching_entries = [e for e in data["entries"] if e["name"] == "x.csv"]
+    matching_entries = [e for e in data["entries"] if e["name"] == "x.py"]
     assert len(matching_entries) == 1
 
 
@@ -263,25 +302,42 @@ def test_missing_file_returns_false(tmp_path: Path) -> None:
     fingerprint check can't run, so fail closed. Different from
     "name never staged" (also False) — both produce the same
     answer, which is what the gate needs."""
-    (tmp_path / "x.csv").write_text("a\n")
+    (tmp_path / "x.py").write_text("# script\n")
     initialize(tmp_path)
-    assert is_known(tmp_path, "x.csv")
-    (tmp_path / "x.csv").unlink()
-    assert not is_known(tmp_path, "x.csv")
+    assert is_known(tmp_path, "x.py")
+    (tmp_path / "x.py").unlink()
+    assert not is_known(tmp_path, "x.py")
+
+
+def test_symlink_substitution_is_rejected(tmp_path: Path) -> None:
+    """If a name was staged as a regular file but someone replaces
+    the on-disk entry with a symlink (eg pointing at a sensitive
+    file outside cwd), ``is_known`` rejects it. The manifest
+    fingerprint is meaningless against a symlink target the
+    attacker controls."""
+    target = (tmp_path / "report.log")
+    target.write_text("data\n")
+    initialize(tmp_path)
+    assert is_known(tmp_path, "report.log")
+    secret = tmp_path / "secret.log"
+    secret.write_text("secret\n")
+    target.unlink()
+    target.symlink_to(secret)
+    assert not is_known(tmp_path, "report.log")
 
 
 def test_manifest_round_trips_through_disk(tmp_path: Path) -> None:
     """The manifest persists on disk in the documented v2 shape —
     a second process / fresh import would observe the same entries
     with the same fingerprints."""
-    (tmp_path / "a.csv").write_text("a,b\n1,2\n")
+    (tmp_path / "a.py").write_text("# py\n")
     (tmp_path / "b.r").write_text("# r script\n")
     initialize(tmp_path)
     raw = (tmp_path / ".nora" / MANIFEST_FILENAME).read_text(encoding="utf-8")
     data = json.loads(raw)
     assert data["version"] == 2
     names_in_entries = sorted(e["name"] for e in data["entries"])
-    assert names_in_entries == ["a.csv", "b.r"]
+    assert names_in_entries == ["a.py", "b.r"]
     # Each entry carries a sha256 + size — the load-bearing v2
     # additions over v1.
     for entry in data["entries"]:
@@ -289,3 +345,78 @@ def test_manifest_round_trips_through_disk(tmp_path: Path) -> None:
         assert len(entry["sha256"]) == 64  # sha256 hex
         assert isinstance(entry.get("size_bytes"), int)
         assert entry["size_bytes"] >= 0
+
+
+# ---------------------------------------------------------------------------
+# Recallable-only fingerprinting: skip data files at first open
+# ---------------------------------------------------------------------------
+
+
+def test_initialize_skips_non_recallable_extensions(tmp_path: Path) -> None:
+    """Data files cannot have their bytes returned through any
+    recall surface (``read_attached_file`` /
+    ``submit_script_file`` / ``search_in_session_files`` all
+    reject data extensions before reaching the provenance check).
+    Hashing them at first-open does no security work and would
+    force a full-file read of every staged dataset before the UI
+    is usable — a 3 GB ``.dta`` would block folder-open.
+
+    The recallable set is the union of script / log / graph
+    extensions from ``session_files``."""
+    (tmp_path / "data.csv").write_text("a,b\n1,2\n")
+    (tmp_path / "panel.dta").write_bytes(b"\x00" * 16)
+    (tmp_path / "results.parquet").write_bytes(b"\x00" * 16)
+    (tmp_path / "analysis.py").write_text("import pandas\n")
+    (tmp_path / "fit.log").write_text("ok\n")
+    (tmp_path / "plot.png").write_bytes(b"\x89PNG\r\n")
+
+    names = initialize(tmp_path)
+    # Only recallable extensions enter the manifest.
+    assert names == {"analysis.py", "fit.log", "plot.png"}
+    assert not is_known(tmp_path, "data.csv")
+    assert not is_known(tmp_path, "panel.dta")
+    assert not is_known(tmp_path, "results.parquet")
+
+
+def test_mark_known_skips_non_recallable_extensions(tmp_path: Path) -> None:
+    """The bridge endpoints call ``mark_known`` after every staging
+    event; a researcher dropping a folder of mixed files should
+    not pay the cost of hashing each dataset. Non-recallable
+    extensions are skipped silently — the file stays usable for
+    analysis but the manifest doesn't grow."""
+    initialize(tmp_path)
+    (tmp_path / "data.csv").write_text("a\n")
+    (tmp_path / "panel.dta").write_bytes(b"\x00")
+    (tmp_path / "analysis.R").write_text("# r\n")
+
+    mark_known(tmp_path, ["data.csv", "panel.dta", "analysis.R"])
+    assert known_names(tmp_path) == {"analysis.R"}
+
+
+def test_initialize_does_not_read_large_data_files(tmp_path: Path) -> None:
+    """End-to-end behavioral check: hashing a multi-GB data file
+    is what makes session-open slow. We don't actually need a
+    huge file to verify the fix; we monkey-patch the fingerprint
+    helper to fail loudly if it's called for a data extension and
+    confirm initialize completes without invoking it."""
+    import nora.file_provenance as fp_mod
+
+    (tmp_path / "huge.csv").write_text("x\n")
+    (tmp_path / "small.py").write_text("# script\n")
+
+    calls: list[str] = []
+    original = fp_mod._fingerprint
+
+    def _track(path: Path):
+        calls.append(path.name)
+        return original(path)
+
+    fp_mod._fingerprint = _track  # type: ignore[assignment]
+    try:
+        initialize(tmp_path)
+    finally:
+        fp_mod._fingerprint = original  # type: ignore[assignment]
+
+    # ``huge.csv`` is skipped entirely, no read.
+    assert "huge.csv" not in calls
+    assert "small.py" in calls

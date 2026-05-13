@@ -432,8 +432,6 @@ nora$from_t_test <- function(res, ...) {
 #' panel. The caller provides the numbers; we don't recompute.
 nora$from_summarize <- function(variable, n, mean, sd, missing_count,
                                    distinct_count = NULL,
-                                   min_value = NULL,
-                                   max_value = NULL,
                                    ...) {
   cat(sprintf(
     "%s: n=%d, mean=%.6g, sd=%.6g, missing=%d",
@@ -443,12 +441,11 @@ nora$from_summarize <- function(variable, n, mean, sd, missing_count,
     cat(sprintf(", distinct=%d", as.integer(distinct_count)))
   }
   cat("\n")
-  # min_value / max_value pass through ONLY when the dataset's
-  # `.nora/policy.json` lists this variable in
-  # ``non_disclosive_variables``; the sanitizer drops them silently
-  # for any variable not on that list. Pass them when you have them
-  # — they cost nothing and surface automatically when the
-  # researcher has opted the variable in.
+  # min_value / max_value are no longer accepted: the sanitizer drops
+  # them in every payload because nothing in the payload binds the
+  # reported values to the named variable's actual column. A future
+  # Nora-owned bounds path (request_data extension) is the correct
+  # surface; emit aggregates only here.
   args <- list(
     type = "descriptive",
     variable = variable,
@@ -458,8 +455,6 @@ nora$from_summarize <- function(variable, n, mean, sd, missing_count,
     missing_count = as.integer(missing_count),
     distinct_count = if (is.null(distinct_count)) NULL else as.integer(distinct_count)
   )
-  if (!is.null(min_value)) args$min_value <- as.numeric(min_value)
-  if (!is.null(max_value)) args$max_value <- as.numeric(max_value)
   do.call(nora$result, c(args, list(...)))
 }
 
@@ -542,12 +537,34 @@ nora$from_magnitude_table <- function(df, group_var, value_var,
     )
   }
 
+  # Reject `...` arguments that would override fields the helper
+  # computes from raw data. Without this guard, a caller could pass
+  # `cells=list(...)` (or row_variable=..., etc.) and the
+  # `c(list(computed), list(...))` concatenation below would emit
+  # duplicate keys whose JSON serialization a downstream parser
+  # resolves by last-occurrence, replacing the helper's computation.
+  # The `_via_helper` marker (stamped at the end) would then
+  # authenticate attacker-supplied values, and the sanitizer (which
+  # trusts the marker to skip recomputing `max_share`) would let a
+  # forged max_share=0 bypass the dominance gate.
+  extras <- list(...)
+  reserved <- c("type", "row_variable", "value_variable",
+                "aggregation", "cells", "_via_helper")
+  forbidden <- intersect(names(extras), reserved)
+  if (length(forbidden) > 0) {
+    stop("nora$from_magnitude_table: cannot override helper-",
+         "computed fields via extra arguments: ",
+         paste(sort(forbidden), collapse = ", "),
+         ". These are computed from the data and bound to the ",
+         "_via_helper provenance marker.")
+  }
+
   # Bypass nora$result and write directly so the helper-provenance
   # marker (`_via_helper`) survives. The generic nora$result strips
   # `_via_helper` from caller-passed kwargs so a script can't forge
   # this marker through the public API. The sanitizer requires the
   # marker for magnitude_table because cell-level `max_share` is
-  # consulted-only and stripped — without proof that max_share came
+  # consulted-only and stripped; without proof that max_share came
   # from raw-data computation a malicious script could publish a
   # dominance-violating value with `max_share=0` and skip the gate.
   payload <- c(
@@ -558,7 +575,7 @@ nora$from_magnitude_table <- function(df, group_var, value_var,
       aggregation = aggregation,
       cells = cells
     ),
-    list(...)
+    extras
   )
   payload[["_via_helper"]] <- "from_magnitude_table"
   nora$.write_result(payload)
@@ -780,6 +797,44 @@ nora$.unique_plot_name <- function(d, base) {
   }
 }
 
+# Scrub a categorical tick label that will be rendered into a
+# model-visible plot image. Mirrors the Python helper's use of
+# ``safe_text`` on raw category names: strip C0/C1 control chars,
+# bidi overrides, zero-width chars, and BOM/word-joiner; cap to
+# 24 chars; fall back to "[redacted]" if the scrub leaves nothing.
+# Plot images bypass the JSON/text path's safety gate, so any raw
+# string that reaches an axis label has to be cleaned here.
+nora$.safe_tick_label <- function(v) {
+  s <- tryCatch(as.character(v), error = function(e) "")
+  if (length(s) != 1 || is.na(s)) s <- ""
+  # C0 controls (U+0001-U+001F) and DEL (U+007F). R strings cannot
+  # carry a literal U+0000 (the C-string representation forbids
+  # it), so the NUL byte never reaches this function and doesn't
+  # need a strip pass — and ``\x00`` in a string literal is a
+  # parse error anyway.
+  s <- gsub("[\x01-\x1f\x7f]", "", s, perl = TRUE, useBytes = FALSE)
+  # C1 controls (U+0080-U+009F).
+  s <- gsub("[-]", "", s, perl = TRUE, useBytes = FALSE)
+  # Bidi overrides + isolates and zero-width chars: LRM/RLM,
+  # LRE/RLE/PDF, LRO/RLO, LRI/RLI/FSI/PDI, ZWSP/ZWNJ/ZWJ, word
+  # joiner, BOM, invisible-times / invisible-separator.
+  s <- gsub(
+    paste0(
+      "[\u200b\u200c\u200d\u200e\u200f",
+      "\u202a\u202b\u202c\u202d\u202e",
+      "\u2060\u2062\u2063",
+      "\u2066\u2067\u2068\u2069",
+      "\ufeff]"
+    ),
+    "", s, perl = TRUE, useBytes = FALSE,
+  )
+  # Cap at 24 chars (matches the Python helper's per-tick limit).
+  if (nchar(s) > 24) s <- paste0(substr(s, 1, 23), "…")
+  if (!nzchar(s)) s <- "[redacted]"
+  s
+}
+
+
 nora$.append_plot_manifest <- function(file, kind, label) {
   d <- nora$.plots_dir()
   if (is.null(d)) return(invisible(NULL))
@@ -1000,7 +1055,17 @@ nora$plot_interaction <- function(model, var, label = NULL,
         )
         graphics::lines(grid, pr$fit, lwd = 2, col = "#1F4E79")
       } else {
-        labels <- as.character(grid)
+        # Run tick labels through the same text-safety primitive
+        # the Python helper applies. ``grid`` values come straight
+        # from levels in the raw data, so without scrubbing, a
+        # frequent category name with embedded control chars,
+        # bidi overrides, zero-width chars, or prompt-like text
+        # would render straight into the model-visible image,
+        # bypassing the JSON/text safety gate. Empty after scrub
+        # becomes "[redacted]" so the bar stays identifiable.
+        labels <- vapply(grid, function(v) {
+          nora$.safe_tick_label(v)
+        }, character(1))
         graphics::barplot(
           pr$fit, names.arg = labels,
           ylab = ytitle, main = ptitle, col = "#4C78A8",

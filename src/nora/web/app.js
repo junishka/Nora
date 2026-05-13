@@ -4478,8 +4478,9 @@ function showInstallConfirmationModal(evt) {
   };
   document.addEventListener('keydown', onKey);
   document.body.appendChild(overlay);
-  // Focus Deny by default so an absent-minded Enter doesn't approve;
-  // researcher must move to Approve deliberately.
+  // Focus Deny by default so an absent-minded Enter denies (the
+  // button's native Enter handler clicks it); the researcher must
+  // Tab to Approve before Enter approves.
   denyBtn.focus();
 }
 

@@ -254,8 +254,15 @@ def test_from_lm_emits_vcov_when_cov_params_available(runtime) -> None:
     intercept = np.ones(n)
     exog = np.column_stack([intercept, treatment, age])
 
+    # Diagonals must equal SE² for the sanitizer's aggregate-
+    # consistency check. bse = [0.4, 0.3, 0.02] → SE² = [0.16,
+    # 0.09, 0.0004]. Off-diagonals are realistic small covariances.
     cov_df = pd.DataFrame(
-        [[0.50, 0.02, 0.01], [0.02, 0.30, 0.005], [0.01, 0.005, 0.10]],
+        [
+            [0.16,   0.005,  0.001],
+            [0.005,  0.09,   0.0002],
+            [0.001,  0.0002, 0.0004],
+        ],
         index=["Intercept", "treatment", "age"],
         columns=["Intercept", "treatment", "age"],
     )
@@ -287,7 +294,7 @@ def test_from_lm_emits_vcov_when_cov_params_available(runtime) -> None:
     ]
     # Diagonal exists and matches the input within sigfig clamp.
     treatment_var = sanitized["vcov"]["treatment"]["treatment"]
-    assert 0.29 <= treatment_var <= 0.31
+    assert 0.089 <= treatment_var <= 0.091
     # Off-diagonal symmetry preserved.
     cov_age_treat = sanitized["vcov"]["age"]["treatment"]
     cov_treat_age = sanitized["vcov"]["treatment"]["age"]

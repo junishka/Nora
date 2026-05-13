@@ -230,11 +230,21 @@ def enumerate_run_dir_scripts(
         pass
 
     candidates.sort(key=lambda t: -t[0])
-    top = candidates[:max_count]
 
+    # Compute the duplicate-name tally over the FULL candidate set
+    # before slicing. If listing uses ``max_count=12`` and lookup
+    # uses ``max_count=64``, slicing first means a name unique in
+    # the top 12 (and so listed without a suffix) can be flagged
+    # as a duplicate in the top 64 (and so resolved with a
+    # ``(short_id)`` suffix), and vice versa. Either way the
+    # listed name no longer round-trips through lookup. Tallying
+    # over the full set makes the disambiguation decision
+    # independent of ``max_count``.
     name_counts: dict[str, int] = {}
-    for _, _path, display, _sid, _sz in top:
+    for _, _path, display, _sid, _sz in candidates:
         name_counts[display] = name_counts.get(display, 0) + 1
+
+    top = candidates[:max_count]
 
     reserved = reserved_names or frozenset()
 
