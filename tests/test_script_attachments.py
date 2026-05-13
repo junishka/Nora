@@ -560,7 +560,7 @@ def test_upload_files_under_cap_still_works(
     ``add_files_from_blobs`` after the gate is in place. Without
     this, a typo in the gate could silently reject everything."""
     import nora.ui as ui_mod
-    # Cap stays at 512 MB — well above our test payload.
+    # Cap stays at the production default — well above our test payload.
     bridge = _make_bridge(tmp_path)
     payload = [{
         "name": "small.csv",
@@ -670,10 +670,10 @@ def test_js_landing_drop_has_aggregate_cap() -> None:
 def test_js_image_drop_short_circuits_data_path_on_image_rejection() -> None:
     """When ``stageImageFile`` rejects an image (over the 5 MB
     vision cap, or wrong MIME), the caller MUST NOT then run
-    ``stageDataFile`` — that path has a 512 MB cap, so an oversize
-    image would slip through and freeze the bridge on a 100 MB
-    screenshot. The fix returns a boolean from stageImageFile and
-    gates the data-path call on it.
+    ``stageDataFile`` — that path has the much-larger drag-drop cap
+    (~1 GB), so an oversize image would slip through and freeze the
+    bridge on a 100 MB screenshot. The fix returns a boolean from
+    stageImageFile and gates the data-path call on it.
     """
     src = (Path(__file__).resolve().parent.parent
            / "src" / "nora" / "web" / "app.js").read_text(encoding="utf-8")

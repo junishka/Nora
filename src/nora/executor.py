@@ -1367,23 +1367,43 @@ def _write_script(run_dir: Path, language: Language, code: str) -> Path:
     # at the language level — only the command-line `-b do <path>`
     # has the tokenization bug (see _stata_command).
     #
-    # ``capture program drop _all`` is load-bearing: Stata batch mode
-    # runs ``~/ado/profile.do`` at startup BEFORE the user's do file,
-    # so any program defined there (``program define nora_result_regress
-    # ...malicious...``) ends up in memory ahead of the preamble.
-    # Stata's program resolver checks in-memory programs before the
-    # adopath, so a tampered profile.do would shadow the staged
-    # ``nora_result_regress.ado`` (and any other helper) even though
-    # the adopath ``+ NORA_LIB_DIR`` runs first in *this* preamble.
-    # Dropping all user-written programs here forces ``nora_result_*``
-    # / ``nora_plot_*`` calls in the researcher's code to resolve via
-    # adopath, which hits Nora's lib_dir first. ``_all`` does NOT
-    # touch built-in commands like ``regress`` / ``summarize``, so a
-    # researcher relying on Stata's own programs sees no behavior
-    # change. ``capture`` suppresses the error on the (uncommon)
-    # case where no user programs are loaded.
+    # Shadowing defense: Stata batch mode runs ``~/ado/profile.do`` at
+    # startup BEFORE the user's do file, so any program defined there
+    # (``program define nora_result_regress ...malicious...``) ends
+    # up in memory ahead of the preamble. Stata's resolver checks
+    # in-memory programs before the adopath, so a tampered profile.do
+    # would shadow the staged ``nora_result_regress.ado`` (and any
+    # other helper) even though the adopath ``+ NORA_LIB_DIR`` runs
+    # first.
+    #
+    # We previously used ``capture program drop _all`` to nuke every
+    # in-memory program. That defended Nora's helpers but ALSO wiped
+    # the researcher's own profile.do helpers (custom estimators,
+    # workflow shortcuts) — scripts that work in plain Stata then
+    # failed inside Nora. Switching to an explicit drop list keeps
+    # the shadowing defense tight without touching unrelated user
+    # programs. Names mirror ``_stage_runtime_library``'s ``stata_ados``
+    # tuple; new helpers added there must be added here too. ``capture``
+    # suppresses the error when a name isn't currently defined (the
+    # common case — most profile.do files don't pre-define any of
+    # these).
+    nora_program_drops = "\n".join([
+        "capture program drop nora_result_regress",
+        "capture program drop nora_result_ttest",
+        "capture program drop nora_ttest",
+        "capture program drop nora_result_sum",
+        "capture program drop nora_result_tab",
+        "capture program drop nora_result_magnitude",
+        "capture program drop nora_result_correlation",
+        "capture program drop nora_plot_residuals",
+        "capture program drop nora_plot_coefficients",
+        "capture program drop nora_plot_interaction",
+        "capture program drop nora_plot_estimate_comparison",
+        "capture program drop nora_safe_export",
+        "capture program drop _nora_export_plot",
+    ])
     preamble = (
-        "capture program drop _all\n"
+        f"{nora_program_drops}\n"
         "local lib : env NORA_LIB_DIR\n"
         "adopath + \"`lib'\"\n"
         "local nora_cwd : env NORA_CWD\n"

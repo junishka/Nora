@@ -278,14 +278,29 @@ class SessionRunner:
         the runner in a state where some prior staging survives and
         some doesn't, with no visible signal to the researcher.
         """
-        self.pending_script_attachments.clear()
-        self.pending_mentioned_files.clear()
-        self.pending_mentioned_images.clear()
-        self.pending_plot_images.clear()
+        self.clear_unsent_pending()
         # Queued-message frozen attachments belong to messages that
         # would have flushed AFTER the rewound point. Drop them too —
         # the rewound conversation no longer expects those messages.
         self.frozen_pending_attachments.clear()
+
+    def clear_unsent_pending(self) -> None:
+        """Drop the four ``pending_*`` lists WITHOUT touching queued-
+        message frozen snapshots.
+
+        Called by the session-switch path. The frontend wipes its
+        staged composer chips on the way out of a session; this is the
+        matching backend wipe of the lists those chips would have
+        ridden in on. Frozen snapshots stay — they belong to messages
+        the researcher already committed to send (they sit in the JS
+        queue) and must still fire with their original attachments
+        when the in-flight turn finishes. Mixing the two clears was
+        what made the rewind path's broader wipe wrong for switch.
+        """
+        self.pending_script_attachments.clear()
+        self.pending_mentioned_files.clear()
+        self.pending_mentioned_images.clear()
+        self.pending_plot_images.clear()
 
     # -------- queued-send attachment freezing --------
     #

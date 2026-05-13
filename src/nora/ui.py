@@ -228,6 +228,17 @@ class NoraBridge:
         picks it up. The token round-trips back via
         ``respond_install_confirmation`` to release the awaiting
         future on the tool handler's loop.
+
+        ``evaluate_js`` exceptions are deliberately NOT caught here:
+        :func:`nora.install_confirmation.request_confirmation` wraps
+        every emitter call in its own try/except and treats a raise as
+        deny-immediately. Swallowing the exception at this layer
+        prevented that handling from ever firing — the awaiting Future
+        then sat on its 5-minute timeout, hanging the tool. Letting
+        the exception propagate restores the documented contract
+        (failed emit → instant deny) and matches the comment in
+        ``install_confirmation.py`` ("Treat as a failed emit and deny
+        rather than blocking forever").
         """
         if self._window is None:
             return
@@ -555,14 +566,14 @@ class NoraBridge:
         into a fresh session dir. Multiple files are supported —
         they all land in the same session.
 
-        Size capped per-file at ``_DRAG_DROP_MAX_BYTES`` (512 MB).
+        Size capped per-file at ``_DRAG_DROP_MAX_BYTES`` (1 GB).
         The constraint is peak memory while transferring through
         the bridge: a file of N bytes needs roughly 3–4N during
         upload (JS ArrayBuffer + JS base64 string + Python-side
-        decode), so 512 MB peaks around 2 GB — comfortable on any
-        modern Mac. Larger datasets should use the file picker
-        (:meth:`choose_files`), which copies directly from disk
-        with no memory overhead and no size limit.
+        decode), so 1 GB peaks around 3–4 GB. Larger datasets
+        should use the file picker (:meth:`choose_files`), which
+        copies directly from disk with no memory overhead and no
+        size limit.
 
         The cap is enforced on the base64 string length BEFORE
         ``b64decode`` runs so a forged or malicious oversize blob
@@ -576,11 +587,11 @@ class NoraBridge:
         decoded: list[tuple[str, bytes]] = []
         # Aggregate cap on decoded bytes: each file passes the
         # per-file cap, but a multi-file drop accumulates them all
-        # in this list before staging. Five 400 MB files would each
-        # pass ``_DRAG_DROP_MAX_BYTES`` per-file yet hold ~2 GB of
+        # in this list before staging. Two 800 MB files would each
+        # pass ``_DRAG_DROP_MAX_BYTES`` per-file yet hold ~1.6 GB of
         # decoded bytes in this scope. Bound the total too — same
         # threshold as per-file so the rule reads consistently from
-        # the user's side ("drag-drop moves up to 512 MB total").
+        # the user's side ("drag-drop moves up to 1 GB total").
         # The JS side gates first; this is defense-in-depth.
         aggregate_bytes = 0
         rejected_exts: list[str] = []
@@ -604,8 +615,8 @@ class NoraBridge:
             # Strip any data URL prefix JS may have added.
             if "," in content_b64:
                 content_b64 = content_b64.split(",", 1)[1]
-            # Pre-decode size gate. base64 expands 4:3, so a 512 MB
-            # binary file is ~683 MB encoded; ``_b64_oversize`` does
+            # Pre-decode size gate. base64 expands 4:3, so a 1 GB
+            # binary file is ~1.33 GB encoded; ``_b64_oversize`` does
             # the comparison without materializing the decoded blob.
             if _b64_oversize(content_b64, _DRAG_DROP_MAX_BYTES):
                 approx_mb = (len(content_b64) * 3 // 4) // (1024 * 1024)
@@ -903,6 +914,49 @@ class NoraBridge:
         token = uuid.uuid4().hex[:16]
         runner.freeze_pending_for_queue(token)
         return token
+
+    def clear_pending_for_session(self, session_cwd: str) -> dict[str, Any]:
+        """Drop any pending @-mentions, staged scripts, plot carries
+        and queued-message frozen snapshots on the named session's
+        runner.
+
+        Called by the JS session-switch handler. The frontend wipes
+        its staged composer state (image thumbs, data notices, mention
+        chips) when the researcher leaves a session — without this
+        bridge call, the BACKEND runner's pending_* lists for that
+        session survive hidden, and the next plain message sent on
+        return would silently inline @-mentions / scripts the
+        researcher staged before the switch (and which the UI no
+        longer shows). The desync makes vanished attachments ride
+        invisibly. Clearing here keeps both sides aligned: nothing
+        staged in the UI, nothing staged on the runner.
+
+        ``session_cwd`` is the path of the runner to clear (not the
+        bridge's ``self.cwd`` — the JS already knows which session
+        it's leaving). Idempotent: returns ``{"ok": True}`` even when
+        the runner doesn't exist yet (a session the researcher
+        clicked into but never typed in).
+        """
+        if not session_cwd:
+            return {"ok": False, "reason": "empty session_cwd"}
+        try:
+            resolved = Path(session_cwd).resolve()
+        except (OSError, RuntimeError) as e:
+            return {"ok": False, "reason": f"bad path: {e}"}
+        runner = self._runners.get(str(resolved))
+        if runner is None:
+            # No live runner = nothing to clear. Not an error: the JS
+            # may call this on a sidebar entry the researcher never
+            # actually opened, or after a runner has already been
+            # closed.
+            return {"ok": True, "cleared": False}
+        # Use the narrower clear so queued-message frozen snapshots
+        # survive. Those belong to messages the researcher already
+        # committed to send (sitting in the JS queue) and must still
+        # fire when the in-flight turn finishes — dropping them on a
+        # focus switch would silently lose the user's queued work.
+        runner.clear_unsent_pending()
+        return {"ok": True, "cleared": True}
 
     def discard_pending_attachments_token(
         self, session_cwd: str, token: str,
@@ -1275,8 +1329,8 @@ class NoraBridge:
         # Aggregate-bytes accumulator for the data/script copy path.
         # The per-file cap protects each individual decode, but a
         # multi-file drop accumulates blobs in this method's scope
-        # before writing to disk. Five 400 MB .dta files would each
-        # pass per-file yet hold ~2 GB of decoded bytes concurrently
+        # before writing to disk. Two 800 MB .dta files would each
+        # pass per-file yet hold ~1.6 GB of decoded bytes concurrently
         # in transient heap. Bound the total at the same threshold so
         # the drag-drop rule reads the same as the landing page.
         # Images are NOT counted (5 MB cap each, capped count) — a
@@ -1298,7 +1352,7 @@ class NoraBridge:
             # ``acceptedByComposer``; this is defense-in-depth for any
             # client that bypasses it, AND a perf win — without it,
             # an unknown-extension drop would still flow through
-            # ``base64.b64decode`` (allocating up to 512 MB of bytes)
+            # ``base64.b64decode`` (allocating up to 1 GB of bytes)
             # before being silently dropped by the dispatch below.
             # Surface the name in ``skipped`` so the researcher gets a
             # clear "we ignored these" signal rather than the file
@@ -1307,7 +1361,7 @@ class NoraBridge:
                 skipped.append(f"{safe_name} (unsupported file type)")
                 continue
             # Pre-decode size gate. Both data/script files (capped at
-            # _DRAG_DROP_MAX_BYTES, 512 MB) and images (capped at
+            # _DRAG_DROP_MAX_BYTES, 1 GB) and images (capped at
             # _IMAGE_MAX_BYTES, 5 MB) are checked BEFORE the
             # ``base64.b64decode`` allocation. Without the image-side
             # check, an oversize image flowed through to the decode
@@ -1491,21 +1545,18 @@ class NoraBridge:
         """
         if self.cwd is None:
             return {"ok": True, "files": []}
-        from nora.session_files import enumerate_session_files
+        from nora.session_files import enumerate_files_panel_rows
 
         # Files panel uses the researcher-facing view: hide things
         # that already render on a result card (run-dir scripts,
         # ``_nora_plots/`` helper outputs) and hide files in cwd
-        # that a ``submit_script`` run produced (per its
+        # that a ``submit_script`` run CREATED (per its
         # ``cwd_writes.json`` manifest). The model-facing
         # ``list_session_files`` tool keeps the full view.
-        rows = enumerate_session_files(
-            self.cwd,
-            include_data=True,
-            include_run_scripts=False,
-            include_run_plots=False,
-            exclude_script_writes=True,
-        )
+        # ``enumerate_files_panel_rows`` is the shared definition so
+        # the read/delete defence gates stay in lock-step with this
+        # listing.
+        rows = enumerate_files_panel_rows(self.cwd)
         # Running budget shared across all rows. Once exhausted, the
         # remaining image / PDF rows still appear in the panel but
         # ship without ``data`` — the UI falls back to a placeholder
@@ -1777,9 +1828,12 @@ class NoraBridge:
         text to put on the clipboard for a ``.dta`` or ``.gph``.
 
         Takes a full ``path`` rather than a basename (mirroring
-        :meth:`delete_session_file`) so that a researcher-uploaded
-        ``script.do`` in cwd can be addressed unambiguously even if
-        the panel's display name differs from the disk name.
+        :meth:`delete_session_file`) so the caller can identify the
+        exact on-disk file. The read gate then requires the path to
+        appear in the Files-panel listing
+        (:func:`nora.session_files.enumerate_files_panel_rows`); any
+        path the panel doesn't show — run-dir scripts, helper plots,
+        raw subprocess logs, ``.nora/`` internals — is refused.
         Containment in cwd is verified before any read.
 
         Size cap: 4 MB. The clipboard can hold more, but multi-MB
@@ -1810,25 +1864,15 @@ class NoraBridge:
         # so the panel never lists those files — and any request
         # naming one has no legitimate UI origin.
         #
-        # Enumeration kwargs MUST match ``list_session_files``
-        # (above) — same researcher-facing view. Specifically:
-        # run-dir scripts, helper plots, and cwd files that a
-        # ``submit_script`` run created or modified are hidden from
-        # the panel by design (they're already represented on the
-        # script's result card), so reading them through this
-        # bridge endpoint has no legitimate UI origin. The cwd-
-        # writes case is the load-bearing one: a sandbox script
-        # that wrote raw rows into ``out.log`` would be reachable
-        # through here with the prior, broader enumeration.
-        from nora.session_files import enumerate_session_files
+        # Use the shared ``enumerate_files_panel_rows`` helper so this
+        # gate stays in lock-step with the panel listing. Calling
+        # ``enumerate_session_files`` with broader flags inline drifted
+        # from the actual panel mode (PR #55 narrowed the panel but
+        # not this gate), which made the "only what the panel surfaces"
+        # claim untrue.
+        from nora.session_files import enumerate_files_panel_rows
         listing_paths: set[Path] = set()
-        for row in enumerate_session_files(
-            cwd_resolved,
-            include_data=True,
-            include_run_scripts=False,
-            include_run_plots=False,
-            exclude_script_writes=True,
-        ):
+        for row in enumerate_files_panel_rows(cwd_resolved):
             try:
                 listing_paths.add(Path(row["path"]).resolve())
             except OSError:
@@ -2081,8 +2125,30 @@ class NoraBridge:
         if runner is None:
             return {"ok": False, "reason": "no active session"}
 
+        # @-mention is an explicit researcher action — they clicked a
+        # row in the Files panel / mention dropdown vouching for this
+        # file. If the target is a cwd top-level file, fold it into
+        # the provenance manifest so a subsequent ``read_attached_file``
+        # /``submit_script_file`` doesn't reject it as sandbox-output.
+        # This closes the folder-backed-session gap: a researcher who
+        # adds ``analysis_v2.py`` to their project dir outside Nora
+        # between sessions can now @-mention it and have it be
+        # recallable — without this hook, the manifest's "first-open
+        # snapshot only" rule made externally-added files invisible
+        # to recall even though they appear in the mention dropdown.
+        # Run-dir files (helper plots, run-dir scripts) are not in
+        # the cwd top-level scope and never have been gated by the
+        # manifest, so skip them.
+        target_resolved = target.resolve()
+        if target_resolved.parent == cwd_resolved:
+            try:
+                from nora.file_provenance import mark_known
+                mark_known(self.cwd, [target_resolved.name])
+            except Exception:  # noqa: BLE001 — provenance is best-effort
+                pass
+
         ext = target.suffix.lower()
-        target_str = str(target.resolve())
+        target_str = str(target_resolved)
         if ext in _INLINE_SCRIPT_EXTS:
             try:
                 content = target.read_bytes()
@@ -2788,6 +2854,8 @@ class NoraBridge:
             except Exception:  # noqa: BLE001
                 state = None
             custom = state.custom_name if state is not None else None
+            pinned = state.pinned if state is not None else False
+            pinned_at = state.pinned_at if state is not None else ""
             # ``size`` drives the delete-confirm dialog so the
             # researcher knows how much data is about to be wiped.
             # Folder-backed sessions don't get a delete button (the
@@ -2807,6 +2875,8 @@ class NoraBridge:
                 "size": size,
                 "title": _session_title(child),
                 "custom_name": custom,
+                "pinned": pinned,
+                "pinned_at": pinned_at,
                 # ``kind`` distinguishes staged (under SESSIONS_ROOT)
                 # from folder-backed (registered via choose_folder).
                 # The page uses this to render a different icon /
@@ -2844,7 +2914,22 @@ class NoraBridge:
         except Exception:  # noqa: BLE001 — registry is supplementary
             pass
 
-        entries.sort(key=lambda e: e["last_activity"], reverse=True)
+        # Two-tier sort, all descending so reverse=True drops out:
+        #   1. Pinned sessions sit ahead of unpinned. With ``reverse=
+        #      True`` and a bool first key, True (pinned) > False
+        #      (unpinned), so pinned rows come first.
+        #   2. Within pinned: sort by ``pinned_at`` desc — most
+        #      recently pinned floats to the very top. Unpinned rows
+        #      carry an empty pinned_at in the key so a stale stamp
+        #      (left behind after an unpin) doesn't perturb the
+        #      unpinned group's last_activity ordering.
+        #   3. Within unpinned: ``last_activity`` desc — the existing
+        #      most-recently-worked-first behaviour.
+        def _sort_key(e: dict[str, Any]) -> tuple[bool, str, float]:
+            is_pinned = bool(e.get("pinned", False))
+            stamp = e.get("pinned_at", "") if is_pinned else ""
+            return (is_pinned, stamp, float(e.get("last_activity", 0.0)))
+        entries.sort(key=_sort_key, reverse=True)
         return {"ok": True, "sessions": entries, "current": current}
 
     def delete_session(self, path: str) -> dict[str, Any]:
@@ -3042,6 +3127,62 @@ class NoraBridge:
             "path": str(target),
             "title": title,
             "custom_name": (name.strip() or None) if isinstance(name, str) else None,
+        }
+
+    def set_session_pinned(self, path: str, pinned: bool) -> dict[str, Any]:
+        """Toggle a session's pin-to-top flag so the sidebar surfaces
+        frequently-revisited sessions ahead of the time-sorted list.
+
+        Unlike :meth:`set_session_name`, this accepts BOTH staged
+        sessions (under ``~/.nora-sessions/``) AND folder-backed
+        sessions registered via :meth:`choose_folder`. Pinning is a
+        non-destructive UI preference — there's no reason to deny it
+        for a project directory the researcher already opened.
+
+        Returns ``{ok, path, pinned}`` on success so the page can
+        update the row without a full re-list (a ``list_sessions``
+        refresh still follows for the sort).
+        """
+        if not path:
+            return {"ok": False, "reason": "empty path"}
+        try:
+            target = Path(path).expanduser().resolve()
+        except OSError as e:
+            return {"ok": False, "reason": f"bad path: {e}"}
+        if not target.is_dir():
+            return {"ok": False, "reason": f"not a directory: {target}"}
+        # Accept the same two shapes ``switch_session`` accepts: a
+        # direct staged session under SESSIONS_ROOT, or a folder
+        # previously registered via ``choose_folder``. Anything else
+        # would let a JS caller seed a phantom ``.nora/`` skeleton
+        # under an arbitrary path.
+        sessions_root = SESSIONS_ROOT.resolve()
+        is_staged_session = (
+            target != sessions_root and target.parent == sessions_root
+        )
+        is_registered_folder = False
+        try:
+            from nora.external_sessions import is_registered as _is_registered
+            is_registered_folder = _is_registered(SESSIONS_ROOT, target)
+        except Exception:  # noqa: BLE001 — registry is supplementary
+            is_registered_folder = False
+        if not (is_staged_session or is_registered_folder):
+            return {
+                "ok": False,
+                "reason": (
+                    "must be a session directory under ~/.nora-sessions/ "
+                    "or a folder previously opened via the picker"
+                ),
+            }
+        try:
+            from nora.session_state import set_pinned
+            state = set_pinned(target, bool(pinned))
+        except Exception as e:  # noqa: BLE001 — surface, don't crash
+            return {"ok": False, "reason": f"could not save pin: {e}"}
+        return {
+            "ok": True,
+            "path": str(target),
+            "pinned": bool(state.pinned) if state is not None else bool(pinned),
         }
 
     def interrupt_turn(self) -> dict[str, Any]:
@@ -4204,8 +4345,11 @@ _MENTION_VISION_MAX_BYTES = 5 * 1024 * 1024
 # not images — those have their own 5 MB cap upstream). The chain is
 # FileReader → base64 string → pywebview bridge → ``b64decode``, with
 # peak memory roughly 3–4× the file size while the encoded string and
-# decoded bytes both live on the heap. 512 MB peaks around 2 GB total,
-# which is comfortable on any modern Mac without swap pressure.
+# decoded bytes both live on the heap. 1 GB peaks around 3–4 GB total,
+# which is comfortable on a 16 GB Mac and tight (but workable) on an
+# 8 GB Mac during the transfer window. Researchers on entry-tier
+# hardware with multi-GB datasets should prefer the Choose Files path
+# regardless — it avoids the in-memory round-trip entirely.
 #
 # Files larger than this should use the native picker
 # (:meth:`Bridge.choose_files` / :meth:`Bridge.add_files`), which uses
@@ -4213,7 +4357,7 @@ _MENTION_VISION_MAX_BYTES = 5 * 1024 * 1024
 # ``file.size`` before calling FileReader; this constant is the
 # backend's matching defense-in-depth check, in case a client bypasses
 # the JS gate or sends a forged base64 string from a non-browser path.
-_DRAG_DROP_MAX_BYTES = 512 * 1024 * 1024
+_DRAG_DROP_MAX_BYTES = 1024 * 1024 * 1024
 
 
 # Server-side mirror of the JS-side ``COMPOSER_DATA_EXTS`` plus the

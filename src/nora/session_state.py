@@ -135,6 +135,14 @@ class SessionState:
     # prefers this over the auto-derived title (dataset name /
     # timestamp). ``None`` means "use the auto-derived title".
     custom_name: str | None = None
+    # Researcher-toggled "pin to top" flag. The sidebar surfaces pinned
+    # sessions ahead of unpinned ones regardless of last_activity, so
+    # frequently-revisited sessions stay reachable without scrolling.
+    # ``pinned_at`` is the ISO timestamp of the most recent pin toggle
+    # to ``True`` — used to sort within the pinned group so the most
+    # recently pinned session sits at the very top.
+    pinned: bool = False
+    pinned_at: str = ""
 
 
 # ---------------------------------------------------------------------------
@@ -244,6 +252,8 @@ def write_session_state(
     with _state_lock_for(cwd):
         prior = read_session_state(cwd)
         custom_name = prior.custom_name if prior is not None else None
+        pinned = prior.pinned if prior is not None else False
+        pinned_at = prior.pinned_at if prior is not None else ""
 
         state = SessionState(
             version=SESSION_STATE_VERSION,
@@ -255,6 +265,8 @@ def write_session_state(
             datasets=datasets,
             active_model=model,
             custom_name=custom_name,
+            pinned=pinned,
+            pinned_at=pinned_at,
         )
 
         _atomic_write(cwd / ".nora" / SESSION_STATE_FILENAME, state)
@@ -314,6 +326,64 @@ def set_custom_name(cwd: Path, name: str | None) -> SessionState | None:
                 datasets=prior.datasets,
                 active_model=prior.active_model,
                 custom_name=cleaned,
+                pinned=prior.pinned,
+                pinned_at=prior.pinned_at,
+            )
+        _atomic_write(cwd / ".nora" / SESSION_STATE_FILENAME, state)
+    return state
+
+
+def set_pinned(cwd: Path, pinned: bool) -> SessionState | None:
+    """Update only the ``pinned`` flag on the session's state file.
+
+    Stamps ``pinned_at`` with the current UTC time whenever a session
+    flips from unpinned to pinned, so the sidebar can sort the pinned
+    group most-recently-pinned-first. Unpinning leaves the prior
+    ``pinned_at`` alone — harmless, since the flag itself is what the
+    sort consults first. Returns the new ``SessionState`` or ``None``
+    if the cwd is invalid.
+
+    Mirrors :func:`set_custom_name` in being a targeted edit that does
+    NOT regenerate the rest of the snapshot — pin-toggle should be
+    instantaneous and never trip a partial turn-end snapshot.
+    """
+    if cwd is None or not cwd.is_dir():
+        return None
+    flag = bool(pinned)
+    now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    with _state_lock_for(cwd):
+        prior = read_session_state(cwd)
+        if prior is None:
+            # Seed a minimal state — the next successful turn fills the
+            # rest. Without this, pinning a session that has never had
+            # a turn (rare but possible: pin the landing-screen folder
+            # before chatting) would no-op silently.
+            state = SessionState(
+                version=SESSION_STATE_VERSION,
+                last_active_at=now,
+                pinned=flag,
+                pinned_at=now if flag else "",
+            )
+        else:
+            # Re-stamp ``pinned_at`` only on the unpinned→pinned
+            # transition. Idempotent pins (already True) keep the
+            # original stamp so a researcher who clicks the icon twice
+            # by accident doesn't jump the row to the very top.
+            new_pinned_at = prior.pinned_at
+            if flag and not prior.pinned:
+                new_pinned_at = now
+            state = SessionState(
+                version=prior.version,
+                last_active_at=prior.last_active_at,
+                turn_count=prior.turn_count,
+                last_user_message=prior.last_user_message,
+                last_assistant_summary=prior.last_assistant_summary,
+                recent_results=prior.recent_results,
+                datasets=prior.datasets,
+                active_model=prior.active_model,
+                custom_name=prior.custom_name,
+                pinned=flag,
+                pinned_at=new_pinned_at,
             )
         _atomic_write(cwd / ".nora" / SESSION_STATE_FILENAME, state)
     return state
@@ -364,6 +434,8 @@ def read_session_state(cwd: Path | None) -> SessionState | None:
             datasets=[str(d) for d in (raw.get("datasets") or []) if d],
             active_model=raw.get("active_model"),
             custom_name=(raw.get("custom_name") or None),
+            pinned=bool(raw.get("pinned", False)),
+            pinned_at=str(raw.get("pinned_at", "") or ""),
         )
     except (TypeError, ValueError):
         return None

@@ -600,13 +600,18 @@ _RECALL_CONVERSATION_DESC_OAI = (
 )
 
 _READ_ATTACHED_FILE_DESC_OAI = (
-    "Re-fetch a file the researcher attached earlier (.py / .do / .r "
-    "/ .rmd as inline text, .png / .jpg / .pdf / .eps as a vision "
-    "content block; PDF/EPS are rasterised). Use when the file's "
-    "content has scrolled out of your context but the file is still "
-    "on disk in the session cwd. Datasets (.csv / .dta / .parquet / "
-    "etc.) are NOT retrievable through this tool; use get_schema or "
-    "write a script. 'name' is treated as a basename."
+    "Re-fetch a script or source attachment the researcher attached "
+    "earlier (.py / .do / .r / .rmd returned as inline text). Use "
+    "when the file's content has scrolled out of your context but the "
+    "file is still on disk in the session cwd. "
+    "IMAGES (.png / .jpg / .pdf / .eps): on this provider, image "
+    "bytes CANNOT be returned through a tool result — the function-"
+    "call-output channel is text-only. If you need to see a plot "
+    "again, ask the researcher to @mention the file in their next "
+    "message so it arrives as vision input on the user side; do NOT "
+    "call this tool for images on OpenAI. Datasets (.csv / .dta / "
+    ".parquet / etc.) are NEVER retrievable through this tool; use "
+    "get_schema or write a script. 'name' is treated as a basename."
 )
 
 

@@ -414,3 +414,29 @@ def enumerate_session_files(
         key=lambda r: (r["priority"], -r.get("mtime", 0), r["name"].lower())
     )
     return rows
+
+
+def enumerate_files_panel_rows(cwd: Path) -> list[dict[str, Any]]:
+    """Single source of truth for the researcher-facing Files panel
+    listing.
+
+    Mirrors the panel's narrow view: hides run-dir scripts and
+    helper-produced plots (those already render on their result card)
+    and drops cwd files that a ``submit_script`` run created (per its
+    ``cwd_writes.json`` manifest). Pre-existing researcher files that
+    a script modified in place remain visible — see
+    :func:`script_written_cwd_files`.
+
+    Use this helper anywhere the code's contract is "only files the
+    Files panel surfaces" (e.g. the bridge's read/delete defence
+    gates). Calling :func:`enumerate_session_files` with the panel
+    arguments inline would drift over time and silently broaden those
+    gates beyond what the panel actually shows.
+    """
+    return enumerate_session_files(
+        cwd,
+        include_data=True,
+        include_run_scripts=False,
+        include_run_plots=False,
+        exclude_script_writes=True,
+    )

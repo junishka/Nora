@@ -268,6 +268,48 @@ def test_bridge_install_emitter_propagates_evaluate_js_failure() -> None:
         )
 
 
+def test_install_confirmation_modal_enter_does_not_unconditionally_approve() -> None:
+    """The install-confirmation modal focuses Deny by default. A
+    document-level keydown handler used to call ``respond(true)`` on
+    every Enter, contradicting the focus default — researchers
+    pressing Enter on the focused Deny button got an Approve anyway,
+    flipping a safety modal into auto-approve.
+
+    Pin the structural fix: the Enter branch must gate on
+    ``document.activeElement === approveBtn``. Source-grep test
+    because the modal's keyboard behaviour can't be exercised
+    headlessly without spinning up a browser.
+    """
+    app_js = (Path(__file__).resolve().parent.parent
+              / "src" / "nora" / "web" / "app.js").read_text(encoding="utf-8")
+
+    # Extract the showInstallConfirmationModal function body to keep
+    # the assertion local to THIS modal, not any other dialog in the
+    # file that might also handle Enter.
+    m = re.search(
+        r"function showInstallConfirmationModal\([^)]*\)\s*\{(.*?)\n\}\n",
+        app_js,
+        re.DOTALL,
+    )
+    assert m is not None, "showInstallConfirmationModal not found in app.js"
+    body = m.group(1)
+
+    assert "denyBtn.focus()" in body, (
+        "modal must focus Deny by default — the keyboard-default-safe "
+        "posture that the Enter gate complements"
+    )
+    # Unconditional Enter-to-approve must NOT be there.
+    assert "e.key === 'Enter' && !e.shiftKey" not in body, (
+        "Enter must not unconditionally approve; that contradicts the "
+        "Deny-by-default focus and turns Enter on Deny into Approve"
+    )
+    # The Enter branch must gate on activeElement === approveBtn.
+    assert "document.activeElement === approveBtn" in body, (
+        "Enter approval must require Approve to actually have focus; "
+        "without the gate the modal's safety default is bypassed"
+    )
+
+
 # ---------------------------------------------------------------------------
 # 2. fireQueuedMessage no longer overwrites focused activeLiveTurn
 # ---------------------------------------------------------------------------
@@ -587,3 +629,385 @@ def test_read_attached_file_recalls_gif(tmp_path: Path, monkeypatch) -> None:
     image_blocks = [b for b in res["content"] if b.get("type") == "image"]
     assert image_blocks
     assert image_blocks[0]["mimeType"] == "image/gif"
+
+
+# ---------------------------------------------------------------------------
+# Session pin to top
+# ---------------------------------------------------------------------------
+
+def test_list_sessions_surfaces_pinned_field(tmp_path: Path, monkeypatch) -> None:
+    """``list_sessions`` must expose ``pinned`` and ``pinned_at`` per
+    entry so the sidebar can render the pin icon and sort correctly."""
+    from nora import ui as ui_mod
+    from nora.ui import NoraBridge
+    from nora.session_state import set_pinned
+
+    sessions_root = tmp_path / ".nora-sessions"
+    sessions_root.mkdir()
+    monkeypatch.setattr(ui_mod, "SESSIONS_ROOT", sessions_root)
+
+    s_unpinned = sessions_root / "20260511T120000Z_aaaaaaaa"
+    s_unpinned.mkdir()
+    s_pinned = sessions_root / "20260510T120000Z_bbbbbbbb"
+    s_pinned.mkdir()
+    set_pinned(s_pinned, True)
+
+    bridge = NoraBridge(cwd=None)
+    res = bridge.list_sessions()
+    assert res["ok"]
+    by_path = {s["path"]: s for s in res["sessions"]}
+    assert by_path[str(s_pinned.resolve())]["pinned"] is True
+    assert by_path[str(s_unpinned.resolve())]["pinned"] is False
+    assert by_path[str(s_pinned.resolve())]["pinned_at"], (
+        "pinned entries must carry the timestamp the UI uses to sort "
+        "within the pinned group"
+    )
+
+
+def test_list_sessions_pins_sort_first(tmp_path: Path, monkeypatch) -> None:
+    """The pinned session must come ahead of an unpinned session that
+    was worked more recently. Without the two-tier sort the pin would
+    have no visible effect — the whole point is to override
+    last_activity ordering for items the researcher wants reachable."""
+    import time as _time
+    from nora import ui as ui_mod
+    from nora.ui import NoraBridge
+    from nora.session_state import set_pinned
+
+    sessions_root = tmp_path / ".nora-sessions"
+    sessions_root.mkdir()
+    monkeypatch.setattr(ui_mod, "SESSIONS_ROOT", sessions_root)
+
+    # The pinned session is OLDER on disk than the unpinned one.
+    old_pinned = sessions_root / "20260101T120000Z_aaaaaaaa"
+    old_pinned.mkdir()
+    set_pinned(old_pinned, True)
+    # Force its chat_history mtime older than the unpinned's. Without
+    # this, both sessions share tmp_path's mtime ≈ now and the sort
+    # would be ambiguous on last_activity.
+    nora_dir = old_pinned / ".nora"
+    nora_dir.mkdir(exist_ok=True)
+    hist = nora_dir / "chat_history.jsonl"
+    hist.write_text("", encoding="utf-8")
+    old_mtime = _time.time() - 86400  # 1 day ago
+    import os as _os
+    _os.utime(hist, (old_mtime, old_mtime))
+
+    new_unpinned = sessions_root / "20260512T120000Z_bbbbbbbb"
+    new_unpinned.mkdir()
+
+    bridge = NoraBridge(cwd=None)
+    res = bridge.list_sessions()
+    assert res["ok"]
+    paths_in_order = [s["path"] for s in res["sessions"]]
+    assert paths_in_order[0] == str(old_pinned.resolve()), (
+        f"pinned session must lead the list; got {paths_in_order!r}"
+    )
+
+
+def test_list_sessions_pinned_group_sorted_by_pinned_at(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    """Within the pinned group, the most recently pinned session
+    sits at the very top. Without this the order inside the pinned
+    cluster is undefined and a fresh pin can land below older
+    pins."""
+    import time as _time
+    from nora import ui as ui_mod
+    from nora.ui import NoraBridge
+    from nora.session_state import set_pinned
+
+    sessions_root = tmp_path / ".nora-sessions"
+    sessions_root.mkdir()
+    monkeypatch.setattr(ui_mod, "SESSIONS_ROOT", sessions_root)
+
+    first = sessions_root / "20260101T120000Z_aaaaaaaa"
+    first.mkdir()
+    set_pinned(first, True)
+
+    _time.sleep(1.01)  # ISO timestamps are second-resolution
+    second = sessions_root / "20260102T120000Z_bbbbbbbb"
+    second.mkdir()
+    set_pinned(second, True)
+
+    bridge = NoraBridge(cwd=None)
+    res = bridge.list_sessions()
+    pinned = [s for s in res["sessions"] if s["pinned"]]
+    assert len(pinned) == 2
+    assert pinned[0]["path"] == str(second.resolve()), (
+        "the most recently pinned session must sit ahead of older pins"
+    )
+    assert pinned[1]["path"] == str(first.resolve())
+
+
+def test_set_session_pinned_round_trip(tmp_path: Path, monkeypatch) -> None:
+    """The bridge method accepts a staged session path, persists the
+    flag, and surfaces the new value through the next list_sessions
+    call."""
+    from nora import ui as ui_mod
+    from nora.ui import NoraBridge
+
+    sessions_root = tmp_path / ".nora-sessions"
+    sessions_root.mkdir()
+    monkeypatch.setattr(ui_mod, "SESSIONS_ROOT", sessions_root)
+
+    session = sessions_root / "20260511T120000Z_aaaaaaaa"
+    session.mkdir()
+    bridge = NoraBridge(cwd=None)
+
+    pin_res = bridge.set_session_pinned(str(session), True)
+    assert pin_res["ok"] is True
+    assert pin_res["pinned"] is True
+
+    listing = bridge.list_sessions()
+    entry = next(
+        s for s in listing["sessions"] if s["path"] == str(session.resolve())
+    )
+    assert entry["pinned"] is True
+
+    unpin_res = bridge.set_session_pinned(str(session), False)
+    assert unpin_res["ok"] is True
+    assert unpin_res["pinned"] is False
+
+    listing2 = bridge.list_sessions()
+    entry2 = next(
+        s for s in listing2["sessions"] if s["path"] == str(session.resolve())
+    )
+    assert entry2["pinned"] is False
+
+
+def test_set_session_pinned_accepts_folder_backed(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    """Pinning a folder-backed session must work too — the rename
+    bridge method gates by SESSIONS_ROOT (a project dir can't be
+    renamed via the sidebar pencil), but pinning is a non-destructive
+    UI preference and there's no reason to deny it for a registered
+    project directory."""
+    from nora import ui as ui_mod
+    from nora.ui import NoraBridge
+    from nora.external_sessions import register
+
+    sessions_root = tmp_path / ".nora-sessions"
+    sessions_root.mkdir()
+    monkeypatch.setattr(ui_mod, "SESSIONS_ROOT", sessions_root)
+
+    project = tmp_path / "my-project"
+    project.mkdir()
+    register(sessions_root, project)
+
+    bridge = NoraBridge(cwd=None)
+    res = bridge.set_session_pinned(str(project), True)
+    assert res["ok"] is True
+    assert res["pinned"] is True
+
+
+def test_set_session_pinned_refuses_arbitrary_path(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    """A path that isn't a staged session AND isn't a registered
+    folder must be refused — without that gate any JS caller could
+    seed a phantom ``.nora/`` skeleton under an arbitrary directory."""
+    from nora import ui as ui_mod
+    from nora.ui import NoraBridge
+
+    sessions_root = tmp_path / ".nora-sessions"
+    sessions_root.mkdir()
+    monkeypatch.setattr(ui_mod, "SESSIONS_ROOT", sessions_root)
+
+    stranger = tmp_path / "somewhere-else"
+    stranger.mkdir()
+
+    bridge = NoraBridge(cwd=None)
+    res = bridge.set_session_pinned(str(stranger), True)
+    assert res["ok"] is False
+    assert "session directory" in res["reason"]
+
+
+# ---------------------------------------------------------------------------
+# clear_pending_for_session — backend desync on session switch
+# ---------------------------------------------------------------------------
+
+def test_clear_pending_for_session_drops_all_pending_lists(
+    tmp_path: Path,
+) -> None:
+    """Stage @-mention, script, plot, and mentioned-image entries on a
+    runner, call ``clear_pending_for_session``, and confirm every
+    pending list is empty afterwards. The frontend wipes its staged
+    composer state when the researcher leaves a session; this bridge
+    method is the matching backend wipe. Without it, attachments
+    staged in A but never sent ride invisibly with the next plain
+    message in A — UI shows no chip, runner inlines the file
+    anyway.
+    """
+    from nora.ui import NoraBridge
+
+    bridge = NoraBridge(cwd=tmp_path)
+    runner = bridge._active_runner()
+    assert runner is not None
+
+    runner.pending_script_attachments.append({
+        "name": "model.py", "kind": "script", "content": "print(1)",
+    })
+    runner.pending_mentioned_files.append("residuals.png")
+    runner.pending_mentioned_images.append({
+        "data": "AA==", "mime": "image/png",
+        "name": "residuals.png", "path": "/tmp/residuals.png",
+    })
+    runner.pending_plot_images.append({
+        "data": "AA==", "mime": "image/png",
+        "name": "coefficients.png", "kind": "image",
+    })
+
+    res = bridge.clear_pending_for_session(str(tmp_path))
+    assert res["ok"] is True
+    assert res["cleared"] is True
+    assert runner.pending_script_attachments == []
+    assert runner.pending_mentioned_files == []
+    assert runner.pending_mentioned_images == []
+    assert runner.pending_plot_images == []
+
+
+def test_clear_pending_for_session_idempotent_on_unknown_runner(
+    tmp_path: Path,
+) -> None:
+    """A session the researcher clicked into but never typed in has no
+    live runner. ``clear_pending_for_session`` must succeed without
+    materialising one (and without errors) — anything else makes the
+    JS-side switch handler treat a routine no-op as a failure.
+    """
+    from nora.ui import NoraBridge
+
+    bridge = NoraBridge(cwd=None)
+    res = bridge.clear_pending_for_session(str(tmp_path / "never-opened"))
+    assert res["ok"] is True
+    assert res["cleared"] is False
+
+
+def test_clear_pending_for_session_rejects_empty_path(
+    tmp_path: Path,
+) -> None:
+    """An empty / null cwd should not silently no-op-OK — that would
+    let a JS caller forget to pass the leaving session's cwd and have
+    the request go through anyway. Surface the bad call so it's
+    fixable at the call site."""
+    from nora.ui import NoraBridge
+
+    bridge = NoraBridge(cwd=tmp_path)
+    res = bridge.clear_pending_for_session("")
+    assert res["ok"] is False
+    assert "session_cwd" in res["reason"]
+
+
+def test_clear_pending_for_session_does_not_clear_queued_frozen_snapshots(
+    tmp_path: Path,
+) -> None:
+    """Queued-message frozen snapshots are owned by messages the
+    researcher has already committed to send (they're sitting in the
+    JS queue). Those must NOT be dropped just because focus left the
+    session — the queued message still needs its attachments when
+    it eventually fires.
+
+    ``runner.clear_pending_attachments`` does drop frozen snapshots
+    on the REWIND path (which is the right call there). The session-
+    switch path must NOT call that broader clear. Pin the boundary
+    here so a future refactor doesn't widen the wipe.
+    """
+    from nora.ui import NoraBridge
+
+    bridge = NoraBridge(cwd=tmp_path)
+    runner = bridge._active_runner()
+    assert runner is not None
+
+    # Stage something AND freeze a queued message snapshot.
+    runner.pending_script_attachments.append(
+        {"name": "queued.py", "kind": "script", "content": "x"}
+    )
+    runner.freeze_pending_for_queue("token-queued")
+    assert "token-queued" in runner.frozen_pending_attachments
+
+    # Now stage fresh items for the NEXT plain message.
+    runner.pending_mentioned_files.append("fresh.png")
+
+    res = bridge.clear_pending_for_session(str(tmp_path))
+    assert res["ok"] is True
+
+    # The fresh pending list was cleared (it's what the leaving
+    # composer was showing).
+    assert runner.pending_mentioned_files == []
+    # But the frozen queued snapshot survives — it belongs to a
+    # message the researcher already committed to send.
+    assert "token-queued" in runner.frozen_pending_attachments
+
+
+def test_switch_session_calls_clear_pending_for_leaving_session() -> None:
+    """JS-side structural check: ``switchSession`` must call
+    ``clear_pending_for_session`` against the LEAVING session before
+    swapping focus. Without that call the backend pending lists for
+    the leaving session survive hidden, and the next plain message
+    on return inlines the (no-longer-visible) staged attachment.
+    """
+    app_js = Path(__file__).resolve().parent.parent / "src" / "nora" / "web" / "app.js"
+    src = app_js.read_text(encoding="utf-8")
+
+    # Pull out the switchSession function body so the assertion fires
+    # against THAT function, not some unrelated `clear_pending_for_session`
+    # call elsewhere.
+    m = re.search(
+        r"async function switchSession\([^)]*\)\s*\{(.*?)\n\}\n",
+        src,
+        re.DOTALL,
+    )
+    assert m is not None, "switchSession function not found in app.js"
+    body = m.group(1)
+
+    assert "clear_pending_for_session" in body, (
+        "switchSession must call api.clear_pending_for_session for the "
+        "leaving session — without it, attachments staged in the prior "
+        "session ride invisibly with that session's next plain message"
+    )
+    # The clear must happen before the focus swap, so it targets the
+    # OLD cwd (``leavingCwd``), not the new one.
+    clear_idx = body.find("clear_pending_for_session")
+    switch_idx = body.find("switch_session(")
+    assert 0 <= clear_idx < switch_idx, (
+        "clear_pending_for_session must be invoked BEFORE switch_session, "
+        "while currentCwd still points at the session being left"
+    )
+
+
+def test_replay_history_has_stale_cwd_guard() -> None:
+    """JS-side structural check: ``replayHistory`` must compare the
+    expected cwd against the live ``currentCwd`` AFTER the
+    ``get_chat_history`` await, and bail when they diverge. Without
+    the guard, a late-arriving A history wipes ``messagesEl`` and
+    paints A's transcript into the now-focused B session.
+    """
+    app_js = Path(__file__).resolve().parent.parent / "src" / "nora" / "web" / "app.js"
+    src = app_js.read_text(encoding="utf-8")
+
+    m = re.search(
+        r"async function replayHistory\([^)]*\)\s*\{(.*?)\n\}\n",
+        src,
+        re.DOTALL,
+    )
+    assert m is not None, "replayHistory function not found in app.js"
+    body = m.group(1)
+
+    # The await on get_chat_history must come before the wipe that
+    # follows — and the stale-cwd check must sit between them, not
+    # after the wipe (else we've already corrupted the DOM).
+    await_idx = body.find("await window.pywebview.api.get_chat_history")
+    guard_idx = body.find("expectedCwd !== currentCwd")
+    wipe_idx = body.find("messagesEl.innerHTML = ''")
+    assert await_idx >= 0, "replayHistory must await get_chat_history"
+    assert guard_idx > await_idx, (
+        "stale-cwd guard must sit AFTER the await — checking before "
+        "the await catches nothing because the user can switch during "
+        "the in-flight RPC"
+    )
+    assert guard_idx < wipe_idx, (
+        "stale-cwd guard must run BEFORE the messagesEl wipe — checking "
+        "after the wipe means a stale response has already destroyed the "
+        "newly-focused session's transcript"
+    )

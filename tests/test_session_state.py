@@ -36,6 +36,7 @@ from nora.session_state import (
     SessionState,
     read_session_state,
     set_custom_name,
+    set_pinned,
     write_session_state,
 )
 
@@ -375,6 +376,137 @@ def test_custom_name_round_trip_via_writer(tmp_path: Path):
 def test_set_custom_name_refuses_bad_cwd(tmp_path: Path):
     """A non-existent directory yields None rather than crashing."""
     assert set_custom_name(tmp_path / "nope", "x") is None
+
+
+# ---------------------------------------------------------------------------
+# Pin to top
+# ---------------------------------------------------------------------------
+
+def test_set_pinned_round_trip(tmp_path: Path):
+    """Pinning seeds a state file when none exists, stamps
+    ``pinned_at`` on the unpinned→pinned transition, and the value
+    reads back through the standard reader."""
+    state = set_pinned(tmp_path, True)
+    assert state is not None
+    assert state.pinned is True
+    assert state.pinned_at, "pinning must stamp pinned_at"
+
+    loaded = read_session_state(tmp_path)
+    assert loaded is not None
+    assert loaded.pinned is True
+    assert loaded.pinned_at == state.pinned_at
+
+
+def test_set_pinned_unpin_keeps_prior_stamp(tmp_path: Path):
+    """Unpinning leaves ``pinned_at`` alone. The sort consults the
+    ``pinned`` flag first, so a stale stamp on an unpinned row
+    doesn't move it — keeping the stamp lets a re-pin re-use the
+    old position only if we deliberately decide to (we don't:
+    re-pinning re-stamps below)."""
+    pinned_first = set_pinned(tmp_path, True)
+    assert pinned_first is not None
+    original_stamp = pinned_first.pinned_at
+
+    unpinned = set_pinned(tmp_path, False)
+    assert unpinned is not None
+    assert unpinned.pinned is False
+    assert unpinned.pinned_at == original_stamp
+
+
+def test_set_pinned_repin_restamps(tmp_path: Path):
+    """The unpinned→pinned transition re-stamps ``pinned_at`` so a
+    fresh pin floats to the top of the pinned group."""
+    import time as _time
+    set_pinned(tmp_path, True)
+    first_stamp = read_session_state(tmp_path).pinned_at
+
+    set_pinned(tmp_path, False)
+    _time.sleep(1.01)  # ISO timestamps are second-resolution
+    set_pinned(tmp_path, True)
+    second_stamp = read_session_state(tmp_path).pinned_at
+
+    assert second_stamp > first_stamp, (
+        "re-pinning after an unpin must re-stamp pinned_at so the "
+        "row sorts ahead of older pins"
+    )
+
+
+def test_set_pinned_idempotent_pin_keeps_stamp(tmp_path: Path):
+    """Pinning an already-pinned session must NOT bump ``pinned_at``.
+    A double-click on the pin icon shouldn't surprise the researcher
+    by jumping the row above other pins that were intentionally
+    pinned earlier in the same minute."""
+    import time as _time
+    set_pinned(tmp_path, True)
+    first_stamp = read_session_state(tmp_path).pinned_at
+    _time.sleep(1.01)
+    set_pinned(tmp_path, True)
+    second_stamp = read_session_state(tmp_path).pinned_at
+    assert first_stamp == second_stamp
+
+
+def test_pinned_survives_per_turn_rewrite(tmp_path: Path):
+    """``write_session_state`` runs after every successful turn and
+    rebuilds the file. The pin flag and stamp must be carried
+    forward — without that, a turn would silently unpin the
+    session."""
+    _write_chat_log(tmp_path, [])
+    set_pinned(tmp_path, True)
+    stamp_before = read_session_state(tmp_path).pinned_at
+
+    write_session_state(tmp_path, model="sonnet-4-6", store_list=[])
+    loaded = read_session_state(tmp_path)
+    assert loaded is not None
+    assert loaded.pinned is True
+    assert loaded.pinned_at == stamp_before
+
+
+def test_set_custom_name_preserves_pinned(tmp_path: Path):
+    """Renaming must not clobber the pin state. The two writers
+    share the per-cwd lock; the rename path must carry pinned/
+    pinned_at forward when it replaces the state file."""
+    set_pinned(tmp_path, True)
+    stamp_before = read_session_state(tmp_path).pinned_at
+
+    set_custom_name(tmp_path, "Renamed mid-pin")
+    loaded = read_session_state(tmp_path)
+    assert loaded is not None
+    assert loaded.pinned is True
+    assert loaded.pinned_at == stamp_before
+    assert loaded.custom_name == "Renamed mid-pin"
+
+
+def test_set_pinned_refuses_bad_cwd(tmp_path: Path):
+    """A non-existent directory yields None rather than crashing
+    — same posture as ``set_custom_name``."""
+    assert set_pinned(tmp_path / "nope", True) is None
+
+
+def test_pinned_field_defaults_when_reading_legacy_file(tmp_path: Path):
+    """A state file written by an older Nora (no ``pinned`` or
+    ``pinned_at`` keys) must read back with ``pinned=False`` and
+    an empty stamp — not raise, not flip pinned True."""
+    nora = tmp_path / ".nora"
+    nora.mkdir()
+    legacy = {
+        "version": SESSION_STATE_VERSION,
+        "last_active_at": "2026-01-01T00:00:00+00:00",
+        "turn_count": 3,
+        "last_user_message": "old",
+        "last_assistant_summary": "old reply",
+        "recent_results": [],
+        "datasets": [],
+        "active_model": None,
+        "custom_name": None,
+    }
+    (nora / SESSION_STATE_FILENAME).write_text(
+        json.dumps(legacy), encoding="utf-8",
+    )
+
+    loaded = read_session_state(tmp_path)
+    assert loaded is not None
+    assert loaded.pinned is False
+    assert loaded.pinned_at == ""
 
 
 def test_read_handles_missing_optional_fields(tmp_path: Path):

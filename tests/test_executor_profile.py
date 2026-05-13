@@ -403,7 +403,7 @@ def test_mach_deny_appears_after_allow(example_profile: str):
 # Stata preamble — block ``~/ado/profile.do`` shadow attack
 # ---------------------------------------------------------------------------
 
-def test_stata_preamble_drops_user_defined_programs(tmp_path):
+def test_stata_preamble_drops_nora_helpers_only(tmp_path):
     """Stata batch mode (``stata -b do script.do``) sources
     ``~/ado/profile.do`` at interpreter startup, BEFORE the user's
     do file. Stata's program resolver checks in-memory programs
@@ -413,16 +413,19 @@ def test_stata_preamble_drops_user_defined_programs(tmp_path):
     the staged ``nora_result_regress.ado`` even though our preamble
     runs ``adopath + NORA_LIB_DIR``.
 
-    Concrete trigger: a malicious research-package tarball ships a
-    profile.do snippet ("for shared helpers") and the researcher
-    pastes it into ``~/ado/profile.do``. Every subsequent Stata run
-    is compromised — the malicious helper can read ``$NORA_RUN_TOKEN``
-    from env and emit a token-valid payload with whatever fields it
-    wants. ``capture program drop _all`` in our preamble forces
-    helper resolution back to the adopath (where lib_dir comes first),
-    cleaning up whatever profile.do loaded. ``_all`` does NOT touch
-    Stata's built-in commands (``regress``, ``summarize``, etc.).
-    ``capture`` suppresses errors when no user programs are loaded.
+    Defense: the preamble drops every Nora helper name BEFORE adding
+    the runtime lib to the adopath. After the drops, ``nora_result_*``
+    / ``nora_plot_*`` calls in the researcher's code resolve via
+    adopath, which hits Nora's lib_dir first.
+
+    Earlier versions used ``capture program drop _all`` here, which
+    defended the helpers but also wiped every other program loaded
+    by profile.do — including the researcher's own workflow helpers.
+    Scripts that worked in plain Stata then failed inside Nora with
+    "command not found" on a custom utility. The fix narrows the
+    drop list to JUST the Nora helpers; unrelated user programs
+    survive. ``capture`` suppresses the no-such-program error in
+    the common case where profile.do hasn't defined any of these.
     """
     from nora.executor import _write_script
 
@@ -431,19 +434,46 @@ def test_stata_preamble_drops_user_defined_programs(tmp_path):
     (run_dir / "lib").mkdir()
     script_path = _write_script(run_dir, "Stata", 'reg y x\n')
     text = script_path.read_text(encoding="utf-8")
-    # The drop MUST be present and MUST run before adopath setup,
-    # so it cleans up profile.do residue before Nora's helpers are
-    # made discoverable.
-    drop_idx = text.find("capture program drop _all")
+
+    # ``_all`` wipe must NOT be present — that's the regression we're
+    # protecting against.
+    assert "capture program drop _all" not in text, (
+        "Stata preamble must not drop _all; that wipes the researcher's "
+        "own profile.do helpers along with potential shadowers."
+    )
+
+    # Every Nora helper from ``_stage_runtime_library``'s ``stata_ados``
+    # tuple MUST be in the drop list — that's how the shadowing
+    # defense works.
+    required_drops = [
+        "nora_result_regress",
+        "nora_result_ttest",
+        "nora_ttest",
+        "nora_result_sum",
+        "nora_result_tab",
+        "nora_result_magnitude",
+        "nora_result_correlation",
+        "nora_plot_residuals",
+        "nora_plot_coefficients",
+        "nora_plot_interaction",
+        "nora_plot_estimate_comparison",
+        "nora_safe_export",
+        "_nora_export_plot",
+    ]
     adopath_idx = text.find("adopath +")
-    assert drop_idx >= 0, (
-        "Stata preamble must include `capture program drop _all` to "
-        "clear user-defined programs loaded by ~/ado/profile.do"
-    )
-    assert drop_idx < adopath_idx, (
-        "`capture program drop _all` must run before `adopath +` so "
-        "the cleanup happens before helpers become discoverable"
-    )
+    assert adopath_idx > 0, "preamble must set adopath"
+    for name in required_drops:
+        line = f"capture program drop {name}"
+        idx = text.find(line)
+        assert idx >= 0, (
+            f"Stata preamble must drop {name!r} so a profile.do "
+            f"shadow attack can't pre-define it ahead of the staged "
+            f".ado on the adopath."
+        )
+        assert idx < adopath_idx, (
+            f"`capture program drop {name}` must run before `adopath +` "
+            f"so the cleanup happens before helpers become discoverable."
+        )
 
 
 # ---------------------------------------------------------------------------

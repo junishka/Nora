@@ -213,6 +213,40 @@ def _record_looks_like_header(record: list[str]) -> bool:
     return False
 
 
+def _csv_has_header(path: Path, delimiter: str) -> bool:
+    """Single source of truth for "does this CSV/TSV have a header?"
+    so :func:`row_count` and the names_only fast paths agree.
+
+    Without this shared peek, the two surfaces could disagree on a
+    headerless numeric CSV: ``row_count`` (which runs its own header
+    heuristic) reports N rows of data, while the fast-path extract
+    (which used pandas' default ``header='infer'``, i.e. always treat
+    row 1 as header) silently labels the data row as column names AND
+    reports a row count that doesn't match what a full extract would
+    return. The schema response then looks internally inconsistent
+    (variable names look like data, observation count is one too many).
+
+    Reads only the first parsed record — constant-time on any file
+    size. Returns ``True`` (header present) on read errors so callers
+    fall back to pandas' usual behaviour rather than guessing.
+    """
+    import csv
+
+    try:
+        with open(
+            path, "r", encoding="utf-8", errors="replace", newline="",
+        ) as f:
+            reader = csv.reader(f, delimiter=delimiter)
+            for record in reader:
+                return _record_looks_like_header(record)
+    except OSError:
+        return True
+    # Empty file — no record at all. Default to "has header" so the
+    # downstream pandas read uses its default and yields a zero-row
+    # frame rather than failing on an unexpected option.
+    return True
+
+
 def row_count(dataset_path: Path) -> int | None:
     """Return the row count for the dataset at ``dataset_path`` without
     materialising the values where the format allows it.
@@ -551,14 +585,33 @@ def _extract_csv(path: Path, depth: str) -> dict[str, Any]:
         # the first line, vs a full pass that materialises every
         # column in memory for type inference. A bare "what columns
         # does this dataset have" call should not OOM the app.
-        header_df = pd.read_csv(path, nrows=0)
+        #
+        # Honour the SAME header heuristic ``row_count`` uses so the
+        # two outputs stay consistent: a headerless numeric CSV
+        # (``1,2,3\n4,5,6``) was reporting variable names ``"1","2","3"``
+        # alongside observation_count=2, but a full extract would
+        # have consumed row 1 as the header and reported only 1
+        # data row. With the shared peek, both surfaces agree:
+        # headerless files come back with ``0,1,2…`` placeholder
+        # names and the full row count.
+        has_header = _csv_has_header(path, ",")
+        header_df = (
+            pd.read_csv(path, nrows=0)
+            if has_header
+            else pd.read_csv(path, header=None, nrows=0)
+        )
         return _names_only_payload(
             list(header_df.columns), path, "csv",
         )
     # low_memory=False gives a single-pass type inference — more accurate
     # for columns where the type isn't obvious from the first chunk. For
     # genuinely huge CSVs this will be slow; step 7 can add streaming.
-    df = pd.read_csv(path, low_memory=False)
+    has_header = _csv_has_header(path, ",")
+    df = (
+        pd.read_csv(path, low_memory=False)
+        if has_header
+        else pd.read_csv(path, header=None, low_memory=False)
+    )
     return _extract_from_pandas(
         df, depth=depth, dataset_name=path.name, file_type="csv"
     )
@@ -572,12 +625,23 @@ def _extract_tsv(path: Path, depth: str) -> dict[str, Any]:
     import pandas as pd
 
     if depth == "names_only":
-        # See _extract_csv for the fast-path rationale.
-        header_df = pd.read_csv(path, sep="\t", nrows=0)
+        # See _extract_csv for the fast-path rationale and the
+        # header-heuristic alignment with ``row_count``.
+        has_header = _csv_has_header(path, "\t")
+        header_df = (
+            pd.read_csv(path, sep="\t", nrows=0)
+            if has_header
+            else pd.read_csv(path, sep="\t", header=None, nrows=0)
+        )
         return _names_only_payload(
             list(header_df.columns), path, "tsv",
         )
-    df = pd.read_csv(path, sep="\t", low_memory=False)
+    has_header = _csv_has_header(path, "\t")
+    df = (
+        pd.read_csv(path, sep="\t", low_memory=False)
+        if has_header
+        else pd.read_csv(path, sep="\t", header=None, low_memory=False)
+    )
     return _extract_from_pandas(
         df, depth=depth, dataset_name=path.name, file_type="tsv"
     )

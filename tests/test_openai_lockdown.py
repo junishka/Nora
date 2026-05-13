@@ -746,3 +746,166 @@ def test_send_yields_turnerror_when_tool_loop_does_not_converge(
         "exhausted tool loop must NOT advance the committed response id "
         "onto a turn whose last response has a pending function_call"
     )
+
+
+# ---------------------------------------------------------------------------
+# Missing API key surfaces as AuthFailure, not RuntimeError
+# ---------------------------------------------------------------------------
+
+def test_send_with_no_api_key_yields_auth_failure(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """``SessionRunner.ensure_session`` awaits ``OpenAISession.open()``
+    BEFORE any event stream exists. If ``open()`` raises on a missing
+    key, the runner translates the RuntimeError into a generic
+    ``turn_error`` — diverging from the Anthropic provider, whose
+    open() succeeds and whose send() yields AuthFailure on the 401.
+
+    Verify the deferred path: open() with no key no-ops, and the
+    first ``send()`` round yields ``AuthFailure`` so the runner emits
+    the same provider-neutral ``auth_failure`` event the API-call
+    path produces for 401 responses."""
+    import asyncio
+    from nora.provider import openai as openai_provider
+    from nora.provider.base import AuthFailure
+
+    # No keyring credential, no env key. _resolve_api_key returns None.
+    monkeypatch.setattr(openai_provider, "_resolve_api_key", lambda: None)
+
+    sess = OpenAISession(
+        cwd=tmp_path,
+        model="gpt-5.5",
+        system_prompt="you are nora",
+    )
+
+    # open() must NOT raise — that was the pre-fix behaviour that
+    # short-circuited the auth_failure event path.
+    asyncio.run(sess.open())
+    assert sess._client is None, (
+        "open() with no key must defer client construction"
+    )
+
+    events: list[Any] = []
+
+    async def _drive() -> None:
+        async for ev in sess.send("hi"):
+            events.append(ev)
+
+    asyncio.run(_drive())
+
+    assert events, "send() must yield at least one event on missing key"
+    assert isinstance(events[0], AuthFailure), (
+        f"first event must be AuthFailure; got "
+        f"{type(events[0]).__name__}. Without this the runner emits a "
+        f"generic turn_error and the UI never enters the auth-failure "
+        f"flow that prompts the researcher to fix credentials."
+    )
+    assert "OpenAI API key" in events[0].reason
+
+
+def test_runner_ensure_session_does_not_raise_on_missing_openai_key(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """End-to-end: the runner's ``ensure_session`` must not blow up
+    on a missing OpenAI key. The translation happens at send-time,
+    not at open-time. Mirrors the Anthropic posture (whose
+    ClaudeSDKClient construction also doesn't fail on missing
+    credentials)."""
+    import asyncio
+    from nora.provider import openai as openai_provider
+    from nora.runner import SessionRunner
+
+    monkeypatch.setattr(openai_provider, "_resolve_api_key", lambda: None)
+
+    runner = SessionRunner(
+        cwd=tmp_path,
+        provider="openai",
+        model="gpt-5.5",
+    )
+
+    # ensure_session must succeed and return a ProviderSession whose
+    # ._client is None; the runner's turn loop will then iterate
+    # send() and receive AuthFailure.
+    sess = asyncio.run(runner.ensure_session())
+    assert sess is not None
+    assert sess._client is None  # type: ignore[attr-defined]
+
+
+# ---------------------------------------------------------------------------
+# parallel_tool_calls is pinned explicitly
+# ---------------------------------------------------------------------------
+
+def test_request_kwargs_pin_parallel_tool_calls(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """The OpenAI docstring claims ``parallel_tool_calls`` is on. The
+    request payload must SET it explicitly so a future SDK/API default
+    change can't silently flip the behaviour. Pin the field at the
+    request boundary so a regression is caught by this test rather
+    than by surprised researchers."""
+    import asyncio
+
+    from nora.provider import openai as openai_provider
+    monkeypatch.setattr(openai_provider, "_resolve_api_key", lambda: "sk-test")
+
+    import openai as openai_pkg
+    monkeypatch.setattr(
+        openai_pkg, "AsyncOpenAI", _FakeAsyncOpenAI, raising=True,
+    )
+
+    sess = OpenAISession(
+        cwd=tmp_path,
+        model="gpt-5.5",
+        system_prompt="you are nora",
+    )
+
+    async def _drive() -> None:
+        async for _ in sess.send("hello"):
+            pass
+
+    asyncio.run(_drive())
+
+    api = sess._client.responses  # type: ignore[union-attr]
+    assert len(api.calls) == 1
+    call = api.calls[0]
+    assert call.get("parallel_tool_calls") is True, (
+        "parallel_tool_calls must be pinned to True on every request; "
+        "without this the model loses concurrent tool calls if the "
+        "SDK/API default ever flips"
+    )
+
+
+# ---------------------------------------------------------------------------
+# OpenAI tool description for read_attached_file warns away from images
+# ---------------------------------------------------------------------------
+
+def test_read_attached_file_openai_description_warns_about_images() -> None:
+    """The canonical Anthropic description for ``read_attached_file``
+    says images come back as a vision content block. On OpenAI that
+    contract is impossible — function_call_output is text-only, and
+    the response is rewritten to ``image_not_supported_on_provider``.
+    The OpenAI-specific description must spell this out so the model
+    doesn't waste a tool call inviting the rewrite path.
+    """
+    from nora.provider.tool_schemas import build_tool_specs
+
+    specs = {s.name: s for s in build_tool_specs()}
+    spec = specs["read_attached_file"]
+    assert spec.openai_description is not None, (
+        "read_attached_file must have a provider-specific OpenAI "
+        "description so the image-not-supported guidance reaches the "
+        "model"
+    )
+    desc = spec.openai_description
+    # Must definitively say image bytes can't return.
+    assert "image bytes" in desc.lower() or "cannot" in desc.lower()
+    # Must point at the recovery path (re-@mention via user message).
+    assert "@mention" in desc, (
+        "OpenAI description must direct the model to the @mention "
+        "recovery path so the researcher can re-send the file as "
+        "user-side vision input"
+    )
+    # The vanilla "vision content block" wording from the canonical
+    # description must NOT be in the OpenAI variant — that's the
+    # invitation to a guaranteed failed tool call.
+    assert "vision content block" not in desc
