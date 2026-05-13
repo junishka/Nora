@@ -171,9 +171,9 @@ def delete_credential(provider: str) -> dict[str, object]:
             return {
                 "ok": False,
                 "reason": (
-                    "keyring backend is unavailable; could not confirm "
-                    "current credential state — try again once the "
-                    "system store is reachable"
+                    "keyring backend is unavailable. Could not confirm "
+                    "current credential state. Try again once the "
+                    "system store is reachable."
                 ),
             }
         _CRED_CACHE[provider] = None

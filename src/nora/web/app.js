@@ -503,7 +503,7 @@ function showChat(payload) {
   // above for the rationale.
   cwdEl.textContent = formatCwd(payload.cwd || '');
   cwdEl.title = payload.cwd
-    ? payload.cwd + ' — click to open in Finder'
+    ? payload.cwd + '. Click to open in Finder.'
     : '';
 
   // Mark this session as the focused one. Subsequent
@@ -820,7 +820,7 @@ landingEl.addEventListener('drop', async (e) => {
     setLandingError(
       formatDragDropOversizeReason(
         oversize,
-        'Use Choose Files… below — it copies directly from disk ' +
+        'Use Choose Files… below. It copies directly from disk ' +
           'with no memory overhead, so there is no size limit.',
       ),
     );
@@ -990,9 +990,9 @@ function renderAttachments() {
     const isScript = ['py', 'do', 'r', 'rmd'].includes(ext);
     if (isScript) {
       chip.classList.add('compose-attachment-script');
-      chip.title = name + ' — saved in this session and sent with your next message';
+      chip.title = name + '. Saved in this session and sent with your next message.';
     } else {
-      chip.title = name + ' — copied into the session';
+      chip.title = name + '. Copied into the session.';
     }
     const label = document.createElement('span');
     label.className = 'compose-attachment-filename';
@@ -1039,7 +1039,7 @@ async function stageImageFile(file) {
     return false;
   }
   if (file.size > MAX_IMAGE_BYTES) {
-    appendError('Image too large — max 5 MB per file.');
+    appendError('Image too large. Max 5 MB per file.');
     return false;
   }
   const data = await new Promise((resolve, reject) => {
@@ -1103,7 +1103,7 @@ async function stageDataFile(file) {
     appendError(
       formatDragDropOversizeReason(
         file,
-        'Use the + button next to the composer instead — it opens ' +
+        'Use the + button next to the composer instead. It opens ' +
           'the native picker and copies directly from disk with no ' +
           'size limit.',
       ),
@@ -1218,7 +1218,7 @@ if (form) {
     if (skipped.length > 0) {
       appendError(
         'Skipped: ' + skipped.map((f) => f.name).join(', ') +
-        ' — only images and data/script files (.csv, .tsv, .dta, .rds, .parquet, .jsonl, .do, .r, .py, .ipynb, .log, .smcl, .gph, .rmd) can be dropped here.'
+        '. Only images and data/script files (.csv, .tsv, .dta, .rds, .parquet, .jsonl, .do, .r, .py, .ipynb, .log, .smcl, .gph, .rmd) can be dropped here.'
       );
     }
     for (const file of usable) {
@@ -1805,7 +1805,7 @@ form.addEventListener('submit', async (e) => {
   // pending.
   if (turnInFlight) {
     userEl.classList.add('queued');
-    userEl.title = 'Queued — will send when the current turn finishes.';
+    userEl.title = 'Queued. Will send when the current turn finishes.';
     // Freeze the runner's current pending_* lists into a per-message
     // snapshot. The bridge clears the runner's pending state, so any
     // attachments the user stages NEXT (for a later queued message)
@@ -2539,33 +2539,57 @@ function append(kind, text, markdown, attachments, images) {
       const chip = document.createElement('span');
       chip.className = 'message-attachment-chip';
       chip.textContent = '📎 ' + name;
-      chip.title = name + ' — sent with this message';
+      chip.title = name + '. Sent with this message.';
       row.appendChild(chip);
     });
     wrapper.appendChild(row);
   }
   messagesEl.appendChild(wrapper);
   if (kind === 'assistant') {
-    // Top-align the new reply so a long answer is read from its
-    // beginning, not from its bottom. scrollToBottom() would land
-    // the researcher at the LAST line of the answer and force them
-    // to scroll back up to the first sentence — exactly the wrong
-    // direction for prose. Other message kinds (user, system,
-    // error) still pin to the bottom: a user message pairs with
-    // the empty composer below it, and system / error notices are
-    // usually short status lines.
+    // Anchor on the user's own preceding message so the researcher
+    // sees what they asked at the top of the viewport, then the
+    // reply right below. Scrolling to the assistant bubble's top
+    // landed them on the second line of the answer and dropped
+    // their own question off-screen — confusing for "what did I
+    // just ask?" review. Falls back to top-anchoring the reply
+    // itself if no preceding user message exists (the first turn
+    // of a session that opens with an assistant greeting). Other
+    // message kinds (user, system, error) still pin to the
+    // bottom: a user message pairs with the empty composer below
+    // it, and system / error notices are usually short status
+    // lines.
     //
-    // Remember this wrapper so the turn_done handler can re-anchor
-    // to it AFTER the loading indicator is removed. Without that
-    // re-anchor, hiding the cat shifts everything up by ~80px and
-    // the answer's first line scrolls off the top of the viewport.
-    pendingAssistantTopAnchor = wrapper;
-    scrollMessageToTop(wrapper);
+    // Remember the anchor element so the turn_done handler can
+    // re-apply the scroll AFTER the loading indicator is removed.
+    // Without that re-anchor, hiding the cat shifts everything up
+    // by ~80px and the chosen anchor scrolls off the top.
+    const anchor = findPrecedingUserMessage(wrapper) || wrapper;
+    pendingAssistantTopAnchor = anchor;
+    scrollMessageToTop(anchor);
   } else {
     if (kind === 'user') pendingAssistantTopAnchor = null;
     scrollToBottom();
   }
   return wrapper;
+}
+
+function findPrecedingUserMessage(wrapper) {
+  /* Walk backwards through ``messagesEl`` siblings looking for the
+   * nearest user bubble preceding ``wrapper``. Used by the new-
+   * reply anchor logic so the researcher sees their own question
+   * above the reply, not just the reply.
+   *
+   * Returns ``null`` when nothing matches (rare — only at session
+   * start before the researcher has typed anything, or when the
+   * provider emits an assistant message without a preceding user
+   * turn).
+   */
+  let prev = wrapper.previousElementSibling;
+  while (prev) {
+    if (prev.classList && prev.classList.contains('user')) return prev;
+    prev = prev.previousElementSibling;
+  }
+  return null;
 }
 
 // Set when we top-align a new assistant reply; the turn_done handler
@@ -3669,7 +3693,7 @@ async function runEditedMessage(wrapper) {
   if (!textarea) return;
   const newText = textarea.value.trim();
   if (!newText) {
-    toast('Edited message is empty — type something or click Cancel.', 'info');
+    toast('Edited message is empty. Type something or click Cancel.', 'info');
     return;
   }
   if (!window.pywebview || !window.pywebview.api) return;
@@ -3717,7 +3741,7 @@ async function runEditedMessage(wrapper) {
     const msg = (
       'This message originally included ' + parts.join(' and ') + '.\n\n'
       + 'Editing and re-running will send the new text WITHOUT those '
-      + 'attachments — the rerun is therefore a different request than '
+      + 'attachments. The rerun is therefore a different request than '
       + 'the original. To keep the attachments, cancel here and resend '
       + 'a new message instead.\n\n'
       + 'Continue without attachments?'
@@ -3801,7 +3825,7 @@ async function runEditedMessage(wrapper) {
 
   if (res.hidden_count > 0) {
     toast(
-      'Edited message — ' + res.hidden_count + ' prior result'
+      'Edited message. ' + res.hidden_count + ' prior result'
       + (res.hidden_count === 1 ? '' : 's')
       + ' hidden from model context.',
       'success',
@@ -5060,7 +5084,7 @@ function friendlyAddFilesError(raw) {
     return "Couldn't open the file picker. Try restarting Nora.";
   }
   if (/no active session/i.test(s)) {
-    return 'Start a session first — drop files or pick a folder from the landing screen.';
+    return 'Start a session first. Drop files or pick a folder from the landing screen.';
   }
   if (/window not ready/i.test(s)) {
     return 'Nora is still starting up. Try again in a moment.';
@@ -5149,7 +5173,13 @@ const feedbackEmailEl = document.getElementById('feedback-email');
 function openFeedback() {
   if (!feedbackOverlay) return;
   feedbackOverlay.classList.remove('hidden');
-  if (feedbackMessageEl) {
+  // Focus the subject line — that's the natural starting field
+  // (write the headline, then expand into the body). Landing the
+  // caret in the body box first forced the researcher to tab
+  // backwards to fill in the subject.
+  if (feedbackSubjectEl) {
+    feedbackSubjectEl.focus();
+  } else if (feedbackMessageEl) {
     feedbackMessageEl.focus();
   }
 }
