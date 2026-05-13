@@ -218,6 +218,171 @@ def test_python_remove_refuses_package_not_in_nora_target(
     assert statuses2_by_name["site_only"].status == "skipped"
 
 
+@pytest.mark.parametrize("name", [
+    "nora",
+    "Nora",
+    "NORA",
+])
+def test_python_install_refuses_nora_distribution_name(
+    name: str, tmp_path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The Python ``nora`` helper module (``nora.from_lm``,
+    ``nora.result``, ``nora.plot_*``) is staged onto every script's
+    sys.path by the executor preamble. A model that calls
+    ``install_packages(language='Python', packages=['nora'])`` is
+    confused: there's nothing to fetch (the helpers are already
+    importable), and the literal ``nora`` distribution on PyPI is an
+    unrelated empty placeholder owned by another author (~1 KB,
+    metadata only, no module code). Installing it does not provide
+    the helpers and leaves a useless ``.dist-info`` in the Nora pkg
+    dir.
+
+    The guard rejects the name (PEP 503 normalised: case-folded,
+    ``-``/``_``/``.`` collapsed) at the installer boundary BEFORE pip
+    ever launches, and surfaces a ``skipped`` per-package status with
+    the instruction to just ``import nora``.
+    """
+    import asyncio
+    monkeypatch.setenv(
+        "NORA_PYTHON_PKG_BASE", str(tmp_path / "nora-pkgs"),
+    )
+    from nora.package_installer import InstallResult, install_packages
+    import nora.env_detect as _env_detect
+    from nora.env_detect import Environment, Tool
+
+    fake_env = Environment(
+        python=Tool(
+            name="Python", binary="/usr/bin/python3",
+            version="Python 3.12.0",
+            missing_packages=(), optional_missing_packages=(),
+            extra_read_paths=(),
+        ),
+        r=None, stata=None, sandbox_exec=None,
+    )
+    monkeypatch.setattr(_env_detect, "detect_environment", lambda: fake_env)
+
+    # Track every pip subprocess that gets launched — must remain
+    # empty for the nora-only case.
+    pip_launched: list[list[str]] = []
+    import subprocess as _subprocess
+    real_popen = _subprocess.Popen
+
+    def _fake_popen(cmd, **kwargs):  # type: ignore[no-untyped-def]
+        is_install_call = kwargs.get("start_new_session")
+        is_pip = (
+            isinstance(cmd, list)
+            and len(cmd) >= 3
+            and cmd[1] == "-m"
+            and cmd[2] == "pip"
+        )
+        if is_install_call and is_pip:
+            pip_launched.append(list(cmd))
+
+            class _FakePopen:
+                pid = -1
+                returncode = 0
+
+                def communicate(self, input=None, timeout=None):  # noqa: ARG002
+                    return ("", "")
+
+                def kill(self) -> None:  # pragma: no cover
+                    pass
+
+            return _FakePopen()
+        return real_popen(cmd, **kwargs)
+    monkeypatch.setattr(_subprocess, "Popen", _fake_popen)
+
+    result = asyncio.run(install_packages(
+        language="Python", packages=[name], action="install",
+    ))
+
+    assert isinstance(result, InstallResult)
+    assert pip_launched == [], (
+        f"pip must NOT launch for the {name!r} distribution name — "
+        "the runtime helpers are preloaded by the executor preamble"
+    )
+    assert result.error is not None
+    statuses_by_name = {s.name: s for s in result.statuses}
+    assert name in statuses_by_name
+    blocked = statuses_by_name[name]
+    assert blocked.status == "skipped"
+    assert "import nora" in blocked.detail
+    assert "placeholder" in blocked.detail
+
+
+def test_python_install_blocks_nora_alongside_legitimate_packages(
+    tmp_path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Mixed-list case: a model request like ``['pandas', 'nora']``
+    must let ``pandas`` through to pip while ``nora`` is filtered
+    out as ``skipped``. Don't tank the entire call because of one
+    bad name."""
+    import asyncio
+    monkeypatch.setenv(
+        "NORA_PYTHON_PKG_BASE", str(tmp_path / "nora-pkgs"),
+    )
+    from nora.package_installer import install_packages
+    import nora.env_detect as _env_detect
+    from nora.env_detect import Environment, Tool
+
+    fake_env = Environment(
+        python=Tool(
+            name="Python", binary="/usr/bin/python3",
+            version="Python 3.12.0",
+            missing_packages=(), optional_missing_packages=(),
+            extra_read_paths=(),
+        ),
+        r=None, stata=None, sandbox_exec=None,
+    )
+    monkeypatch.setattr(_env_detect, "detect_environment", lambda: fake_env)
+
+    pip_launched: list[list[str]] = []
+    import subprocess as _subprocess
+    real_popen = _subprocess.Popen
+
+    def _fake_popen(cmd, **kwargs):  # type: ignore[no-untyped-def]
+        is_install_call = kwargs.get("start_new_session")
+        is_pip = (
+            isinstance(cmd, list)
+            and len(cmd) >= 3
+            and cmd[1] == "-m"
+            and cmd[2] == "pip"
+        )
+        if is_install_call and is_pip:
+            pip_launched.append(list(cmd))
+
+            class _FakePopen:
+                pid = -1
+                returncode = 0
+
+                def communicate(self, input=None, timeout=None):  # noqa: ARG002
+                    return ("", "")
+
+                def kill(self) -> None:  # pragma: no cover
+                    pass
+
+            return _FakePopen()
+        return real_popen(cmd, **kwargs)
+    monkeypatch.setattr(_subprocess, "Popen", _fake_popen)
+
+    result = asyncio.run(install_packages(
+        language="Python", packages=["pandas", "nora"], action="install",
+    ))
+
+    assert len(pip_launched) == 1, (
+        "exactly one pip invocation expected — for pandas only"
+    )
+    pip_argv = pip_launched[0]
+    assert "pandas" in pip_argv
+    assert "nora" not in pip_argv, (
+        "the nora name leaked into the pip argv — guard must run "
+        "before pip dispatch"
+    )
+    statuses_by_name = {s.name: s for s in result.statuses}
+    assert statuses_by_name["nora"].status == "skipped"
+    assert statuses_by_name["pandas"].status == "ok"
+
+
 def test_python_remove_handles_pep503_name_normalization(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:

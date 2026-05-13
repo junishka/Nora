@@ -101,7 +101,7 @@ Stata (runtime on adopath):
   nora_result_magnitude <group> <value>, aggregation(sum|mean), label("...")
   nora_result_correlation <varlist>, method(pearson|spearman|kendall), label("...")
 
-Python (pandas + numpy, statsmodels for OLS, scipy for t-tests):
+Python (pandas + numpy, statsmodels for OLS, scipy for t-tests). The `nora` runtime is preloaded into every script's sys.path; do NOT call `install_packages` with `nora` (the distribution by that name on PyPI is an unrelated empty placeholder):
   import nora
   nora.from_lm(model)                          # statsmodels result; sklearn → nora.result(...)
   nora.from_t_test(res, n1=..., n2=..., mean1=..., mean2=..., test_type="welch")
