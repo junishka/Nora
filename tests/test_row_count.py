@@ -297,3 +297,96 @@ def test_row_count_csv_with_quoted_multiline_field(tmp_path: Path) -> None:
         "embedded \\n inside quoted CSV fields must not bump the row "
         "count — that would false-flag the submit_script audit"
     )
+
+
+# ---------------------------------------------------------------------------
+# names_only fast path must agree with row_count on header detection
+# ---------------------------------------------------------------------------
+
+def test_names_only_headerless_csv_does_not_consume_data_as_header(
+    tmp_path: Path,
+) -> None:
+    """A headerless numeric CSV used to come back through the
+    ``names_only`` fast path with variable names ``["1","2","3"]``
+    (pandas' default ``header='infer'`` consumed row 1 as a header)
+    AND ``observation_count=2`` (from ``row_count``, which correctly
+    detected the lack of a header).
+
+    Two surfaces of the schema response disagreed about the same
+    file: the variable list said row 1 was a column name, the row
+    count said it was data. Share ``_csv_has_header`` between the two
+    so they agree: variables are auto-generated placeholders
+    (``0,1,2…``) and observation_count covers every line.
+    """
+    from nora.schema import extract
+
+    # Use values that don't overlap with pandas' integer-placeholder
+    # names (0, 1, 2…) so the "names look like placeholders, not data"
+    # assertion is unambiguous.
+    p = tmp_path / "no_header.csv"
+    p.write_text("100,200,300\n400,500,600\n")
+
+    res = extract(p, depth="names_only")
+    assert res["status"] == "ok"
+    # Variables must NOT be ``["100","200","300"]`` — that would mean
+    # row 1 got silently promoted to column names against the header
+    # heuristic's verdict.
+    names = [v["name"] for v in res["variables"]]
+    for data_value in ("100", "200", "300"):
+        assert data_value not in names, (
+            f"headerless CSV must not surface its first data row as column "
+            f"names; got {names}"
+        )
+    # Pandas ``header=None`` produces integer placeholders 0..n-1,
+    # which ``safe_key`` stringifies. Confirm the response carries
+    # exactly those placeholders for a 3-column file.
+    assert names == ["0", "1", "2"], (
+        f"headerless CSV should fall back to pandas' integer "
+        f"placeholders; got {names}"
+    )
+    assert res["observation_count"] == 2, (
+        f"both data rows must be counted; got "
+        f"{res['observation_count']}"
+    )
+
+
+def test_names_only_headered_csv_still_uses_first_row_as_names(
+    tmp_path: Path,
+) -> None:
+    """Don't regress the headered case — the fast path must still
+    detect ``id,name,value`` style headers and surface them as the
+    variable list. Mixed-type first rows are the common case for
+    research CSVs; the headerless branch only applies to all-numeric
+    first records."""
+    from nora.schema import extract
+
+    p = tmp_path / "with_header.csv"
+    p.write_text("id,score,year\n1,3.14,2020\n2,2.71,2021\n3,1.41,2022\n")
+    res = extract(p, depth="names_only")
+    assert res["status"] == "ok"
+    names = [v["name"] for v in res["variables"]]
+    assert names == ["id", "score", "year"]
+    assert res["observation_count"] == 3
+
+
+def test_names_only_headerless_tsv_matches_row_count(tmp_path: Path) -> None:
+    """Mirror of the CSV test for TSV — the fast path shares the
+    same heuristic, so headerless TSVs must not have row 1 consumed
+    as a header either."""
+    from nora.schema import extract, row_count
+
+    # Same numeric-overlap caveat as the CSV test — pick values that
+    # can't collide with pandas' 0-indexed integer placeholders.
+    p = tmp_path / "no_header.tsv"
+    p.write_text("100\t200\t300\n400\t500\t600\n700\t800\t900\n")
+
+    rc = row_count(p)
+    res = extract(p, depth="names_only")
+    assert res["observation_count"] == rc, (
+        f"names_only fast path and row_count must agree on the same "
+        f"file: fast path says {res['observation_count']}, "
+        f"row_count says {rc}"
+    )
+    names = [v["name"] for v in res["variables"]]
+    for data_value in ("100", "200", "300"):
+        assert data_value not in names

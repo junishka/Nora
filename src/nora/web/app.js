@@ -561,7 +561,12 @@ function showChat(payload) {
     contextChip.classList.remove('stale');
   }
 
-  replayHistory();
+  // Pass the cwd we just committed to so replay can abandon if the
+  // user has already switched again by the time the history fetch
+  // resolves. Without the guard, two quick A→B switches race the
+  // get_chat_history responses and a late-arriving A history paints
+  // into B's transcript.
+  replayHistory(currentCwd);
   rotatePlaceholder();
   input.focus();
 }
@@ -590,11 +595,28 @@ function queueDisposableTurn(nodes) {
   if (kept.length > 0) staleTranscriptTurns.push(kept);
 }
 
-async function replayHistory() {
+async function replayHistory(expectedCwd) {
+  /* ``expectedCwd`` pins which session this replay belongs to. After
+   * the ``get_chat_history`` await resolves, we compare against the
+   * live ``currentCwd`` and abandon if it changed — that means the
+   * researcher switched again while our fetch was in flight, and a
+   * fresher ``replayHistory`` call is already (or about to be)
+   * painting the new session's transcript. Without this guard, a
+   * late-arriving response wipes ``messagesEl`` and paints the
+   * previous session's history into the now-focused session's view
+   * (the response carries whichever cwd was active at call time;
+   * pywebview RPC ordering doesn't preserve issue order).
+   *
+   * Callers that don't pass an explicit cwd default to the live
+   * ``currentCwd`` — same effect as the pre-guard behaviour, plus
+   * the guard is a no-op (expected matches live).
+   */
+  if (expectedCwd === undefined) expectedCwd = currentCwd;
   if (!window.pywebview || !window.pywebview.api) return;
   if (typeof window.pywebview.api.get_chat_history !== 'function') return;
   try {
     const res = await window.pywebview.api.get_chat_history();
+    if (expectedCwd !== currentCwd) return;
     if (!res || !res.ok) return;
     const events = res.events || [];
     // Always wipe the existing transcript before painting from
@@ -836,11 +858,11 @@ landingEl.addEventListener('drop', async (e) => {
   }
   // Aggregate cap: each file passes the per-file cap (above), but
   // the loop below accumulates every file's base64 string in
-  // memory before calling upload_files. Five 400 MB files would
-  // each pass the per-file cap yet hold ~3 GB of base64 in the JS
+  // memory before calling upload_files. Two 800 MB files would
+  // each pass the per-file cap yet hold ~2.1 GB of base64 in the JS
   // heap concurrently, freezing or crashing the page. Bound the
   // total too. Same threshold as per-file so the user sees a
-  // consistent rule: "the drag-drop path can move up to 512 MB at
+  // consistent rule: "the drag-drop path can move up to 1 GB at
   // a time, regardless of how many files."
   const aggregateBytes = accepted.reduce((s, f) => s + f.size, 0);
   if (aggregateBytes > MAX_DRAG_DROP_BYTES) {
@@ -858,7 +880,7 @@ landingEl.addEventListener('drop', async (e) => {
   try {
     // Read serially with a progress message so large drops don't
     // look frozen. readAsDataURL loads the whole file into memory —
-    // size gated above, so the worst case here is one ~512 MB read.
+    // size gated above, so the worst case here is one ~1 GB read.
     const payload = [];
     for (let i = 0; i < accepted.length; i++) {
       const file = accepted[i];
@@ -928,19 +950,19 @@ const ALLOWED_IMAGE_MIMES = new Set([
 const MAX_IMAGE_BYTES = 5 * 1024 * 1024;  // 5 MB per image (Anthropic limit ballpark)
 
 // Drag-drop / paste cap on data and script files. The Python backend
-// caps the same path at 2 GB, but the FileReader → base64 → bridge →
-// decode chain peaks at roughly 3–4× the file size in memory. A 1 GB
-// drop would peak around 3.4 GB on the JS heap alone, which the
-// pywebview bridge handles slowly and which can swap a 16 GB Mac
-// while we're holding it. 512 MB keeps the peak under ~2 GB even in
-// the worst case (base64 string + decoded bytes coexisting in memory
-// during the bridge transfer) — comfortable on any modern Mac. Above
-// this, the native file picker (Choose Files… / + button) uses
-// ``shutil.copy2`` and avoids the round-trip entirely; the user
-// switches paths with one click. Picked over the backend's 2 GB cap
-// because rejecting AFTER allocating multiple GB defeats the whole
-// point of a cap.
-const MAX_DRAG_DROP_BYTES = 512 * 1024 * 1024;
+// enforces the same cap (``_DRAG_DROP_MAX_BYTES`` in ui.py); both
+// sides must move together. The FileReader → base64 → bridge → decode
+// chain peaks at roughly 3–4× the file size in memory, so 1 GB peaks
+// around 3–4 GB across the JS heap and the bridge transfer. That's
+// fine on a 16 GB Mac and tight (but workable) on 8 GB during the
+// transfer window — researchers on entry-tier hardware with multi-GB
+// datasets should prefer the native file picker (Choose Files… /
+// + button), which uses ``shutil.copy2`` and avoids the in-memory
+// round-trip entirely. Above this cap, drag-drop is rejected with a
+// clear hint pointing at that path. Picking the same cap on both
+// sides means rejecting BEFORE allocating multiple GB — rejecting
+// after the bridge transfer defeats the whole point of a cap.
+const MAX_DRAG_DROP_BYTES = 1024 * 1024 * 1024;
 
 function formatDragDropOversizeReason(file, hint) {
   const mb = Math.round(file.size / (1024 * 1024));
@@ -1241,7 +1263,7 @@ if (form) {
         // passed the vision cap. Earlier code unconditionally ran
         // both, so a 100 MB screenshot rejected by the 5 MB vision
         // cap STILL got FileReader-base64'd and bridge-sent under
-        // the 512 MB drag-drop cap, freezing the UI on the very
+        // the 1 GB drag-drop cap, freezing the UI on the very
         // payload the image cap was meant to refuse. Treat the
         // image cap as the floor for both paths.
         const accepted = await stageImageFile(file);
@@ -2583,9 +2605,13 @@ function append(kind, text, markdown, attachments, images) {
 
 function findPrecedingUserMessage(wrapper) {
   /* Walk backwards through ``messagesEl`` siblings looking for the
-   * nearest user bubble preceding ``wrapper``. Used by the new-
-   * reply anchor logic so the researcher sees their own question
-   * above the reply, not just the reply.
+   * nearest user bubble that DROVE this reply. Skip ``.queued`` and
+   * ``.not-sent`` user bubbles: those sit in the DOM ahead of the
+   * reply (queued ones haven't fired yet; cancelled ones never will),
+   * so DOM proximity would otherwise mis-anchor the reply under a
+   * later prompt that the model never saw. Example: A is in flight,
+   * the researcher queues B, A's reply arrives — without the filter
+   * the reply would anchor under B's prompt, not A's.
    *
    * Returns ``null`` when nothing matches (rare — only at session
    * start before the researcher has typed anything, or when the
@@ -2594,7 +2620,14 @@ function findPrecedingUserMessage(wrapper) {
    */
   let prev = wrapper.previousElementSibling;
   while (prev) {
-    if (prev.classList && prev.classList.contains('user')) return prev;
+    if (
+      prev.classList
+      && prev.classList.contains('user')
+      && !prev.classList.contains('queued')
+      && !prev.classList.contains('not-sent')
+    ) {
+      return prev;
+    }
     prev = prev.previousElementSibling;
   }
   return null;
@@ -3536,6 +3569,28 @@ const ICON_SVG = {
     'd="M9 2h5v5M14 2L7 9M3 4h3M3 4v9h9v-3"/>' +
     '</svg>'
   ),
+  // Pushpin glyphs — paired so pinned vs unpinned read distinctly at
+  // a glance in the sidebar. ``pin`` is the outlined "click to pin"
+  // affordance (only the cap stroke + the needle line). ``pinFilled``
+  // is the engaged state — same silhouette but solid, so it carries
+  // visual weight against the row's body text and the researcher can
+  // spot which sessions are pinned without reading hover titles.
+  pin: (
+    '<svg viewBox="0 0 24 24" width="14" height="14" fill="none" ' +
+    'stroke="currentColor" stroke-width="1.8" stroke-linecap="round" ' +
+    'stroke-linejoin="round" aria-hidden="true">' +
+    '<path d="M9 3h6v4l3 4H6l3-4V3z"></path>' +
+    '<line x1="12" y1="11" x2="12" y2="20"></line>' +
+    '</svg>'
+  ),
+  pinFilled: (
+    '<svg viewBox="0 0 24 24" width="14" height="14" ' +
+    'fill="currentColor" stroke="currentColor" stroke-width="1.8" ' +
+    'stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">' +
+    '<path d="M9 3h6v4l3 4H6l3-4V3z"></path>' +
+    '<line x1="12" y1="11" x2="12" y2="20"></line>' +
+    '</svg>'
+  ),
 };
 
 function iconSvg(name) {
@@ -4406,7 +4461,20 @@ function showInstallConfirmationModal(evt) {
   });
   const onKey = (e) => {
     if (e.key === 'Escape') respond(false);
-    if (e.key === 'Enter' && !e.shiftKey) respond(true);
+    // Enter MUST NOT unconditionally approve. The modal focuses
+    // Deny by default (see ``denyBtn.focus()`` below), and an
+    // unguarded ``Enter → respond(true)`` contradicted that — a
+    // researcher hitting Enter on the focused Deny button got an
+    // Approve anyway, which is the opposite of what every native
+    // dialog convention promises. Only approve if Approve actually
+    // has keyboard focus (the researcher Tabbed to it deliberately).
+    // Native button activation on the focused element handles the
+    // visual case correctly without this branch; the explicit gate
+    // is here so a focus change that happens between events still
+    // routes correctly.
+    if (e.key === 'Enter' && document.activeElement === approveBtn) {
+      respond(true);
+    }
   };
   document.addEventListener('keydown', onKey);
   document.body.appendChild(overlay);
@@ -4621,14 +4689,36 @@ function renderSessions(sessions, currentPath) {
     return;
   }
   sessions.forEach((s) => {
-    // Each row: the clickable session body on the left (switches
-    // cwd), a trash button on the right (deletes). The trash button
-    // is a sibling rather than a nested child so its click doesn't
-    // bubble to the switch handler.
+    // Each row: a pin toggle on the far left, the clickable session
+    // body in the middle (switches cwd), rename + trash on the right.
+    // Every action button is a sibling of the session-item button
+    // rather than a nested child — putting interactives inside the
+    // <button> is invalid nesting AND would make their clicks bubble
+    // into the switch handler.
     const row = document.createElement('div');
     row.className = 'session-row';
     if (s.path === currentPath) row.classList.add('active');
+    if (s.pinned) row.classList.add('pinned');
     row.title = s.path;
+
+    // Pin toggle — leftmost. Two visually distinct icons make pinned
+    // vs unpinned readable at a glance without reading the title
+    // attribute, and the row is also tagged ``.pinned`` so we can
+    // also hint with a subtle background/weight change in CSS.
+    const pinBtn = document.createElement('button');
+    pinBtn.type = 'button';
+    pinBtn.className = 'session-pin';
+    if (s.pinned) pinBtn.classList.add('is-pinned');
+    pinBtn.setAttribute(
+      'aria-label', s.pinned ? 'Unpin session' : 'Pin session to top'
+    );
+    pinBtn.title = s.pinned ? 'Unpin from top' : 'Pin to top';
+    pinBtn.innerHTML = iconSvg(s.pinned ? 'pinFilled' : 'pin');
+    pinBtn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      toggleSessionPinned(s.path, !s.pinned);
+    });
+    row.appendChild(pinBtn);
 
     const btn = document.createElement('button');
     btn.type = 'button';
@@ -4720,6 +4810,42 @@ function formatBytes(n) {
   if (n < 1024 * 1024) return (n / 1024).toFixed(0) + ' KB';
   if (n < 1024 * 1024 * 1024) return (n / (1024 * 1024)).toFixed(1) + ' MB';
   return (n / (1024 * 1024 * 1024)).toFixed(2) + ' GB';
+}
+
+async function toggleSessionPinned(path, pinned) {
+  /* Flip a session's pin-to-top flag through the bridge. The bridge
+   * stamps ``pinned_at`` on the pin transition so the sort within
+   * the pinned group surfaces the most-recently-pinned row first,
+   * matching the researcher's most likely "I just pinned this, where
+   * did it go" expectation.
+   *
+   * On success we re-fetch the session list rather than mutating the
+   * row in place: a pin reorders the panel, which is easier to do
+   * correctly from a fresh list_sessions render than by splicing the
+   * existing DOM. The round-trip is cheap (list_sessions is a
+   * directory walk).
+   */
+  if (!path) return;
+  if (!window.pywebview || !window.pywebview.api) return;
+  if (typeof window.pywebview.api.set_session_pinned !== 'function') {
+    toast('Restart Nora to enable session pinning.', 'info');
+    return;
+  }
+  try {
+    const res = await window.pywebview.api.set_session_pinned(path, pinned);
+    if (!res || !res.ok) {
+      toast(
+        'Pin failed: ' + ((res && res.reason) || 'unknown'),
+        'error',
+      );
+      return;
+    }
+  } catch (err) {
+    console.warn('set_session_pinned failed', err);
+    toast('Pin failed: ' + (err && err.message ? err.message : err), 'error');
+    return;
+  }
+  if (typeof loadSessions === 'function') loadSessions();
 }
 
 async function deleteSession(s, isCurrent) {
@@ -4906,6 +5032,28 @@ async function switchSession(path, isCurrent) {
     // backend process hasn't been restarted since this code landed.
     toast('Restart Nora to enable session switching.', 'info');
     return;
+  }
+  // Clear the LEAVING session's backend pending lists. ``showChat``
+  // wipes the JS-side staged composer state (image thumbs, data
+  // notices, mention chips) on the way in to the new session — but
+  // the runner's ``pending_*`` lists are per-cwd and survive a focus
+  // switch. Without this call, a script attachment / @-mention
+  // staged in A but never sent rides invisibly with the next plain
+  // message in A: the UI shows no chip, the backend silently
+  // inlines the file. Best-effort: a missing bridge method or a
+  // failing RPC just means we keep the prior behaviour, not a
+  // hard error.
+  const leavingCwd = currentCwd;
+  if (
+    leavingCwd
+    && leavingCwd !== path
+    && typeof window.pywebview.api.clear_pending_for_session === 'function'
+  ) {
+    try {
+      await window.pywebview.api.clear_pending_for_session(leavingCwd);
+    } catch (err) {
+      console.warn('clear_pending_for_session failed', err);
+    }
   }
   try {
     const res = await window.pywebview.api.switch_session(path);

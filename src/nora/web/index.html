@@ -14,17 +14,14 @@
   <meta http-equiv="Pragma" content="no-cache" />
   <meta http-equiv="Expires" content="0" />
   <title>Nora</title>
-  <!-- Lexend: research-backed, designed for reading proficiency —
-       letter shapes are spaced and proportioned to reduce visual
-       noise, which helps dyslexic readers (and everyone else). Loads
-       from Google Fonts when online; falls back to system UI fonts
-       offline, so the app stays usable on a locked-down network. -->
-  <link rel="preconnect" href="https://fonts.googleapis.com" />
-  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
-  <link
-    href="https://fonts.googleapis.com/css2?family=Lexend:wght@300;400;500;600;700&display=swap"
-    rel="stylesheet"
-  />
+  <!-- System UI font stack only. Earlier builds pulled Lexend from
+       Google Fonts (preconnect + stylesheet to fonts.googleapis.com /
+       fonts.gstatic.com), but Nora positions itself as a local
+       privacy-layer for sensitive analysis — a first-launch network
+       call to Google for fonts contradicts that posture, even though
+       it's metadata-only. Using the platform's native UI face keeps
+       launches offline-clean and avoids a connection a security-
+       minded reviewer would flag. -->
   <link rel="stylesheet" href="style.css" />
 </head>
 <body>
@@ -155,7 +152,7 @@
             <line x1="12" y1="3" x2="12" y2="15"/>
           </svg>
           <p class="drop-zone-hint">Drop .csv, .tsv, .dta, .rds, .parquet, or .jsonl files</p>
-          <p class="drop-zone-sub">For files larger than 2 GB, use Choose files</p>
+          <p class="drop-zone-sub">For files larger than 1 GB, use Choose files</p>
         </div>
       </div>
 

@@ -2,7 +2,7 @@
 
 ## What you'll need
 
-- **A Mac** — macOS 11 (Big Sur) or later, Intel or Apple Silicon.
+- **A Mac** — Apple Silicon (M1 or later), macOS 11 (Big Sur) or later. The released `.dmg` ships an arm64 binary; Intel Macs aren't supported yet.
 - **Analysis runtime(s)** — install the tools you want Nora to run:
   R (`Rscript` on PATH), Stata (`stata-mp` / `stata-se` / `stata`
   on PATH or `/Applications/Stata`), or Python with the packages

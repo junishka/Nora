@@ -208,6 +208,17 @@ class OpenAISession:
     # ---- lifecycle -------------------------------------------------------
 
     async def open(self) -> None:
+        """Lazy-build the AsyncOpenAI client if a key is available.
+
+        Missing-key is NOT raised here: the provider contract terminates
+        a turn with an ``AuthFailure`` event, and ``open()`` runs from
+        ``SessionRunner.ensure_session`` BEFORE any event stream
+        exists, so a ``RuntimeError`` at this layer would surface as a
+        generic ``turn_error`` instead. To stay parity with the
+        Anthropic path (whose ``open()`` doesn't fail on missing key
+        either), we no-op here on a missing key and let
+        :meth:`send` yield ``AuthFailure`` on the first round.
+        """
         if self._client is not None:
             return
         # Lazy import: keeps the openai SDK off Anthropic-only code
@@ -221,10 +232,10 @@ class OpenAISession:
             )
         api_key = _resolve_api_key()
         if not api_key:
-            raise RuntimeError(
-                "no OpenAI API key configured. Add one in the auth "
-                "screen or set OPENAI_API_KEY in the environment."
-            )
+            # Defer: ``send()`` checks ``self._client`` and emits
+            # ``AuthFailure`` on the first round, matching how
+            # Anthropic surfaces a missing key.
+            return
         self._client = AsyncOpenAI(api_key=api_key)
         self._tools = build_openai_tools()
         # Lockdown verified at session open AND at every send (defense
@@ -298,7 +309,19 @@ class OpenAISession:
         """
         await self.open()
         client = self._client
-        assert client is not None
+        if client is None:
+            # ``open()`` declined to build a client because no API key
+            # is configured. Yield the provider-neutral ``AuthFailure``
+            # event so the runner emits ``auth_failure`` — same shape
+            # the API-call path uses for 401s further down. Without
+            # this branch a missing key crashed ``ensure_session`` and
+            # surfaced as a generic ``turn_error``, breaking parity
+            # with the Anthropic provider.
+            yield AuthFailure(reason=(
+                "no OpenAI API key configured. Add one in the auth "
+                "screen or set OPENAI_API_KEY in the environment."
+            ))
+            return
 
         # Round-1 input is just the new user message. Subsequent
         # rounds inside this turn carry only the function-call outputs
@@ -360,6 +383,14 @@ class OpenAISession:
                     "input": pending_input,
                     "tools": self._tools,
                     "tool_choice": "auto",
+                    # Pin to True explicitly. The Responses API has
+                    # defaulted this to True historically — and the
+                    # docstring above relies on that — but a silent
+                    # SDK/API default change would otherwise break
+                    # Nora's tool-loop ergonomics without warning.
+                    # Pinning surfaces the dependency at the request
+                    # boundary and the lockdown test asserts it.
+                    "parallel_tool_calls": True,
                     # store=True is required for reasoning models AND
                     # for ``previous_response_id`` chaining: the
                     # server has to retain the prior response object

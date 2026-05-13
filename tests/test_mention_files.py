@@ -272,3 +272,92 @@ def test_unstage_clears_mentioned_files_and_images(tmp_path: Path) -> None:
     bridge.unstage_attachment("fig.png")
     assert bridge._pending_mentioned_images == []
     assert "fig.png" not in bridge._pending_mentioned_files
+
+
+# ---------------------------------------------------------------------------
+# @-mention extends the provenance manifest (folder-backed workflow)
+# ---------------------------------------------------------------------------
+
+def test_attach_session_file_marks_cwd_file_as_known(tmp_path: Path) -> None:
+    """Folder-backed sessions are explicitly meant to be edited
+    outside Nora: the researcher opens a project dir, closes Nora,
+    adds ``analysis_v2.py`` in their editor, reopens Nora. The
+    file_provenance manifest snapshots cwd ONLY on the first open
+    (so sandbox-output written between sessions can't be silently
+    promoted), which means externally-added files end up unknown to
+    ``is_known`` even though they appear in the @-mention dropdown.
+
+    Fix: @-mention IS an explicit researcher action — clicking a row
+    in the dropdown vouches for the file. The bridge's
+    ``attach_session_file`` now folds the cwd top-level target into
+    the manifest, so a subsequent ``read_attached_file`` /
+    ``submit_script_file`` against the same name passes the
+    provenance gate. The model can't trigger @-mention, so this
+    expansion can't be abused to launder sandbox-written files.
+    """
+    from nora.file_provenance import initialize, is_known
+
+    cwd = tmp_path / "project"
+    cwd.mkdir()
+    # First-open snapshot: only this file exists; manifest pins it.
+    (cwd / "original.py").write_text("print(1)", encoding="utf-8")
+    initialize(cwd)
+
+    # Between sessions: researcher adds a new file in their editor.
+    new_file = cwd / "analysis_v2.py"
+    new_file.write_text("import pandas\n", encoding="utf-8")
+
+    # Pre-fix invariant: the new file is NOT in the manifest because
+    # initialize is first-open-only. Without the @-mention hook, the
+    # next read_attached_file would refuse it.
+    assert not is_known(cwd, "analysis_v2.py"), (
+        "test premise: a between-session add is not yet known"
+    )
+
+    bridge = NoraBridge(cwd=cwd)
+    res = bridge.attach_session_file("analysis_v2.py")
+    assert res["ok"] is True
+
+    # After @-mention: the file IS known, so the provenance gate
+    # downstream accepts it.
+    assert is_known(cwd, "analysis_v2.py"), (
+        "@-mention must mark the cwd target as known so a subsequent "
+        "read_attached_file / submit_script_file isn't refused — that "
+        "was the folder-backed-session breakage"
+    )
+
+
+def test_attach_session_file_does_not_mark_run_dir_files(tmp_path: Path) -> None:
+    """The provenance manifest tracks cwd top-level only. Helper
+    plots / run-dir scripts live under ``<cwd>/.nora/runs/<id>/`` and
+    are out of scope for ``is_known`` (it's basename-keyed on cwd
+    top-level). Don't pollute the manifest with run-dir filenames —
+    a top-level file later created with the same basename would
+    then be accepted without a researcher having vouched for it.
+    """
+    from nora.file_provenance import initialize, is_known, known_names
+
+    cwd = tmp_path / "project"
+    cwd.mkdir()
+    initialize(cwd)
+
+    # Stage a helper plot under a run dir, simulating a prior submit_script.
+    run_dir = cwd / ".nora" / "runs" / "r0001"
+    plots_dir = run_dir / "_nora_plots"
+    plots_dir.mkdir(parents=True)
+    plot = plots_dir / "residuals.png"
+    plot.write_bytes(_TINY_PNG)
+
+    bridge = NoraBridge(cwd=cwd)
+    bridge.attach_session_file("residuals.png", path=str(plot))
+
+    # The run-dir plot's basename must NOT enter the cwd manifest —
+    # a future cwd-level write of ``residuals.png`` should NOT inherit
+    # known-status from a same-named run-dir plot the researcher
+    # @-mentioned.
+    assert "residuals.png" not in known_names(cwd), (
+        "@-mention of a run-dir file must not extend the cwd-top-level "
+        "manifest — run-dir basenames overlap is common and would "
+        "launder unknown cwd files"
+    )
+    assert not is_known(cwd, "residuals.png")

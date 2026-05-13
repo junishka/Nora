@@ -47,7 +47,7 @@
   --max-width: 1080px;
   --radius: 12px;
 
-  --font-sans: 'Lexend', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+  --font-sans: system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
   --font-mono: ui-monospace, 'SF Mono', Menlo, monospace;
 }
 
@@ -119,10 +119,9 @@ html, body {
   height: 100vh;
   font-family: var(--font-sans);
   font-size: 16px;
-  line-height: 1.6;   /* Lexend reads best with slightly more leading */
+  line-height: 1.6;
   background: var(--bg);
   color: var(--text);
-  font-feature-settings: "ss01", "ss02";  /* Lexend readable variants */
 }
 
 body {
@@ -1077,13 +1076,72 @@ kbd {
   overflow: hidden;
   padding: 8px 10px;
   border: none;
-  border-radius: 7px 0 0 7px;
+  border-radius: 0;
   background: transparent;
   color: var(--text);
   font-family: inherit;
   font-size: 13px;
   text-align: left;
   cursor: pointer;
+}
+
+/* Pin toggle sits on the FAR LEFT of the row, ahead of the title.
+ * Unpinned rows show it dimmed-and-hover-revealed (matches the rename
+ * / delete pattern so the row's resting state stays calm). Pinned
+ * rows keep it always-visible at full strength so the researcher can
+ * spot pinned items at a glance, AND the filled icon variant
+ * reinforces the engaged state in a way the outlined icon never
+ * does. */
+.session-pin {
+  flex: 0 0 auto;
+  width: 24px;
+  align-self: stretch;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+  border: none;
+  background: transparent;
+  color: var(--text-dim);
+  line-height: 1;
+  cursor: pointer;
+  border-radius: 7px 0 0 7px;
+  transition: color 0.15s, background 0.15s, opacity 0.15s;
+  opacity: 0;
+}
+
+.session-pin.is-pinned {
+  opacity: 1;
+  color: var(--accent);
+}
+
+.session-row:hover .session-pin,
+.session-row:focus-within .session-pin,
+.session-row.active .session-pin {
+  opacity: 1;
+}
+
+.session-pin:hover {
+  color: var(--text);
+  background: rgba(0, 0, 0, 0.05);
+}
+
+.session-pin.is-pinned:hover {
+  color: var(--accent);
+}
+
+@media (prefers-color-scheme: dark) {
+  .session-pin:hover {
+    background: rgba(255, 255, 255, 0.05);
+  }
+}
+
+/* Pinned rows get a soft tint so the pinned group reads as a
+ * visually distinct cluster at the top of the panel even before the
+ * eye lands on the icon. Subtle enough not to compete with the
+ * active-row tint. */
+.session-row.pinned:not(.active) {
+  background: var(--accent-soft);
 }
 
 /* Busy dot — visible only when a turn is in flight for this

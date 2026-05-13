@@ -17,6 +17,7 @@ Two distinct production failures these tests pin:
 
 from __future__ import annotations
 
+import json
 import os
 from pathlib import Path
 
@@ -259,3 +260,63 @@ def test_delete_does_not_clear_env_set_by_user_shell(
 
     # User's shell-exported env stays.
     assert os.environ.get("ANTHROPIC_API_KEY") == "sk-ant-from-shell"
+
+
+# ---------------------------------------------------------------------------
+# Subscription wins over a stale keyring credential
+# ---------------------------------------------------------------------------
+
+def test_ensure_env_skips_keyring_when_subscription_present(
+    tmp_path: Path, fake_keyring: _FakeKeyring,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``detect_auth`` checks ``~/.claude.json`` BEFORE the keyring,
+    so a researcher with a valid Claude subscription AND a stale
+    keyring API key gets ``subscription`` reported. But
+    ``_ensure_anthropic_env`` then injected the keyring credential
+    into ``ANTHROPIC_API_KEY`` anyway — and the SDK prefers an
+    explicit env API key over OAuth, silently routing the
+    researcher's traffic through the stale (possibly-defunct) key
+    and bypassing the subscription. Verify the injection is now
+    suppressed when subscription is detected.
+    """
+    # Subscription configured: a ``~/.claude.json`` with an OAuth
+    # account. Override the outer fixture's "always missing" Path
+    # stub for this test.
+    fake_home = tmp_path / "home"
+    fake_home.mkdir()
+    claude_json = fake_home / ".claude.json"
+    claude_json.write_text(json.dumps({
+        "oauthAccount": {"accountUuid": "abc-123-uuid"},
+    }), encoding="utf-8")
+
+    class _StubHome:
+        @staticmethod
+        def home() -> Path:
+            return fake_home
+
+    monkeypatch.setattr("nora.provider.anthropic.Path", _StubHome)
+
+    # Plus a stale keyring credential lingering from a prior session.
+    fake_keyring.set_password("nora", "anthropic", "sk-ant-STALE")
+
+    from nora.provider import anthropic as a_mod
+    a_mod._ENV_INJECTED_BY_NORA = False  # reset module state
+
+    # Sanity check: detect_auth must agree subscription is the
+    # configured path — otherwise this test is testing the wrong
+    # precondition.
+    assert a_mod.detect_auth() == "subscription"
+
+    a_mod._ensure_anthropic_env()
+
+    # The injection must NOT have happened. With the bug, this
+    # assertion fails: ANTHROPIC_API_KEY would be "sk-ant-STALE",
+    # overriding the subscription path on the next SDK call.
+    assert "ANTHROPIC_API_KEY" not in os.environ, (
+        "subscription must take priority over a stale keyring "
+        "credential; injecting the keyring key would silently "
+        "route traffic through the (possibly-defunct) API key "
+        "and bypass the researcher's active Claude subscription"
+    )
+    assert a_mod._ENV_INJECTED_BY_NORA is False

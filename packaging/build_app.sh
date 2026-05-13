@@ -45,6 +45,37 @@ DIST_DIR="$REPO_ROOT/dist"
 PYINSTALLER_OUT="$DIST_DIR/nora"
 APP_BUNDLE="$DIST_DIR/Nora.app"
 
+# Derive the bundle version from pyproject.toml so the .app's
+# Info.plist (CFBundleVersion / CFBundleShortVersionString) can't
+# drift from the package version. Previously the heredoc below
+# hardcoded the same "0.0.1" string and a bump of pyproject's version
+# without touching this script would ship a .app whose Apple-side
+# version disagreed with what the dependency manifest claimed —
+# silent skew that's invisible until someone diff's the two later.
+# ``tomllib`` is stdlib in Python 3.11+; on Big Sur we may only have
+# the system 3.9, so prefer ``uv run`` (which uses the project's
+# pinned Python) and fall back to the system interpreter only if uv
+# isn't on PATH.
+if command -v uv >/dev/null 2>&1; then
+    APP_VERSION="$(uv run python -c '
+import tomllib, sys
+with open("pyproject.toml", "rb") as f:
+    print(tomllib.load(f)["project"]["version"])
+')"
+else
+    APP_VERSION="$(/usr/bin/python3 - <<'PY'
+import tomllib
+with open("pyproject.toml", "rb") as f:
+    print(tomllib.load(f)["project"]["version"])
+PY
+)"
+fi
+if [[ -z "$APP_VERSION" ]]; then
+    echo "Could not read project.version from pyproject.toml" >&2
+    exit 1
+fi
+echo "==> Bundle version: $APP_VERSION"
+
 echo "==> Running PyInstaller"
 uv run pyinstaller packaging/nora.spec --clean --noconfirm >/dev/null
 
@@ -83,7 +114,10 @@ fi
 cp "$ICON_SRC" "$APP_BUNDLE/Contents/Resources/Nora.icns"
 
 echo "==> Writing Info.plist"
-cat > "$APP_BUNDLE/Contents/Info.plist" <<'PLIST'
+# Heredoc delimiter is unquoted (``PLIST``, not ``'PLIST'``) so
+# ``$APP_VERSION`` expands. The rest of the heredoc contains no shell
+# metacharacters, so the unquoted form is safe.
+cat > "$APP_BUNDLE/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -95,9 +129,9 @@ cat > "$APP_BUNDLE/Contents/Info.plist" <<'PLIST'
     <key>CFBundleIdentifier</key>
     <string>app.junishka.nora</string>
     <key>CFBundleVersion</key>
-    <string>0.0.1</string>
+    <string>${APP_VERSION}</string>
     <key>CFBundleShortVersionString</key>
-    <string>0.0.1</string>
+    <string>${APP_VERSION}</string>
     <key>CFBundleExecutable</key>
     <string>Nora</string>
     <key>CFBundleIconFile</key>

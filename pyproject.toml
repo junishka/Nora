@@ -1,7 +1,7 @@
 [project]
 name = "nora"
 version = "0.0.1"
-description = "Local privacy layer letting Claude drive statistical analysis on a researcher's own machine (macOS-only at this stage)"
+description = "Local privacy layer letting frontier LLMs (Anthropic, OpenAI) drive statistical analysis on a researcher's own machine (macOS-only at this stage)"
 requires-python = ">=3.10"
 classifiers = [
     "Development Status :: 4 - Beta",

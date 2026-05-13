@@ -156,6 +156,28 @@ _DISALLOWED_BUILTINS: tuple[str, ...] = (
 # ---------------------------------------------------------------------------
 
 
+def _has_claude_subscription() -> bool:
+    """Return True iff ``~/.claude.json`` carries an OAuth account.
+
+    Factored so :func:`detect_auth` and :func:`_ensure_anthropic_env`
+    agree on the subscription test. Without sharing this helper the
+    injection path could (and did) silently override an active Claude
+    CLI subscription with a stale keyring API key: ``detect_auth``
+    reported ``subscription``, but ``_ensure_anthropic_env`` skipped
+    the subscription check and copied the keyring credential into
+    ``ANTHROPIC_API_KEY``, which the SDK then preferred over OAuth.
+    """
+    claude_json = Path.home() / ".claude.json"
+    if not claude_json.is_file():
+        return False
+    try:
+        data = json.loads(claude_json.read_text())
+    except (json.JSONDecodeError, OSError):
+        return False
+    oauth = data.get("oauthAccount")
+    return isinstance(oauth, dict) and bool(oauth.get("accountUuid"))
+
+
 def detect_auth() -> str:
     """Return ``'subscription'``, ``'api_key'``, or ``'unknown'``.
 
@@ -170,16 +192,8 @@ def detect_auth() -> str:
     """
     if os.environ.get("ANTHROPIC_API_KEY"):
         return "api_key"
-    claude_json = Path.home() / ".claude.json"
-    if claude_json.is_file():
-        try:
-            data = json.loads(claude_json.read_text())
-        except (json.JSONDecodeError, OSError):
-            pass
-        else:
-            oauth = data.get("oauthAccount")
-            if isinstance(oauth, dict) and oauth.get("accountUuid"):
-                return "subscription"
+    if _has_claude_subscription():
+        return "subscription"
     # Last resort: keyring. Imported here rather than at module load
     # to avoid an import cycle (nora.auth doesn't depend on this
     # module, but keeping it lazy makes the dependency direction
@@ -202,17 +216,25 @@ _ENV_INJECTED_BY_NORA: bool = False
 
 def _ensure_anthropic_env() -> None:
     """Copy a keyring-stored Anthropic API key into ``ANTHROPIC_API_KEY``
-    if the env var isn't already set. The Claude Agent SDK reads the
-    env var at client construction; this is the bridge between
-    Nora's keyring storage and the SDK's expectations.
+    if (a) the env var isn't already set AND (b) no Claude CLI
+    subscription is configured. The Claude Agent SDK reads the env
+    var at client construction; this is the bridge between Nora's
+    keyring storage and the SDK's expectations.
 
-    Subscription auth wins implicitly: when the env var is unset and
-    ``~/.claude.json`` carries an OAuth account, the SDK uses that
-    path and never consults the env var, so this function's no-op
-    branch is correct.
+    Subscription takes priority: when ``~/.claude.json`` carries an
+    OAuth account we deliberately do NOT inject a keyring API key,
+    because the SDK prefers an explicit ``ANTHROPIC_API_KEY`` over
+    the OAuth path. Injecting a stale keyring credential there would
+    silently override the researcher's active subscription with a
+    possibly-defunct API key — and ``detect_auth`` would still
+    report ``subscription`` because it checks the .claude.json file
+    BEFORE the keyring, leaving the page UI and the runtime out of
+    sync.
     """
     global _ENV_INJECTED_BY_NORA
     if os.environ.get("ANTHROPIC_API_KEY"):
+        return
+    if _has_claude_subscription():
         return
     from nora import auth as _auth
     cred = _auth.get_credential("anthropic")

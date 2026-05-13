@@ -294,6 +294,35 @@ if [[ "$APP_ARCHS" != "arm64" ]]; then
 fi
 echo "  ✓ Architecture: arm64"
 
+# Version-skew check: ``pyproject.toml``'s ``project.version`` must
+# match the bundle's ``CFBundleShortVersionString``. ``build_app.sh``
+# now derives the plist value from pyproject (so the two CAN'T diverge
+# unless the derive step silently failed), but a release-time
+# regression check pins the invariant — and catches a stale
+# pre-derive bundle that wasn't rebuilt before this release pass.
+PLIST_VERSION="$(
+    /usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' \
+        "$APP/Contents/Info.plist" 2>/dev/null || true
+)"
+PYPROJECT_VERSION="$(
+    /usr/bin/python3 - <<'PY'
+import tomllib
+with open("pyproject.toml", "rb") as f:
+    print(tomllib.load(f)["project"]["version"])
+PY
+)"
+if [[ -z "$PLIST_VERSION" || -z "$PYPROJECT_VERSION" ]]; then
+    echo "  ✗ Could not read both versions (plist='$PLIST_VERSION', pyproject='$PYPROJECT_VERSION')." >&2
+    exit 1
+fi
+if [[ "$PLIST_VERSION" != "$PYPROJECT_VERSION" ]]; then
+    echo "  ✗ Version skew: Info.plist='$PLIST_VERSION' but pyproject.toml='$PYPROJECT_VERSION'." >&2
+    echo "    The bundle was likely built before build_app.sh's derive-from-pyproject" >&2
+    echo "    step landed (or that step failed silently). Rebuild and re-run." >&2
+    exit 1
+fi
+echo "  ✓ Version: $PLIST_VERSION (matches pyproject.toml)"
+
 ASSESS="$( /usr/sbin/spctl --assess --verbose=2 --type execute "$APP" 2>&1 || true )"
 if echo "$ASSESS" | grep -qE "accepted"; then
     echo "  ✓ spctl assess: $(echo "$ASSESS" | tr '\n' ' ' | sed 's/  */ /g')"
