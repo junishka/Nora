@@ -4,19 +4,20 @@ Background
 ----------
 The ``install_packages`` tool reaches outside the sandbox to mutate the
 researcher's machine — pip / R install / SSC writes to the user
-library. The system prompt instructs the model to ask the researcher
-in chat first, but a prompt-only consent gate is brittle: a jailbroken
-or buggy model can call the tool directly. Both providers (Anthropic
-via ``ALLOWED_TOOL_NAMES`` and OpenAI via the generic handler
-dispatch) allow the tool through without an additional runtime gate.
+library. Both providers (Anthropic via ``ALLOWED_TOOL_NAMES`` and
+OpenAI via the generic handler dispatch) allow the tool through
+without an additional runtime gate, so a buggy or jailbroken model
+could otherwise call it without any researcher signal.
 
-This module is the hard gate. The tool handler calls
+This module is the single consent gate. The tool handler calls
 ``request_confirmation`` and only proceeds with the install if a
 human-side approval comes back. The approval is surfaced through the
 bridge, which emits an event to the page; the page shows a modal
 with the language / action / package names; the researcher clicks
 Approve or Deny; that decision returns through the bridge and
-resolves the awaiting Future on the tool's event loop.
+resolves the awaiting Future on the tool's event loop. The system
+prompt tells the model NOT to also ask in chat, so the modal is the
+one place the researcher decides.
 
 Threading model
 ---------------
@@ -126,10 +127,9 @@ async def request_confirmation(
     """
     emitter = _request_emitter
     if emitter is None:
-        # Failing closed. The system prompt's request-in-chat workflow
-        # is the prompt-only side; this module is the hard gate. With
-        # no UI to surface the request, the researcher cannot
-        # affirmatively consent, so the safe default is deny.
+        # Failing closed. With no UI to surface the modal, the
+        # researcher cannot affirmatively consent, so the safe default
+        # is deny.
         return False
     loop = asyncio.get_running_loop()
     fut: asyncio.Future = loop.create_future()
