@@ -1082,10 +1082,13 @@ kbd {
   /* Grid: click target on the left, trash icon on the right. The
    * active session tints the whole row; the trash button is always
    * visible (small and muted) so users don't have to hover-discover
-   * the delete affordance. */
+   * the delete affordance. ``gap: 0`` keeps the pin button visually
+   * flush against the title slot; the small breathing room between
+   * the pin glyph and the title comes from ``.session-item`` left
+   * padding so we can tune the two independently. */
   display: flex;
   align-items: stretch;
-  gap: 2px;
+  gap: 0;
   border: 1px solid transparent;
   border-radius: 8px;
   transition: background 0.15s, border-color 0.15s;
@@ -1112,7 +1115,7 @@ kbd {
   align-items: center;
   gap: 6px;
   overflow: hidden;
-  padding: 8px 10px;
+  padding: 8px 10px 8px 4px;
   border: none;
   border-radius: 0;
   background: transparent;
@@ -1286,7 +1289,7 @@ kbd {
 .session-item-editing {
   flex: 1 1 0;
   min-width: 0;
-  padding: 8px 10px;
+  padding: 8px 10px 8px 4px;
 }
 
 .sidebar-list-empty {
