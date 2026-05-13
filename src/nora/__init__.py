@@ -4,4 +4,4 @@ Claude drives statistical analysis against data on the researcher's own machine.
 Data never leaves the machine.
 """
 
-__version__ = "0.0.1"
+__version__ = "0.9.0"
