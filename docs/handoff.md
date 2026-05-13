@@ -104,7 +104,6 @@ keep streaming.
 | **Top-anchor scroll on assistant replies** — long answers used to land the researcher at the LAST line via `scrollToBottom()`, forcing a manual scroll back to the first sentence; `append()` now top-aligns assistant wrappers via `scrollMessageToTop` (sets `messagesEl.scrollTop = wrapper.offsetTop - 16`, clamped to scroll max). Re-applied on `turn_done` after the loading-indicator removal shifts layout by ~80 px. User / system / error messages still pin to the bottom (composer / status visibility) | ✅ done |
 | **List-marker selection-leak fix** — chat-output `<ul>` / `<ol>` drop the native `::marker` (which lives in the parent's padding gutter where WebKit paints text-selection background but does NOT repaint it on selection clear, leaving thin colored bars on every li after a multi-bullet drag-select). Bullets / numbers now render via `::before` inside the `<li>` content box, with a CSS counter (`chat-ol`) for ordered lists. Visual indent unchanged; selection paints/clears uniformly | ✅ done |
 | **Loading-label rotation expansion + sidebar shortcut guard** — added 18 data-themed gerunds (`crunching`, `wrangling`, `polishing`, …) and 3 noun-phrase jokes (`herding outliers`, `minding the gaps`, `reticulating splines`). Sidebar arrow/Backspace shortcut handler now bails out when focus is inside an `<input>` / `<textarea>` / `[contenteditable]` so typing in the rename input doesn't fire the row's delete confirm | ✅ done |
-| **Real-researcher pilot** | ⏳ self-pilot in progress |
 | **Cross-query composition / release ledger** | ⏭ named, future-deployment scope |
 | **Apple Developer Program signing + notarization for distributable .dmg** | ✅ done — release `.dmg` is signed (Developer ID Application) and notarized |
 | **Stata batch wrapper around `_cons` "omitted" edge case** | ⏭ named, low-priority |
@@ -355,14 +354,6 @@ the `active_model` recorded in `.nora/session_state.json` — a
 researcher who switched to Opus for one project comes back to Opus
 next time, even when the launcher passes the cwd directly.
 
-## Known-real, deferred
-
-The actual near-term blocker is one item:
-
-- **Outside pilot.** The release `.dmg` is signed and notarized.
-  What is still missing is a real outside researcher using Nora on
-  real data and feeding back where the workflow drags.
-
 ## Longer-term: governance for wider distribution
 
 These don't bite while Nora is being run by researchers on their
@@ -383,14 +374,13 @@ them by surprise.
   `docs/direction.md` §"Known-real, design-pending" for the DP /
   τ-ARGUS / release-ledger options and why naïve query counters
   are worse than nothing. Not the right thing to spend time on
-  before the product has demonstrated value with one or more
-  outside pilots.
+  until concrete beta-user demand surfaces it.
 - **Bounded covert channels in regression metadata.** Documented
   in `sanitizer.py` (`predictor_variables` is script-authored;
   `nora$result(...)` allows hand-crafted payloads). Bandwidth is
   small (~hundred bytes per regression); same threat-model
-  scenario as cumulative-inference above. Out of scope for
-  self-pilots.
+  scenario as cumulative-inference above. Out of scope at the
+  current scale.
 - (Other deployment-level concerns land here as they surface —
   multi-tenant key management, per-organisation policy
   enforcement, audit-log retention, etc. None are real today.)
@@ -542,11 +532,11 @@ If you're picking this up to finish and ship it, in this order:
 
 1. **Run it yourself on your own data.** Catch the UX rough
    edges before anyone else sees them.
-2. **Try it on a colleague's data** (or yours via a colleague).
-   The difference between "self-pilot" and "someone who didn't
-   build it" is where most real UX bugs live.
+2. **Try it on someone else's data** (with their permission).
+   Workflows that do not match the maintainer's mental model
+   surface UX bugs internal testing misses.
 3. **Distribution-mode concerns (cumulative-inference /
    release-ledger, multi-tenant policy, audit retention) wait
-   until distribution itself is real.** They're meaningful work
-   for a future deployment, not for the current self-pilot mode.
+   until distribution itself is real.** They are meaningful work
+   for a future deployment, not for the current scale.
    See "Longer-term: governance for wider distribution" above.

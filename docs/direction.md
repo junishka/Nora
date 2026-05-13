@@ -152,16 +152,7 @@ As of 2026-05-12, the implementation covers:
 
 ## What's remaining (prioritized)
 
-### 1. Outside pilot on real data
-
-The release path exists; the missing signal is a real outside
-researcher using Nora on real data. The user self-pilot is useful,
-but a colleague or two validates whether the install flow, model
-choice, runtime requirements, file upload, raw-output panels,
-policy chip, and result tables make sense to someone who did not
-build the system.
-
-### 2. First-open policy nudge
+### 1. First-open policy nudge
 
 Schema depth is already explicit researcher policy in
 `<cwd>/.nora/policy.json`, with per-dataset ceilings and a
@@ -172,7 +163,7 @@ The remaining UX polish is an explicit first-open nudge for
 un-policy'd datasets so researchers understand the default before
 their first analysis.
 
-### 3. Runtime-authenticity follow-on, only if needed
+### 2. Runtime-authenticity follow-on, only if needed
 
 The implemented per-run token rejects trivial hand-crafted writes
 to `NORA_RESULT_PATH`; tests pin that behavior. It is a cost-raising
@@ -181,7 +172,7 @@ inside the interpreter. A stronger pre-opened-fd design remains
 available if future pilots involve a threat model where runtime
 authenticity is load-bearing.
 
-### 4. Distribution-mode governance
+### 3. Distribution-mode governance
 
 Cumulative inference, release ledgers, multi-tenant policy, and
 audit retention are real concerns for wider deployment. They are
