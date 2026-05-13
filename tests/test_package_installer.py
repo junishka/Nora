@@ -146,28 +146,42 @@ def test_python_remove_refuses_package_not_in_nora_target(
         "Name: managed\n", encoding="utf-8",
     )
 
-    # Intercept subprocess.run and only record pip invocations.
-    # ``nora_python_pkg_dir`` also runs a small ``python -c "import
-    # sys; print(version)"`` probe through subprocess.run; we don't
-    # want that one polluting the leak-detection assertion.
+    # Intercept subprocess.Popen for pip invocations only. The
+    # installer now uses Popen + communicate (so it can killpg the
+    # process tree on timeout / cancel). ``nora_python_pkg_dir``
+    # still uses subprocess.run for its version probe, which goes
+    # through Popen internally — let those passthrough to the real
+    # Popen by checking ``start_new_session`` (only the install path
+    # sets it).
     pip_launched: list[list[str]] = []
     import subprocess as _subprocess
-    real_run = _subprocess.run
+    real_popen = _subprocess.Popen
 
-    def _fake_run(cmd, **kwargs):  # type: ignore[no-untyped-def]
+    class _FakePopen:
+        def __init__(self, cmd, **kwargs):  # type: ignore[no-untyped-def]
+            self._cmd = list(cmd) if isinstance(cmd, list) else cmd
+            self.pid = -1
+            self.returncode = 0
+
+        def communicate(self, input=None, timeout=None):  # type: ignore[no-untyped-def]
+            return ("", "")
+
+        def kill(self) -> None:  # pragma: no cover — never reached
+            pass
+
+    def _fake_popen(cmd, **kwargs):  # type: ignore[no-untyped-def]
+        is_install_call = kwargs.get("start_new_session")
         is_pip = (
             isinstance(cmd, list)
             and len(cmd) >= 3
             and cmd[1] == "-m"
             and cmd[2] == "pip"
         )
-        if is_pip:
+        if is_install_call and is_pip:
             pip_launched.append(list(cmd))
-            return _subprocess.CompletedProcess(
-                args=cmd, returncode=0, stdout="", stderr="",
-            )
-        return real_run(cmd, **kwargs)
-    monkeypatch.setattr(_subprocess, "run", _fake_run)
+            return _FakePopen(cmd, **kwargs)
+        return real_popen(cmd, **kwargs)
+    monkeypatch.setattr(_subprocess, "Popen", _fake_popen)
 
     # Case 1: removing a package that ISN'T in Nora's target. The
     # request must fail cleanly without pip ever being launched.
@@ -284,7 +298,7 @@ def test_install_packages_tool_scrubs_credentials_from_raw_excerpts(
         duration_seconds=0.5,
     )
 
-    async def _fake_install(language, packages, action):  # type: ignore[no-untyped-def]
+    async def _fake_install(language, packages, action, proc_register=None):  # type: ignore[no-untyped-def]
         return fake_result
 
     monkeypatch.setattr(
@@ -629,21 +643,43 @@ def test_install_subprocess_env_drops_parent_secrets(
 
     captured: dict[str, dict[str, str] | None] = {"env": None}
 
-    def fake_run(*args, **kwargs):
-        captured["env"] = dict(kwargs.get("env") or {})
-
-        class _R:
-            returncode = 0
-            stdout = ""
-            stderr = ""
-        return _R()
-
+    # Capture the install Popen call ONLY. ``_python_version_tag``
+    # (called from ``nora_python_pkg_dir``) also uses subprocess.run
+    # internally (which uses Popen under the hood); we let those
+    # passthrough to the real Popen so the version probe still works.
     import subprocess as _sp
-    monkeypatch.setattr(_sp, "run", fake_run)
+    real_popen = _sp.Popen
+
+    class _FakePopen:
+        def __init__(self, cmd, **kwargs):  # type: ignore[no-untyped-def]
+            self._cmd = list(cmd) if isinstance(cmd, list) else cmd
+            self.pid = -1
+            self.returncode = 0
+            # Only mark the install env — let probe calls go through
+            # real Popen by raising NotImplementedError up through
+            # the dispatch wrapper.
+            captured["env"] = dict(kwargs.get("env") or {})
+
+        def communicate(self, input=None, timeout=None):  # type: ignore[no-untyped-def]
+            return ("", "")
+
+        def kill(self) -> None:  # pragma: no cover
+            pass
+
+    def _dispatch_popen(cmd, **kwargs):  # type: ignore[no-untyped-def]
+        # Identify the install command (pip / Rscript / Stata
+        # install) — those have ``start_new_session=True`` set,
+        # which the executor's run_script / package_installer use
+        # but the version probe does not.
+        if kwargs.get("start_new_session"):
+            return _FakePopen(cmd, **kwargs)
+        return real_popen(cmd, **kwargs)
+
+    monkeypatch.setattr(_sp, "Popen", _dispatch_popen)
     # Run the install branch synchronously so the test doesn't
     # depend on the asyncio thread-pool executor seeing our patched
-    # ``subprocess.run`` (which it does, but reasoning about the
-    # capture order is simpler this way).
+    # Popen (which it does, but reasoning about the capture order
+    # is simpler this way).
     async def _sync_to_thread(func, *args, **kwargs):
         return func(*args, **kwargs)
     monkeypatch.setattr(asyncio, "to_thread", _sync_to_thread)
@@ -677,7 +713,7 @@ def test_install_subprocess_env_drops_parent_secrets(
     ))
 
     env = captured["env"]
-    assert env is not None, "subprocess.run was not called with an env dict"
+    assert env is not None, "subprocess.Popen was not called with an env dict"
     # The three secrets we set MUST NOT cross to the installer.
     for leak in ("ANTHROPIC_API_KEY", "OPENAI_API_KEY", "AWS_SECRET_ACCESS_KEY"):
         assert leak not in env, (

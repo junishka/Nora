@@ -115,16 +115,22 @@ def test_plot_helper_summary_caps_row_count(tmp_path: Path) -> None:
     a per-call total so this surface can't bypass the inline payload
     budget."""
     from nora.tools import _PLOT_HELPER_MAX_ROWS, _summarize_plot_helpers
+    from nora.executor import register_run_token, RESULT_TOKEN_FIELD
 
     plots_dir = tmp_path / "_nora_plots"
     plots_dir.mkdir()
     manifest = plots_dir / "manifest.jsonl"
     overflow_factor = 4
+    token = "test-cap-row-count-token"
     lines = [
-        json.dumps({"file": f"p{i:04d}.png", "kind": "scatter", "label": ""})
+        json.dumps({
+            "file": f"p{i:04d}.png", "kind": "scatter", "label": "",
+            RESULT_TOKEN_FIELD: token,
+        })
         for i in range(_PLOT_HELPER_MAX_ROWS * overflow_factor)
     ]
     manifest.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    register_run_token(tmp_path, token)
 
     summary = _summarize_plot_helpers(tmp_path)
     assert summary is not None
@@ -168,17 +174,23 @@ def test_plot_helper_summary_under_caps_unchanged(tmp_path: Path) -> None:
     """A normal three-plot run must not see the truncation markers —
     the caps only kick in for pathological volume."""
     from nora.tools import _summarize_plot_helpers
+    from nora.executor import register_run_token, RESULT_TOKEN_FIELD
 
     plots_dir = tmp_path / "_nora_plots"
     plots_dir.mkdir()
     manifest = plots_dir / "manifest.jsonl"
+    token = "test-under-caps-token"
     manifest.write_text(
         "\n".join(
-            json.dumps({"file": f"{name}.png", "kind": name, "label": ""})
+            json.dumps({
+                "file": f"{name}.png", "kind": name, "label": "",
+                RESULT_TOKEN_FIELD: token,
+            })
             for name in ("residuals", "coefficients", "interaction")
         ) + "\n",
         encoding="utf-8",
     )
+    register_run_token(tmp_path, token)
 
     summary = _summarize_plot_helpers(tmp_path)
     assert summary is not None

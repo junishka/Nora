@@ -27,9 +27,17 @@ let the sanitizer there handle it.
 
 - ``na_count`` — returns the count of NA observations for a variable,
   and total observation count. NA counts by themselves are scalar
-  metadata about the pipeline, not a subgroup breakdown — low
-  disclosure risk. We suppress only if the non-NA count falls below
-  the cell-suppression threshold (that's the disclosive case).
+  metadata about the pipeline, not a subgroup breakdown. We suppress
+  symmetrically: when the rarer of (missing, non-missing) falls in
+  [1, threshold), both counts are withheld. "Only 3 people have a
+  non-NA value" identifies those 3 by inverse; "only 1 missing
+  observation" identifies the one person with missingness. Either
+  side at exactly zero is safe (no individual to identify), and
+  counts at or above the threshold are aggregate enough to publish.
+  The complement gate also rides through ``numeric_bounds`` /
+  ``quartiles`` / ``correlation_pair`` so the model can't recover
+  the rare side by subtracting from the schema's exact
+  observation_count.
 
 Future types (deferred):
 - ``missingness_pattern`` — correlation of missingness with other
@@ -185,6 +193,55 @@ def _resolve_variable(
 
 
 # ---------------------------------------------------------------------------
+# Shared complement-leak suppression
+# ---------------------------------------------------------------------------
+#
+# Schema extraction publishes exact ``observation_count`` at every
+# schema depth (names_only included). Per-variable handlers below
+# return ``n_nonmissing`` / ``n_complete``. The difference is the exact
+# missing count — which ``_na_count`` already coarsens when one side
+# is rare, because rare missingness identifies the small side directly.
+# Publishing the COMPLEMENT (n_nonmissing or n_complete) without the
+# same gate reopens the rare-missingness channel: schema says
+# observation_count=1000, the bounds path says n_nonmissing=999, and
+# the model trivially infers missing=1, which na_count would have
+# refused to disclose. The helper below applies the symmetric gate
+# both surfaces consume so the gate is named once and the policy
+# can't drift between call sites.
+
+
+def _safe_count_pair(
+    nonmissing: int, total: int, threshold: int,
+) -> tuple[int | None, int | str, str | None]:
+    """Return ``(nonmissing_field, missing_field, note)`` after applying
+    the rare-side suppression rule.
+
+    The two values that ride through to the model are the
+    nonmissing-count field (an int, ``None`` when suppressed) and the
+    missing-count field (an int when safe to publish, otherwise the
+    suppression marker string). Either side being rare (in [1,
+    threshold)) suppresses BOTH numbers — publishing the complement
+    is what reopens the rare-missingness channel ``_na_count``
+    already closes. Zero on either side is safe (no individual to
+    identify).
+    """
+    missing = total - nonmissing
+    rare_side = min(nonmissing, missing)
+    if rare_side == 0 or rare_side >= threshold:
+        return nonmissing, missing, None
+    return (
+        None,
+        suppression_marker(threshold),
+        (
+            "Exact non-missing and missing counts suppressed: one "
+            f"side is below the disclosure threshold of {threshold}, "
+            "so publishing either count (or its complement) would "
+            "identify the rarer subgroup by inverse."
+        ),
+    )
+
+
+# ---------------------------------------------------------------------------
 # Top-level dispatch
 # ---------------------------------------------------------------------------
 
@@ -252,13 +309,13 @@ def handle(
     if request_type == "categorical_levels":
         return _categorical_levels(series, n_total, config)
     if request_type == "numeric_bounds":
-        return _numeric_bounds(series, n_total)
+        return _numeric_bounds(series, n_total, config)
     if request_type == "na_count":
         return _na_count(series, n_total, config)
     if request_type == "quartiles":
-        return _quartiles(series, n_total)
+        return _quartiles(series, n_total, config)
     if request_type == "correlation_pair":
-        return _correlation_pair(df, variable, variable2)
+        return _correlation_pair(df, variable, variable2, config)
     # Unreachable — allowlist checked above.
     return RequestResult(status="error", reason="internal: unreachable")
 
@@ -351,7 +408,9 @@ def _categorical_levels(
 # numeric_bounds
 # ---------------------------------------------------------------------------
 
-def _numeric_bounds(series: Any, n_total: int) -> RequestResult:
+def _numeric_bounds(
+    series: Any, n_total: int, config: SDCConfig,
+) -> RequestResult:
     """Return rounded 5th and 95th percentiles of a numeric variable.
 
     Rounded to 2 significant figures. We use the 5th/95th percentiles
@@ -409,19 +468,27 @@ def _numeric_bounds(series: Any, n_total: int) -> RequestResult:
 
     p5 = float(non_na.quantile(0.05))
     p95 = float(non_na.quantile(0.95))
-    return RequestResult(
-        status="granted",
-        answer={
-            "percentile_5": round_to_sigfigs(p5, 2),
-            "percentile_95": round_to_sigfigs(p95, 2),
-            "precision": "2 significant figures",
-            "n_nonmissing": n_effective,
-            "note": (
-                "5th and 95th percentiles are returned instead of min/max "
-                "to avoid revealing extreme individual observations."
-            ),
-        },
+    # Same rare-side gate ``_na_count`` applies. Without this, schema
+    # publishes observation_count=N exactly, this path publishes
+    # n_nonmissing=N-1 exactly, and the model trivially recovers the
+    # rare missing count by subtraction — defeating the na_count gate.
+    nonmissing_field, missing_field, count_note = _safe_count_pair(
+        n_effective, n_total, config.cell_suppression_threshold,
     )
+    answer: dict[str, Any] = {
+        "percentile_5": round_to_sigfigs(p5, 2),
+        "percentile_95": round_to_sigfigs(p95, 2),
+        "precision": "2 significant figures",
+        "n_nonmissing": nonmissing_field,
+        "missing_count": missing_field,
+        "note": (
+            "5th and 95th percentiles are returned instead of min/max "
+            "to avoid revealing extreme individual observations."
+        ),
+    }
+    if count_note is not None:
+        answer["count_note"] = count_note
+    return RequestResult(status="granted", answer=answer)
 
 
 # ---------------------------------------------------------------------------
@@ -486,7 +553,9 @@ def _na_count(series: Any, n_total: int, config: SDCConfig) -> RequestResult:
 # quartiles
 # ---------------------------------------------------------------------------
 
-def _quartiles(series: Any, n_total: int) -> RequestResult:
+def _quartiles(
+    series: Any, n_total: int, config: SDCConfig,
+) -> RequestResult:
     """Return rounded 25th and 75th percentiles of a numeric variable.
 
     Pairs with ``numeric_bounds`` (5th / 95th) to give the model an IQR-
@@ -553,22 +622,27 @@ def _quartiles(series: Any, n_total: int) -> RequestResult:
     # constraint to invert.
     rounded_q25 = round_to_sigfigs(q25, 2)
     rounded_q75 = round_to_sigfigs(q75, 2)
-    return RequestResult(
-        status="granted",
-        answer={
-            "percentile_25": rounded_q25,
-            "percentile_75": rounded_q75,
-            "iqr": rounded_q75 - rounded_q25,
-            "precision": "2 significant figures",
-            "n_nonmissing": n_effective,
-            "note": (
-                "25th and 75th percentiles are returned. The 50th "
-                "(median) is deliberately omitted: for any odd-N "
-                "variable it is exactly an individual observation, "
-                "which the SDC rules forbid at the row level."
-            ),
-        },
+    # Same rare-side gate as ``_numeric_bounds`` / ``_na_count``.
+    nonmissing_field, missing_field, count_note = _safe_count_pair(
+        n_effective, n_total, config.cell_suppression_threshold,
     )
+    answer: dict[str, Any] = {
+        "percentile_25": rounded_q25,
+        "percentile_75": rounded_q75,
+        "iqr": rounded_q75 - rounded_q25,
+        "precision": "2 significant figures",
+        "n_nonmissing": nonmissing_field,
+        "missing_count": missing_field,
+        "note": (
+            "25th and 75th percentiles are returned. The 50th "
+            "(median) is deliberately omitted: for any odd-N "
+            "variable it is exactly an individual observation, "
+            "which the SDC rules forbid at the row level."
+        ),
+    }
+    if count_note is not None:
+        answer["count_note"] = count_note
+    return RequestResult(status="granted", answer=answer)
 
 
 # ---------------------------------------------------------------------------
@@ -576,7 +650,7 @@ def _quartiles(series: Any, n_total: int) -> RequestResult:
 # ---------------------------------------------------------------------------
 
 def _correlation_pair(
-    df: Any, var1: str, var2: str | None,
+    df: Any, var1: str, var2: str | None, config: SDCConfig,
 ) -> RequestResult:
     """Pearson correlation between two numeric variables.
 
@@ -695,33 +769,38 @@ def _correlation_pair(
         return RequestResult(status="denied", reason=reason)
 
     sigfigs = sigfigs_for_n(n_complete)
-    # Coarsen rare ``missing_count`` — same gate the schema-side
-    # ``na_count`` request applies. ``len(s1) - n_complete`` is the
-    # number of rows where at least one of the two variables is
-    # missing; if that count is small but nonzero (e.g. 1 of 1000),
-    # it directly identifies the one incomplete observation.
-    # Zero missingness is fine (no individual to identify); counts
-    # at or above the threshold are aggregate enough to publish.
-    threshold = DEFAULT_CONFIG.cell_suppression_threshold
-    missing = int(len(s1) - n_complete)
-    if 0 < missing < threshold:
-        missing_field: int | str = suppression_marker(threshold)
-    else:
-        missing_field = missing
-    return RequestResult(
-        status="granted",
-        answer={
-            "variable": safe_key(str(var1)),
-            "variable2": safe_key(str(var2)),
-            "correlation": round_to_sigfigs(r, sigfigs),
-            "method": "pearson",
-            "n_complete": n_complete,
-            "missing_count": missing_field,
-            "note": (
-                "Pearson correlation between the two variables on rows "
-                "where BOTH are observed. For a multi-variable matrix "
-                "use submit_script + nora$from_correlation / "
-                "nora.from_correlation."
-            ),
-        },
+    # Use the caller-supplied SDCConfig so a stricter policy (e.g.
+    # ``SDCConfig(cell_suppression_threshold=25)``) takes effect on
+    # this surface too. Previously this path hard-coded
+    # ``DEFAULT_CONFIG.cell_suppression_threshold``, so the same
+    # config that tightened ``categorical_levels`` / ``na_count``
+    # silently no-op'd on correlation_pair — a stricter site policy
+    # would protect only some of the discovery surfaces.
+    threshold = config.cell_suppression_threshold
+    total_rows = int(len(s1))
+    # Coarsen rare missingness symmetrically through both n_complete
+    # AND missing_count. The previous fix only coarsened
+    # missing_count, but kept n_complete exact — so the model still
+    # recovered the rare missing count by subtracting from schema's
+    # exact observation_count. ``_safe_count_pair`` is the shared
+    # gate ``_numeric_bounds`` / ``_quartiles`` / ``_na_count`` use.
+    n_complete_field, missing_field, count_note = _safe_count_pair(
+        n_complete, total_rows, threshold,
     )
+    answer: dict[str, Any] = {
+        "variable": safe_key(str(var1)),
+        "variable2": safe_key(str(var2)),
+        "correlation": round_to_sigfigs(r, sigfigs),
+        "method": "pearson",
+        "n_complete": n_complete_field,
+        "missing_count": missing_field,
+        "note": (
+            "Pearson correlation between the two variables on rows "
+            "where BOTH are observed. For a multi-variable matrix "
+            "use submit_script + nora$from_correlation / "
+            "nora.from_correlation."
+        ),
+    }
+    if count_note is not None:
+        answer["count_note"] = count_note
+    return RequestResult(status="granted", answer=answer)

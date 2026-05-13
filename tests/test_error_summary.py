@@ -234,6 +234,77 @@ def test_stata_excludes_end_of_dofile_trailer_rc() -> None:
     assert "end of do-file" not in excerpt
 
 
+def test_stata_unwraps_modifier_prefixes_to_underlying_verb() -> None:
+    """Stata wrappers like ``capture``, ``quietly``, ``noisily`` take
+    another command as their body. Reporting the wrapper as the
+    failing verb (``capture``) is useless to the model — the
+    actionable information is the inner command (``regress``).
+    The extractor unwraps known modifier prefixes iteratively
+    before picking the verb."""
+    log_capture_noisily = (
+        ". capture noisily regress y x_missing\n"
+        "variable x_missing not found\n"
+        "r(111);\n"
+        "\n"
+        "end of do-file\n"
+        "\n"
+        "r(111);\n"
+    )
+    excerpt = extract_debug_excerpt(log_capture_noisily, "", 111, "Stata")
+    assert excerpt is not None
+    assert ". regress" in excerpt, (
+        f"verb should unwrap to the inner command, got: {excerpt!r}"
+    )
+    assert "capture" not in excerpt
+    assert "noisily" not in excerpt
+    # Still no args / message body.
+    assert "x_missing" not in excerpt
+    assert "[message body redacted]" in excerpt
+    assert "r(111);" in excerpt
+
+
+def test_stata_unwraps_short_form_modifier_prefixes() -> None:
+    """Stata accepts short forms ``cap`` / ``qui`` / ``noi``. The
+    unwrapper covers those too — a script that hits an error via
+    ``qui summarize x`` should report ``summarize``, not ``qui``."""
+    log = (
+        ". qui summarize bad_var\n"
+        "variable bad_var not found\n"
+        "r(111);\n"
+        "\n"
+        "end of do-file\n"
+        "\n"
+        "r(111);\n"
+    )
+    excerpt = extract_debug_excerpt(log, "", 111, "Stata")
+    assert excerpt is not None
+    assert ". summarize" in excerpt
+    assert "qui" not in excerpt
+    assert "bad_var" not in excerpt
+
+
+def test_stata_modifier_only_command_redacts_completely() -> None:
+    """A pathological echo with ONLY a wrapper and nothing after
+    (the script body got cut by extraction) should fail closed:
+    no verb gets through. Without this guard, the wrapper itself
+    would survive as the verb after the strip loop empties the
+    token list."""
+    log = (
+        ". capture\n"
+        "r(198);\n"
+        "\n"
+        "end of do-file\n"
+        "\n"
+        "r(198);\n"
+    )
+    excerpt = extract_debug_excerpt(log, "", 198, "Stata")
+    assert excerpt is not None
+    # No verb survives.
+    assert ". " not in excerpt or "[command body redacted]" in excerpt
+    assert "capture" not in excerpt
+    assert "r(198);" in excerpt
+
+
 def test_stata_no_command_echo_returns_rc_only() -> None:
     """If the executor truncated the log such that the failing
     command isn't present, return the rc line only. The error

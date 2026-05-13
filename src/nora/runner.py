@@ -482,10 +482,30 @@ class SessionRunner:
         rogue runtime modification can't introduce a new "kind"
         (e.g., "raw_histogram") that would slip past this gate.
 
+        Per-entry ``_token`` re-validation: the executor's
+        ``_filter_plot_manifest`` strips/validates tokens at run
+        completion and rewrites the manifest with cleaned content.
+        That rewrite CAN fail (the manifest lives in script-writable
+        territory; a script can chmod it read-only or otherwise
+        block the host's write). When the rewrite fails, the executor
+        currently leaves the original manifest in place — which
+        would let a forged ``{"kind": "coefficients", ...}`` entry
+        slip through and stage a row-level plot for vision. Solution:
+        the runner re-validates each entry's ``_token`` against the
+        per-run token registered by the executor. Entries with a
+        missing / wrong token are dropped HERE regardless of what
+        the on-disk manifest contains. If no token is registered
+        for the run (replay / re-attach / unknown provenance), all
+        entries are dropped — fail closed.
+
         Idempotency: re-reading the same manifest is fine — every
         consumed plot list is dropped after a successful turn, and
         only newly-produced runs land plots in their own run_dir.
         """
+        from nora.executor import get_run_token, RESULT_TOKEN_FIELD
+        import secrets as _secrets
+
+        expected_token = get_run_token(run_dir)
         try:
             plots_dir = run_dir / "_nora_plots"
             manifest = plots_dir / "manifest.jsonl"
@@ -502,6 +522,30 @@ class SessionRunner:
                     continue
                 if not isinstance(entry, dict):
                     continue
+                # Authenticity gate. Every entry MUST carry a
+                # ``_token`` that matches the executor's per-run
+                # token. The runtime libraries (R/Stata/Python
+                # helpers) stamp every entry they emit; a forged
+                # entry hand-crafted by the script body (bypassing
+                # the helpers) cannot mint a valid token without
+                # introspecting the runtime library's loaded
+                # state — the existing trust model. Missing /
+                # mismatched / no-registry-entry all fail closed
+                # so a rewrite-blocked manifest can't smuggle a
+                # row-level plot through this side channel.
+                if expected_token is None:
+                    continue
+                got = entry.get(RESULT_TOKEN_FIELD)
+                if not isinstance(got, str) or not _secrets.compare_digest(
+                    got, expected_token,
+                ):
+                    continue
+                # Strip the token from the in-memory copy so it
+                # never rides on a staged plot's metadata.
+                entry = {
+                    k: v for k, v in entry.items()
+                    if k != RESULT_TOKEN_FIELD
+                }
                 entries.append(entry)
         except OSError:
             return

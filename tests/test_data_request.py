@@ -611,7 +611,14 @@ def test_correlation_pair_coarsens_rare_missingness(tmp_path: Path):
     assert r.status == "granted", r.reason
     # The exact "1" must NOT be in the answer — coarsened to the marker.
     assert r.answer["missing_count"] == "<10"
-    assert r.answer["n_complete"] == n - 1
+    # ``n_complete`` is ALSO suppressed (set to None) so the model can't
+    # recover the rare missing count by subtracting from the schema's
+    # exact observation_count. Publishing one without the other is
+    # what reopened this channel.
+    assert r.answer["n_complete"] is None, (
+        f"n_complete leaked the complement of the rare missing count: "
+        f"got {r.answer['n_complete']}"
+    )
 
 
 def test_correlation_pair_keeps_large_missing_count(tmp_path: Path):
@@ -788,3 +795,242 @@ def test_unreadable_dataset_error_sanitized(tmp_path: Path):
     r = handle(missing, "numeric_bounds", "v")
     assert r.status == "error"
     assert "\n" not in r.reason
+
+
+# ---------------------------------------------------------------------------
+# Complement-leak suppression on n_nonmissing / n_complete
+# ---------------------------------------------------------------------------
+#
+# Schema publishes exact ``observation_count``. The per-variable handlers
+# below publish ``n_nonmissing`` / ``n_complete``. The difference is the
+# missing count, which ``_na_count`` already coarsens when one side is
+# rare. The handlers below must apply the same gate or the model
+# recovers the rare missing count by subtraction.
+
+
+def test_numeric_bounds_suppresses_rare_complement(tmp_path: Path):
+    """Schema says observation_count=1000, numeric_bounds used to say
+    n_nonmissing=999. The model trivially infers missing=1 — exactly
+    the rare-missingness signal ``_na_count`` denies. The fix: when
+    either side of (nonmissing, missing) is in [1, threshold),
+    suppress both numbers."""
+    n = 1000
+    income = np.arange(n, dtype=float)
+    income[42] = np.nan  # one missing
+    df = pd.DataFrame({"income": income})
+    p = tmp_path / "rare_missing.csv"
+    df.to_csv(p, index=False)
+
+    r = handle(p, "numeric_bounds", "income")
+    assert r.status == "granted", r.reason
+    # The complement that would leak the rare missing count must be
+    # suppressed.
+    assert r.answer["n_nonmissing"] is None, (
+        f"n_nonmissing leaked the complement of rare missingness: "
+        f"got {r.answer['n_nonmissing']}"
+    )
+    assert r.answer["missing_count"] == "<10"
+
+
+def test_quartiles_suppresses_rare_complement(tmp_path: Path):
+    """Same as numeric_bounds: schema=1000, quartiles used to publish
+    n_nonmissing=999. The gate must be symmetric across both surfaces."""
+    n = 1000
+    income = np.arange(n, dtype=float)
+    income[5] = np.nan
+    df = pd.DataFrame({"income": income})
+    p = tmp_path / "quartiles_rare_missing.csv"
+    df.to_csv(p, index=False)
+
+    r = handle(p, "quartiles", "income")
+    assert r.status == "granted", r.reason
+    assert r.answer["n_nonmissing"] is None, (
+        f"n_nonmissing leaked the complement: "
+        f"got {r.answer['n_nonmissing']}"
+    )
+    assert r.answer["missing_count"] == "<10"
+
+
+def test_numeric_bounds_passes_complete_data(tmp_path: Path):
+    """Happy path: no missingness → both counts publish exactly,
+    no suppression note."""
+    n = 100
+    df = pd.DataFrame({"income": np.arange(n, dtype=float)})
+    p = tmp_path / "complete.csv"
+    df.to_csv(p, index=False)
+
+    r = handle(p, "numeric_bounds", "income")
+    assert r.status == "granted", r.reason
+    assert r.answer["n_nonmissing"] == n
+    assert r.answer["missing_count"] == 0
+    assert "count_note" not in r.answer
+
+
+def test_numeric_bounds_passes_above_threshold_missingness(tmp_path: Path):
+    """Missingness above the threshold is aggregate enough — both
+    counts publish exactly."""
+    n = 200
+    income = np.arange(n, dtype=float)
+    income[:50] = np.nan  # 50 missing > threshold (10)
+    df = pd.DataFrame({"income": income})
+    p = tmp_path / "many_missing.csv"
+    df.to_csv(p, index=False)
+
+    r = handle(p, "numeric_bounds", "income")
+    assert r.status == "granted", r.reason
+    assert r.answer["n_nonmissing"] == 150
+    assert r.answer["missing_count"] == 50
+
+
+# ---------------------------------------------------------------------------
+# SDCConfig honored by correlation_pair
+# ---------------------------------------------------------------------------
+
+
+def test_correlation_pair_honors_caller_config(tmp_path: Path):
+    """A stricter ``SDCConfig(cell_suppression_threshold=25)`` must
+    take effect on correlation_pair too. The path previously
+    hard-coded ``DEFAULT_CONFIG.cell_suppression_threshold`` so the
+    site-policy knob silently no-op'd here, drifting away from
+    ``categorical_levels`` / ``na_count`` which DID honor the
+    config. 20 missing rows on the default policy (threshold=10)
+    would publish ``missing_count=20``; under threshold=25 it must
+    coarsen."""
+    n = 100
+    income = np.arange(n, dtype=float)
+    age = np.arange(n, dtype=float) + 5.0
+    age[:20] = np.nan  # 20 missing; <25 under strict policy
+    df = pd.DataFrame({"income": income, "age": age})
+    p = tmp_path / "strict_policy.csv"
+    df.to_csv(p, index=False)
+
+    strict = SDCConfig(cell_suppression_threshold=25)
+    r = handle(
+        p, "correlation_pair", "income",
+        variable2="age", config=strict,
+    )
+    assert r.status == "granted", r.reason
+    assert r.answer["missing_count"] == "<25", (
+        f"correlation_pair ignored the stricter SDCConfig: "
+        f"got missing_count={r.answer['missing_count']!r}"
+    )
+    assert r.answer["n_complete"] is None, (
+        "n_complete must be suppressed when missing is rare under "
+        "the caller's stricter policy"
+    )
+
+
+# ---------------------------------------------------------------------------
+# MinimumNViolation message — actual N must not leak
+# ---------------------------------------------------------------------------
+
+
+def test_minimum_n_violation_message_omits_actual_count():
+    """The exception's str() must not include the actual ``n`` —
+    that's exactly the small-subgroup signal the gate is suppressing.
+    The sanitizer forwards ``str(e)`` as model-visible
+    ``rejection_reason`` at four catch sites, so the leak fires
+    every time a regression / t-test / descriptive / correlation
+    matrix gets called on a small N."""
+    from nora.sdc import MinimumNViolation, require_minimum_n
+
+    with pytest.raises(MinimumNViolation) as exc_info:
+        require_minimum_n(7, threshold=30, field="n")
+    msg = str(exc_info.value)
+    assert "7" not in msg, (
+        f"MinimumNViolation message leaked actual N: {msg!r}"
+    )
+    assert "30" in msg, "threshold should remain visible — it's a config constant"
+    # ``actual`` is retained on the instance for researcher audit logs.
+    assert exc_info.value.actual == 7
+    assert exc_info.value.required == 30
+
+
+def test_ols_small_n_rejection_omits_actual_count():
+    """End-to-end: a small-N OLS rejection forwarded through the
+    sanitizer must not surface the small N in ``rejection_reason``."""
+    from nora.sanitizer import sanitize
+    payload = {
+        "type": "linear_regression", "n": 7,
+        "coefficients": {"x": 1.0},
+        "standard_errors": {"x": 0.5},
+        "response_variable": "y",
+        "predictor_variables": ["x"],
+    }
+    result = sanitize(payload)
+    assert not result.ok
+    reason = result.rejection_reason or ""
+    assert "7" not in reason, (
+        f"OLS rejection leaked the small N: {reason!r}"
+    )
+
+
+def test_ttest_small_n_rejection_omits_actual_count():
+    """t-test with a small-group N: the rejection must say which
+    field is below threshold but not its exact count."""
+    from nora.sanitizer import sanitize
+    payload = {
+        "type": "t_test", "n1": 3, "n2": 200,
+        "mean1": 1.0, "mean2": 1.2, "sd1": 0.1, "sd2": 0.1,
+        "df": 200, "t_statistic": 1.5, "p_value": 0.1,
+    }
+    result = sanitize(payload)
+    assert not result.ok
+    reason = result.rejection_reason or ""
+    assert "=3" not in reason and " 3 " not in reason, (
+        f"t-test rejection leaked n1=3: {reason!r}"
+    )
+
+
+def test_descriptive_small_n_rejection_omits_actual_count():
+    """Descriptive summary with n below threshold: same posture."""
+    from nora.sanitizer import sanitize
+    payload = {
+        "type": "descriptive", "n": 4,
+        "variable": "income", "mean": 50000.0, "sd": 1.0,
+        "missing_count": 0,
+    }
+    result = sanitize(payload)
+    assert not result.ok
+    reason = result.rejection_reason or ""
+    assert " 4 " not in reason and "=4" not in reason, (
+        f"descriptive rejection leaked n=4: {reason!r}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# suppress_cells_below — exception text scrubs key/value
+# ---------------------------------------------------------------------------
+
+
+def test_suppress_cells_below_typeerror_does_not_echo_key_or_value():
+    """The TypeError message used to include ``key`` (a data-derived
+    category label) and the bad value. If a caller forwards that
+    exception text into a model-visible rejection, the label and
+    value leak. The patched message keeps the diagnosis ('not int')
+    but drops the data-origin pieces."""
+    from nora.sdc import suppress_cells_below
+    hostile_key = "rare_diagnosis_label_X"
+    hostile_value = "secret-data-9999"
+
+    with pytest.raises(TypeError) as exc_info:
+        suppress_cells_below({hostile_key: hostile_value}, threshold=5)  # type: ignore[dict-item]
+    msg = str(exc_info.value)
+    assert hostile_key not in msg, (
+        f"TypeError leaked cell key: {msg!r}"
+    )
+    assert hostile_value not in msg, (
+        f"TypeError leaked cell value: {msg!r}"
+    )
+
+
+def test_suppress_cells_below_valueerror_does_not_echo_key_or_value():
+    """The negative-count ValueError previously echoed the key + the
+    negative count. Same scrubbing posture."""
+    from nora.sdc import suppress_cells_below
+    hostile_key = "rare_diagnosis_label_Y"
+    with pytest.raises(ValueError) as exc_info:
+        suppress_cells_below({hostile_key: -99}, threshold=5)
+    msg = str(exc_info.value)
+    assert hostile_key not in msg
+    assert "-99" not in msg, f"ValueError leaked the negative count: {msg!r}"

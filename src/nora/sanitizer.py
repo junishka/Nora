@@ -2261,7 +2261,29 @@ def _sanitize_correlation_matrix(
     # the variables list shows the truncated form. Without this, a
     # legitimate matrix with a 50-char variable name returned with
     # ``correlations: {}`` and ``ok=True`` — silent empty success.
-    declared = set(out.get("variables") or [])
+    sanitized_vars = list(out.get("variables") or [])
+    # Reject sanitized-name collisions in the declared variables list.
+    # Two raw names like ``"A B"`` / ``"A\nB"`` collapse to the same
+    # ``safe_key`` and the previous ``set(...)`` silently merged
+    # them — leaving a matrix where one declared label represents
+    # two source variables (and the corresponding rows / columns
+    # were dropped or merged in the per-key collision counters
+    # below). The result was an ``ok=True`` matrix that was
+    # ambiguous from the model's seat. Reject loudly so the script
+    # has to disambiguate at the source. Same posture as the
+    # frequency_table collision check above.
+    if len(sanitized_vars) != len(set(sanitized_vars)):
+        return SanitizerResult(
+            ok=False, analysis_type="correlation_matrix",
+            rejection_reason=(
+                "two or more variable names sanitize to the same "
+                "key (e.g. embedded newlines or shared 40-char "
+                "prefix). The declared variables list is ambiguous; "
+                "rename the source variables to disambiguate. The "
+                "colliding names are withheld — they're data-derived."
+            ),
+        )
+    declared = set(sanitized_vars)
 
     sanitized_corr: dict[str, dict[str, float]] = {}
     # Counters only — row/col keys are data-derived (variable names),

@@ -336,6 +336,74 @@ def _format_bad_lines_summary(bad_lines: list[str], payload_count: int) -> str:
 _BAD_LINES_TAIL_CAP = 20
 
 
+# In-process registry mapping resolved run_dir → per-run token.
+# Populated when a run completes (right before the executor returns
+# its ExecutionResult); consumed by the runner's ``_capture_plots``
+# so it can re-validate each manifest entry's ``_token`` field
+# directly, defense-in-depth over the executor's own rewrite.
+#
+# Why the runner re-validates: ``_filter_plot_manifest`` rewrites
+# the on-disk manifest with validated content, but the manifest
+# lives in the script-writable ``<run_dir>/_nora_plots/`` directory.
+# A script can chmod the manifest read-only or replace it with a
+# symlink whose target the host can't safely overwrite. If the
+# host's rewrite fails, the original (forged) manifest stays. The
+# runner's re-validation guarantees that even a leaked / unwritable
+# manifest cannot smuggle a row-level plot past the kind gate.
+#
+# The token IS NOT plumbed through ToolCallResult.text (the JSON
+# the model sees) — exposing it there would let the model emit
+# forged entries with the real token. The in-process dict is the
+# private channel.
+#
+# Cleanup: the runner removes its entry after consumption. A turn
+# that never reaches ``_capture_plots`` (early failure) leaves an
+# entry behind; the registry would grow without bound on long-
+# lived sessions. The cap below bounds the worst case by evicting
+# the oldest entries when full.
+_RUN_TOKEN_REGISTRY: dict[str, str] = {}
+_RUN_TOKEN_REGISTRY_CAP = 256
+
+
+def register_run_token(run_dir: Path, token: str) -> None:
+    """Record ``token`` as the authenticity token for ``run_dir``.
+
+    Resolves the run_dir before keying so a runner using a
+    non-canonical path (relative, symlinked) still finds the entry.
+    Evicts the oldest entries past ``_RUN_TOKEN_REGISTRY_CAP``.
+    """
+    try:
+        key = str(run_dir.resolve())
+    except OSError:
+        key = str(run_dir)
+    _RUN_TOKEN_REGISTRY[key] = token
+    while len(_RUN_TOKEN_REGISTRY) > _RUN_TOKEN_REGISTRY_CAP:
+        # Pop oldest insertion-order entry (Python dicts preserve order).
+        _RUN_TOKEN_REGISTRY.pop(next(iter(_RUN_TOKEN_REGISTRY)), None)
+
+
+def get_run_token(run_dir: Path) -> str | None:
+    """Return the token registered for ``run_dir``, or ``None`` if
+    no entry exists.
+
+    Non-destructive: both the runner's ``_capture_plots`` and the
+    tool layer's ``_summarize_plot_helpers`` need to validate
+    entries in the same run. A single consume would race the two
+    callers. Cleanup is handled by the registry's LRU eviction cap
+    so stale entries don't accumulate.
+
+    Missing entry → caller treats every manifest entry as
+    untrusted (fail closed). A re-attached session or replay path
+    that lacks the in-process registration drops all helper plots
+    rather than silently trusting their kind labels.
+    """
+    try:
+        key = str(run_dir.resolve())
+    except OSError:
+        key = str(run_dir)
+    return _RUN_TOKEN_REGISTRY.get(key)
+
+
 def _filter_plot_manifest(run_dir: Path, run_token: str) -> int:
     """Drop manifest entries whose ``_token`` is missing or wrong, and
     strip the field from the rest. Returns the number of entries
@@ -387,28 +455,38 @@ def _filter_plot_manifest(run_dir: Path, run_token: str) -> int:
         ):
             dropped += 1
             continue
-        cleaned = {k: v for k, v in entry.items() if k != RESULT_TOKEN_FIELD}
-        kept.append(cleaned)
+        # Keep ``_token`` in the validated entries. Downstream
+        # readers (runner's ``_capture_plots`` and the tool layer's
+        # ``_summarize_plot_helpers``) re-validate the token
+        # themselves — defense in depth against this rewrite being
+        # blocked by a script that chmods the manifest read-only.
+        # The token is per-run and never reaches the model: the
+        # runner strips it from staged plot metadata, and the
+        # summary skips the field. Keeping it on disk lets every
+        # consumer make the same authenticity decision, instead of
+        # implicitly trusting the rewrite to have happened.
+        kept.append(entry)
     if dropped == 0:
-        # Every line validated; manifest content is unchanged except
-        # for the ``_token`` field, which downstream consumers don't
-        # otherwise care about. Rewrite anyway to strip it so the
-        # field never reaches the runner / tools / Files panel.
+        # Every line validated; manifest content is unchanged.
+        # Still rewrite so disk content matches what we just
+        # validated (no torn writes from a partial helper crash).
         pass
-    try:
-        manifest_path.write_text(
-            "".join(
-                json.dumps(e, ensure_ascii=False) + "\n" for e in kept
-            ),
-            encoding="utf-8",
-        )
-    except OSError:
-        # Best-effort: if we can't rewrite, leave the original file
-        # in place. Consumers that read ``_token``-bearing entries
-        # treat them as opaque (they don't gate on it), so the
-        # runner's allowlist still bounds what's attached — but the
-        # forged-entry filter is bypassed in this rare case.
-        pass
+    # No-follow rewrite: the manifest lives in script-writable
+    # territory. A script can symlink ``manifest.jsonl`` →
+    # arbitrary user-writable path so the host's write follows
+    # and overwrites the symlink target. The helper refuses to
+    # follow. If the rewrite fails for any reason (symlink
+    # planted, chmod-blocked, disk full), the original file
+    # stays in place — but downstream readers (runner's
+    # ``_capture_plots`` and tools' ``_summarize_plot_helpers``)
+    # re-validate the ``_token`` field per entry, so a forged
+    # entry can't smuggle through the failed rewrite. This is
+    # the load-bearing security gate; the rewrite is just an
+    # optimization to keep the on-disk manifest small.
+    _write_text_no_follow(
+        manifest_path,
+        "".join(json.dumps(e, ensure_ascii=False) + "\n" for e in kept),
+    )
     return dropped
 
 
@@ -418,6 +496,71 @@ def _filter_plot_manifest(run_dir: Path, run_token: str) -> int:
 # view — they're already represented in the script's result card, so
 # duplicating them in the panel just adds noise.
 CWD_WRITES_MANIFEST_NAME = "cwd_writes.json"
+
+
+def _write_text_no_follow(path: Path, text: str) -> bool:
+    """Write ``text`` to ``path`` without following symlinks.
+
+    The post-run host writes (cwd_writes.json, stdout.log, stderr.log,
+    the plot manifest rewrite) all land in script-writable directories.
+    A script can plant a symlink at the target path BEFORE exiting,
+    pointing at any host-writable file (``~/.ssh/known_hosts``,
+    ``~/.config/...``, etc.). A plain ``Path.write_text`` follows
+    that symlink and overwrites the target with content the script
+    can largely control. The macOS sandbox's
+    ``(allow file-write* (subpath run_dir))`` does NOT block symlink
+    creation in the run_dir (verified empirically against the actual
+    profile shape Nora uses).
+
+    Defense: ``os.open`` with ``O_NOFOLLOW``. If the path already
+    exists as a symlink, the open fails with ``ELOOP`` and we
+    refuse to write — the host doesn't follow the link, and the
+    legitimate file (if any) was never the symlink to begin with.
+    The legitimate happy path (path doesn't exist OR is a regular
+    file) writes the content as before.
+
+    We also fstat the opened fd and refuse non-regular files
+    (a FIFO planted by the script could let it siphon the host's
+    write into a process it controls).
+
+    Returns ``True`` on success, ``False`` when the open / write
+    failed for ANY reason. Callers treat False as fail-open for
+    the data they were writing (the manifest just stays empty /
+    the log stays missing), which is the same posture the prior
+    ``except OSError: pass`` blocks already had.
+    """
+    import stat as _stat
+
+    flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
+    # O_NOFOLLOW is present on macOS / Linux / BSD. On platforms
+    # without it the open follows symlinks; we accept that as the
+    # cost of cross-platform compat (Nora targets macOS today; the
+    # symlink-creation primitive is also platform-gated).
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    try:
+        fd = os.open(path, flags, 0o600)
+    except OSError:
+        return False
+    try:
+        try:
+            st = os.fstat(fd)
+        except OSError:
+            return False
+        if not _stat.S_ISREG(st.st_mode):
+            return False
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                fd = -1
+                f.write(text)
+        except OSError:
+            return False
+    finally:
+        if fd >= 0:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+    return True
 
 
 def _snapshot_cwd_top_level(cwd: Path) -> dict[str, tuple[float, int]]:
@@ -515,13 +658,14 @@ def _write_cwd_writes_manifest(
     if not rows:
         return
     manifest_path = run_dir / CWD_WRITES_MANIFEST_NAME
-    try:
-        manifest_path.write_text(
-            json.dumps(rows, ensure_ascii=False),
-            encoding="utf-8",
-        )
-    except OSError:
-        pass
+    # No-follow write: the manifest path lives inside run_dir,
+    # which is script-writable. A script can plant a symlink at
+    # the manifest path before exiting so the host's write
+    # follows it and overwrites an arbitrary user file. The
+    # helper refuses to follow.
+    _write_text_no_follow(
+        manifest_path, json.dumps(rows, ensure_ascii=False),
+    )
 
 
 def _parse_result_jsonl(
@@ -910,6 +1054,13 @@ def run_script(
         # a script that wrote a half-finished dataset before getting
         # killed still produced clutter the panel should hide.
         _write_cwd_writes_manifest(cwd, run_dir, cwd_pre_snapshot)
+        # Register the token even on timeout: the helper library may
+        # have written valid token-bearing manifest entries before
+        # the kill, and the runner's re-validation needs the token
+        # to recognize them. Without this, every timed-out run drops
+        # all its plots — including ones the helper library wrote
+        # legitimately seconds before the kill.
+        register_run_token(run_dir, run_token)
         return ExecutionResult(
             ok=False, language=language,
             raw_stdout=stdout or "",
@@ -946,13 +1097,15 @@ def run_script(
     # dumpy-blob truncation. See ``test_error_summary_no_leak.py`` for
     # the SDC boundary regressions, and ``test_stderr_isolation.py`` for
     # the broader "no raw log file ever crosses" pin.
-    try:
-        (run_dir / "stdout.log").write_text(raw_stdout, encoding="utf-8")
-        (run_dir / "stderr.log").write_text(raw_stderr, encoding="utf-8")
-    except OSError:
-        # Persistence failure isn't fatal — raw output still lives in the
-        # ExecutionResult fields for in-process rendering.
-        pass
+    # No-follow writes: stdout.log / stderr.log land in run_dir
+    # which is script-writable, and the host runs unsandboxed.
+    # A script can plant a symlink at either path before exiting,
+    # so the host's write follows the link and overwrites
+    # attacker-chosen files. The helper refuses to follow;
+    # persistence failure isn't fatal — raw output still lives
+    # in the ExecutionResult fields for in-process rendering.
+    _write_text_no_follow(run_dir / "stdout.log", raw_stdout)
+    _write_text_no_follow(run_dir / "stderr.log", raw_stderr)
 
     # 6. Parse result file. The runtime libraries write JSONL (one
     # payload per line). A script that calls a single helper produces
@@ -1053,6 +1206,14 @@ def run_script(
             f"with missing or invalid authenticity token — likely "
             f"hand-crafted by the script bypassing the helper library"
         )
+
+    # Register the per-run token so the runner's ``_capture_plots``
+    # can re-validate manifest entries directly. The on-disk filter
+    # above is a best-effort optimization (smaller manifest); the
+    # runner-side validation is the load-bearing one because the
+    # manifest lives in script-writable territory and the rewrite
+    # CAN fail without the token validation getting a second chance.
+    register_run_token(run_dir, run_token)
 
     return ExecutionResult(
         ok=ok, language=language,

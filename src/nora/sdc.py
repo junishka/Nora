@@ -43,8 +43,20 @@ def suppression_marker(threshold: int) -> str:
 class MinimumNViolation(Exception):
     """Raised when a hard SDC rule (minimum N) would be violated.
 
-    Carries a machine-readable reason so the sanitizer can forward it as a
-    policy rejection rather than an exception trace.
+    The model-visible string ONLY names the field and the threshold —
+    never the exact ``actual`` count that fell below it. Publishing the
+    suppressed N defeats the purpose of the gate: ``n=7`` is exactly
+    the kind of small subgroup size the minimum-N rule exists to hide.
+    A model that wants the subgroup size can intentionally probe with
+    crafted scripts and read it off the rejection reason. ``actual``
+    is retained as an instance attribute so researcher audit logs
+    keep the precise value, but the SDC boundary is the ``str(e)``
+    surface the sanitizer's ``rejection_reason`` forwards.
+
+    This matches the posture already used by ``_na_count`` /
+    ``_numeric_bounds`` / ``_quartiles`` / ``_correlation_pair``
+    denial reasons in ``data_request.py`` — the threshold is safe to
+    disclose (fixed config constant), the actual count is not.
     """
 
     def __init__(self, field: str, actual: int, required: int):
@@ -52,7 +64,7 @@ class MinimumNViolation(Exception):
         self.actual = actual
         self.required = required
         super().__init__(
-            f"{field}={actual} is below the minimum threshold of {required} "
+            f"{field} is below the minimum threshold of {required} "
             f"required by SDC policy"
         )
 
@@ -163,11 +175,16 @@ def suppress_cells_below(
     total = 0
     for k, v in counts.items():
         if not isinstance(v, int):
-            raise TypeError(
-                f"cell count for key {k!r} must be int, got {type(v).__name__}"
-            )
+            # Don't echo the cell key — those are data-derived
+            # category labels and the model-visible rejection path
+            # forwards exception text verbatim through
+            # ``rejection_reason``. Same posture as the rare-N
+            # suppressions in ``data_request.py``: keep the boundary
+            # category-name-free. The raw key/value still reach
+            # researcher-side logs via the exception traceback.
+            raise TypeError("cell count must be int")
         if v < 0:
-            raise ValueError(f"cell count for key {k!r} is negative: {v}")
+            raise ValueError("cell count is negative")
         total += v
         if v < threshold:
             out[k] = marker

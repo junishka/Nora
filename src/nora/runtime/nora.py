@@ -557,13 +557,22 @@ def from_table(variable: str, counts: Any, *, n: int | None = None,
         iv = _safe_int(v)
         if iv is not None:
             clean_counts[str(k)] = iv
+    # Default: auto-compute n from the clean counts. Branch on caller-
+    # supplied n so a NaN / non-finite caller value flows through
+    # ``_safe_int`` and lands as ``None`` (which the sanitizer
+    # rejects), rather than getting silently coerced to 0 by
+    # ``or 0``. ``n=0`` and a malformed/non-finite n both used to
+    # serialize as ``"n": 0`` — a valid-looking sanitizer payload
+    # that hid the upstream undefined-count problem.
     if n is None:
-        n = sum(clean_counts.values())
+        safe_n: int | None = sum(clean_counts.values())
+    else:
+        safe_n = _safe_int(n)
     fields = {
         "variable": variable,
         "counts": clean_counts,
-        "n": _safe_int(n) or 0,
-        "missing_count": _safe_int(missing_count) or 0,
+        "n": safe_n,
+        "missing_count": _safe_int(missing_count),
     }
     fields.update(extra)
     result(type="frequency_table", **fields)
@@ -615,11 +624,16 @@ def from_crosstab(table: Any, *, row_variable: str | None = None,
         row_variable = row_variable or "row"
         col_variable = col_variable or "column"
 
+    # ``missing_count`` rides as ``None`` when the caller passed
+    # a NaN / non-finite value so the sanitizer rejects it. The
+    # previous ``or 0`` silently coerced bad inputs to a
+    # valid-looking ``0``, hiding the upstream undefined-count
+    # problem from disclosure-control review.
     fields = {
         "row_variable": row_variable,
         "col_variable": col_variable,
         "counts": counts,
-        "missing_count": _safe_int(missing_count) or 0,
+        "missing_count": _safe_int(missing_count),
     }
     fields.update(extra)
     result(type="crosstab", **fields)

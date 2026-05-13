@@ -75,7 +75,7 @@ def test_install_packages_proceeds_on_approval(monkeypatch) -> None:
 
     captured: dict[str, object] = {}
 
-    async def fake_install(language, packages, action):
+    async def fake_install(language, packages, action, proc_register=None):
         captured["language"] = language
         captured["packages"] = list(packages)
         captured["action"] = action

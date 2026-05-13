@@ -111,17 +111,21 @@ def test_summarize_plot_helpers_marks_residuals_researcher_only(
     ``plot_residuals`` with no acknowledgement — but flags it
     ``researcher_only`` so the model knows it can't see the image."""
     from nora.tools import _summarize_plot_helpers
+    from nora.executor import register_run_token, RESULT_TOKEN_FIELD
 
     plots_dir = tmp_path / "_nora_plots"
     plots_dir.mkdir()
+    token = "test-residuals-researcher-only-token"
     (plots_dir / "manifest.jsonl").write_text(
         json.dumps({
             "file": "residuals.png",
             "kind": "residuals",
             "label": "Residual diagnostics",
+            RESULT_TOKEN_FIELD: token,
         }) + "\n",
         encoding="utf-8",
     )
+    register_run_token(tmp_path, token)
     summary = _summarize_plot_helpers(tmp_path)
     assert summary is not None
     succeeded = summary["succeeded"]
@@ -137,17 +141,21 @@ def test_summarize_plot_helpers_does_not_mark_visible_kinds_researcher_only(
     (coefficients, interaction, marginal_effects) must not get the
     researcher_only flag — they're model-visible."""
     from nora.tools import _summarize_plot_helpers
+    from nora.executor import register_run_token, RESULT_TOKEN_FIELD
 
     plots_dir = tmp_path / "_nora_plots"
     plots_dir.mkdir()
+    token = "test-visible-kinds-token"
     (plots_dir / "manifest.jsonl").write_text(
         json.dumps({
             "file": "coef.png",
             "kind": "coefficients",
             "label": "ok",
+            RESULT_TOKEN_FIELD: token,
         }) + "\n",
         encoding="utf-8",
     )
+    register_run_token(tmp_path, token)
     summary = _summarize_plot_helpers(tmp_path)
     assert summary is not None
     assert "researcher_only" not in summary["succeeded"][0]

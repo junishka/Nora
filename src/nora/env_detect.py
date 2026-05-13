@@ -102,6 +102,19 @@ def _r_missing_packages(
     machines with slow R). The probe writes a single boolean per
     package to stdout, separated by spaces.
 
+    Uses ``system.file(package = pkg)`` rather than
+    ``requireNamespace(pkg)``. ``requireNamespace`` LOADS the
+    package namespace, which fires the package's ``.onLoad`` hook
+    and runs arbitrary R code OUTSIDE the analysis sandbox (the
+    probe is a vanilla ``Rscript`` invocation at app startup and
+    after package installs). A malicious or compromised package
+    named ``haven`` or ``ggplot2`` would execute code during the
+    probe with the full parent environment (no env filter applied
+    to ``Rscript`` here). ``system.file`` only checks the
+    installed-package directory on disk and does NOT load
+    namespaces — answers "is this package installed?" without
+    executing package code.
+
     Failures (Rscript missing, weird R version, OS error) return
     "all missing" rather than the conservative "none missing" so
     the system prompt is honest about uncertainty.
@@ -109,7 +122,7 @@ def _r_missing_packages(
     if not packages:
         return ()
     expr = "; ".join(
-        f"cat(requireNamespace(\"{pkg}\", quietly=TRUE), \" \")"
+        f"cat(nzchar(system.file(package=\"{pkg}\")), \" \")"
         for pkg in packages
     )
     try:
@@ -265,13 +278,26 @@ def _r_version(binary: str) -> str | None:
 
 
 def _python_version(binary: str) -> str | None:
-    """Run ``python --version`` and return the first banner line."""
+    """Run ``python --version`` and return the first banner line.
+
+    ``--version`` short-circuits CPython startup before ``site.py``
+    runs, so ``sitecustomize`` / ``usercustomize`` and the inherited
+    ``PYTHONPATH`` can't execute code via this probe. The filtered
+    env + no ``-I`` here is intentional: ``-I`` doesn't compose
+    with bare ``--version`` on all Python versions and the version
+    flag doesn't load anything off sys.path anyway. The filtered
+    env still strips parent-process secrets (``ANTHROPIC_API_KEY``,
+    AWS creds) before the subprocess inherits them, matching the
+    other probes.
+    """
+    from nora.executor import _filter_env
     try:
         out = subprocess.run(
             [binary, "--version"],
             capture_output=True,
             text=True,
             timeout=5,
+            env=_filter_env(dict(os.environ)),
         )
     except (OSError, subprocess.TimeoutExpired):
         return None
@@ -293,24 +319,27 @@ def _python_missing_packages(
     "all packages missing" so the executor's missing-packages
     branch trips and surfaces a coherent error to the researcher.
 
-    The probe runs with ``PYTHONPATH`` set to include the Nora pkg
-    dir so packages installed via ``install_packages`` (which writes
-    to ``--target <nora_python_pkg_dir>``) count as present. Without
-    this the executor's preflight refuses runs even after a
-    successful Nora install.
+    Uses ``importlib.util.find_spec(pkg)`` rather than
+    ``__import__(pkg)``. ``__import__`` executes the package's
+    ``__init__.py`` (and any imports it triggers) OUTSIDE the
+    analysis sandbox: this probe runs at app startup and after
+    ``install_packages``, with full filesystem and network. A
+    package masquerading as ``pandas`` / ``statsmodels`` would
+    get code execution during detection. ``find_spec`` only
+    consults sys.path finders — for top-level package names it
+    returns metadata without importing the package, so no
+    ``__init__.py`` runs.
+
+    The probe is launched with ``-I`` (isolated mode) so the
+    inherited ``PYTHONPATH`` and the user-site ``usercustomize.py``
+    can't inject startup code. The Nora package dir is added to
+    ``sys.path`` explicitly inside the probe rather than via
+    ``PYTHONPATH`` env (which ``-I`` ignores). Without ``-I`` an
+    attacker-controlled ``sitecustomize.py`` / ``usercustomize.py``
+    on the inherited path would execute at every detection run.
     """
     if not required:
         return ()
-    probe = (
-        "import json, sys\n"
-        f"missing = []\n"
-        f"for pkg in {list(required)!r}:\n"
-        "    try:\n"
-        "        __import__(pkg)\n"
-        "    except Exception:\n"
-        "        missing.append(pkg)\n"
-        "sys.stdout.write(json.dumps(missing))\n"
-    )
     # Lazy import: ``package_installer`` and ``executor`` are sibling
     # modules and cheap to import, but keeping them lazy avoids any
     # import-cycle surprise if env_detect ever gets pulled in earlier
@@ -318,29 +347,36 @@ def _python_missing_packages(
     from nora.package_installer import nora_python_pkg_dir
     from nora.executor import _filter_env
     pkg_dir = str(nora_python_pkg_dir(binary))
+    # ``find_spec`` returns ``None`` when the package isn't on
+    # sys.path. Wrap in try/except so a finder that raises (rare,
+    # but possible with broken namespace packages) doesn't mark
+    # ALL packages missing — only the offending one.
+    probe = (
+        "import json, sys\n"
+        f"sys.path.insert(0, {pkg_dir!r})\n"
+        "import importlib.util\n"
+        f"required = {list(required)!r}\n"
+        "missing = []\n"
+        "for pkg in required:\n"
+        "    try:\n"
+        "        spec = importlib.util.find_spec(pkg)\n"
+        "    except Exception:\n"
+        "        spec = None\n"
+        "    if spec is None:\n"
+        "        missing.append(pkg)\n"
+        "sys.stdout.write(json.dumps(missing))\n"
+    )
     # Filter the probe's env through the same allowlist the executor
-    # uses for analysis scripts. The probe runs ``__import__(pkg)`` for
-    # the configured packages — pandas, numpy, statsmodels, scipy,
-    # matplotlib — which executes each package's ``__init__.py``
-    # OUTSIDE the script sandbox and with no network deny. Without the
-    # filter, those imports inherit secrets like ``ANTHROPIC_API_KEY``
-    # / AWS credentials from the parent process env. If
-    # ``install_packages`` ever wrote a malicious package masquerading
-    # as one of the probed names into ``nora_python_pkg_dir``, its
-    # import code would have a clean exfiltration path. The script
-    # executor's ``_filter_env`` is the canonical allowlist; using it
-    # here keeps the two surfaces aligned.
-    filtered = _filter_env(dict(os.environ))
-    existing = filtered.get("PYTHONPATH", "")
-    probe_env = {
-        **filtered,
-        "PYTHONPATH": (
-            f"{pkg_dir}{os.pathsep}{existing}" if existing else pkg_dir
-        ),
-    }
+    # uses for analysis scripts. The probe runs OUTSIDE the script
+    # sandbox and with no network deny. Without the filter, the
+    # interpreter inherits secrets like ``ANTHROPIC_API_KEY`` / AWS
+    # credentials from the parent process env. The script executor's
+    # ``_filter_env`` is the canonical allowlist; using it here keeps
+    # the two surfaces aligned.
+    probe_env = _filter_env(dict(os.environ))
     try:
         out = subprocess.run(
-            [binary, "-c", probe],
+            [binary, "-I", "-c", probe],
             capture_output=True,
             text=True,
             timeout=10,
@@ -370,16 +406,26 @@ def _python_prefixes(binary: str) -> tuple[str, ...]:
     the default sandbox already covers) would fail to load even the
     standard library inside the sandbox.
 
+    ``-I`` (isolated mode) + filtered env: the probe runs OUTSIDE
+    the analysis sandbox at startup. Without ``-I``, an inherited
+    ``PYTHONPATH`` pointing at attacker-controlled ``sitecustomize.py``
+    would execute code during the probe. The probe only reads
+    ``sys.prefix`` / ``sys.exec_prefix``, which are populated
+    independently of the user/parent PYTHONPATH, so ``-I`` is safe
+    here.
+
     Best-effort: a probe failure returns an empty tuple. The
     sandbox falls back to the default system trees, which works for
     Apple's bundled python3 and Homebrew installs but breaks venvs.
     """
+    from nora.executor import _filter_env
     try:
         out = subprocess.run(
-            [binary, "-c", "import sys; print(sys.prefix); print(sys.exec_prefix)"],
+            [binary, "-I", "-c", "import sys; print(sys.prefix); print(sys.exec_prefix)"],
             capture_output=True,
             text=True,
             timeout=5,
+            env=_filter_env(dict(os.environ)),
         )
     except (OSError, subprocess.TimeoutExpired):
         return ()
