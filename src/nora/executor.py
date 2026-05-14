@@ -1663,6 +1663,15 @@ def _build_profile(
         _quote("/private/etc/protocols"),
         _quote("/private/etc/services"),
         _quote("/private/etc/nsswitch.conf"),
+        # Stata-MP (Stata 19 / StataNow) links LibreSSL and performs
+        # OpenSSL config init at startup. If `openssl.cnf` is unreadable
+        # LibreSSL aborts with "Auto configuration failed" and Stata
+        # exits 1 before opening its batch log, so even `display "hi"`
+        # dies in ~0.06s with no diagnostic surfaced to the researcher.
+        # The cert bundle (`cert.pem`) is deliberately NOT allowed:
+        # `(deny network*)` blocks outbound TLS anyway, so a script
+        # can't reach a verifier even if it loaded the bundle.
+        _quote("/private/etc/ssl/openssl.cnf"),
     ]
 
     # Per-run read scope: system trees needed by R/Stata to bootstrap

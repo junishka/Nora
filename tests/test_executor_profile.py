@@ -120,6 +120,10 @@ def test_narrow_private_etc_literals_present(example_profile: str):
         '(literal "/private/etc/protocols")',
         '(literal "/private/etc/services")',
         '(literal "/private/etc/nsswitch.conf")',
+        # Stata 19 / StataNow links LibreSSL; without openssl.cnf the
+        # binary aborts at startup with "Auto configuration failed"
+        # before opening its batch log.
+        '(literal "/private/etc/ssl/openssl.cnf")',
     ]
     for entry in required_literals:
         assert entry in example_profile, f"missing required literal: {entry}"
