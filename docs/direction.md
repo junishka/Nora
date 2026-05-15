@@ -1,19 +1,33 @@
 # Nora — architectural direction
 
-Working document. Last substantive update **2026-05-12**, after
-the release-readiness / documentation alignment pass: Nora is now
-documented as a multi-provider app (Anthropic or OpenAI), the
-model-facing surface is consistently fourteen MCP tools, supported
-data formats are consistently seven (`.csv`, `.tsv`, `.dta`,
-`.rds`, `.parquet`, `.jsonl`, `.ndjson`), install language treats
-R / Stata / Python as selectable analysis runtimes, and the `.dmg`
-is recorded as signed + notarized. Earlier self-pilot batches
-covered concurrent sessions, plot vision, Stata export reliability,
-runtime-environment probing, Files-panel polish, the Builder →
-Nora rename, the web UI `.app`, the memory stack, and the
-security-review fixes. The core decision — stay with
-script-submission ("Option A") rather than pivot to plan-submission
-with a bundled local LLM — still stands from 2026-04-20.
+Working document. Last substantive update **2026-05-15**, after
+the audit-fixes pass: install-packages consent is modal-only, the
+script-failure `debug_excerpt` is documented at its stricter
+redaction posture (exception bodies redacted wholesale, only
+parser-anchored framing crosses), `load_data` and the schema fast
+paths share a CSV/TSV header peek so they no longer disagree on
+headerless files, `_names_only_payload` distinguishes
+"row_count unknown" from "empty dataset", JSONL `names_only`
+unions keys across the file, malformed per-dataset policy entries
+clamp to the strictest tier (rather than fail open), the
+`chat_history` lightweight readers honour their "never raises"
+contract through concurrent-delete races, cancelled
+`submit_script` runs no longer emit a model-visible cancelled
+tool result, `delete_credential` notices external Keychain
+deletions, the session-focus switch leaves model-captured plot
+images intact, the loop-shutdown race that could leave a runner
+permanently busy is fixed, pywebview's deprecated `OPEN_DIALOG` /
+`FOLDER_DIALOG` are replaced by `FileDialog.OPEN` /
+`FileDialog.FOLDER`, and `_materialize_cache_busted_index` routes
+its bust file to a temp directory in packaged builds so the write
+no longer modifies the codesigned bundle. The previous batch
+(2026-05-12) was the release-readiness / documentation alignment
+pass: multi-provider framing, fourteen-tool MCP surface, seven
+supported data formats, R / Stata / Python as selectable analysis
+runtimes, signed + notarized `.dmg`. The core decision — stay
+with script-submission ("Option A") rather than pivot to
+plan-submission with a bundled local LLM — still stands from
+2026-04-20.
 
 For the single-page overview aimed at someone picking this up, see
 [`docs/handoff.md`](handoff.md). [`docs/overview.md`](overview.md)
@@ -69,7 +83,7 @@ researcher use case demands it.
 
 ## What's built
 
-As of 2026-05-12, the implementation covers:
+As of 2026-05-15, the implementation covers:
 
 - Spine + full SDK lockdown (14 MCP tools — get_schema, search_schema,
   request_data, submit_script, submit_script_file, expand_result,
@@ -146,8 +160,8 @@ As of 2026-05-12, the implementation covers:
   support.
 - Packaging: `.app` launches the web UI directly (no Terminal popup);
   the release `.dmg` is signed and notarized.
-- 1121 pytest cases collected via `uv run pytest --collect-only -q`
-  on 2026-05-12, plus Hypothesis-generated adversarial cases.
+- 1312 pytest cases collected via `uv run pytest --collect-only -q`
+  on 2026-05-15, plus Hypothesis-generated adversarial cases.
   Canonical repo: [github.com/junishka/Nora](https://github.com/junishka/Nora).
 
 ## What's remaining (prioritized)

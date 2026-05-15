@@ -1,25 +1,39 @@
 # Nora — handoff
 
 Single-page entry point for picking this project up. Last
-substantive update **2026-05-12**, after the release-readiness /
-documentation alignment pass: public copy now describes Nora as
-multi-provider (Anthropic or OpenAI) instead of Claude-only;
-install docs list R, Stata, and Python as analysis runtimes rather
-than treating Stata as optional; the tool surface is consistently
-documented as fourteen MCP tools including `install_packages`; the
-`.dmg` status is signed + notarized; GitHub URLs point at the
-canonical `junishka/Nora` repo; test counts were refreshed from
-pytest collection. The previous substantive batch (2026-05-03)
-was chat-UX polish: researcher-renameable sessions, top-anchored
-long assistant replies, WebKit list-marker selection fixes,
-expanded loading labels, and sidebar keyboard shortcut guards.
-The 2026-04-30 batch was the multi-result wire-format pass:
-append-mode JSONL result emission, partial-success semantics,
-inline compact result payloads, canonical markdown tables,
-`submit_script_file`, `search_schema`, row-count audit caching,
-and related recall/listing/session-state audit fixes. If
-something here disagrees with the code, trust the code and file a
-patch to this doc.
+substantive update **2026-05-15**, after the audit-fixes pass:
+`install_packages` consent is modal-only (the system prompt and
+tool description now agree that the Approve/Deny modal is the one
+gate); `error_summary.py` is documented at its current stricter
+redaction posture (exception bodies redacted wholesale, only
+parser-anchored framing survives); schema fast paths use a shared
+header peek so `load_data` and the names_only payload agree on
+headerless CSV/TSV; `_names_only_payload` distinguishes
+"row_count unknown" (`observation_count: null`) from "empty
+dataset"; JSONL `names_only` unions keys across the file instead
+of reading only the first record; malformed per-dataset policy
+entries now clamp to the strictest tier instead of falling open;
+`chat_history`'s lightweight readers honour their "never raises"
+contract through concurrent-delete races; cancelled `submit_script`
+runs raise `CancelledError` instead of returning a model-visible
+"status: cancelled" tool result; `delete_credential` uses a fresh
+keyring read so an external-Keychain deletion is recognised as
+"already absent" rather than a false "delete failed"; session
+focus switch no longer wipes captured plot images; the loop-
+shutdown race that could leave a runner permanently busy is
+fixed; pywebview's deprecated `OPEN_DIALOG` / `FOLDER_DIALOG`
+are replaced by `FileDialog.OPEN` / `FileDialog.FOLDER`; and
+`_materialize_cache_busted_index` routes its output to a temp
+directory (with an injected `<base href>`) when `web_dir` is
+read-only, so the cache-bust write no longer modifies the
+codesigned bundle (clean-install Gatekeeper now passes).
+The previous substantive batch (2026-05-12) was the release-
+readiness / documentation alignment pass: multi-provider framing,
+unified install docs, fourteen-tool surface including
+`install_packages`, signed + notarized `.dmg`, canonical
+`junishka/Nora` URLs, refreshed test counts. If something here
+disagrees with the code, trust the code and file a patch to this
+doc.
 
 ## What Nora is (one paragraph)
 
@@ -69,7 +83,7 @@ keep streaming.
 | **Files chip** — top-right popup listing graphs/scripts/logs (graphs first); rows now have `[copy/send/open] [title/thumbnail] [×]`; image rows render PDF/EPS via sips sidecars; click-to-lightbox uses 96vw/96vh for sharp viewing | ✅ done |
 | **delete_session_file** — Files-panel `×` deletes any file inside the session cwd, removes its PDF→PNG sidecar, drops matching pending-attachment chips | ✅ done |
 | **Image attachments** — saved to cwd, staged for vision, rendered above the user bubble, clickable lightbox; persistent chip under the user bubble matches accent styling so a script attachment reads as obviously as an image thumbnail | ✅ done |
-| **Cache-busted JS/CSS** — `_materialize_cache_busted_index` writes a per-launch `index.bust-<hash>.html` so WKWebView reloads frontend assets instead of serving stale cached versions on Python restart | ✅ done |
+| **Cache-busted JS/CSS** — `_materialize_cache_busted_index` writes a per-launch `.index.bust-<hash>.html` so WKWebView reloads frontend assets instead of serving stale cached versions on Python restart. When `web_dir` isn't writable (packaged `.app` bundle, where `Resources/` is sealed by codesign), the bust file lands in a process-private temp directory with an injected `<base href>` so relative asset refs still resolve back into the bundle — preserves cache-busting in both dev and packaged builds without modifying the signed bundle | ✅ done |
 | **Frontend** (`nora`) — pywebview shell, sessions sidebar, theme toggle, model picker grouped by provider with $ pricing links, drag-drop file/image upload, Lottie cat loader, status line, per-message attachment chips, topbar visually integrated with chat surface | ✅ done |
 | **Packaging** (`.app` + `.dmg`) — bundles the web UI; .app launches pywebview with no Terminal popup; release `.dmg` is signed and notarized; launcher logging now resilient to unwritable log dirs | ✅ done |
 | **Product-identity prompt rule** — model introduces itself as Nora, uses first person ("I noticed…" not "Nora flagged…") | ✅ done |
@@ -108,8 +122,8 @@ keep streaming.
 | **Apple Developer Program signing + notarization for distributable .dmg** | ✅ done — release `.dmg` is signed (Developer ID Application) and notarized |
 | **Stata batch wrapper around `_cons` "omitted" edge case** | ⏭ named, low-priority |
 
-**1121 pytest cases collected** via `uv run pytest --collect-only -q`
-on 2026-05-12. Full pass/fail depends on local sandbox/runtime
+**1312 pytest cases collected** via `uv run pytest --collect-only -q`
+on 2026-05-15. Full pass/fail depends on local sandbox/runtime
 availability. Coverage spans SDK lockdown (Anthropic) +
 OpenAI lockdown, schema for all seven file formats, executor SBPL
 profile, Python executor end-to-end, helper-through-sanitizer
@@ -271,11 +285,13 @@ that runner's session; OTHER runners are untouched.
 - `provider/anthropic.py` — wraps `ClaudeSDKClient`. Translates
   SDK message blocks into provider-neutral events. Holds the
   `_DISALLOWED_BUILTINS` list and `_gate_tool_use` catch-all.
-- `provider/openai.py` — wraps the Responses API. Maintains
-  `_input` across turns (OpenAI conversation = our session). Tool
-  loop dispatches via `nora.tools.HANDLERS` so behaviour is
-  byte-for-byte identical regardless of which model called the
-  tool.
+- `provider/openai.py` — wraps the Responses API. Chains turns
+  via `previous_response_id` so the OpenAI server holds the prior
+  conversation state; the bridge only sends new content per turn
+  (the user message on a fresh turn, function-call outputs
+  between tool-loop rounds). Tool loop dispatches via
+  `nora.tools.HANDLERS` so behaviour is byte-for-byte identical
+  regardless of which model called the tool.
 
 ### Concurrent-session execution
 
@@ -387,12 +403,18 @@ them by surprise.
 
 ## Rough edges (work, but annoy)
 
-- Transformations log shows `"dropped unknown/forbidden field
-  'label'"` on every R `submit_script` because the
-  `nora$from_lm(m, label=…)` arg is stripped by the schema
-  allowlist. Harmless (the `submit_script` MCP-tool label is
-  stored separately), but noisy. Fix: widen the per-type string
-  allowlist to include `label`.
+- Transformations log shows a single `"dropped N unknown/forbidden
+  field(s)"` summary on every script call that passed a
+  `label=…` arg, because `label` is omitted from the per-type
+  string allowlist (most types — `_CORR_ALLOWED_STRING_FIELDS` is
+  the lone outlier that lists it, which is its own minor
+  inconsistency). Harmless: the field is extracted as
+  `helper_label` from the raw payload BEFORE the sanitizer runs
+  ([tools.py:1358-1364](../src/nora/tools.py)) and stored on the
+  row's `label` column, where every model-facing surface
+  (`expand_result`, `list_results`, `compose_results`) reads it
+  from. The log noise just confirms the sanitizer correctly
+  refuses to duplicate the field into the sanitized payload.
 - Raw-log panel cap is 32 KB per stream with head + tail
   preservation and a `[… N bytes truncated from the middle …]`
   marker. Sufficient for regression tables and helper summaries;
@@ -401,11 +423,6 @@ them by surprise.
   reports it as "omitted" (perfect-fit edge case) — generated
   JSON becomes malformed. Only triggers on degenerate toy data;
   flagged in a test comment. Not a production blocker.
-- OpenAI `previous_response_id` is not used; the bridge replays
-  the conversation via its own `_input` array and prepends its
-  context prefix on every fresh session open. Server-side
-  resumption could trim per-turn payload size on long
-  conversations — out of scope for now.
 
 ## Key files (reading order)
 
@@ -436,7 +453,7 @@ them by surprise.
 | `docs/overview.md` | Plain-language description for researchers |
 | `docs/install.md` | Researcher-facing install flow |
 | `docs/verification.md` | Manual smoke-test recipes (incl. Stata, which CI can't) |
-| `tests/` | 1121 pytest cases collected as of 2026-05-12. `test_sanitizer.py` is the property-test backbone (now also covers vif / condition_number / vcov + correlation_matrix); `test_concurrent_sessions.py` pins the per-task ContextVar isolation; `test_plot_vision.py` pins the manifest-allowlist privacy gate; `test_run_dir_plots.py` covers thumbnail collection + PDF→PNG conversion + Stata export fallback chain; `test_openai_lockdown.py` pins the no-built-in-tools invariant; `test_cross_session_recall.py` pins the env-gated cross-session lookup + path-confinement defense; `test_bridge_lifecycle.py` covers active-session delete + landing-page navigation |
+| `tests/` | 1312 pytest cases collected as of 2026-05-15. `test_sanitizer.py` is the property-test backbone (now also covers vif / condition_number / vcov + correlation_matrix); `test_concurrent_sessions.py` pins the per-task ContextVar isolation; `test_plot_vision.py` pins the manifest-allowlist privacy gate; `test_run_dir_plots.py` covers thumbnail collection + PDF→PNG conversion + Stata export fallback chain; `test_openai_lockdown.py` pins the no-built-in-tools invariant; `test_cross_session_recall.py` pins the env-gated cross-session lookup + path-confinement defense; `test_bridge_lifecycle.py` covers active-session delete + landing-page navigation |
 
 ## Decisions worth not re-litigating
 
