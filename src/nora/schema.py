@@ -159,9 +159,28 @@ def load_data(dataset_path: Path) -> Any:
             )
         return obj
     if suffix == ".csv":
-        return pd.read_csv(dataset_path, low_memory=False)
+        # Use the same header peek as ``_extract_csv`` / ``row_count``
+        # so a headerless numeric CSV (``1,2,3\n4,5,6``) doesn't get
+        # row 1 consumed as the column header here while the schema
+        # surface reports positional names (``0,1,2…``) plus 2 rows.
+        # The disagreement broke ``request_data``: the model picked
+        # variable ``"0"`` from the schema response, then ``load_data``
+        # gave it columns ``["1","2","3"]`` and 1 data row.
+        has_header = _csv_has_header(dataset_path, ",")
+        return (
+            pd.read_csv(dataset_path, low_memory=False)
+            if has_header
+            else pd.read_csv(dataset_path, header=None, low_memory=False)
+        )
     if suffix == ".tsv":
-        return pd.read_csv(dataset_path, sep="\t", low_memory=False)
+        has_header = _csv_has_header(dataset_path, "\t")
+        return (
+            pd.read_csv(dataset_path, sep="\t", low_memory=False)
+            if has_header
+            else pd.read_csv(
+                dataset_path, sep="\t", header=None, low_memory=False,
+            )
+        )
     if suffix == ".parquet":
         # pandas dispatches to pyarrow (preferred) or fastparquet —
         # pyarrow is a declared dep of nora so this works out of
@@ -553,11 +572,15 @@ def _names_only_payload(
     variable list.
 
     Observation count comes from ``row_count(path)`` (metadata- or
-    streaming-only for these formats). A ``None`` return falls back
-    to ``0`` so the response stays well-formed; the caller can decide
-    to escalate to the full-load path if they need a real count.
+    streaming-only for these formats). A ``None`` return — meaning
+    "the light path couldn't compute the count" — surfaces to the
+    model as ``observation_count: null`` so it can tell "I don't
+    know" apart from "the dataset has zero rows". Previously we
+    coerced the None to 0, which made a parquet footer read failure
+    or a mid-stream CSV encoding error look like a factual empty
+    dataset.
     """
-    obs = row_count(path) or 0
+    obs = row_count(path)
     variables = [{"name": safe_key(str(c))} for c in column_names]
     return {
         "status": "ok",
@@ -566,7 +589,7 @@ def _names_only_payload(
         "dataset": safe_text(path.name),
         "file_type": file_type,
         "depth": "names_only",
-        "observation_count": int(obs),
+        "observation_count": int(obs) if obs is not None else None,
         "variables": variables,
     }
 
@@ -686,6 +709,56 @@ def _extract_parquet(path: Path, depth: str) -> dict[str, Any]:
 # Line-delimited JSON — .jsonl / .ndjson
 # ---------------------------------------------------------------------------
 
+# Hard cap on the number of distinct keys we'll collect from a JSONL
+# names_only stream. A pathological file with millions of unique keys
+# would otherwise turn the fast path into an unbounded-memory walk.
+# 10_000 covers every legitimate tabular JSONL I've seen by orders of
+# magnitude; beyond that the file isn't a "variable list" in any
+# useful sense.
+_JSONL_NAMES_KEY_CAP = 10_000
+
+
+def _jsonl_column_union(path: Path) -> list[str]:
+    """Stream a JSONL file and return the union of top-level keys,
+    in first-seen order.
+
+    Lines that aren't a JSON object (blank, malformed, top-level
+    array / scalar) are skipped — the full-depth path via
+    ``pd.read_json`` would coerce or raise on the same input, but we
+    can't afford a raise here when the fast path is the only thing
+    standing between the model and a missing-column lookup. Best
+    effort: every well-formed object contributes its keys.
+    """
+    import json as _json
+
+    seen: dict[str, None] = {}
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    record = _json.loads(line)
+                except ValueError:
+                    continue
+                if not isinstance(record, dict):
+                    continue
+                for k in record.keys():
+                    if k in seen:
+                        continue
+                    seen[k] = None
+                    if len(seen) >= _JSONL_NAMES_KEY_CAP:
+                        return list(seen.keys())
+    except OSError:
+        # Mirrors the full-depth path: a read failure surfaces through
+        # the empty-names list, and ``row_count`` will return ``None``
+        # so the payload says ``observation_count: null`` rather than
+        # claiming a factual empty dataset.
+        return []
+    return list(seen.keys())
+
+
 def _extract_jsonl(path: Path, depth: str) -> dict[str, Any]:
     """One JSON object per line. Each object is treated as a row;
     pandas infers column types from the union of keys.
@@ -699,16 +772,24 @@ def _extract_jsonl(path: Path, depth: str) -> dict[str, Any]:
     import pandas as pd
 
     if depth == "names_only":
-        # Fast path: read only the first record to discover keys.
-        # JSONL has no separate schema, so we can't avoid reading at
-        # least one line; ``nrows=1`` keeps memory bounded.
-        # Note: this only sees keys present in the first record. A
-        # downstream consumer that needs the full column union must
-        # use a deeper depth (which loads the file).
-        header_df = pd.read_json(path, lines=True, nrows=1)
-        return _names_only_payload(
-            list(header_df.columns), path, "jsonl",
-        )
+        # Stream the file once and union the keys across every record.
+        # JSONL is schema-less in the limit (each row may add new
+        # keys), so a fast path that read only the first record could
+        # silently miss columns — ``{"id":1}\n{"id":2,"treatment":1}``
+        # would advertise only ``id`` at names_only while a deeper
+        # depth (which loads everything via ``pd.read_json``) saw
+        # both. That asymmetry broke the basic ``names_only`` contract
+        # ("the list of variables in this dataset"); a model that
+        # consulted names_only to discover columns then queried
+        # ``treatment`` got "column not found".
+        #
+        # Streaming with ``json.loads`` per line and unioning keys
+        # avoids materialising values or running pandas' type
+        # inference — far cheaper than the full ``read_json`` we'd
+        # otherwise use, while still seeing every column. Insertion
+        # order is preserved so the names list reads first-seen-first.
+        names = _jsonl_column_union(path)
+        return _names_only_payload(names, path, "jsonl")
     df = pd.read_json(path, lines=True)
     return _extract_from_pandas(
         df, depth=depth, dataset_name=path.name, file_type="jsonl"

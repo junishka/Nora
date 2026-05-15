@@ -209,7 +209,19 @@ def load_policy(cwd: Path) -> NoraPolicy:
     raw = data.get("datasets")
     if isinstance(raw, dict):
         for name, entry in raw.items():
-            if not isinstance(name, str) or not isinstance(entry, dict):
+            if not isinstance(name, str):
+                # JSON keys are always strings, but be defensive.
+                continue
+            if not isinstance(entry, dict):
+                # Malformed entry shape (e.g. ``"survey.csv": "names_only"``
+                # written as shorthand without the wrapping dict).
+                # Skipping the entry would silently fall back to
+                # ``default_max_depth``, contradicting the "per-entry
+                # malformations clamp to the strictest tier" rule in the
+                # module docstring. Record a fail-closed entry so the
+                # researcher's apparent intent — they wrote a key with
+                # this dataset name — is honoured at the strictest tier.
+                datasets[name] = DatasetPolicy(max_depth=FAIL_CLOSED_MAX_DEPTH)
                 continue
             max_depth = entry.get("max_depth", FAIL_CLOSED_MAX_DEPTH)
             if max_depth not in VALID_DEPTHS:

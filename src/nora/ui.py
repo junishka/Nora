@@ -497,7 +497,7 @@ class NoraBridge:
                 "All files (*.*)",
             )
             result = self._window.create_file_dialog(
-                webview.OPEN_DIALOG,
+                webview.FileDialog.OPEN,
                 allow_multiple=True,
                 file_types=file_types,
             )
@@ -526,7 +526,7 @@ class NoraBridge:
         try:
             import webview
             result = self._window.create_file_dialog(
-                webview.FOLDER_DIALOG, allow_multiple=False
+                webview.FileDialog.FOLDER, allow_multiple=False
             )
         except Exception as e:  # noqa: BLE001
             return {"ok": False, "reason": f"dialog error: {e}"}
@@ -916,20 +916,29 @@ class NoraBridge:
         return token
 
     def clear_pending_for_session(self, session_cwd: str) -> dict[str, Any]:
-        """Drop any pending @-mentions, staged scripts, plot carries
-        and queued-message frozen snapshots on the named session's
-        runner.
+        """Drop researcher-staged @-mentions, staged scripts, and
+        mentioned images on the named session's runner. Queued-
+        message frozen snapshots and model-captured plot images are
+        intentionally left alone — see below.
 
         Called by the JS session-switch handler. The frontend wipes
         its staged composer state (image thumbs, data notices, mention
         chips) when the researcher leaves a session — without this
-        bridge call, the BACKEND runner's pending_* lists for that
+        bridge call, the BACKEND runner's user-staged lists for that
         session survive hidden, and the next plain message sent on
         return would silently inline @-mentions / scripts the
         researcher staged before the switch (and which the UI no
         longer shows). The desync makes vanished attachments ride
         invisibly. Clearing here keeps both sides aligned: nothing
         staged in the UI, nothing staged on the runner.
+
+        Queued-message frozen snapshots stay because the researcher
+        already committed to send those messages (they sit in the
+        JS queue). Plot images stay because they're model output
+        from the previous turn's submit_script, queued to ride this
+        session's next user turn regardless of focus — a researcher
+        who returns and asks "interpret the plot" must still find
+        the image attached.
 
         ``session_cwd`` is the path of the runner to clear (not the
         bridge's ``self.cwd`` — the JS already knows which session
@@ -950,12 +959,17 @@ class NoraBridge:
             # actually opened, or after a runner has already been
             # closed.
             return {"ok": True, "cleared": False}
-        # Use the narrower clear so queued-message frozen snapshots
-        # survive. Those belong to messages the researcher already
-        # committed to send (sitting in the JS queue) and must still
-        # fire when the in-flight turn finishes — dropping them on a
-        # focus switch would silently lose the user's queued work.
-        runner.clear_unsent_pending()
+        # Use the user-staged-only clear: frozen queued-message
+        # snapshots survive (they belong to messages the researcher
+        # already committed to send, sitting in the JS queue, and
+        # must still fire when the in-flight turn finishes), AND
+        # ``pending_plot_images`` survives. Plot images are captured
+        # by ``_capture_plots`` from the prior turn's submit_script
+        # output, not by anything the researcher staged through the
+        # composer, so a focus toggle should not erase them — a
+        # return to this session with "interpret the plot" must
+        # still attach the image the model just produced.
+        runner.clear_unsent_user_staged()
         return {"ok": True, "cleared": True}
 
     def discard_pending_attachments_token(
@@ -1108,7 +1122,28 @@ class NoraBridge:
         # flight" while the runner went on to execute the supposedly-
         # cancelled turn.
         runner.register_pending_turn(turn_id)
-        asyncio.run_coroutine_threadsafe(coro, self._loop)
+        try:
+            asyncio.run_coroutine_threadsafe(coro, self._loop)
+        except RuntimeError as e:
+            # The pre-check above only catches ``self._loop is None``;
+            # a non-None loop can still be closed or stopping (e.g.,
+            # mid-shutdown). Without this cleanup the registered
+            # pending id would never be drained (the coroutine never
+            # starts → ``_consume_pending_turn`` never runs), and
+            # ``is_busy`` would keep returning True forever, wedging
+            # the UI on this session. Drop the unstarted coroutine,
+            # discard the pending id, and surface a turn_error so
+            # the JS state machine moves the composer back out of
+            # the "sending" state.
+            coro.close()
+            runner.discard_pending_turn(turn_id)
+            self._dispatch_event({
+                "type": "turn_error",
+                "message": f"could not schedule turn: {e}",
+                "session_cwd": str(runner.cwd),
+                "turn_id": turn_id,
+            })
+            return None
         return turn_id
 
     def add_files(self) -> dict[str, Any]:
@@ -1144,7 +1179,7 @@ class NoraBridge:
                 "All files (*.*)",
             )
             result = self._window.create_file_dialog(
-                webview.OPEN_DIALOG,
+                webview.FileDialog.OPEN,
                 allow_multiple=True,
                 file_types=file_types,
             )
@@ -5078,38 +5113,38 @@ def _read_raw_logs(run_dir: str | None) -> tuple[str, str]:
 
 
 def _materialize_cache_busted_index(web_dir: Path, index_path: Path) -> Path:
-    """Write a sibling ``index.bust-<id>.html`` next to the source
-    index whose script/link refs carry a per-launch ``?v=<build-id>``
-    query string. WKWebView caches file:// resources by full URL
-    (including the query string), so a unique build-id per launch
-    forces a fresh fetch of every JS/CSS asset and prevents
-    "I restarted but the new code isn't running" — a real failure
-    mode where users iterate on the frontend, restart the bridge,
-    and still see stale rendering because WKWebView served the
-    cached app.js.
+    """Write an ``index.bust-<id>.html`` whose script/link refs carry
+    a per-launch ``?v=<build-id>`` query string. WKWebView caches
+    file:// resources by full URL (including the query string), so a
+    unique build-id per launch forces a fresh fetch of every JS/CSS
+    asset and prevents "I restarted but the new code isn't running" —
+    a real failure mode where users iterate on the frontend, restart
+    the bridge, and still see stale rendering because WKWebView
+    served the cached app.js.
 
     The build-id hashes the mtimes of every .js / .css / .html file
     under ``web_dir`` so logically-identical reloads reuse the same
     cache key, while real code changes invalidate it.
 
+    Bundle-safety: in a packaged macOS .app, ``web_dir`` lives under
+    ``Contents/Resources/nora/web/`` — sealed by codesign. Writing
+    the bust file there at first launch modifies the bundle and
+    breaks ``spctl --assess`` ("sealed resource is missing or
+    invalid"), blocking Gatekeeper on clean installs. When ``web_dir``
+    isn't writable we route the bust file to a process-private temp
+    directory and inject a ``<base href>`` so the bust file (now
+    outside ``web_dir``) still resolves the HTML's relative
+    ``app.js`` / ``style.css`` / image refs back to the bundle's
+    web_dir.
+
     Falls back to the original index_path on any error — cache busting
     is a polish feature, not a correctness one.
     """
     import hashlib
+    import os
+    import re
+    import tempfile
     try:
-        # Wipe stale ``.index.bust-*.html`` siblings before generating
-        # a fresh one. Without this, every launch leaves a new sibling
-        # in ``web/`` and the directory accumulates indefinitely
-        # (each iteration on app.js / style.css produced one). Also
-        # avoids confusion when reading mtimes during debugging — only
-        # the live bust-file should be present after startup.
-        for stale in web_dir.glob(".index.bust-*.html"):
-            try:
-                stale.unlink()
-            except OSError:
-                # Best-effort cleanup — don't crash the launch if a
-                # sibling is locked / read-only / already gone.
-                continue
         stamps: list[str] = []
         for child in sorted(web_dir.iterdir()):
             if child.suffix.lower() in {".js", ".css", ".html"}:
@@ -5120,11 +5155,45 @@ def _materialize_cache_busted_index(web_dir: Path, index_path: Path) -> Path:
         if not stamps:
             return index_path
         build_id = hashlib.sha256("\n".join(stamps).encode()).hexdigest()[:12]
+
+        # Pick the output directory based on whether ``web_dir`` is
+        # writable. Dev mode keeps the bust file co-located with
+        # assets so relative refs resolve as before; packaged-app /
+        # read-only-web_dir mode routes to a temp directory and adds
+        # a ``<base>`` tag so relative refs still resolve.
+        web_dir_writable = os.access(web_dir, os.W_OK)
+        if web_dir_writable:
+            out_dir = web_dir
+            base_tag = ""
+        else:
+            out_dir = Path(tempfile.gettempdir()) / "nora-cache-bust"
+            try:
+                out_dir.mkdir(parents=True, exist_ok=True)
+            except OSError:
+                return index_path
+            base_tag = (
+                f'<base href="{web_dir.resolve().as_uri()}/" />\n'
+            )
+
+        # Wipe stale ``.index.bust-*.html`` siblings before generating
+        # a fresh one. Without this, every launch leaves a new sibling
+        # in ``out_dir`` and the directory accumulates indefinitely
+        # (each iteration on app.js / style.css produced one). Also
+        # avoids confusion when reading mtimes during debugging — only
+        # the live bust-file should be present after startup.
+        for stale in out_dir.glob(".index.bust-*.html"):
+            try:
+                stale.unlink()
+            except OSError:
+                # Best-effort cleanup — don't crash the launch if a
+                # sibling is locked / read-only / already gone.
+                continue
+
         html = index_path.read_text(encoding="utf-8")
-        # Append ``?v=<build-id>`` to script/link refs. We rewrite
-        # only the local refs (no protocol) so the Google Fonts
-        # preconnects and any future remote CDN loads stay alone.
-        import re
+
+        # Append ``?v=<build-id>`` to local script/link refs. Remote
+        # URLs (Google Fonts preconnect, future CDN loads) are left
+        # alone.
         def _add_bust(m: re.Match[str]) -> str:
             attr = m.group(1)
             url = m.group(2)
@@ -5136,10 +5205,11 @@ def _materialize_cache_busted_index(web_dir: Path, index_path: Path) -> Path:
             r'(src|href)="([^"]+\.(?:js|css))"',
             _add_bust, html,
         )
-        # Stash the rewritten file beside the original. .gitignore'd
-        # via the leading dot so accidental git status noise stays
-        # out of the working tree.
-        out = web_dir / f".index.bust-{build_id}.html"
+        if base_tag:
+            # Inject just after <head> so the base applies to every
+            # subsequent relative ref (scripts, stylesheets, images).
+            html = html.replace("<head>", f"<head>\n  {base_tag}", 1)
+        out = out_dir / f".index.bust-{build_id}.html"
         out.write_text(html, encoding="utf-8")
         return out
     except Exception:  # noqa: BLE001 — fall back to source index on any failure

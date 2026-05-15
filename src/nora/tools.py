@@ -1216,14 +1216,15 @@ async def request_data(args: dict[str, Any]) -> dict[str, Any]:
 
 async def _execute_script_for_submit(
     language: str, code: str, cwd: Path,
-) -> tuple[Any, dict[str, Any] | None]:
+) -> Any:
     """Run the executor in a worker thread, with cancellation handling.
 
-    Returns ``(exec_result, None)`` on completion, or
-    ``(exec_result, early_payload)`` when the turn was cancelled
-    mid-run — the caller short-circuits with ``early_payload`` and
-    skips sanitize / store / response assembly. ``CancelledError`` is
-    re-raised so the runner's outer cancel branch handles teardown.
+    Returns the ``ExecutionResult`` on completion. Raises
+    ``asyncio.CancelledError`` when the turn was cancelled mid-run —
+    callers do nothing; the exception propagates through the SDK's
+    tool-dispatch path (the MCP server wrapper only catches plain
+    ``Exception``) and lands in the runner's outer ``except
+    asyncio.CancelledError`` branch, which handles teardown.
     """
     import asyncio as _asyncio
     from nora.runtime.turn_context import (
@@ -1252,24 +1253,24 @@ async def _execute_script_for_submit(
 
     if is_current_turn_cancelled():
         # Drop the result entirely if the turn was cancelled while the
-        # subprocess was still running. The Popen finished naturally
-        # (or got killed) and we now hold an ExecutionResult, but
-        # persisting it as a chat-visible result would surface a tool
-        # answer for a turn the researcher cancelled — exactly the
-        # leak the turn-identity contract is designed to prevent. The
-        # raw run_dir stays on disk for debugging; we just don't
-        # sanitize, store, or return a structured payload.
-        early = {
-            "status": "cancelled",
-            "reason": (
-                "turn was cancelled while the script was running; "
-                "raw stdout/stderr remain on disk in the run_dir but "
-                "are not surfaced as a result"
-            ),
-            "run_dir": str(exec_result.run_dir),
-        }
-        return exec_result, early
-    return exec_result, None
+        # subprocess was still running. Earlier this path returned a
+        # ``{"status": "cancelled", ...}`` early payload, which the
+        # caller wrapped as an MCP text response — the provider then
+        # yielded a ``ToolCallResult`` carrying it, and even though
+        # the dispatcher drops events from cancelled turns, the
+        # payload still briefly entered the provider's outgoing state
+        # (OpenAI's ``function_call_output`` list, Anthropic's CLI
+        # session) before the asyncio cancel propagated. Raising
+        # CancelledError here ensures no ``ToolCallResult`` is ever
+        # emitted for the cancelled run: the MCP server wrapper
+        # catches ``Exception`` only, so ``CancelledError`` (a
+        # ``BaseException``) flows through the SDK's tool-dispatch
+        # path uninterrupted and lands in the runner's outer
+        # ``except asyncio.CancelledError`` branch where session
+        # teardown happens. The raw run_dir stays on disk for the
+        # researcher; no sanitize / store / response work runs.
+        raise _asyncio.CancelledError()
+    return exec_result
 
 
 def _resolve_sdc_and_source_n(
@@ -1790,20 +1791,12 @@ async def submit_script(args: dict[str, Any]) -> dict[str, Any]:
 
     cwd = get_cwd()
 
-    # 1. Execute. Cancellation surfaces here as either ``CancelledError``
-    # (re-raised so the runner's outer cancel branch handles teardown)
-    # or as ``early_payload`` set when the turn was cancelled mid-run.
-    exec_result, early_payload = await _execute_script_for_submit(
-        language, code, cwd,
-    )
-    if early_payload is not None:
-        # The cancellation path already populates ``early_payload``
-        # with status / reason / debug_excerpt; ensure it carries
-        # the same envelope-shape monitoring fields the happy path
-        # does so callers don't have to handle two response shapes.
-        return _as_mcp_text(_with_zero_phase_metadata(
-            early_payload, language=language,
-        ))
+    # 1. Execute. Cancellation surfaces here as ``CancelledError``,
+    # which propagates through the SDK's tool-dispatch path (the MCP
+    # server wrapper catches ``Exception`` only) and lands in the
+    # runner's outer cancel branch where session teardown happens.
+    # No ``ToolCallResult`` ever gets yielded for a cancelled run.
+    exec_result = await _execute_script_for_submit(language, code, cwd)
 
     # 2a. Persist the script-level label to the run dir so the Files
     # panel can name the SCRIPT after what the model called the whole

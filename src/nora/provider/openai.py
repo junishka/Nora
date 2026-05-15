@@ -10,11 +10,12 @@ byte identical regardless of which model authored the call.
 
 Lockdown discipline is the headline guarantee:
 
-- The ``tools`` list sent to OpenAI contains EXACTLY the six Nora
-  function tools and nothing else. No ``{"type": "web_search"}``,
-  ``{"type": "code_interpreter"}``, ``{"type": "file_search"}``,
-  no Agents-SDK built-ins. ``test_openai_lockdown.py`` mocks the
-  client and asserts this on every request.
+- The ``tools`` list sent to OpenAI contains EXACTLY the Nora
+  function tools listed in ``build_tool_specs()`` and nothing else.
+  No ``{"type": "web_search"}``, ``{"type": "code_interpreter"}``,
+  ``{"type": "file_search"}``, no Agents-SDK built-ins.
+  ``test_openai_lockdown.py`` mocks the client and asserts this on
+  every request.
 - ``parallel_tool_calls`` is on (the default) so the model can run
   ``get_schema`` and ``request_data`` in parallel during exploration,
   but every dispatch goes through the SAME ``HANDLERS`` map and the
@@ -200,7 +201,7 @@ class OpenAISession:
         # we walk a local pointer through each round so a mid-turn
         # failure leaves the committed pointer at the last good turn.
         self._last_response_id: str | None = None
-        # Cached tool list — same six function tools for every call.
+        # Cached tool list — same function tools for every call.
         # Built once at open() rather than per-send so the lockdown
         # check has a stable reference.
         self._tools: list[dict[str, Any]] = []

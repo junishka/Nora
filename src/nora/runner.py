@@ -285,14 +285,14 @@ class SessionRunner:
         self.frozen_pending_attachments.clear()
 
     def clear_unsent_pending(self) -> None:
-        """Drop the four ``pending_*`` lists WITHOUT touching queued-
-        message frozen snapshots.
+        """Drop all four ``pending_*`` lists WITHOUT touching queued-
+        message frozen snapshots. Used by the rewind path through
+        ``clear_pending_attachments`` — when the researcher revises an
+        earlier message, both the user-staged attachments AND the
+        model-captured plots from the rewound branch are stale.
 
-        Called by the session-switch path. The frontend wipes its
-        staged composer chips on the way out of a session; this is the
-        matching backend wipe of the lists those chips would have
-        ridden in on. Frozen snapshots stay — they belong to messages
-        the researcher already committed to send (they sit in the JS
+        Frozen snapshots stay here — they belong to messages the
+        researcher already committed to send (they sit in the JS
         queue) and must still fire with their original attachments
         when the in-flight turn finishes. Mixing the two clears was
         what made the rewind path's broader wipe wrong for switch.
@@ -301,6 +301,30 @@ class SessionRunner:
         self.pending_mentioned_files.clear()
         self.pending_mentioned_images.clear()
         self.pending_plot_images.clear()
+
+    def clear_unsent_user_staged(self) -> None:
+        """Drop only the three researcher-staged ``pending_*`` lists,
+        leaving ``pending_plot_images`` alone.
+
+        Called by the session-switch path. The frontend wipes its
+        staged composer chips (script attachments, @-mentioned files,
+        @-mentioned images) on the way out of a session; this is the
+        matching backend wipe of those three lists so a re-open of
+        the same session doesn't silently inline attachments whose
+        chips the UI has already cleared.
+
+        Plot images are NOT touched here. They aren't researcher-
+        staged — ``_capture_plots`` appended them from the previous
+        turn's submit_script output, and they're queued to ride the
+        very next user turn in THIS session. Clearing them on a
+        focus toggle would lose model-generated state without any
+        researcher action that says "discard these plots," and a
+        return to the session with "interpret the plot" would no
+        longer attach the image the model just produced.
+        """
+        self.pending_script_attachments.clear()
+        self.pending_mentioned_files.clear()
+        self.pending_mentioned_images.clear()
 
     # -------- queued-send attachment freezing --------
     #
@@ -730,6 +754,23 @@ class SessionRunner:
         """
         with self._turn_lock:
             self._pending_turn_ids.append(turn_id)
+
+    def discard_pending_turn(self, turn_id: str) -> None:
+        """Remove a pending turn id without marking it cancelled.
+
+        Distinct from ``cancel_turn``: this is the cleanup path for
+        when the bridge registered a pending id but the subsequent
+        ``asyncio.run_coroutine_threadsafe`` raised (worker loop
+        closed mid-shutdown, etc.) — the coroutine never started, so
+        there's nothing to cancel; we just need to evict the id so
+        ``is_busy`` stops reporting True. No cancelled-id history
+        entry is added because no turn ever ran.
+        """
+        with self._turn_lock:
+            try:
+                self._pending_turn_ids.remove(turn_id)
+            except ValueError:
+                pass
 
     def _consume_pending_turn(self, turn_id: str) -> bool:
         """Atomically transition ``turn_id`` from pending → running,

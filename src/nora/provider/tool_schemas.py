@@ -1,4 +1,4 @@
-"""Canonical, provider-neutral schemas for the six Nora MCP tools.
+"""Canonical, provider-neutral schemas for the Nora MCP tools.
 
 This module is the single source of truth for tool name, description,
 and input schema. Both the Claude Agent SDK registration in
@@ -468,10 +468,11 @@ _INSTALL_PACKAGES_DESC = (
     "(which runs sandboxed with no network); this tool runs the "
     "language's package manager directly so it CAN reach CRAN / PyPI "
     "/ SSC and write the user library.\n\n"
-    "Confirm with the researcher in chat BEFORE calling this tool. "
-    "When a script fails because a package is missing, name the "
-    "missing packages and ask 'install these?' Wait for an explicit "
-    "yes. Don't install on your own initiative.\n\n"
+    "Calling the tool surfaces an Approve / Deny modal listing the "
+    "language, action, and package names; that modal is the only "
+    "consent gate, so call the tool directly when an install is "
+    "needed instead of asking in chat first. On a denial, do NOT "
+    "retry; pause and ask the researcher what they'd like to do.\n\n"
     "Privacy: an install fetches public package code from a "
     "canonical registry and writes to the user's library; no "
     "researcher data participates. Repos / index URLs are hard-"
@@ -532,7 +533,7 @@ _SEARCH_IN_SESSION_FILES_DESC = (
 
 
 # ---------------------------------------------------------------------------
-# The seven tools.
+# The tools.
 # ---------------------------------------------------------------------------
 # Order matches the order in which they appear to the model in the
 # system-prompt enumeration in ``system_prompt.py``.
