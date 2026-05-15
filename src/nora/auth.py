@@ -199,15 +199,25 @@ def delete_credential(provider: str) -> dict[str, object]:
         _CRED_CACHE[provider] = None
         return {"ok": True, "provider": provider}
 
-    # Pre-check via the cached read so we can distinguish "entry was
-    # already absent → idempotent OK" from "delete itself failed".
+    # Pre-check so we can distinguish "entry was already absent →
+    # idempotent OK" from "delete itself failed".
     # ``keyring.delete_password`` wraps every backend error in
     # ``PasswordDeleteError`` regardless of cause (item-not-found vs.
     # backend locked vs. permission denied), so the exception type
-    # alone can't tell us which we hit. Reading first is portable and
-    # cheap (cached after first call).
+    # alone can't tell us which we hit. Reading first is portable.
+    #
+    # ``force_refresh=True`` so the answer reflects the live keyring,
+    # not a cached value from a prior auth-screen render. Without
+    # this, a researcher who deletes the credential directly in
+    # Keychain Access while Nora's auth panel is still open hits
+    # this path with a stale cache: pre-check sees the old key,
+    # ``delete_password`` raises ``PasswordDeleteError`` because the
+    # entry's already gone, and we surface ``ok=False`` even though
+    # the target state ("credential is absent") is already met.
+    # Delete is rare and user-initiated, so paying one extra keyring
+    # hit per call is cheap and worth the correctness.
     try:
-        existing = get_credential(provider)
+        existing = get_credential(provider, force_refresh=True)
     except Exception:  # noqa: BLE001 — get_credential is non-raising; defensive
         existing = None
 

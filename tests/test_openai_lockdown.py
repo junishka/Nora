@@ -2,9 +2,10 @@
 
 Mirrors the spirit of Nora's existing Claude SDK lockdown coverage:
 no matter what changes upstream in the OpenAI Responses API, the
-``tools`` field Nora sends must contain EXACTLY the six Nora function
-tools and no built-in types (web_search, code_interpreter,
-file_search, image_generation, mcp, computer_use_preview, …).
+``tools`` field Nora sends must contain EXACTLY the Nora function
+tools (the canonical list in ``build_tool_specs()``) and no built-in
+types (web_search, code_interpreter, file_search, image_generation,
+mcp, computer_use_preview, …).
 
 Without these guards, a future "let's enable web_search to help with
 literature lookups" PR could silently punch a hole in the privacy

@@ -77,13 +77,21 @@ def read_turns(cwd: Path | None) -> list[Turn]:
     if cwd is None:
         return []
     path = cwd / ".nora" / "chat_history.jsonl"
-    if not path.exists() or path.stat().st_size == 0:
-        return []
 
     # First pass: collect raw events in order. Skips blank and
     # unparseable lines rather than failing the whole read.
+    # The existence / size check sits inside the try so the function
+    # honours its "never raises" contract even when the file
+    # disappears or permissions flip between ``exists()`` and the
+    # subsequent ``stat()`` / ``open()`` — without this, a concurrent
+    # session-delete or rotation racing the snapshot writer would
+    # raise FileNotFoundError / PermissionError and bubble up into
+    # ``write_session_state``, which has its own "never raises"
+    # contract a chat turn depends on.
     events: list[dict[str, Any]] = []
     try:
+        if not path.exists() or path.stat().st_size == 0:
+            return []
         with path.open("r", encoding="utf-8") as f:
             for line in f:
                 line = line.strip()
@@ -226,13 +234,18 @@ def read_last_turn_summary(cwd: Path | None) -> tuple[int, str, str]:
     if cwd is None:
         return (0, "", "")
     path = cwd / ".nora" / "chat_history.jsonl"
-    if not path.exists() or path.stat().st_size == 0:
-        return (0, "", "")
 
     turn_count = 0
     last_user = ""
     last_assistant_parts: list[str] = []
+    # Existence / size check inside the try — same race as
+    # ``read_turns``: a concurrent delete or perm-flip between
+    # ``exists()`` and ``stat()`` would otherwise raise out of this
+    # function and break the "never raises" contract that
+    # ``write_session_state`` (called every turn end) relies on.
     try:
+        if not path.exists() or path.stat().st_size == 0:
+            return (0, "", "")
         with path.open("rb") as f:
             for raw_line in f:
                 line = raw_line.strip()

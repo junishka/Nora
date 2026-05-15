@@ -128,12 +128,12 @@ because Nora invokes them as subprocesses.
   - `policy.py` for per-dataset schema-depth ceilings.
   - `store.py` for the SQLite result store and audit log.
   - `session_state.py` for the per-session "at a glance" snapshot.
-  - `runtime/` for the R library, the Python library, and the ten
-    Stata `.ado` helpers scripts call.
+  - `runtime/` for the R library, the Python library, and the
+    thirteen Stata `.ado` helpers scripts call.
   - `provider/` for the Anthropic and OpenAI session adapters.
   - `chat_service.py` for the typed event stream the frontend
     consumes.
-- `tests/` for 1121 pytest cases collected as of 2026-05-12.
+- `tests/` for 1312 pytest cases collected as of 2026-05-15.
   `test_sanitizer.py` is the property-test backbone.
   `test_executor_*` cover the sandbox profile.
   `test_concurrent_sessions.py` covers multi-runner isolation.

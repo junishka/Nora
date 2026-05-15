@@ -10,11 +10,18 @@ failed, the model's tool result carried only ``status``, ``reason``
 was effectively blind: it would re-iterate ad nauseum, propose
 plausible-but-wrong fixes, and the researcher waited.
 
-The fix is a new ``debug_excerpt`` field on the failure tool result:
-~500-1000 chars of the actual error message, extracted from the
-language's own error idiom. Researcher-style: not "KeyError raised
-at line 42", but the literal `KeyError: 'a_yp0'` Nora needs to
-know which column was missing.
+The fix is a new ``debug_excerpt`` field on the failure tool result
+that carries the parser-owned framing of the language's error
+idiom: the exception type and the user-code frame (with the
+indented source-line preview) for Python; the literal ``Error :``
+template plus the ``Calls:`` chain for R; the failing command's
+verb plus ``r(<code>);`` for Stata.
+
+What the model sees is intentionally thin: enough framing to know
+what KIND of failure happened and where in the script source it
+fired (the model wrote the script and already knows what each
+identifier means), but nothing that crossed the SDC boundary in
+the exception message body.
 
 SDC boundary
 ------------
@@ -28,16 +35,29 @@ stdout/stderr to the model. The boundary is preserved by:
   2. **stdout is read only for Stata** (because Stata batch mode
      puts everything in the .log file, which the executor merges
      into stdout). For R and Python, only stderr is scanned.
-  3. **No `print(df)` leakage.** Because Stata's extractor anchors
+  3. **Exception bodies are redacted wholesale.** The exception
+     TYPE and the user-code FRAME (file + line + source-line
+     preview) are parser-owned; the body that follows the type is
+     script-controlled and could exfiltrate any short cell value
+     (``raise RuntimeError(df.iloc[0]['secret'])``). Each language's
+     extractor keeps only the parser-anchored framing — Python's
+     traceback frames including the verbatim source-line preview
+     (which is user-authored .py source, not runtime-evaluated
+     text), R's ``Error :`` template plus ``Calls:`` chain, Stata's
+     command verb plus ``r(<code>);`` line.
+  4. **No `print(df)` leakage.** Because Stata's extractor anchors
      on `r(<code>);` and walks back to the most recent `. <cmd>`,
      intervening `display` / `list` output stays out of the
-     excerpt. The 1 KB hard cap is the second line of defense.
-  4. **Length-aware redaction.** Quoted args longer than 200 chars
-     get truncated in place - covers the "ValueError with a 5KB
-     pandas repr" foot-gun.
-  5. **Credential scrub.** Regex out `sk-...`, `AKIA...`,
-     three-segment JWTs. Catches the `print(os.environ)` foot-gun.
-  6. **Path normalisation.** Absolute paths get reduced to their
+     excerpt. The ``MAX_EXCERPT_BYTES`` hard cap is defense in depth.
+  5. **Length-aware redaction.** Quoted args longer than
+     ``MAX_QUOTED_ARG_BYTES`` get truncated in place — covers the
+     "ValueError with a 5KB pandas repr" foot-gun even though the
+     body itself is already redacted.
+  6. **Credential scrub.** Regex out `sk-...`, `AKIA...`,
+     three-segment JWTs, GitHub / Slack / HF tokens, URL userinfo.
+     Catches the `print(os.environ)` foot-gun and pip's echo of
+     token-bearing index URLs from ``install_packages``.
+  7. **Path normalisation.** Absolute paths get reduced to their
      basename so the home-directory layout doesn't leak. Line
      numbers are preserved - that's what the model actually needs.
 
