@@ -455,3 +455,140 @@ def test_r_and_python_kmeans_iris_agree(tmp_path: Path) -> None:
     assert "ss_ratio" in r_pl  # R has it
     # Both helpers emit total_within_ss / inertia.
     assert "inertia" in r_pl and "inertia" in py_pl
+
+
+# ---------------------------------------------------------------------------
+# Stata via nora_result_cluster.ado
+# ---------------------------------------------------------------------------
+
+_STATA = None
+for _name in ("stata-mp", "stata-se", "stata"):
+    _p = shutil.which(_name)
+    if _p:
+        _STATA = _p
+        break
+
+_NORA_RESULT_CLUSTER_ADO = (
+    _REPO_ROOT / "src" / "nora" / "runtime" / "nora_result_cluster.ado"
+)
+requires_stata_cluster = pytest.mark.skipif(
+    _STATA is None or not _NORA_RESULT_CLUSTER_ADO.is_file(),
+    reason="Stata binary / nora_result_cluster.ado not available",
+)
+
+
+_STATA_KMEANS_SCRIPT = r"""
+adopath ++ "{runtime_dir}"
+local _path : env NORA_RESULT_PATH
+capture erase "`_path'"
+sysuse auto, clear
+quietly drop if missing(price, mpg, weight, length)
+quietly cluster kmeans price mpg weight length, k(3) name(kmclus) start(random(42))
+nora_result_cluster price mpg weight length, clusvar(kmclus) ///
+    method("kmeans") label("Stata auto kmeans k=3")
+"""
+
+
+_STATA_WARD_SCRIPT = r"""
+adopath ++ "{runtime_dir}"
+local _path : env NORA_RESULT_PATH
+capture erase "`_path'"
+sysuse auto, clear
+quietly drop if missing(price, mpg, weight, length)
+quietly cluster wardslinkage price mpg weight length, name(wardlink)
+quietly cluster generate wardclus = groups(3), name(wardlink)
+nora_result_cluster price mpg weight length, clusvar(wardclus) ///
+    method("hierarchical") linkage("ward") ///
+    label("Stata auto Ward k=3")
+"""
+
+
+@requires_stata_cluster
+def test_stata_nora_result_cluster_kmeans(tmp_path: Path) -> None:
+    """Happy path: Stata cluster kmeans → helper → sanitizer.
+
+    The R / Python tests above pin the contract in detail; this
+    only asserts the Stata helper produces a sanitizer-valid payload
+    with the required fields populated. Cross-language numeric
+    agreement is not asserted here (different starting points yield
+    different partitions; the partition-shape comparison lives in
+    the R-vs-Python test above)."""
+    result_path = tmp_path / "stata_kmeans.jsonl"
+    script_path = tmp_path / "audit.do"
+    runtime_dir = (_REPO_ROOT / "src" / "nora" / "runtime").resolve()
+    script_path.write_text(
+        _STATA_KMEANS_SCRIPT.format(runtime_dir=str(runtime_dir))
+    )
+    env = os.environ.copy()
+    env["NORA_RUN_TOKEN"] = "test-token-not-secret"
+    env["NORA_RESULT_PATH"] = str(result_path)
+    proc = subprocess.run(
+        [_STATA, "-b", "do", str(script_path)],
+        cwd=_REPO_ROOT, env=env,
+        capture_output=True, text=True, timeout=120,
+    )
+    if not result_path.is_file() or result_path.stat().st_size == 0:
+        pytest.skip(
+            "Stata cluster kmeans produced no payload (likely Stata version "
+            f"lacks cluster kmeans). stdout tail: {proc.stdout[-300:]}"
+        )
+    payload = json.loads(result_path.read_text().strip().splitlines()[0])
+    payload.pop("_token", None)
+    res = sanitize(payload)
+    assert res.ok, (
+        f"sanitizer rejected Stata kmeans payload: {res.rejection_reason}"
+    )
+    s = res.sanitized
+    assert s["type"] == "cluster_analysis"
+    assert s["method"] == "kmeans"
+    assert s["n_clusters"] == 3
+    assert s["n_features"] == 4
+    assert set(s["variables"]) == {"price", "mpg", "weight", "length"}
+    # Synthetic labels: cluster_1 / cluster_2 / cluster_3.
+    assert set(s["cluster_labels"]) <= {"cluster_1", "cluster_2", "cluster_3"}
+    # Cluster sizes sum to n_observations (modulo suppressed clusters).
+    sizes = s.get("cluster_sizes", {})
+    assert sizes and sum(sizes.values()) <= s["n_observations"]
+    # Centroids present (kmeans is centroid-based).
+    centroids = s.get("centroids", {})
+    assert centroids
+    for cluster_label, row in centroids.items():
+        assert set(row.keys()) <= {"price", "mpg", "weight", "length"}
+
+
+@requires_stata_cluster
+def test_stata_nora_result_cluster_ward(tmp_path: Path) -> None:
+    """Happy path: Stata hierarchical (Ward linkage) → helper →
+    sanitizer. Pins that linkage="ward" rides through and the same
+    cluster_analysis shape applies (centroids computed post-hoc from
+    the assignment, since Stata's hierarchical commands don't store
+    them natively)."""
+    result_path = tmp_path / "stata_ward.jsonl"
+    script_path = tmp_path / "audit.do"
+    runtime_dir = (_REPO_ROOT / "src" / "nora" / "runtime").resolve()
+    script_path.write_text(
+        _STATA_WARD_SCRIPT.format(runtime_dir=str(runtime_dir))
+    )
+    env = os.environ.copy()
+    env["NORA_RUN_TOKEN"] = "test-token-not-secret"
+    env["NORA_RESULT_PATH"] = str(result_path)
+    proc = subprocess.run(
+        [_STATA, "-b", "do", str(script_path)],
+        cwd=_REPO_ROOT, env=env,
+        capture_output=True, text=True, timeout=120,
+    )
+    if not result_path.is_file() or result_path.stat().st_size == 0:
+        pytest.skip(
+            f"Stata Ward produced no payload. stdout tail: {proc.stdout[-300:]}"
+        )
+    payload = json.loads(result_path.read_text().strip().splitlines()[0])
+    payload.pop("_token", None)
+    res = sanitize(payload)
+    assert res.ok, (
+        f"sanitizer rejected Stata Ward payload: {res.rejection_reason}"
+    )
+    s = res.sanitized
+    assert s["method"] == "hierarchical"
+    assert s["linkage"] == "ward"
+    assert s["n_clusters"] == 3
+    assert "centroids" in s

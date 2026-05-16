@@ -457,6 +457,9 @@ def test_stata_preamble_drops_nora_helpers_only(tmp_path):
         "nora_result_tab",
         "nora_result_magnitude",
         "nora_result_correlation",
+        "nora_result_km",
+        "nora_result_cluster",
+        "nora_result_factor",
         "nora_plot_residuals",
         "nora_plot_coefficients",
         "nora_plot_interaction",
@@ -514,6 +517,9 @@ def test_packaging_spec_bundles_every_runtime_file_stage_runtime_references():
         "nora_result_tab.ado",
         "nora_result_magnitude.ado",
         "nora_result_correlation.ado",
+        "nora_result_km.ado",
+        "nora_result_cluster.ado",
+        "nora_result_factor.ado",
         "nora_plot_residuals.ado",
         "nora_plot_coefficients.ado",
         "nora_plot_interaction.ado",
@@ -532,3 +538,85 @@ def test_packaging_spec_bundles_every_runtime_file_stage_runtime_references():
             f"but missing from nora.runtime — would crash with "
             f"FileNotFoundError in a real run"
         )
+
+
+def test_every_runtime_helper_file_is_in_executor_staging_lists():
+    """The inverse direction of the test above: every user-callable
+    runtime helper that exists in ``src/nora/runtime/`` MUST also be
+    in the executor's staging tuple AND its ``capture program drop``
+    shadowing-defense list. Pre-0.10.0 the existing one-direction
+    check (staging-list-must-exist-on-disk) silently allowed a
+    helper to be PRESENT on disk yet NEVER STAGED — exactly what
+    happened to ``nora_result_km.ado``, which lived in the runtime
+    directory but was missing from the ``stata_ados`` tuple and from
+    the program-drop list. Researchers calling ``nora_result_km``
+    got ``command unknown`` with no clue why.
+
+    This test reads the runtime directory directly and asserts every
+    ``.ado`` (Stata helper) and ``.R`` (R runtime) and ``.py``
+    (Python runtime, excluding internal modules) file is wired into
+    the staging path. New helpers added to the directory now
+    structurally force their staging entry — the test fails until
+    both lists are updated.
+
+    Files explicitly excluded from "user-callable runtime" because
+    they're internal Python infrastructure, not files that the
+    executor's _stage_runtime treats as researcher-facing helpers:
+        - ``__init__.py`` (package marker)
+        - ``turn_context.py`` (turn-id propagation — internal API
+          imported by tools.py, not staged as a runtime helper)
+    """
+    import re
+    from pathlib import Path
+
+    runtime_dir = (
+        Path(__file__).resolve().parents[1] / "src" / "nora" / "runtime"
+    )
+    executor_text = (
+        Path(__file__).resolve().parents[1] / "src" / "nora" / "executor.py"
+    ).read_text(encoding="utf-8")
+
+    # Files that live in runtime/ but are Python internals, not
+    # researcher-facing helpers staged into the per-run scratch dir.
+    excluded = {"__init__.py", "turn_context.py"}
+
+    on_disk = sorted(
+        p.name for p in runtime_dir.iterdir()
+        if p.is_file() and p.name not in excluded
+    )
+
+    missing_from_staging: list[str] = []
+    missing_from_program_drops: list[str] = []
+    for name in on_disk:
+        # Staging: the filename must appear as a string literal
+        # somewhere in executor.py (in the stata_ados / r_names /
+        # python_names tuples inside _stage_runtime_library).
+        if f'"{name}"' not in executor_text:
+            missing_from_staging.append(name)
+            continue
+        # Program-drop list applies only to .ado helpers (the
+        # shadowing defense is Stata-specific).
+        if not name.endswith(".ado"):
+            continue
+        program_name = re.sub(r"\.ado$", "", name)
+        drop_line = f'"capture program drop {program_name}"'
+        if drop_line not in executor_text:
+            missing_from_program_drops.append(name)
+
+    assert not missing_from_staging, (
+        "runtime helper(s) present in src/nora/runtime/ but NOT wired "
+        "into executor.py's _stage_runtime_library staging tuples — "
+        f"the helpers will fail with 'command unknown' at script time: "
+        f"{missing_from_staging}\n"
+        "Fix: add the filename to the appropriate tuple in "
+        "_stage_runtime_library (r_names / stata_ados / python_names)."
+    )
+    assert not missing_from_program_drops, (
+        "Stata helper(s) staged but missing from the "
+        "'capture program drop' shadowing-defense list in "
+        f"executor.py: {missing_from_program_drops}\n"
+        "Fix: add the corresponding 'capture program drop <name>' "
+        "line to nora_program_drops alongside the existing entries. "
+        "Without it, a researcher's profile.do could pre-define the "
+        "helper and shadow the staged version."
+    )

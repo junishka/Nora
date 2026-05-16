@@ -62,13 +62,19 @@ requires_stata = pytest.mark.skipif(
 
 
 EXPECTED_FIT_METRICS: dict[str, tuple[str, ...]] = {
-    "ols":           ("r_squared",),
-    "logit":         ("pseudo_r_squared", "log_likelihood", "aic"),
-    "poisson":       ("pseudo_r_squared", "log_likelihood", "aic"),
-    "stcox":         ("concordance", "log_likelihood", "n_failures"),
-    "xtreg_fe":      ("r_squared", "fixed_effects"),
-    "areg":          ("r_squared", "fixed_effects"),
-    "ols_clustered": ("r_squared", "cluster_variables", "n_clusters"),
+    "ols":               ("r_squared",),
+    "logit":             ("pseudo_r_squared", "log_likelihood", "aic"),
+    "poisson":           ("pseudo_r_squared", "log_likelihood", "aic"),
+    "stcox":             ("concordance", "log_likelihood", "n_failures"),
+    "xtreg_fe":          ("r_squared", "fixed_effects"),
+    "areg":              ("r_squared", "fixed_effects"),
+    "ols_clustered":     ("r_squared", "cluster_variables", "n_clusters"),
+    "mixed_re_intercept": (
+        "random_effects_variance", "n_groups_per_level", "fit_method", "icc",
+    ),
+    "meglm_logit_re":    (
+        "random_effects_variance", "n_groups_per_level", "fit_method",
+    ),
 }
 
 
@@ -231,4 +237,86 @@ def test_stata_cluster_robust_emits_cardinality(
     # Audit data has 60 panels — clustering on id gives 60 clusters.
     assert isinstance(nc, dict) and nc.get("id") == 60, (
         f"expected n_clusters={{id: 60}}, got {nc!r}"
+    )
+
+
+@requires_stata
+def test_stata_mixed_emits_variance_components(
+    stata_payloads: dict[str, dict],
+) -> None:
+    """``mixed sy sx || school:`` should populate
+    random_effects_variance with both a ``school`` (intercept variance)
+    key and a ``residual`` (sigma_e^2) key, n_groups_per_level with
+    ``{"school": 50}``, fit_method "REML" (default), and a finite ICC.
+
+    Mirrors the R lme4 / Python statsmodels.MixedLM contract pinned by
+    ``test_mixed_effects_real_fits.py`` — the Stata path now emits the
+    same field shape so the model sees identical structure regardless
+    of which language the researcher used."""
+    assert "mixed_re_intercept" in stata_payloads
+    s = sanitize(stata_payloads["mixed_re_intercept"]).sanitized or {}
+
+    rev = s.get("random_effects_variance")
+    assert isinstance(rev, dict), f"expected dict, got {type(rev).__name__}"
+    assert "school" in rev, (
+        f"random_effects_variance missing 'school' key — got {list(rev)}"
+    )
+    assert "residual" in rev, (
+        f"random_effects_variance missing 'residual' key — got {list(rev)}"
+    )
+    for key, val in rev.items():
+        assert isinstance(val, float) and val > 0, (
+            f"random_effects_variance[{key!r}] = {val!r} (expected positive float)"
+        )
+
+    ng = s.get("n_groups_per_level")
+    # Audit builds 50 schools of 30 obs each.
+    assert isinstance(ng, dict) and ng.get("school") == 50, (
+        f"expected n_groups_per_level={{school: 50}}, got {ng!r}"
+    )
+
+    assert s.get("fit_method") == "REML", (
+        f"mixed default is REML, helper emitted {s.get('fit_method')!r}"
+    )
+
+    icc = s.get("icc")
+    assert isinstance(icc, float) and 0.0 < icc < 1.0, (
+        f"ICC for single-grouping intercept-only fit should be in (0, 1), "
+        f"got {icc!r}"
+    )
+
+
+@requires_stata
+def test_stata_meglm_emits_variance_components_no_residual(
+    stata_payloads: dict[str, dict],
+) -> None:
+    """``meglm sy_bin sx || school:, family(binomial) link(logit)`` has
+    no residual variance (logit family). The helper must:
+      * emit random_effects_variance with ``school`` but NOT ``residual``
+      * emit n_groups_per_level (same disclosure profile as `mixed`)
+      * emit fit_method == "ML" (meglm is always ML; no REML for
+        nonlinear-link mixed models)
+      * NOT emit ``icc`` (undefined without sigma_e^2)
+    """
+    assert "meglm_logit_re" in stata_payloads
+    s = sanitize(stata_payloads["meglm_logit_re"]).sanitized or {}
+
+    rev = s.get("random_effects_variance")
+    assert isinstance(rev, dict)
+    assert "school" in rev
+    assert "residual" not in rev, (
+        f"meglm logit has no residual variance; helper should NOT emit it. "
+        f"random_effects_variance = {rev!r}"
+    )
+
+    ng = s.get("n_groups_per_level")
+    assert isinstance(ng, dict) and ng.get("school") == 50
+
+    assert s.get("fit_method") == "ML", (
+        f"meglm is always ML, helper emitted {s.get('fit_method')!r}"
+    )
+
+    assert "icc" not in s, (
+        f"ICC requires residual variance (Gaussian only); helper should "
+        f"NOT emit it for meglm. got s['icc'] = {s.get('icc')!r}"
     )

@@ -1,13 +1,17 @@
-*! version 0.0.4  Nora runtime: emit a linear_regression payload from e().
+*! version 0.0.5  Nora runtime: emit a coefficient_table_with_fit_stats payload from e().
 *!
-*! Call after a regression command (regress, logit, etc. — anything that
-*! populates e(b), e(V), e(N), e(depvar)). Writes the structured payload
-*! to the path in $NORA_RESULT_PATH so the Nora executor can pick
-*! it up and route through the sanitizer.
+*! Call after a regression command (regress, logit, probit, poisson,
+*! stcox, xtreg fe, areg, ivregress, mixed, meglm — anything that
+*! populates e(b), e(V), e(N), e(depvar)). Writes the structured
+*! payload to the path in $NORA_RESULT_PATH so the Nora executor
+*! can pick it up and route through the sanitizer.
 *!
 *! Usage:
 *!   regress y x1 x2
 *!   nora_result_regress, label("OLS income ~ edu+age")
+*!
+*!   mixed y x || school:
+*!   nora_result_regress, label("random-intercept by school")
 *!
 *! Notes:
 *! - `version 13` for broad Stata compatibility (Stata 13, 14, 15, 16, 17, 18).
@@ -65,6 +69,48 @@ program define nora_result_regress
     matrix `Vmat' = e(V)
     local vnames : colnames `bmat'
     local k = colsof(`bmat')
+
+    * Mixed-effects models (mixed, meglm) post e(b) with TWO blocks of
+    * columns: fixed-effect parameters under the dep-var equation
+    * prefix ("y:x", "y:_cons", ...) followed by transformed variance
+    * components under prefixes like "lns1_1_1:_cons" (log-SD of school
+    * intercept), "lnc1_1_1_2:_cons" (atanh of intercept-slope
+    * correlation), "lnsig_e:_cons" (log residual SD). e(k_f) reports
+    * the count of fixed-effect parameters — restrict bmat / Vmat /
+    * vnames / k to that leading submatrix so the existing coefficient
+    * / SE / p-value / vcov blocks operate only on the fixed effects.
+    * The variance components are emitted separately further down via
+    * estat recovariance (natural-scale matrices, one per RE level).
+    * Without this guard the helper would emit a "coefficient" called
+    * "lns1_1_1:_cons" and the sanitizer would reject the whole
+    * payload because predictor names must be plain identifiers.
+    *
+    * The leading "<depvar>:" equation prefix is also stripped from
+    * vnames here so predictor names match the dataset schema
+    * (sanitizer expects "x", not "y:x").
+    local _is_mixed_re = ("`e(cmd)'" == "mixed") | ("`e(cmd)'" == "meglm")
+    if `_is_mixed_re' & "`e(k_f)'" != "" & !missing(`=e(k_f)') & `=e(k_f)' > 0 {
+        local _k_f = `=e(k_f)'
+        matrix `bmat' = e(b)[1, 1..`_k_f']
+        matrix `Vmat' = e(V)[1..`_k_f', 1..`_k_f']
+        local _raw_names : colnames `bmat'
+        local k = `_k_f'
+        * Strip equation prefix "y:" from each colname. tokenize
+        * splits on whitespace so this is a simple per-name loop.
+        local _stripped ""
+        forvalues i = 1/`k' {
+            local _full : word `i' of `_raw_names'
+            local _colon = strpos("`_full'", ":")
+            if `_colon' > 0 {
+                local _term = substr("`_full'", `_colon' + 1, .)
+            }
+            else {
+                local _term = "`_full'"
+            }
+            local _stripped "`_stripped' `_term'"
+        }
+        local vnames "`_stripped'"
+    }
 
     tempname fh
     file open `fh' using `"`path'"', write text append
@@ -542,6 +588,134 @@ program define nora_result_regress
     else if "`e(cmd)'" == "areg" & "`e(absvar)'" != "" & "`e(df_a)'" != "" & !missing(`=e(df_a)') {
         local _nlevels = `=e(df_a)' + 1
         file write `fh' `","fixed_effects":{"`e(absvar)'":`_nlevels'}"'
+    }
+
+    * Mixed-effects variance components, group counts, fit method, ICC.
+    *
+    * Matches the contract R's from_lm (lme4::merMod) and Python's
+    * from_lm (statsmodels MixedLMResultsWrapper) emit through the same
+    * sanitizer bucket:
+    *   random_effects_variance: {group: var_intercept,
+    *                             group.slope_term: var_slope,
+    *                             residual: sigma_e^2}
+    *   n_groups_per_level:      {group: count}
+    *   fit_method:              "REML" / "ML"
+    *   icc:                     single-grouping intercept-only case
+    *
+    * Stata stores random-effects parameters in e(b) on a transformed
+    * scale (log-SD, atanh-correlation) that the optimizer uses.
+    * ``estat recovariance`` posts the NATURAL-scale RE covariance
+    * matrices in r(Cov_1), r(Cov_2), ... — one per RE level. Row /
+    * column names are the random-effect terms (_cons for the
+    * intercept, varname for random slopes). Diagonals of those
+    * matrices are the variance components we emit.
+    *
+    * Level ordering: e(ivars) lists grouping variables outermost
+    * first; e(N_g) is a 1 × n_levels matrix with columns in the
+    * same order. r(Cov_1) corresponds to e(ivars)'s first word.
+    if `_is_mixed_re' {
+        local _ivars = "`e(ivars)'"
+        local _n_levels : word count `_ivars'
+
+        capture quietly estat recovariance
+        local _have_rec = (_rc == 0)
+
+        * random_effects_variance — buffer pairs into a local macro
+        * so we can omit the field entirely when no entries survive
+        * (matches R/Python which never emit empty dicts here).
+        local _re_pairs ""
+        if `_have_rec' & `_n_levels' > 0 {
+            forvalues lev = 1/`_n_levels' {
+                local _gname : word `lev' of `_ivars'
+                tempname _cov
+                capture matrix `_cov' = r(Cov_`lev')
+                if _rc continue
+                local _nr = rowsof(`_cov')
+                if `_nr' == 0 continue
+                local _rnames : rownames `_cov'
+                forvalues r = 1/`_nr' {
+                    local _rterm : word `r' of `_rnames'
+                    if missing(`_cov'[`r', `r']) continue
+                    if `_cov'[`r', `r'] < 0 continue
+                    local _v = `_cov'[`r', `r']
+                    * Key convention: group name for the intercept
+                    * (_cons), "group.term" for random slopes — mirrors
+                    * the R helper's lme4::VarCorr walk.
+                    local _key = "`_gname'"
+                    if "`_rterm'" != "_cons" {
+                        local _key = "`_gname'.`_rterm'"
+                    }
+                    local _x = strofreal(`_v', "%21.17e")
+                    local _re_pairs `"`_re_pairs',"`_key'":`_x'"'
+                }
+            }
+        }
+        * Residual variance — Gaussian families only. mixed posts
+        * e(sigma_e); meglm with a non-identity link (binomial,
+        * poisson, ...) has no residual-variance parameter.
+        if "`e(sigma_e)'" != "" & !missing(`=e(sigma_e)') & `=e(sigma_e)' > 0 {
+            local _se2 = `=e(sigma_e)' * `=e(sigma_e)'
+            local _x = strofreal(`_se2', "%21.17e")
+            local _re_pairs `"`_re_pairs',"residual":`_x'"'
+        }
+        if `"`_re_pairs'"' != "" {
+            local _re_body = substr(`"`_re_pairs'"', 2, .)
+            file write `fh' `","random_effects_variance":{`_re_body'}"'
+        }
+
+        * n_groups_per_level — same disclosure profile as fixed_effects
+        * (column name + cardinality, never the level identities).
+        if `_n_levels' > 0 {
+            tempname _ng
+            capture matrix `_ng' = e(N_g)
+            if !_rc & colsof(`_ng') >= `_n_levels' {
+                local _ng_pairs ""
+                forvalues lev = 1/`_n_levels' {
+                    local _gname : word `lev' of `_ivars'
+                    if missing(`_ng'[1, `lev']) continue
+                    local _n = `_ng'[1, `lev']
+                    local _ng_pairs `"`_ng_pairs',"`_gname'":`=`_n''"'
+                }
+                if `"`_ng_pairs'"' != "" {
+                    local _ng_body = substr(`"`_ng_pairs'"', 2, .)
+                    file write `fh' `","n_groups_per_level":{`_ng_body'}"'
+                }
+            }
+        }
+
+        * Fit method. mixed: e(method) is "REML" or "ML" (set by the
+        * default vs , mle option). meglm: nonlinear-link mixed
+        * models are always ML (REML isn't defined there), so
+        * hardcode regardless of what e(method) returns (meglm's
+        * e(method) reports the integration scheme, not REML/ML).
+        local _fm = ""
+        if "`e(cmd)'" == "mixed" {
+            if "`e(method)'" == "REML" | "`e(method)'" == "ML" {
+                local _fm = "`e(method)'"
+            }
+        }
+        else if "`e(cmd)'" == "meglm" {
+            local _fm = "ML"
+        }
+        if "`_fm'" != "" {
+            file write `fh' `","fit_method":"`_fm'""'
+        }
+
+        * ICC — only well-defined for single-grouping, intercept-only
+        * random-effect specifications, AND a residual variance to
+        * divide into. estat icc validates the structure internally
+        * (refuses if the model has random slopes or multiple levels)
+        * and posts the correct quantity in r(icc1). Two safety nets
+        * around it: gate on n_levels == 1 (estat icc on multilevel
+        * fits posts r(icc1), r(icc2), ... which mean something
+        * different) and on sigma_e populated (Gaussian only).
+        if `_n_levels' == 1 & "`e(sigma_e)'" != "" {
+            capture quietly estat icc
+            if !_rc & "`r(icc1)'" != "" & !missing(`=r(icc1)') {
+                local _x = strofreal(`=r(icc1)', "%21.17e")
+                file write `fh' `","icc":`_x'"'
+            }
+        }
     }
 
     * vcov — full variance-covariance matrix of the coefficient
