@@ -44,6 +44,61 @@ Also needs:
   The first launch shows an auth screen and stores the credential in
   the system keyring.
 
+### Analysis-side packages (R / Python)
+
+The `.app` bundle ships Python plus the Nora runtime, but it does
+not bundle the analysis stacks the model writes scripts against —
+those have to be present in whichever language(s) you want Nora to
+run. Most missing packages can be installed live from chat via the
+`install_packages` tool (an Approve / Deny modal lists the
+packages before anything runs). The reference below lists which
+packages back which analysis shape so you know what to install.
+
+**Python** (system `python3`; Nora invokes whichever interpreter
+`python3` resolves to):
+
+- Required for any script run: `pandas`, `numpy`, `statsmodels`,
+  `scipy`. The executor refuses to start a Python subprocess if
+  any of these are missing.
+- Plots: `matplotlib`. Probed at session open; missing it makes
+  `plot_*` helpers fail with a clear install hint.
+- Cluster analysis / PCA: `scikit-learn`. Needed for
+  `nora.from_cluster` and `nora.from_pca`.
+- RDD: `rdrobust` (Python package). Needed for `nora.from_rdd`.
+- Callaway-Sant'Anna DiD: `differences`. Needed for
+  `nora.from_callaway_santanna`.
+
+```bash
+python3 -m pip install pandas numpy statsmodels scipy matplotlib \
+                       scikit-learn rdrobust differences
+```
+
+**R** (`Rscript` on PATH; Nora's helpers reach into installed user
+libraries via `library(pkg)` / `pkg::fn`):
+
+- Common: `haven` (for `.dta` reading), `ggplot2` (for plot
+  helpers' graphics fallback). Both are probed at session open
+  and a missing one is surfaced in the runtime panel of the
+  system prompt.
+- Mixed-effects (`lmer` / `glmer` via `from_lm`): `lme4`.
+- Fixed-effects + cluster-robust regression + Sun-Abraham +
+  TWFE event study: `fixest`.
+- Kaplan-Meier + Cox PH: `survival`.
+- Callaway-Sant'Anna DiD (`from_callaway_santanna`): `did`.
+- RDD (`from_rdd`): `rdrobust` (R package).
+
+```r
+install.packages(c(
+  "haven", "ggplot2", "lme4", "fixest", "survival", "did", "rdrobust"
+))
+```
+
+**Stata.** Nora's Stata helpers ship under `src/nora/runtime/`
+(`.ado` files); the executor places them on the `adopath` for each
+script run. No SSC installs are required. The DiD `csdid` and RDD
+`rdrobust` SSC ports are deferred; for those analyses, run the
+script through R or Python in the same session.
+
 ## Install
 
 If you have a `Nora.dmg`, see [`docs/install.md`](docs/install.md)
@@ -129,13 +184,21 @@ because Nora invokes them as subprocesses.
   - `store.py` for the SQLite result store and audit log.
   - `session_state.py` for the per-session "at a glance" snapshot.
   - `runtime/` for the R library, the Python library, and the
-    thirteen Stata `.ado` helpers scripts call.
+    sixteen Stata `.ado` helpers scripts call (result helpers for
+    every shape with Stata coverage — regress / ttest / sum / tab /
+    magnitude / correlation / km / cluster / factor — plus the four
+    plot helpers, the export-fallback chain, and the ad-hoc safe
+    exporter).
   - `provider/` for the Anthropic and OpenAI session adapters.
   - `chat_service.py` for the typed event stream the frontend
     consumes.
-- `tests/` for 1312 pytest cases collected as of 2026-05-15.
+- `tests/` for 1312+ pytest cases (the 0.10.0 Stata-parity pass
+  added cluster / factor / mixed-effects real-fit pins plus the
+  disk↔staging invariant test; run
+  `uv run pytest --collect-only -q` for the current count).
   `test_sanitizer.py` is the property-test backbone.
-  `test_executor_*` cover the sandbox profile.
+  `test_executor_*` cover the sandbox profile and the executor's
+  staging contract.
   `test_concurrent_sessions.py` covers multi-runner isolation.
 - `docs/` for handoff, overview, direction, install, verification.
 - `packaging/` for the PyInstaller spec and the `.app` / `.dmg`

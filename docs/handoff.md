@@ -1,7 +1,34 @@
 # Nora — handoff
 
 Single-page entry point for picking this project up. Last
-substantive update **2026-05-15**, after the audit-fixes pass:
+substantive update **2026-05-16**, after the 0.10.0 Stata-parity
+pass: `nora_result_regress` now handles `mixed` / `meglm` fits
+(reads `estat recovariance` for variance components, `estat icc`
+for the single-grouping intercept-only case, restricts the
+coefficient submatrix to the fixed-effects equation via `e(k_f)`);
+new `nora_result_cluster.ado` covers `cluster kmeans` /
+`cluster wardslinkage` / `cluster completelinkage` /
+`cluster averagelinkage` / `cluster singlelinkage` with centroids
++ within-SS + the SS decomposition computed from the dataset
+directly (Stata's clustering commands don't store centroids
+natively); new `nora_result_factor.ado` covers `pca` and `factor`
+(pcf / pf / ml / ipf extraction) reading loadings + eigenvalues +
+explained-variance ratios from `e()`, plus ML-FA goodness-of-fit
+fields. The Kaplan-Meier helper was physically present under
+0.9.x but never wired into `_stage_runtime_library`'s `stata_ados`
+tuple — calls to `nora_result_km` failed with "command unknown" at
+runtime; fixed by adding the file to the staging tuple and the
+`capture program drop` shadowing-defense list, and the
+disk↔staging invariant is now pinned by a new test
+(`test_every_runtime_helper_file_is_in_executor_staging_lists`)
+so a future helper added to `src/nora/runtime/` without staging
+fails the test. The DiD Stata path is reframed in the system
+prompt as no-realistic-workflow (recommend R / Python in the same
+session loading the `.dta` via `haven` / `pyreadstat`); RDD Stata
+is targeted for 0.10.1 with a documented cross-language numerics
+verification protocol (see [CHANGELOG.md](../CHANGELOG.md)
+deferred section). The previous substantive batch (2026-05-15)
+was the audit-fixes pass:
 `install_packages` consent is modal-only (the system prompt and
 tool description now agree that the Approve/Deny modal is the one
 gate); `error_summary.py` is documented at its current stricter
@@ -91,6 +118,8 @@ keep streaming.
 | **Per-provider system prompt + lean OpenAI tool descriptions** — `build_system_prompt(cwd, server_name, provider)`; OpenAI gets a name-only tool intro instead of the Anthropic `mcp__nora__` mention; `ToolSpec.openai_description` field for the four biggest tools (recall_conversation, read_attached_file, submit_script, get_schema) cuts tool-array tokens by ~46% on the OpenAI path. Saves ~818 tokens/call, biggest wins compound across 100+ turn sessions | ✅ done |
 | **Regression diagnostics** — `vif`, `condition_number`, full `vcov` (variance-covariance matrix) emitted by `from_lm` in R + Python when the design matrix is reachable. Pure aggregates from sigma² · (X'X)⁻¹; cross-field key validation mirrors the existing coefficient defense. Plus a long-standing bug fix: `Intercept` and `const` were silently dropped from statsmodels formula-fit payloads (only `(Intercept)` / `_cons` / `intercept` were in the alias list); now in | ✅ done |
 | **Self-contained Stata helpers** — `nora_result_sum varname [if]` runs `summarize` itself instead of reading whatever's in `r()`. Eliminates the silent foot-gun where a second `summarize <other>` between intent and helper produced a payload labeled "age" carrying income's mean. Same for new `nora_ttest <var> [if] [, against(num) \| paired(var2) \| by(group) [unequal]]` which runs the appropriate `ttest` form itself based on mutually-exclusive shape options. Legacy `nora_result_ttest` kept for back-compat | ✅ done |
+| **Stata parity for the four high-usage shapes that were previously R+Python-only** (0.10.0): mixed-effects through `nora_result_regress` (extended for `mixed` / `meglm`; reads `estat recovariance` for variance components, `estat icc` for the single-grouping intercept-only case, restricts the coefficient submatrix to fixed-effects-only via `e(k_f)` so transformed variance parameters don't appear as "coefficients"); cluster analysis through new `nora_result_cluster.ado` (kmeans + hierarchical with linkage; centroids + within-SS computed from the dataset directly); factor decomposition through new `nora_result_factor.ado` (PCA + factor with pcf / pf / ml / ipf; reads loadings + eigenvalues + explained-variance ratios from `e()`); Kaplan-Meier through `nora_result_km` (the helper existed under 0.9.x but was missing from `_stage_runtime_library`'s `stata_ados` tuple — researchers calling it got "command unknown" until 0.10.0). DiD and RDD stay Stata-deferred for substantive reasons documented in the Stata coverage matrix below | ✅ done (0.10.0) |
+| **Runtime-staging invariant test** — `test_executor_profile.py::test_every_runtime_helper_file_is_in_executor_staging_lists` reads `src/nora/runtime/` at test time and asserts every user-callable `.ado` / `.R` / `.py` file is referenced in the executor's `_stage_runtime_library` staging tuple AND has a `capture program drop <name>` line in the shadowing-defense list. Pins the disk↔staging invariant in both directions; pre-0.10.0 the existing one-direction check (staging-list-must-exist-on-disk) silently allowed `nora_result_km.ado` to live on disk without being staged | ✅ done (0.10.0) |
 | **`correlation_matrix` sanitizer type** — pairwise correlation matrix as a first-class payload (Pearson / Spearman / Kendall), with min-N gate and per-pair value-key validation. R `nora$from_correlation` and Python `nora.from_correlation` helpers; computes complete-case N (not pairwise N) so off-diagonals draw on the same sample | ✅ done |
 | **`request_data` types** — added `quartiles` (25th + 75th + IQR; median omitted as a row-level forbidden field) and `correlation_pair` (Pearson r between two variables, complete-case N). Tool schema gained an optional `variable2` field for multi-variable types | ✅ done |
 | **Cross-session result recall** — `list_results_global(query?)` and `expand_result(result_id, session_path?)`. Env-gated via `NORA_ALLOW_CROSS_SESSION_RECALL=1` (default off — researcher-side project separation, NOT a privacy property; stored payloads are pre-sanitized either way). Path-confined to `~/.nora-sessions/` so prompt-injected lookups can't direct the store loader at arbitrary paths | ✅ done |
@@ -121,6 +150,62 @@ keep streaming.
 | **Cross-query composition / release ledger** | ⏭ named, future-deployment scope |
 | **Apple Developer Program signing + notarization for distributable .dmg** | ✅ done — release `.dmg` is signed (Developer ID Application) and notarized |
 | **Stata batch wrapper around `_cons` "omitted" edge case** | ⏭ named, low-priority |
+
+### Stata coverage matrix (release status)
+
+The sanitizer recognises thirteen analysis shapes. The 0.10.0 release
+ships Stata parity for the four high-usage shapes that were
+previously R+Python-only (cluster, factor, mixed-effects, KM). Two
+shapes remain Stata-deferred for substantive reasons (DiD: SSC
+install flow; RDD: numerics-unverified). The earlier-shipped KM
+helper is now actually reachable — the `.ado` was in the runtime
+directory under 0.9.x but never in the executor's staging list, so
+`nora_result_km` failed with "command not found" on every prior
+release.
+
+| Shape / feature | R helper | Python helper | Stata helper | Status |
+|---|---|---|---|---|
+| `coefficient_table_with_fit_stats` (regress / GLM / Cox PH / fixest / IV-2SLS) | ✓ `from_lm` / `from_iv` | ✓ `from_lm` / `from_iv` | ✓ `nora_result_regress` (covers regress/logit/probit/poisson/stcox/xtreg fe/areg/ivregress/mixed/meglm) | shipped |
+| `t_test` | ✓ `from_t_test` | ✓ `from_t_test` | ✓ `nora_ttest` (legacy `nora_result_ttest` kept) | shipped |
+| `descriptive` | ✓ `from_summarize` | ✓ `from_summarize` | ✓ `nora_result_sum` | shipped |
+| `frequency_table` | ✓ `from_table` | ✓ `from_table` | ✓ `nora_result_tab` (1-way) | shipped |
+| `crosstab` | ✓ `from_crosstab` | ✓ `from_crosstab` | ✓ `nora_result_tab <v1> <v2>` | shipped |
+| `magnitude_table` | ✓ `from_magnitude_table` | ✓ `from_magnitude_table` | ✓ `nora_result_magnitude` | shipped |
+| `correlation_matrix` | ✓ `from_correlation` | ✓ `from_correlation` | ✓ `nora_result_correlation` | shipped |
+| `kaplan_meier` | ✓ `from_kaplan_meier` | ✓ `from_kaplan_meier` | ✓ `nora_result_km` (also fixes the silent staging gap — the helper existed but was never in `_stage_runtime_library`'s `stata_ados` tuple under 0.9.x) | **shipped 0.10.0** (was effectively broken pre-0.10.0) |
+| `cluster_analysis` | ✓ `from_cluster` (kmeans + hierarchical); DBSCAN via `nora$result(...)` | ✓ `from_cluster` (KMeans + AgglomerativeClustering); DBSCAN via `nora.result(...)` | ✓ `nora_result_cluster` (kmeans + hierarchical with linkage; centroids + within-SS computed from the dataset directly since Stata's cluster commands don't store them) | **shipped 0.10.0** |
+| `factor_decomposition` | ✓ `from_pca` + `from_fa` (wraps `psych::fa` — ML / minres / pa factor analysis with rotation, communalities, RMSEA / TLI) | ✓ `from_pca` + `from_factor_analyzer` (wraps `factor_analyzer.FactorAnalyzer`) | ✓ `nora_result_factor` (PCA + factor with pcf/pf/ml/ipf extraction; reads loadings + eigenvalues from `e()`; ML-FA goodness-of-fit via `e(chi2_ms)` / `e(p_ms)` / `e(df_ms)` / `e(ll)`) | **shipped 0.10.0** |
+| `marginal_effects` (per-variable AME / MEM / at-representative scalars from non-linear fits; `at_values` precision-clamped by sample N) | ✓ `from_marginal_effects` (wraps `marginaleffects::avg_slopes` / `slopes`) | ✓ `from_marginal_effects` (wraps `fit.get_margeff`) | ✗ no helper; `nora_result_margins.ado` deferred | **shipped 0.10.0** (R + Python only) |
+| Mixed-effects (sub-feature of `coefficient_table_with_fit_stats`: `random_effects_variance`, `n_groups_per_level`, `icc`, `fit_method`) | ✓ via `from_lm` on `lmer` / `glmer` | ✓ via `from_lm` on `statsmodels.mixedlm` | ✓ Stata `mixed` / `meglm` now routed through `nora_result_regress` — `estat recovariance` for variance components, `estat icc` for the single-grouping intercept-only case | **shipped 0.10.0** |
+| Panel-data diagnostics (sub-feature: `f_test_fe_chi2/p`, `hausman_chi2/p`, `breusch_pagan_chi2/p`, `wooldridge_ar1_chi2/p`) | ✓ R `from_lm` auto-runs `plm::pFtest` / `phtest` / `pbgtest` / `pwartest` on `plm` fits | ✓ Python `from_lm` accepts these as caller kwargs (linearmodels PanelOLS) | ✓ Stata `xtreg, fe` auto-emits `f_test_fe_chi2` + `f_test_fe_p` from `e(F_f)`; other tests pass via caller (run `xttest0` / `xtserial` in the script) | **shipped 0.10.0** |
+| Cluster-robust SE + typed `robust_se_type` enum (`classical`, `hc0..hc3`, `hac_newey_west`, `cluster`, `bootstrap`) (sub-feature) | ✓ fixest `vcov=` arg auto-detected | ✓ `cov_type=` auto-mapped (`HC0..HC3`, `HAC`, `cluster`) | ✓ `vce(cluster id)` + `e(cmd)=="newey"` auto-emit cluster / hac_newey_west; `cluster_variables` + `n_clusters` populated when applicable | shipped |
+| `did_event_study` | ✓ `from_callaway_santanna` + `from_sun_abraham` + `from_twfe_event_study`; de Chaisemartin via `nora$result(...)` | ✓ `from_callaway_santanna`; sun_abraham / twfe_event_study / de_chaisemartin via `nora.result(...)` | ✗ no helper; `csdid` is SSC-distributed and Nora's `install_packages` can't reach SSC | **deferred — no realistic Stata workflow.** The only way to emit `did_event_study` from Stata today is hand-authoring JSON to `NORA_RESULT_PATH` against the field schema — that's a contributor-level escape hatch, not an end-user workflow. System prompt now directs the model to recommend running CS DiD in R or Python via the same session (the `.dta` opens via `haven` / `pyreadstat`; the data stays on the machine). Adding a real Stata helper waits on a contributor pinning the `csdid` API surface |
+| `rdd` | ✓ `from_rdd` (wraps `rdrobust::rdrobust`) | ✓ `from_rdd` (wraps `rdrobust` Python) | ✗ no helper; SSC Stata `rdrobust` port has maintenance lag and numerics haven't been verified against CCT 2014 reference | **deferred — targeted 0.10.1.** Go / no-go is empirical and roughly one Stata session: fit `rdrobust` in Stata and R / Python on the same simulated DGP, compare τ / SE / bandwidths at the 0.5% relative-tolerance level. If they agree, write the helper following the `nora_result_factor.ado` pattern. If they disagree, document the divergence and keep deferred. See [CHANGELOG.md](../CHANGELOG.md) deferred section for the protocol |
+
+**Operational meaning of the two Stata-deferred entries.** Both
+deferrals point a Stata-using researcher at the same fallback:
+open R or Python inside the same session. Same sandbox, same
+sanitizer; the `.dta` opens via `haven` (R) or `pyreadstat`
+(Python) without ever leaving the machine. Only the helper lives
+in a different runtime. The two deferrals differ in *why* the
+Stata helper is missing:
+
+- **RDD: numerics-unverified, targeted 0.10.1.** The Stata SSC
+  `rdrobust` port has known maintenance lag and we have not yet
+  verified its output against the CCT 2014 reference that R and
+  Python `rdrobust` reproduce. Go / no-go is empirical and roughly
+  one Stata session (see [CHANGELOG.md](../CHANGELOG.md) deferred
+  section for the protocol). The deferral has a target version so
+  it isn't open-ended.
+- **DiD: no realistic Stata workflow exists today.** `csdid` is
+  SSC-distributed and `install_packages` does not reach SSC, so
+  Nora cannot install it. Even with a researcher who runs
+  `ssc install csdid` in their own Stata window, the only way to
+  emit a `did_event_study` payload from Stata is hand-authoring
+  JSON to `NORA_RESULT_PATH` against the field schema — that's a
+  contributor-level escape hatch, not an end-user path. Adding a
+  real Stata helper waits on a contributor pinning the `csdid` API
+  surface and following the `nora_result_*` ado-file convention.
 
 **1312 pytest cases collected** via `uv run pytest --collect-only -q`
 on 2026-05-15. Full pass/fail depends on local sandbox/runtime
@@ -441,7 +526,7 @@ them by surprise.
 | `src/nora/sanitizer.py` + `sdc.py` | The SDC allowlist and clamp/suppress primitives |
 | `src/nora/runner.py` | `SessionRunner` — per-cwd execution unit. Owns provider session, lock, turn task, plot-vision capture, helper-error logging |
 | `src/nora/plot_convert.py` | macOS `sips`-based PDF/EPS → PNG conversion with mtime-cached sidecars. Used by both the runner (model vision) and the bridge (researcher thumbnails) |
-| `src/nora/runtime/nora.R` + `nora.py` + `nora_result_*.ado` + `nora_plot_*.ado` + `_nora_export_plot.ado` + `nora_safe_export.ado` | Runtime emitters: result helpers (`from_lm`, `from_t_test`, …) and plot helpers (`plot_residuals`, `plot_interaction`, `plot_coefficients`, `plot_estimate_comparison`). Stata fallback chain in `_nora_export_plot`; Stata ad-hoc safe wrapper in `nora_safe_export` |
+| `src/nora/runtime/nora.R` + `nora.py` + `nora_result_*.ado` + `nora_plot_*.ado` + `_nora_export_plot.ado` + `nora_safe_export.ado` | Runtime emitters: result helpers (`from_lm`, `from_t_test`, `from_cluster`, `from_pca`, `from_kaplan_meier`, …) and plot helpers (`plot_residuals`, `plot_interaction`, `plot_coefficients`, `plot_estimate_comparison`). Sixteen Stata `.ado` files cover every shape with Stata parity — `nora_result_regress` (extended for `mixed` / `meglm` in 0.10.0), `nora_result_cluster` (new in 0.10.0, kmeans + hierarchical with linkage), `nora_result_factor` (new in 0.10.0, PCA + factor with pcf / pf / ml / ipf), `nora_result_km` (newly staged in 0.10.0 — the helper existed earlier but the staging gap kept it unreachable), plus regress / ttest / sum / tab / magnitude / correlation. Stata fallback chain in `_nora_export_plot`; Stata ad-hoc safe wrapper in `nora_safe_export`. **The disk↔staging invariant is pinned by `test_executor_profile.py::test_every_runtime_helper_file_is_in_executor_staging_lists` — a new helper file in this directory must be wired into the executor's staging tuple or the test fails** |
 | `src/nora/schema.py` | Schema extractors for all seven supported file formats |
 | `src/nora/ui.py` | Web UI bridge: runners dict, focus-only `switch_session`, plot collection + diagnostic, Files panel endpoints, cache-busted index.html, `delete_session_file` |
 | `src/nora/chat_service.py` | Back-compat re-export shim for the Event types |
@@ -453,7 +538,7 @@ them by surprise.
 | `docs/overview.md` | Plain-language description for researchers |
 | `docs/install.md` | Researcher-facing install flow |
 | `docs/verification.md` | Manual smoke-test recipes (incl. Stata, which CI can't) |
-| `tests/` | 1312 pytest cases collected as of 2026-05-15. `test_sanitizer.py` is the property-test backbone (now also covers vif / condition_number / vcov + correlation_matrix); `test_concurrent_sessions.py` pins the per-task ContextVar isolation; `test_plot_vision.py` pins the manifest-allowlist privacy gate; `test_run_dir_plots.py` covers thumbnail collection + PDF→PNG conversion + Stata export fallback chain; `test_openai_lockdown.py` pins the no-built-in-tools invariant; `test_cross_session_recall.py` pins the env-gated cross-session lookup + path-confinement defense; `test_bridge_lifecycle.py` covers active-session delete + landing-page navigation |
+| `tests/` | 1312+ pytest cases (the 0.10.0 Stata-parity pass added cluster / factor / mixed-effects real-fit pins plus the disk↔staging invariant test; run `uv run pytest --collect-only -q` for the current count). `test_sanitizer.py` is the property-test backbone (now also covers vif / condition_number / vcov + correlation_matrix); `test_concurrent_sessions.py` pins the per-task ContextVar isolation; `test_plot_vision.py` pins the manifest-allowlist privacy gate; `test_run_dir_plots.py` covers thumbnail collection + PDF→PNG conversion + Stata export fallback chain; `test_openai_lockdown.py` pins the no-built-in-tools invariant; `test_cross_session_recall.py` pins the env-gated cross-session lookup + path-confinement defense; `test_bridge_lifecycle.py` covers active-session delete + landing-page navigation; `test_executor_profile.py` pins the staging-tuple ↔ runtime-directory invariant in both directions (every staged file exists; every file is staged) |
 
 ## Decisions worth not re-litigating
 

@@ -90,4 +90,39 @@ file close ah
 quietly regress y_cont x1 x2, vce(cluster id)
 nora_result_regress
 
+* Mixed-effects (single-grouping random intercept). Pins emission of
+* random_effects_variance, n_groups_per_level, fit_method, icc on the
+* Stata side — matches the contract R lme4 and Python
+* statsmodels.MixedLM ship through nora$from_lm / nora.from_lm.
+* Build a larger panel with real between-cluster variance so `mixed`
+* actually has variance components to estimate. Build per-school
+* effects first, then expand to 30 obs per school for 1500 total.
+preserve
+clear
+set obs 50
+set seed 20260516
+gen school = _n
+gen school_eff = 0.6 * rnormal()
+expand 30
+bysort school: gen sx = rnormal()
+gen sy = school_eff + 0.4 * sx + 0.4 * rnormal()
+
+file open ah using "`_path'", write text append
+file write ah `"{"_audit_label":"mixed_re_intercept"}"' _newline
+file close ah
+quietly mixed sy sx || school:
+nora_result_regress
+
+* meglm logistic with random intercept. Same variance-components
+* shape as `mixed`, but no residual variance (non-Gaussian), so
+* icc must NOT appear and the residual key must not be present in
+* random_effects_variance — pins that gate.
+gen sy_bin = (sy > 0)
+file open ah using "`_path'", write text append
+file write ah `"{"_audit_label":"meglm_logit_re"}"' _newline
+file close ah
+quietly meglm sy_bin sx || school:, family(binomial) link(logit)
+nora_result_regress
+restore
+
 display "audit complete: " "`_path'"

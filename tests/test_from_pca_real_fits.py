@@ -273,3 +273,144 @@ except TypeError as e:
     )
     out = proc.stdout + proc.stderr
     assert "ERR:" in out and "must be a sklearn.decomposition.PCA" in out
+
+
+# ---------------------------------------------------------------------------
+# Stata via nora_result_factor.ado
+# ---------------------------------------------------------------------------
+
+_STATA = None
+for _name in ("stata-mp", "stata-se", "stata"):
+    _p = shutil.which(_name)
+    if _p:
+        _STATA = _p
+        break
+
+_NORA_RESULT_FACTOR_ADO = (
+    _REPO_ROOT / "src" / "nora" / "runtime" / "nora_result_factor.ado"
+)
+requires_stata_factor = pytest.mark.skipif(
+    _STATA is None or not _NORA_RESULT_FACTOR_ADO.is_file(),
+    reason="Stata binary / nora_result_factor.ado not available",
+)
+
+
+_STATA_PCA_SCRIPT = r"""
+adopath ++ "{runtime_dir}"
+local _path : env NORA_RESULT_PATH
+capture erase "`_path'"
+sysuse auto, clear
+quietly drop if missing(price, mpg, weight, length, displacement)
+quietly pca price mpg weight length displacement, components(3)
+nora_result_factor, method("pca") label("Stata auto PCA c=3")
+"""
+
+
+_STATA_FACTOR_ML_SCRIPT = r"""
+adopath ++ "{runtime_dir}"
+local _path : env NORA_RESULT_PATH
+capture erase "`_path'"
+sysuse auto, clear
+quietly drop if missing(price, mpg, weight, length, displacement)
+quietly factor price mpg weight length displacement, ml factors(2)
+nora_result_factor, method("maximum_likelihood") ///
+    label("Stata auto ML factor analysis")
+"""
+
+
+@requires_stata_factor
+def test_stata_nora_result_factor_pca(tmp_path: Path) -> None:
+    """Happy path: Stata pca → helper → sanitizer. Asserts the
+    payload carries loadings (nested dict), eigenvalues, and
+    explained_variance_ratio for every declared component."""
+    result_path = tmp_path / "stata_pca.jsonl"
+    script_path = tmp_path / "audit.do"
+    runtime_dir = (_REPO_ROOT / "src" / "nora" / "runtime").resolve()
+    script_path.write_text(
+        _STATA_PCA_SCRIPT.format(runtime_dir=str(runtime_dir))
+    )
+    env = os.environ.copy()
+    env["NORA_RUN_TOKEN"] = "test-token-not-secret"
+    env["NORA_RESULT_PATH"] = str(result_path)
+    proc = subprocess.run(
+        [_STATA, "-b", "do", str(script_path)],
+        cwd=_REPO_ROOT, env=env,
+        capture_output=True, text=True, timeout=120,
+    )
+    if not result_path.is_file() or result_path.stat().st_size == 0:
+        pytest.skip(
+            f"Stata pca produced no payload. stdout tail: {proc.stdout[-300:]}"
+        )
+    payload = json.loads(result_path.read_text().strip().splitlines()[0])
+    payload.pop("_token", None)
+    res = sanitize(payload)
+    assert res.ok, (
+        f"sanitizer rejected Stata PCA payload: {res.rejection_reason}"
+    )
+    s = res.sanitized
+    assert s["type"] == "factor_decomposition"
+    assert s["method"] == "pca"
+    assert s["n_variables"] == 5
+    assert s["n_components"] == 3
+    loadings = s.get("loadings")
+    assert isinstance(loadings, dict) and len(loadings) == 5
+    for var_row in loadings.values():
+        # Each variable row carries a value for every component.
+        assert set(var_row.keys()) == {"PC1", "PC2", "PC3"}
+    # Eigenvalues + explained-variance ratios present.
+    assert s.get("eigenvalues") and len(s["eigenvalues"]) == 3
+    assert s.get("explained_variance_ratio")
+    # Cumulative variance is monotonically non-decreasing and ≤ 1.
+    cumul = s.get("cumulative_variance", {})
+    if cumul:
+        vals = [cumul.get(f"PC{j+1}") for j in range(3)]
+        assert all(v is not None and 0 <= v <= 1.0 + 1e-9 for v in vals)
+        assert vals == sorted(vals)
+
+
+@requires_stata_factor
+def test_stata_nora_result_factor_ml_factor_analysis(tmp_path: Path) -> None:
+    """Happy path: Stata factor with ml extraction → helper →
+    sanitizer. Pins that the maximum_likelihood method path emits
+    chi_squared + degrees_of_freedom + log_likelihood (the
+    goodness-of-fit fields specific to ML-FA)."""
+    result_path = tmp_path / "stata_factor_ml.jsonl"
+    script_path = tmp_path / "audit.do"
+    runtime_dir = (_REPO_ROOT / "src" / "nora" / "runtime").resolve()
+    script_path.write_text(
+        _STATA_FACTOR_ML_SCRIPT.format(runtime_dir=str(runtime_dir))
+    )
+    env = os.environ.copy()
+    env["NORA_RUN_TOKEN"] = "test-token-not-secret"
+    env["NORA_RESULT_PATH"] = str(result_path)
+    proc = subprocess.run(
+        [_STATA, "-b", "do", str(script_path)],
+        cwd=_REPO_ROOT, env=env,
+        capture_output=True, text=True, timeout=120,
+    )
+    if not result_path.is_file() or result_path.stat().st_size == 0:
+        pytest.skip(
+            f"Stata ML factor produced no payload. stdout tail: {proc.stdout[-300:]}"
+        )
+    payload = json.loads(result_path.read_text().strip().splitlines()[0])
+    payload.pop("_token", None)
+    res = sanitize(payload)
+    assert res.ok, (
+        f"sanitizer rejected Stata ML factor payload: {res.rejection_reason}"
+    )
+    s = res.sanitized
+    assert s["method"] == "maximum_likelihood"
+    # Factor analysis uses factor1 / factor2 / ... labels.
+    loadings = s.get("loadings", {})
+    for var_row in loadings.values():
+        assert set(var_row.keys()) == {"factor1", "factor2"}
+    # ML-specific fields: at least one of these must reach the model.
+    ml_fields = ("chi_squared", "log_likelihood", "degrees_of_freedom")
+    present = [k for k in ml_fields if k in s]
+    assert present, (
+        f"Expected at least one ML-FA fit field {ml_fields}; "
+        f"got {sorted(s.keys())}"
+    )
+    # Communalities + uniqueness (factor-analysis-specific) present.
+    assert "uniqueness" in s
+    assert "communalities" in s

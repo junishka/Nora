@@ -112,3 +112,76 @@ A script that manages to bypass the library now has to first recover
 the token from the interpreter's loaded environment — which shows up
 in the executed script visible to the researcher — rather than just
 writing a file.
+
+## Clean-install smoke (signed `.dmg` only)
+
+The 0.10.0 release ships five new analysis shapes
+(`did_event_study`, `rdd`, `cluster_analysis`, `factor_decomposition`,
+`kaplan_meier`) plus mixed-effects diagnostics. Every helper
+through that pipe was tested on a developer machine with the full
+analysis stack already installed. The first thing a clean-install
+user is likely to hit is a helper-side missing-package failure
+(`matplotlib`, `rdrobust`, `differences`, `did`, `survival`,
+`fixest`, `lme4`) — the failure mode the regular CI suite cannot
+exercise. **Run this before signing the release `.dmg`** on a
+machine that has not run Nora before. Either a clean macOS user
+account, a fresh VM, or a colleague's machine works.
+
+Setup (one-time on the test machine):
+
+```bash
+# Install nothing beyond what the .dmg needs. Specifically do NOT
+# install the optional Python / R packages — the point is to
+# verify the helper-failure paths surface correctly.
+```
+
+Then:
+
+1. **Open `Nora.dmg`, drag to `/Applications`, double-click**.
+   First launch must hit the auth screen with no Gatekeeper
+   error. (Gatekeeper passing is the codesign + notarization
+   check; if it fails, do not ship.)
+2. **Auth screen — enter an API key** for one provider. Should
+   land at the landing-screen drop zone.
+3. **Drop a small CSV** (any 100-row dataset). The session should
+   open into chat with the dataset listed.
+4. **Run one fit per analysis shape**, in any language available
+   on the test machine:
+   - `coefficient_table_with_fit_stats` (OLS regression). Should
+     succeed end-to-end. Verifies the baseline path.
+   - `descriptive` / `frequency_table` / `crosstab` /
+     `magnitude_table` / `correlation_matrix`. Quick batch.
+   - `t_test`.
+   - `kaplan_meier`. Verifies `survival` package detection (R) /
+     `lifelines` or statsmodels (Python).
+   - `did_event_study`. Verifies `did` (R) / `differences` (Py).
+   - `rdd`. Verifies `rdrobust` (R or Py — both are missing on a
+     clean install).
+   - `cluster_analysis`. Verifies `scikit-learn` (Py).
+   - `factor_decomposition`. Verifies `scikit-learn` (Py PCA).
+5. **For each missing-package failure**, confirm:
+   - The result envelope reports `status: "execution_failed"`
+     with a `debug_excerpt` carrying the language's native
+     error idiom.
+   - The model surfaces it to the researcher with a clear
+     install hint (e.g. "`install.packages('did')` is required
+     for Callaway-Sant'Anna").
+   - Calling `install_packages` from chat pops the Approve /
+     Deny modal listing the packages.
+   - After approval, the package installs and the next fit
+     succeeds.
+6. **Run a plot helper** (`plot_coefficients` after a regression).
+   Verifies `matplotlib` (Py) / `ggplot2` (R) fallback and the
+   manifest-allowlisted capture path.
+7. **`plot_residuals`** — confirm the model only sees the
+   `researcher_only: true` marker, while the researcher sees the
+   thumbnail in the Files panel.
+8. **Switch sessions / drop a second dataset** — confirm
+   concurrent-session isolation. The original session's in-flight
+   work (if any) continues.
+
+A clean-install run that surfaces every missing-package failure
+gracefully (no silent helper crash, no model hallucinating a
+result) is the green-light for signing. Failures here are
+shippable as known issues only if accompanied by a documented
+install hint the model surfaces consistently.

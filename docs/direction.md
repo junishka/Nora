@@ -1,7 +1,21 @@
 # Nora — architectural direction
 
-Working document. Last substantive update **2026-05-15**, after
-the audit-fixes pass: install-packages consent is modal-only, the
+Working document. Last substantive update **2026-05-16**, after
+the 0.10.0 Stata-parity pass: extended `nora_result_regress` to
+emit mixed-effects variance components / group counts / fit method
+/ ICC for `mixed` and `meglm` fits; new `nora_result_cluster.ado`
+covers `cluster kmeans` / `cluster wardslinkage` and family with
+centroids + within-SS computed from the dataset directly; new
+`nora_result_factor.ado` covers `pca` and `factor` (pcf / pf / ml /
+ipf) with loadings + eigenvalues + explained-variance ratios; the
+runtime-staging gap that left `nora_result_km.ado` physically
+present but unreachable under 0.9.x is fixed in the executor and
+pinned by a new disk↔staging invariant test; the DiD Stata path is
+reframed in the system prompt as no-realistic-workflow (recommend
+R / Python in the same session), and RDD Stata is targeted for
+0.10.1 with a documented cross-language numerics protocol. The
+previous substantive update **2026-05-15** was the audit-fixes
+pass: install-packages consent is modal-only, the
 script-failure `debug_excerpt` is documented at its stricter
 redaction posture (exception bodies redacted wholesale, only
 parser-anchored framing crosses), `load_data` and the schema fast
@@ -83,7 +97,7 @@ researcher use case demands it.
 
 ## What's built
 
-As of 2026-05-15, the implementation covers:
+As of 2026-05-16, the implementation covers:
 
 - Spine + full SDK lockdown (14 MCP tools — get_schema, search_schema,
   request_data, submit_script, submit_script_file, expand_result,
@@ -110,8 +124,29 @@ As of 2026-05-15, the implementation covers:
   exactly 2); structural size caps on every dict / list payload
   field; filename + variable-name sanitization at every
   prompt-injection surface.
+- **Stata parity for the four high-usage shapes that were
+  previously R+Python-only (0.10.0):** mixed-effects via
+  `nora_result_regress` (`mixed` / `meglm` paths run
+  `estat recovariance` + `estat icc`), cluster analysis via
+  `nora_result_cluster` (kmeans + hierarchical with linkage;
+  centroids + within-SS computed from the dataset directly since
+  Stata's cluster commands don't store them natively), factor
+  decomposition via `nora_result_factor` (PCA + factor with
+  pcf / pf / ml / ipf extraction), and Kaplan-Meier via
+  `nora_result_km` (the helper existed under 0.9.x but the
+  staging tuple gap kept it unreachable until 0.10.0). DiD and
+  RDD stay Stata-deferred for substantive reasons documented in
+  the `handoff.md` Stata coverage matrix and the 0.10.0 CHANGELOG;
+  RDD is targeted for 0.10.1 pending a cross-language numerics
+  check, DiD waits on a contributor pinning the `csdid` API.
 - Runtime libraries for R, Python, and Stata with JSON-escaped
-  labels and CR/LF/TAB handling.
+  labels and CR/LF/TAB handling. The runtime-directory ↔ executor
+  staging invariant is now pinned by
+  `test_every_runtime_helper_file_is_in_executor_staging_lists`
+  in `tests/test_executor_profile.py` — adding a new helper file
+  without wiring it into `_stage_runtime_library`'s tuple fails
+  the test, so the silent-orphan failure mode that hid
+  `nora_result_km.ado` under 0.9.x cannot recur.
 - SQLite result store, keyed by resolved cwd (no cross-session leak
   in the same process).
 - Memory stack: every turn persisted to `.nora/chat_history.jsonl`
@@ -209,6 +244,115 @@ where the threat model includes adaptive probing. Acknowledged
 here so it isn't rediscovered as a surprise; deferred until the
 deployment shape that needs it actually exists.
 
+**Re-read trigger.** Before any change that broadens the
+distribution shape (a new analysis type the sanitizer accepts, a
+new opinionated helper, a new field added to an existing shape's
+allowlist) or that adds a cross-session channel (anything that
+lets one session observe another session's results, or that lets
+a session observe artifacts produced outside Nora), this section
+gets revisited. The composition surface below is the baseline this
+deferral is calibrated against; broaden it and the calibration is
+stale.
+
+#### Current per-shape distribution surface
+
+Thirteen analysis shapes cross the boundary today. The composition
+deferral has to be evaluated against this whole surface, not
+against the smaller set the older threat-model writeup assumed.
+One-line SDC summary per shape:
+
+1. **`coefficient_table_with_fit_stats`** — the regression bucket
+   (OLS, GLM family, Cox PH, fixest, 2SLS, mixed-effects). SDC:
+   precision clamping by N; predictor-key allowlist tied to
+   declared `predictor_variables`; CI length constraint (exactly
+   2); structural caps on diagnostics (`vif`, `vcov`,
+   `condition_number`, `fixed_effects`, `n_clusters`,
+   `random_effects_variance`, `n_groups_per_level`); rejection on
+   coefficient-key collisions or unknown fields.
+2. **`t_test`** — one / two-sample / Welch / paired. SDC:
+   precision clamping; CI length constraint; subtype-allowlist;
+   N-gated emission.
+3. **`descriptive`** — mean / SD / N / missing-count for a single
+   variable. SDC: precision clamping by N; min / max suppressed
+   unless the variable is opted into `non_disclosive_variables`;
+   median is forbidden at this shape (request via `quartiles`
+   instead).
+4. **`frequency_table`** — 1-D counts. SDC: cell suppression at
+   threshold 10; secondary suppression so the suppressed cells'
+   total can't be back-solved; per-cell precision clamping;
+   structural cell cap (200).
+5. **`crosstab`** — 2-D counts. SDC: cell suppression at
+   threshold 10; per-cell clamp; structural cell cap (2500,
+   ~50×50).
+6. **`magnitude_table`** — sum / mean per group. SDC:
+   (1, 85%)-dominance rule (top contributor cannot account for
+   more than 85% of the cell); cell suppression; cell cap (200).
+7. **`correlation_matrix`** — pairwise Pearson / Spearman /
+   Kendall. SDC: complete-case N (not pairwise); min-N gate;
+   per-pair value-key validation; rejection on constant-column
+   NaN with named culprit; variable cap (30, →900 entries).
+8. **`did_event_study`** — heterogeneous-treatment DiD
+   (Callaway-Sant'Anna, Sun-Abraham, TWFE-ES, de Chaisemartin).
+   SDC: cohort-N gate — cohorts below threshold are dropped whole
+   (group + event-time row + SE / p / CI together), partial-cell
+   publication would leak cohort size; precision clamping per
+   cohort's N.
+9. **`rdd`** — regression discontinuity (CCT 2014). SDC:
+   precision clamping by effective N on each side of the cutoff;
+   CCT three-flavor convention enforced (conventional /
+   bias-corrected / robust each carry τ / SE / p / CI of the
+   same length); McCrary density and binscatter are structurally
+   refused — they're visual diagnostics only.
+10. **`cluster_analysis`** — kmeans / hierarchical / agglomerative
+    / dbscan. SDC: per-cluster precision clamping
+    (`_clamp_dict_by_per_key_n`); clusters below the size
+    threshold drop **whole** (size + centroid row +
+    `within_cluster_ss` entry together); per-observation
+    `labels_` / `cluster_membership` are structurally absent from
+    the allowlist.
+11. **`factor_decomposition`** — PCA / factor analysis. SDC:
+    per-variable loading clamps; per-component eigenvalue and
+    variance clamps; per-observation factor scores (`fit$x` /
+    `fit.transform(X)`) are structurally absent from the allowlist.
+12. **`kaplan_meier`** — survival. SDC: median + S(t) at preset
+    horizons (1y / 3y / 5y / 10y) gated by per-horizon
+    `n_at_risk_h`; the KM step function itself does not cross —
+    only the horizon-summarized survival probabilities and an
+    optional cross-group log-rank χ².
+13. **`marginal_effects`** — AME / MEM / at-representative scalars
+    from non-linear fits (logit / probit / Poisson / GLM). SDC:
+    `at_values` entries precision-clamped by sample N so an
+    exact-precision conditioning value cannot leak as a
+    near-identifier; cross-field key validation pins every
+    per-variable dict to the declared `variables` list.
+
+Plot vision adds a fourteenth surface: four model-output helpers
+(`plot_coefficients`, `plot_interaction`, `plot_estimate_comparison`,
+`plot_residuals`) that emit PNG/PDF/EPS via a manifest-allowlisted
+capture path. Helper-allowlist gated; no file-allowlist API exists
+(see "What we're not doing"). Privacy bandwidth: pixel-level
+covert channels are theoretically possible inside a coefficient
+plot, but the input data is already a sanitized model summary, so
+the upper bound is what the SDC pass already released.
+
+#### Cross-session channel: `list_results_global`
+
+`list_results_global(query?)` lets one session look up stored
+results from any other Nora session under `~/.nora-sessions/`.
+Env-gated (`NORA_ALLOW_CROSS_SESSION_RECALL=1`, default off) and
+path-confined to that prefix, so prompt-injected lookups can't
+direct the loader at arbitrary on-disk paths. **It is researcher-side
+project separation, not a privacy property** — every payload it
+returns has already been through the sanitizer at write time, so
+the bytes that cross are the same bytes that crossed when they
+were first emitted. But for composition-attack accounting it is a
+real cross-session channel: a session that queries the global
+store can join its own emissions with prior sessions' emissions,
+expanding the joint distribution beyond what a per-session
+disclosure budget would bound. Named here explicitly so a future
+release-ledger design knows the accounting layer has to span
+sessions, not just turns within a session.
+
 Nora's SDC rules (precision clamping, cell suppression,
 dominance, text-safety) constrain what any **single** sanitized
 result reveals. They do not constrain the **joint distribution of
@@ -220,9 +364,10 @@ every interactive analysis system (not a Nora-specific bug).
 
 `tools.py` (submit_script, request_data) currently serves each call
 independently; `store.py` keeps every sanitized result in a single
-growing SQLite table per cwd. The raw material for a release
-ledger is already on disk — what's missing is the accounting layer
-that reads it and the policy layer that decides when to stop.
+growing SQLite table per cwd, plus the global view via
+`list_results_global`. The raw material for a release ledger is
+already on disk — what's missing is the accounting layer that
+reads it and the policy layer that decides when to stop.
 
 Session-level disclosure budgets are the first layer of defense,
 but naïve implementations ("count calls, stop at N") do not
