@@ -543,11 +543,95 @@ nora$from_lm <- function(model, ...) {
         }
       }
     }
+    # Non-cluster fixest variance flavours. ``feols(..., vcov="hetero")``
+    # selects White HC; ``vcov=NW(lag)`` / ``vcov="NW"`` selects
+    # Newey-West HAC. We probe the call (cleaner than reaching into
+    # the summary object across fixest versions) and map onto the
+    # sanitizer's canonical enum. Cluster already won above; skip the
+    # remap there.
+    if (is.null(args$robust_se_type)) {
+      vcov_arg <- tryCatch(model$call$vcov, error = function(e) NULL)
+      vcov_label <- ""
+      if (!is.null(vcov_arg)) {
+        if (is.character(vcov_arg)) {
+          vcov_label <- tolower(as.character(vcov_arg))
+        } else if (is.call(vcov_arg)) {
+          # NW(...) / conley(...) / etc. — head of the call gives
+          # the helper name.
+          vcov_label <- tolower(as.character(vcov_arg[[1]]))
+        }
+      }
+      rse <- NULL
+      if (nzchar(vcov_label)) {
+        if (vcov_label %in% c("hetero", "white", "hc1", "hc")) {
+          rse <- "hc1"
+        } else if (vcov_label == "hc0") {
+          rse <- "hc0"
+        } else if (vcov_label == "hc2") {
+          rse <- "hc2"
+        } else if (vcov_label == "hc3") {
+          rse <- "hc3"
+        } else if (vcov_label %in% c("nw", "newey_west", "newey-west")) {
+          rse <- "hac_newey_west"
+        } else if (vcov_label == "bootstrap") {
+          rse <- "bootstrap"
+        }
+      }
+      if (!is.null(rse)) {
+        args$robust_se_type <- rse
+      }
+    }
   }
 
   if (!is.null(vif_list) && length(vif_list) > 0) args$vif <- vif_list
   if (!is.null(cond_num)) args$condition_number <- cond_num
   if (!is.null(vcov_nested) && length(vcov_nested) > 0) args$vcov <- vcov_nested
+
+  # Panel-data post-estimation diagnostics. ``plm`` fits expose
+  # the relevant tests as functions taking the fitted model; this
+  # block runs each one inside ``tryCatch`` so a single failure
+  # (typically: test not defined for this fit's effect= specification)
+  # doesn't abort the helper. Each test contributes two scalars
+  # (chi² + p) and the sanitizer's allowlist accepts both. Researchers
+  # using ``plm`` get the diagnostics without having to compute them
+  # script-side and pass through ``...``; researchers using ``fixest``
+  # or core ``lm`` continue to pass through ``...`` because those
+  # packages don't ship panel diagnostics with the same vocabulary.
+  if (inherits(model, "plm")) {
+    # F-test for fixed effects (pooled OLS vs FE). ``plm::pFtest``
+    # takes ``(fe_fit, pooled_fit)``; if the caller only passes the
+    # FE fit, fall back to plm::pFtest with model alone where
+    # supported. ``plm::pFtest`` is the canonical interface.
+    fe_F <- tryCatch(plm::pFtest(model, NULL), error = function(e) NULL)
+    if (!is.null(fe_F) && !is.null(fe_F$statistic) && is.finite(fe_F$statistic)) {
+      args$f_test_fe_chi2 <- as.numeric(fe_F$statistic)
+      if (!is.null(fe_F$p.value) && is.finite(fe_F$p.value)) {
+        args$f_test_fe_p <- as.numeric(fe_F$p.value)
+      }
+    }
+    # Breusch-Pagan LM test for random effects (pooled OLS vs RE).
+    bp <- tryCatch(plm::plmtest(model, type = "bp"), error = function(e) NULL)
+    if (!is.null(bp) && !is.null(bp$statistic) && is.finite(bp$statistic)) {
+      args$breusch_pagan_chi2 <- as.numeric(bp$statistic)
+      if (!is.null(bp$p.value) && is.finite(bp$p.value)) {
+        args$breusch_pagan_p <- as.numeric(bp$p.value)
+      }
+    }
+    # Wooldridge AR(1) test for serial correlation in idiosyncratic
+    # errors. ``plm::pwartest`` is the standard implementation;
+    # ``plm::pbgtest`` is an alternative (Breusch-Godfrey adapted
+    # for panel) that requires more model assumptions.
+    wt <- tryCatch(plm::pwartest(model), error = function(e) NULL)
+    if (!is.null(wt) && !is.null(wt$statistic) && is.finite(wt$statistic)) {
+      args$wooldridge_ar1_chi2 <- as.numeric(wt$statistic)
+      if (!is.null(wt$p.value) && is.finite(wt$p.value)) {
+        args$wooldridge_ar1_p <- as.numeric(wt$p.value)
+      }
+    }
+    # Hausman test (FE vs RE) needs BOTH fits; can't auto-run from
+    # one fit. Caller passes the chi² and p as kwargs (``hausman_chi2``,
+    # ``hausman_p``) after running ``phtest(fe, re)`` themselves.
+  }
 
   do.call(nora$result, c(args, list(...)))
 }
@@ -912,6 +996,176 @@ nora$from_kmeans <- function(fit, variables = NULL, label = NULL) {
 }
 
 
+#' From a ``marginaleffects::avg_slopes`` or ``marginaleffects::slopes``
+#' result, emit a marginal_effects payload.
+#'
+#' Wraps the ``marginaleffects`` package (the actively-maintained
+#' successor to ``margins``). Both ``avg_slopes()`` (average
+#' marginal effects) and ``slopes()`` at a single covariate vector
+#' return a data.frame with the same column shape:
+#'
+#'   * ``term``       — variable name
+#'   * ``estimate``   — marginal effect on the response scale
+#'   * ``std.error``  — delta-method SE
+#'   * ``statistic``  — Wald z (effect / SE)
+#'   * ``p.value``
+#'   * ``conf.low`` / ``conf.high`` — 95% CI
+#'
+#' Method mapping:
+#'   * ``avg_slopes(fit)``         → ``"ame"``
+#'   * ``slopes(fit, newdata="mean")``   → ``"mem"``
+#'   * ``slopes(fit, newdata=df_at)``    → ``"at_representative"``
+#'     (caller passes the conditioning point via ``at_values=``)
+#'
+#' Caller passes ``method`` explicitly because we can't always
+#' detect ``mean`` vs ``representative`` from the result.
+#' ``outcome_variable`` and ``model_family`` ride alongside so the
+#' model can interpret the unit of the marginal effect (logit →
+#' probability change; Poisson → count change; OLS → outcome change).
+#'
+#' Example (AME from a logit fit):
+#'   m <- glm(y ~ age + female + income, data = df, family = binomial)
+#'   ame <- marginaleffects::avg_slopes(m)
+#'   nora$from_marginal_effects(
+#'     ame, method = "ame", outcome_variable = "y",
+#'     model_family = "logit", label = "AME from logit"
+#'   )
+#'
+#' Representative-values form:
+#'   slope_45F <- marginaleffects::slopes(
+#'     m, newdata = data.frame(age = 45, female = 1, income = 30000)
+#'   )
+#'   nora$from_marginal_effects(
+#'     slope_45F, method = "at_representative",
+#'     at_values = list(age = 45, female = 1, income = 30000),
+#'     outcome_variable = "y", model_family = "logit"
+#'   )
+#'
+#' Disclosure note on ``at_values`` (only relevant for
+#' ``method = "at_representative"``): each conditioning value is
+#' precision-clamped by the sample N before it reaches the model —
+#' at n=1000 you get ~4 sigfigs, at n=100 you get ~3. Pass
+#' interpretable summary points (mean / median / percentiles /
+#' round reference values from the literature). An exact-precision
+#' value pulled from a single row is gated by the precision floor;
+#' it won't cross as raw bytes, but the right interpretation is
+#' still "this is a representative point at this precision".
+nora$from_marginal_effects <- function(slopes_df,
+                                       method,
+                                       outcome_variable = NULL,
+                                       model_family = NULL,
+                                       at_values = NULL,
+                                       label = NULL,
+                                       n = NULL) {
+  if (missing(method) || !is.character(method) || length(method) != 1) {
+    stop(
+      "nora$from_marginal_effects: ``method`` is required ",
+      "(one of 'ame' / 'mem' / 'at_representative')"
+    )
+  }
+  if (is.null(slopes_df) || !is.data.frame(slopes_df)) {
+    stop(
+      "nora$from_marginal_effects: ``slopes_df`` must be a data.frame ",
+      "(marginaleffects::avg_slopes(...) or marginaleffects::slopes(...))"
+    )
+  }
+  print(slopes_df)
+
+  cn <- colnames(slopes_df)
+  term_col <- if ("term" %in% cn) "term" else cn[1]
+  est_col  <- if ("estimate" %in% cn) "estimate" else
+              if ("dydx" %in% cn) "dydx" else
+              cn[2]
+  se_col   <- if ("std.error" %in% cn) "std.error" else
+              if ("se" %in% cn) "se" else NA_character_
+  stat_col <- if ("statistic" %in% cn) "statistic" else
+              if ("z" %in% cn) "z" else NA_character_
+  p_col    <- if ("p.value" %in% cn) "p.value" else
+              if ("pvalue" %in% cn) "pvalue" else NA_character_
+  lo_col   <- if ("conf.low" %in% cn) "conf.low" else NA_character_
+  hi_col   <- if ("conf.high" %in% cn) "conf.high" else NA_character_
+
+  terms <- as.character(slopes_df[[term_col]])
+  # marginaleffects emits one row per (term, contrast) combination
+  # for categorical variables; collapse to one row per term by
+  # taking the first occurrence so the per-variable dict is
+  # well-defined. Researchers with multi-contrast categoricals
+  # should expand to indicator columns before fitting (same
+  # advice the regression-bucket sanitizer gives on
+  # formula-categorical names).
+  if (anyDuplicated(terms) > 0) {
+    first_idx <- !duplicated(terms)
+    slopes_df <- slopes_df[first_idx, , drop = FALSE]
+    terms <- terms[first_idx]
+  }
+
+  effects <- list(); ses <- list(); zs <- list(); ps <- list()
+  los <- list(); his <- list()
+  for (i in seq_along(terms)) {
+    nm <- terms[i]
+    v  <- as.numeric(slopes_df[[est_col]][i])
+    if (is.finite(v)) effects[[nm]] <- v
+    if (!is.na(se_col)) {
+      sv <- as.numeric(slopes_df[[se_col]][i])
+      if (is.finite(sv)) ses[[nm]] <- sv
+    }
+    if (!is.na(stat_col)) {
+      sv <- as.numeric(slopes_df[[stat_col]][i])
+      if (is.finite(sv)) zs[[nm]] <- sv
+    }
+    if (!is.na(p_col)) {
+      sv <- as.numeric(slopes_df[[p_col]][i])
+      if (is.finite(sv)) ps[[nm]] <- sv
+    }
+    if (!is.na(lo_col)) {
+      sv <- as.numeric(slopes_df[[lo_col]][i])
+      if (is.finite(sv)) los[[nm]] <- sv
+    }
+    if (!is.na(hi_col)) {
+      sv <- as.numeric(slopes_df[[hi_col]][i])
+      if (is.finite(sv)) his[[nm]] <- sv
+    }
+  }
+
+  # n: row count of the fitted model. marginaleffects results carry
+  # attr(slopes_df, "newdata") or attr(., "data") with the prediction
+  # frame, but the SDC-relevant ``n`` is the underlying training
+  # sample size. Probe ``attr(., "model")`` first, then fall back
+  # to a caller-supplied ``n=``.
+  if (is.null(n)) {
+    m_attr <- attr(slopes_df, "model")
+    if (!is.null(m_attr)) {
+      n <- tryCatch(as.integer(nobs(m_attr)), error = function(e) NULL)
+    }
+  }
+
+  args <- list(
+    type = "marginal_effects",
+    method = as.character(method),
+    variables = as.list(terms),
+    effects = effects
+  )
+  if (length(ses) > 0) args$standard_errors <- ses
+  if (length(zs)  > 0) args$z_statistics    <- zs
+  if (length(ps)  > 0) args$p_values        <- ps
+  if (length(los) > 0) args$ci_lower        <- los
+  if (length(his) > 0) args$ci_upper        <- his
+  if (!is.null(n) && is.finite(n)) args$n <- as.integer(n)
+  if (!is.null(outcome_variable)) args$outcome_variable <- as.character(outcome_variable)
+  if (!is.null(model_family))     args$model_family     <- as.character(model_family)
+  if (!is.null(at_values) && length(at_values) > 0) {
+    clean_at <- list()
+    for (k in names(at_values)) {
+      v <- as.numeric(at_values[[k]])
+      if (is.finite(v)) clean_at[[k]] <- v
+    }
+    if (length(clean_at) > 0) args$at_values <- clean_at
+  }
+  if (!is.null(label)) args$label <- as.character(label)
+  do.call(nora$result, args)
+}
+
+
 #' From a ``stats::prcomp`` fit, emit a factor_decomposition payload.
 #'
 #' Wraps base R's ``prcomp`` (eigen-decomposition of the centered
@@ -1008,6 +1262,165 @@ nora$from_pca <- function(fit, n_components = NULL, label = NULL) {
     eigenvalues = eigenvalues,
     communalities = communalities
   )
+  if (!is.null(label)) args$label <- as.character(label)
+  do.call(nora$result, args)
+}
+
+
+#' From a ``psych::fa`` factor analysis fit, emit a
+#' factor_decomposition payload.
+#'
+#' Wraps the ``psych`` package's ``fa`` (the standard R factor-analysis
+#' implementation — minimum residual / maximum likelihood / principal
+#' factor extraction with all the conventional rotations). The
+#' payload carries:
+#'   * loadings:        {variable: {factor: value}}
+#'   * communalities:   {variable: h²}
+#'   * uniqueness:      {variable: 1 - h²}
+#'   * eigenvalues + explained_variance (per factor)
+#'   * KMO / Bartlett goodness-of-fit when available
+#'
+#' ``method`` defaults to the extraction routine from the fit
+#' (``fit$fm``: "ml" / "minres" / "pa" / etc.) mapped onto the
+#' sanitizer's enum (``maximum_likelihood`` / ``minimum_residual`` /
+#' ``principal_factor`` / ``factor_analysis``). ``rotation`` similarly
+#' comes from ``fit$rotation``. The full row × factor factor-scores
+#' matrix (``fit$scores``) is researcher-only by structural absence —
+#' no field on the sanitizer's allowlist accepts it.
+#'
+#' Example:
+#'   library(psych)
+#'   m <- fa(df[, c("v1","v2","v3","v4","v5")], nfactors = 2,
+#'           rotate = "varimax", fm = "ml")
+#'   nora$from_fa(m, label = "ML factor analysis with varimax")
+nora$from_fa <- function(fit, label = NULL) {
+  if (!(inherits(fit, "fa") || inherits(fit, "psych"))) {
+    stop("nora$from_fa: ``fit`` must be a psych::fa result")
+  }
+  print(fit)
+
+  load_mat <- unclass(fit$loadings)
+  if (is.null(load_mat) || !is.matrix(load_mat)) {
+    stop("nora$from_fa: fit$loadings missing or not a matrix")
+  }
+  variables  <- rownames(load_mat)
+  fac_labels <- colnames(load_mat)
+  n_factors  <- ncol(load_mat)
+  if (is.null(variables) || length(variables) == 0) {
+    stop("nora$from_fa: loadings matrix is missing variable names")
+  }
+
+  loadings <- list()
+  for (v in variables) {
+    row <- list()
+    for (j in seq_len(n_factors)) {
+      row[[fac_labels[j]]] <- as.numeric(load_mat[v, j])
+    }
+    loadings[[v]] <- row
+  }
+
+  # Method: map psych's ``fm`` codes onto the sanitizer enum.
+  fm <- if (!is.null(fit$fm)) tolower(as.character(fit$fm)) else "minres"
+  method <- switch(
+    fm,
+    "ml"     = "maximum_likelihood",
+    "minres" = "minimum_residual",
+    "pa"     = "principal_factor",
+    "factor_analysis"
+  )
+  # Rotation: psych stores ``$rotation`` as the human-readable
+  # name ("varimax", "promax", "oblimin", "none"); pass through
+  # when in the sanitizer's valid set, otherwise drop to "none".
+  valid_rot <- c("none", "varimax", "promax", "oblimin",
+                 "quartimax", "equamax", "geomin", "bentlerT", "bifactor")
+  rotation <- if (!is.null(fit$rotation) && fit$rotation %in% valid_rot)
+                as.character(fit$rotation) else "none"
+
+  # Communalities and uniqueness — psych exposes both directly.
+  communalities <- list()
+  uniqueness <- list()
+  if (!is.null(fit$communality)) {
+    for (v in variables) {
+      h2 <- as.numeric(fit$communality[[v]])
+      if (is.finite(h2)) communalities[[v]] <- h2
+    }
+  }
+  if (!is.null(fit$uniquenesses)) {
+    for (v in variables) {
+      u <- as.numeric(fit$uniquenesses[[v]])
+      if (is.finite(u)) uniqueness[[v]] <- u
+    }
+  }
+
+  # Per-factor variance metrics. ``fit$Vaccounted`` is a small
+  # named matrix; row "SS loadings" gives eigenvalues / explained
+  # variance per factor, row "Proportion Var" gives the ratio,
+  # row "Cumulative Var" gives the running cumulative.
+  eigenvalues <- list()
+  explained_variance <- list()
+  explained_variance_ratio <- list()
+  cumulative_variance <- list()
+  if (!is.null(fit$Vaccounted) && is.matrix(fit$Vaccounted)) {
+    rn <- rownames(fit$Vaccounted)
+    grab_row <- function(name) {
+      if (name %in% rn) as.numeric(fit$Vaccounted[name, ]) else NULL
+    }
+    ss <- grab_row("SS loadings")
+    pv <- grab_row("Proportion Var")
+    cv <- grab_row("Cumulative Var")
+    for (j in seq_len(n_factors)) {
+      if (!is.null(ss) && j <= length(ss) && is.finite(ss[j])) {
+        eigenvalues[[fac_labels[j]]] <- as.numeric(ss[j])
+        explained_variance[[fac_labels[j]]] <- as.numeric(ss[j])
+      }
+      if (!is.null(pv) && j <= length(pv) && is.finite(pv[j])) {
+        explained_variance_ratio[[fac_labels[j]]] <- as.numeric(pv[j])
+      }
+      if (!is.null(cv) && j <= length(cv) && is.finite(cv[j])) {
+        cumulative_variance[[fac_labels[j]]] <- as.numeric(cv[j])
+      }
+    }
+  }
+
+  # Sample size: psych stores ``fit$n.obs`` (or ``$nh``).
+  n_obs <- if (!is.null(fit$n.obs)) as.integer(fit$n.obs) else NA_integer_
+  if (is.na(n_obs) && !is.null(fit$nh)) n_obs <- as.integer(fit$nh)
+
+  args <- list(
+    type = "factor_decomposition",
+    method = method,
+    rotation = rotation,
+    n_observations = n_obs,
+    n_variables = as.integer(length(variables)),
+    n_components = as.integer(n_factors),
+    variables = as.list(variables),
+    components = as.list(fac_labels),
+    loadings = loadings
+  )
+  if (length(communalities) > 0)            args$communalities <- communalities
+  if (length(uniqueness) > 0)               args$uniqueness <- uniqueness
+  if (length(eigenvalues) > 0)              args$eigenvalues <- eigenvalues
+  if (length(explained_variance) > 0)       args$explained_variance <- explained_variance
+  if (length(explained_variance_ratio) > 0) args$explained_variance_ratio <- explained_variance_ratio
+  if (length(cumulative_variance) > 0)      args$cumulative_variance <- cumulative_variance
+
+  # Goodness-of-fit scalars exposed on ML fits.
+  if (!is.null(fit$chi) && is.finite(fit$chi)) {
+    args$chi_squared <- as.numeric(fit$chi)
+  }
+  if (!is.null(fit$PVAL) && is.finite(fit$PVAL)) {
+    args$chi_squared_p_value <- as.numeric(fit$PVAL)
+  }
+  if (!is.null(fit$dof) && is.finite(fit$dof)) {
+    args$degrees_of_freedom <- as.integer(fit$dof)
+  }
+  if (!is.null(fit$RMSEA) && length(fit$RMSEA) >= 1 && is.finite(fit$RMSEA[1])) {
+    args$rmsea <- as.numeric(fit$RMSEA[1])
+  }
+  if (!is.null(fit$TLI) && is.finite(fit$TLI)) {
+    args$tli <- as.numeric(fit$TLI)
+  }
+
   if (!is.null(label)) args$label <- as.character(label)
   do.call(nora$result, args)
 }

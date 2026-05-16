@@ -946,6 +946,90 @@ def _render_cluster_analysis(p: dict[str, Any]) -> str | None:
     return f"{table}\n\n{caption}" if caption else table
 
 
+def _render_marginal_effects(p: dict[str, Any]) -> str | None:
+    """One row per focal variable. Effects + SE + p + CI in the
+    standard regression-row format, plus the method and the
+    conditioning point in the caption.
+
+    Marginal effects from a non-linear estimator (logit, probit,
+    Poisson) carry units the raw coefficient doesn't (probability
+    change, count change); the caption surfaces ``model_family``
+    so the model can interpret scale without re-deriving it.
+    """
+    variables = p.get("variables") or []
+    if not isinstance(variables, list) or not variables:
+        return None
+    effects = p.get("effects") or {}
+    if not isinstance(effects, dict) or not effects:
+        return None
+    ses = p.get("standard_errors") or {}
+    pvs = p.get("p_values") or {}
+    lows = p.get("ci_lower") or {}
+    highs = p.get("ci_upper") or {}
+    has_se = isinstance(ses, dict) and any(
+        isinstance(ses.get(v), (int, float)) for v in variables
+    )
+    has_p = isinstance(pvs, dict) and any(
+        isinstance(pvs.get(v), (int, float)) for v in variables
+    )
+    has_ci = (
+        isinstance(lows, dict) and isinstance(highs, dict)
+        and any(
+            isinstance(lows.get(v), (int, float))
+            and isinstance(highs.get(v), (int, float))
+            for v in variables
+        )
+    )
+    header = ["Variable", "Effect"]
+    if has_se:
+        header.append("SE")
+    if has_p:
+        header.append("p-value")
+    if has_ci:
+        header.append("95% CI")
+    rows: list[list[str]] = []
+    for v in variables:
+        eff = effects.get(v)
+        if eff is None:
+            continue
+        row = [str(v), _fmt_num(eff)]
+        if has_se:
+            row.append(_fmt_num(ses.get(v)))
+        if has_p:
+            row.append(_fmt_pvalue(pvs.get(v)))
+        if has_ci:
+            lo, hi = lows.get(v), highs.get(v)
+            row.append(
+                f"[{_fmt_num(lo)}, {_fmt_num(hi)}]"
+                if lo is not None and hi is not None else ""
+            )
+        rows.append(row)
+    if not rows:
+        return None
+    table = _markdown_table(header, rows)
+
+    cap_parts: list[str] = []
+    method = p.get("method")
+    if isinstance(method, str):
+        cap_parts.append(method.replace("_", " "))
+    family = p.get("model_family")
+    if isinstance(family, str):
+        cap_parts.append(family)
+    outcome = p.get("outcome_variable")
+    if isinstance(outcome, str):
+        cap_parts.append(f"outcome: {outcome}")
+    n = p.get("n")
+    if isinstance(n, int):
+        cap_parts.append(f"n = {n:,}")
+    # Conditioning point: only meaningful for at_representative.
+    at = p.get("at_values") or {}
+    if isinstance(at, dict) and at:
+        items = ", ".join(f"{k}={_fmt_num(at[k])}" for k in sorted(at))
+        cap_parts.append(f"at: {items}")
+    caption = " · ".join(cap_parts)
+    return f"{table}\n\n{caption}" if caption else table
+
+
 _HANDLERS: dict[str, Any] = {
     # Regression bucket — canonical descriptive name and legacy alias
     # both render through the same function. Older stored results
@@ -964,6 +1048,7 @@ _HANDLERS: dict[str, Any] = {
     "kaplan_meier": _render_kaplan_meier,
     "factor_decomposition": _render_factor_decomposition,
     "cluster_analysis": _render_cluster_analysis,
+    "marginal_effects": _render_marginal_effects,
 }
 
 

@@ -502,6 +502,18 @@ def from_lm(model: Any, **extra: Any) -> None:
         if n_clusters:
             fields["n_clusters"] = n_clusters
         fields["robust_se_type"] = "cluster"
+    else:
+        # Non-cluster variance estimator. Map statsmodels' ``cov_type``
+        # values onto the sanitizer's canonical robust_se_type enum
+        # so the model can interpret the variance flavour at a glance
+        # ("hc1" / "hac_newey_west" / "bootstrap") without parsing the
+        # raw label. Helpers don't need to flag classical SEs explicitly
+        # — absence of ``robust_se_type`` already implies model-based
+        # SEs — but emitting it makes the choice legible on
+        # ``expand_result(view="full")``.
+        rse = _normalise_robust_se_type(cov_type)
+        if rse is not None:
+            fields["robust_se_type"] = rse
 
     # Aggregate diagnostics. These derive from the design matrix and
     # residual sums — pure aggregates, no per-observation leak. Add
@@ -523,6 +535,48 @@ def from_lm(model: Any, **extra: Any) -> None:
     # stays as a back-compat alias in the sanitizer for existing
     # stored payloads; new emissions use the descriptive name.
     result(type="coefficient_table_with_fit_stats", **fields)
+
+
+def _normalise_robust_se_type(cov_type: Any) -> str | None:
+    """Map a statsmodels ``cov_type`` label onto the sanitizer's
+    canonical robust_se_type enum.
+
+    Returns ``None`` when the label isn't recognised (so the helper
+    omits the field rather than smuggling a free-text value through),
+    or when the label is the model-based default (``"nonrobust"``)
+    where absence of the field already communicates "classical SEs".
+    Cluster handling lives in the calling site — it needs the
+    cov_kwds["groups"] payload alongside the label, so it stays
+    inline rather than routing through here.
+    """
+    if not isinstance(cov_type, str):
+        return None
+    key = cov_type.strip().lower()
+    if not key or key == "nonrobust":
+        return None
+    # Heteroskedasticity-consistent. statsmodels accepts both bare
+    # ``"HC0"`` / ``"HC1"`` / ... and the prefixed ``"hc0"`` / etc.
+    # depending on the call path.
+    if key in ("hc0", "hc1", "hc2", "hc3"):
+        return key
+    # Newey-West HAC. statsmodels: ``"HAC"`` for kernel HAC,
+    # ``"hac-panel"`` / ``"hac-groupsum"`` for panel-data flavours.
+    # All collapse to ``hac_newey_west`` for the model — the gain
+    # from distinguishing them at the wire-format level is small
+    # compared to the cost of a wider enum.
+    if key.startswith("hac"):
+        return "hac_newey_west"
+    # Bootstrap covariance — surfaces under names like
+    # ``"bootstrap"`` or ``"clusterbootstrap"`` depending on package
+    # version. ``cluster`` is handled separately above.
+    if "bootstrap" in key:
+        return "bootstrap"
+    # Robust default in some packages — the typical mapping is HC1.
+    # statsmodels' ``"robust"`` doesn't exist canonically; this
+    # branch absorbs out-of-tree adapters that emit it.
+    if key in ("robust", "sandwich"):
+        return "hc1"
+    return None
 
 
 def _extract_cluster_metadata(
@@ -649,6 +703,234 @@ def from_iv(
             iv_extra[k] = vf
     iv_extra.update(extra)
     from_lm(model, **iv_extra)
+
+
+def from_marginal_effects(
+    margeff: Any,
+    *,
+    variables: list[str] | None = None,
+    method: str | None = None,
+    outcome_variable: str | None = None,
+    model_family: str | None = None,
+    at_values: dict[str, float] | None = None,
+    label: str | None = None,
+    **extra: Any,
+) -> None:
+    """Emit a ``marginal_effects`` payload from a statsmodels
+    ``DiscreteMargins`` / ``GenericMargins`` result.
+
+    Wraps the output of ``fit.get_margeff(at=..., method=...)`` on a
+    fitted statsmodels Logit / Probit / Poisson / GLM result. The
+    ``DiscreteMargins`` object exposes:
+
+      * ``margeff``           — per-variable marginal effects (ndarray)
+      * ``margeff_se``        — delta-method standard errors
+      * ``tvalues`` / ``pvalues`` — Wald-style test outputs
+      * ``conf_int()``        — 95% CIs as a 2-D array
+      * ``results``           — back-reference to the underlying fit;
+                                ``.model.exog_names`` provides the
+                                column labels.
+      * ``margeff_options``   — dict carrying the ``at`` / ``method``
+                                Stata-vocabulary choices the caller passed.
+
+    Method mapping from statsmodels' ``at`` keyword onto the
+    sanitizer's enum:
+
+      * ``"overall"``  → ``"ame"``  (average over the sample)
+      * ``"mean"``     → ``"mem"``  (evaluated at sample means)
+      * ``"median"``   → ``"at_representative"`` (median is one
+        specific representative covariate vector; the medians are
+        passed through ``at_values``)
+      * any explicit ``at`` dict → ``"at_representative"`` with the
+        dict in ``at_values``
+
+    Example:
+        from statsmodels.formula.api import logit
+        m = logit("y ~ age + female + income", data=df).fit()
+        me = m.get_margeff(at="overall", method="dydx")
+        nora.from_marginal_effects(
+            me, outcome_variable="y", model_family="logit",
+            label="AME from logit",
+        )
+
+    The helper is intentionally narrow — it reads from the
+    ``DiscreteMargins`` shape statsmodels produces and routes onto
+    the sanitizer's enum. R's ``marginaleffects::avg_slopes()``
+    output is structurally different; that path uses
+    ``nora$from_marginal_effects`` in the R runtime.
+
+    **Disclosure note on ``at_values``** (relevant only for
+    ``method="at_representative"``): the conditioning vector you
+    pass is precision-clamped by the sample N before it reaches the
+    model — at n=1000 you get ~4 sigfigs, at n=100 you get ~3. Pass
+    interpretable summary points (means, medians, percentiles,
+    round reference values from the literature). An exact-precision
+    value pulled from a single row is gated by the precision floor;
+    it won't cross as raw bytes, but the right interpretation is
+    still "this is a representative point at this precision".
+    """
+    try:
+        print(margeff.summary() if callable(getattr(margeff, "summary", None))
+              else margeff)
+    except Exception:  # noqa: BLE001
+        pass
+
+    # Duck-typed access — don't import statsmodels at module load.
+    eff_arr = _safe_attr(margeff, "margeff")
+    if eff_arr is None:
+        raise TypeError(
+            "nora.from_marginal_effects: ``margeff`` must expose "
+            "``.margeff`` (statsmodels DiscreteMargins / GenericMargins "
+            "shape). Try ``fit.get_margeff(at=..., method='dydx')``."
+        )
+
+    try:
+        import numpy as np
+    except Exception as e:  # noqa: BLE001
+        raise RuntimeError(
+            "nora.from_marginal_effects requires numpy"
+        ) from e
+
+    eff = np.asarray(eff_arr, dtype=float).ravel()
+    se_attr = _safe_attr(margeff, "margeff_se")
+    se = np.asarray(se_attr, dtype=float).ravel() if se_attr is not None else None
+    t_attr = _safe_attr(margeff, "tvalues")
+    tv = np.asarray(t_attr, dtype=float).ravel() if t_attr is not None else None
+    p_attr = _safe_attr(margeff, "pvalues")
+    pv = np.asarray(p_attr, dtype=float).ravel() if p_attr is not None else None
+    ci_fn = _safe_attr(margeff, "conf_int")
+    ci_arr = None
+    if callable(ci_fn):
+        try:
+            ci_arr = np.asarray(ci_fn(), dtype=float)
+        except Exception:  # noqa: BLE001
+            ci_arr = None
+
+    # Variable names. statsmodels' ``get_margeff`` drops the constant
+    # automatically; the remaining ``margeff_options["exog_names"]``
+    # carries the surviving column labels in order. If not present,
+    # fall back to ``model.exog_names`` minus standard intercept
+    # aliases.
+    if variables is None:
+        opts = _safe_attr(margeff, "margeff_options") or {}
+        if isinstance(opts, dict) and isinstance(opts.get("exog_names"), list):
+            variables = [str(v) for v in opts["exog_names"]]
+        else:
+            inner = _safe_attr(margeff, "results")
+            inner_model = (
+                _safe_attr(inner, "model") if inner is not None else None
+            )
+            exog_names = (
+                list(getattr(inner_model, "exog_names", []) or [])
+                if inner_model is not None else []
+            )
+            variables = [
+                n for n in exog_names
+                if n not in ("const", "Intercept", "(Intercept)", "intercept")
+            ]
+    variables = [str(v) for v in variables]
+    if len(variables) != eff.size:
+        raise ValueError(
+            f"nora.from_marginal_effects: ``variables`` has "
+            f"{len(variables)} entries but margeff has {eff.size}"
+        )
+
+    effects: dict[str, float] = {}
+    ses: dict[str, float] = {}
+    pvs: dict[str, float] = {}
+    zs: dict[str, float] = {}
+    los: dict[str, float] = {}
+    his: dict[str, float] = {}
+    for i, v in enumerate(variables):
+        if i < eff.size and math.isfinite(float(eff[i])):
+            effects[v] = float(eff[i])
+        if se is not None and i < se.size and math.isfinite(float(se[i])):
+            ses[v] = float(se[i])
+        if tv is not None and i < tv.size and math.isfinite(float(tv[i])):
+            zs[v] = float(tv[i])
+        if pv is not None and i < pv.size and math.isfinite(float(pv[i])):
+            pvs[v] = float(pv[i])
+        if ci_arr is not None and i < ci_arr.shape[0] and ci_arr.shape[1] >= 2:
+            lo, hi = float(ci_arr[i, 0]), float(ci_arr[i, 1])
+            if math.isfinite(lo):
+                los[v] = lo
+            if math.isfinite(hi):
+                his[v] = hi
+
+    # Method resolution. Caller-supplied wins; otherwise infer from
+    # the ``margeff_options["at"]`` value statsmodels stashes on the
+    # result.
+    if method is None:
+        opts = _safe_attr(margeff, "margeff_options") or {}
+        at = opts.get("at") if isinstance(opts, dict) else None
+        if at == "overall" or at is None:
+            method = "ame"
+        elif at == "mean":
+            method = "mem"
+        else:
+            method = "at_representative"
+    method = str(method)
+
+    # n: rows of the design statsmodels fit on. Pull from the inner
+    # model — ``margeff`` itself doesn't carry a count directly.
+    n_val: int | None = None
+    inner = _safe_attr(margeff, "results")
+    if inner is not None:
+        n_val = _safe_int(_safe_attr(inner, "nobs"))
+        if n_val is None:
+            inner_model = _safe_attr(inner, "model")
+            endog = (
+                getattr(inner_model, "endog", None)
+                if inner_model is not None else None
+            )
+            if endog is not None:
+                try:
+                    n_val = int(getattr(endog, "shape", (len(endog),))[0])
+                except (TypeError, AttributeError):
+                    n_val = None
+
+    fields: dict[str, Any] = {
+        "type": "marginal_effects",
+        "method": method,
+        "variables": variables,
+        "effects": effects,
+    }
+    if ses:
+        fields["standard_errors"] = ses
+    if zs:
+        fields["z_statistics"] = zs
+    if pvs:
+        fields["p_values"] = pvs
+    if los:
+        fields["ci_lower"] = los
+    if his:
+        fields["ci_upper"] = his
+    if n_val is not None:
+        fields["n"] = n_val
+    if outcome_variable is not None:
+        fields["outcome_variable"] = str(outcome_variable)
+    if model_family is not None:
+        fields["model_family"] = str(model_family)
+    elif inner is not None:
+        # Auto-detect: ``inner.model.__class__.__name__`` reveals
+        # whether we're in Logit / Probit / Poisson / etc.
+        cls = _safe_attr(_safe_attr(inner, "model"), "__class__")
+        if cls is not None:
+            name = getattr(cls, "__name__", "")
+            if isinstance(name, str) and name:
+                fields["model_family"] = name.lower()
+    if at_values is not None and at_values:
+        clean_at: dict[str, float] = {}
+        for k, val in at_values.items():
+            vf = _safe_float(val)
+            if vf is not None:
+                clean_at[str(k)] = vf
+        if clean_at:
+            fields["at_values"] = clean_at
+    if label is not None:
+        fields["label"] = str(label)
+    fields.update(extra)
+    result(**fields)
 
 
 def from_cluster(
@@ -1040,6 +1322,217 @@ def from_pca(
     result(**fields)
 
 
+def from_factor_analyzer(
+    fit: Any,
+    *,
+    variables: list[str] | None = None,
+    method: str | None = None,
+    rotation: str | None = None,
+    n_observations: int | None = None,
+    label: str | None = None,
+    **extra: Any,
+) -> None:
+    """Emit a ``factor_decomposition`` payload from a fitted
+    ``factor_analyzer.FactorAnalyzer``.
+
+    factor_analyzer is the Python-side standard for exploratory
+    factor analysis (the closest analogue to R ``psych::fa``).
+    The fit object exposes:
+
+      * ``loadings_``        — (n_features, n_factors) ndarray
+      * ``get_uniquenesses()``
+      * ``get_communalities()``
+      * ``get_eigenvalues()`` — returns (original, common-factor)
+      * ``get_factor_variance()`` — (variance, proportional,
+                                     cumulative) per factor
+
+    factor_analyzer doesn't store column names (it's fit on a
+    bare ndarray or DataFrame), so ``variables`` must be passed
+    explicitly when the fit was built from a numpy array. When
+    fit from a DataFrame, factor_analyzer stashes the columns in
+    ``.feature_names_`` (newer versions) — probed below as a
+    fallback.
+
+    Privacy carve-out: the per-row factor scores (the result of
+    ``fit.transform(X)``) are structurally absent from the
+    sanitizer's allowlist — no field accepts a 2-D array of
+    per-observation values.
+
+    Example:
+        from factor_analyzer import FactorAnalyzer
+        fa = FactorAnalyzer(n_factors=3, rotation="varimax", method="ml")
+        fa.fit(df[["v1","v2","v3","v4","v5"]])
+        nora.from_factor_analyzer(
+            fa, variables=["v1","v2","v3","v4","v5"],
+            n_observations=len(df), label="ML FA with varimax",
+        )
+    """
+    cls_name = type(fit).__name__
+    if cls_name != "FactorAnalyzer":
+        raise TypeError(
+            "nora.from_factor_analyzer: ``fit`` must be a "
+            "factor_analyzer.FactorAnalyzer instance; got "
+            f"{cls_name!r}"
+        )
+    try:
+        print(fit)
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        import numpy as np
+    except Exception as e:  # noqa: BLE001
+        raise RuntimeError(
+            "nora.from_factor_analyzer requires numpy"
+        ) from e
+
+    loadings_arr = _safe_attr(fit, "loadings_")
+    if loadings_arr is None:
+        raise RuntimeError(
+            "nora.from_factor_analyzer: fit.loadings_ missing — "
+            "was the fit run?"
+        )
+    loadings_arr = np.asarray(loadings_arr)
+    n_feat, n_factors = loadings_arr.shape
+
+    # Variable names. Prefer the caller's list; fall back to
+    # factor_analyzer's stash; default to feature_N for unnamed.
+    if variables is None:
+        fnames = _safe_attr(fit, "feature_names_")
+        if fnames is not None:
+            variables = [str(x) for x in fnames]
+        else:
+            variables = [f"feature_{i+1}" for i in range(n_feat)]
+    variables = [str(v) for v in variables]
+    if len(variables) != n_feat:
+        raise ValueError(
+            f"nora.from_factor_analyzer: variables has "
+            f"{len(variables)} entries but FA was fit on {n_feat} features"
+        )
+
+    fac_labels = [f"factor{i+1}" for i in range(n_factors)]
+
+    # Method: map factor_analyzer's ``method`` slot to the sanitizer
+    # enum. The valid values on the fit are "minres" / "ml" /
+    # "principal".
+    if method is None:
+        m_attr = _safe_attr(fit, "method")
+        if isinstance(m_attr, str):
+            m = m_attr.lower()
+            if m == "ml":
+                method = "maximum_likelihood"
+            elif m == "minres":
+                method = "minimum_residual"
+            elif m == "principal":
+                method = "principal_factor"
+            else:
+                method = "factor_analysis"
+        else:
+            method = "factor_analysis"
+    method = str(method)
+
+    if rotation is None:
+        r_attr = _safe_attr(fit, "rotation")
+        rotation = str(r_attr) if isinstance(r_attr, str) else "none"
+    # Normalize None → "none" so the sanitizer's enum check passes.
+    if rotation in (None, "None"):
+        rotation = "none"
+
+    loadings: dict[str, dict[str, float]] = {}
+    for fi, var in enumerate(variables):
+        row: dict[str, float] = {}
+        for j, lab in enumerate(fac_labels):
+            v = float(loadings_arr[fi, j])
+            if math.isfinite(v):
+                row[lab] = v
+        if row:
+            loadings[var] = row
+
+    # Uniqueness / communalities via factor_analyzer's getters.
+    uniqueness: dict[str, float] = {}
+    communalities: dict[str, float] = {}
+    try:
+        u_arr = np.asarray(fit.get_uniquenesses())
+        for fi, var in enumerate(variables):
+            v = float(u_arr[fi])
+            if math.isfinite(v):
+                uniqueness[var] = v
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        c_arr = np.asarray(fit.get_communalities())
+        for fi, var in enumerate(variables):
+            v = float(c_arr[fi])
+            if math.isfinite(v):
+                communalities[var] = v
+    except Exception:  # noqa: BLE001
+        pass
+
+    eigenvalues: dict[str, float] = {}
+    explained_variance: dict[str, float] = {}
+    explained_variance_ratio: dict[str, float] = {}
+    cumulative_variance: dict[str, float] = {}
+    # ``get_factor_variance()`` → tuple (variance, proportional,
+    # cumulative), each an ndarray of length n_factors.
+    try:
+        var, prop, cum = fit.get_factor_variance()
+        var = np.asarray(var)
+        prop = np.asarray(prop)
+        cum = np.asarray(cum)
+        for j, lab in enumerate(fac_labels):
+            v = float(var[j])
+            if math.isfinite(v):
+                eigenvalues[lab] = v
+                explained_variance[lab] = v
+            p = float(prop[j])
+            if math.isfinite(p):
+                explained_variance_ratio[lab] = p
+            c = float(cum[j])
+            if math.isfinite(c):
+                cumulative_variance[lab] = c
+    except Exception:  # noqa: BLE001
+        pass
+
+    fields: dict[str, Any] = {
+        "type": "factor_decomposition",
+        "method": method,
+        "rotation": rotation,
+        "n_variables": n_feat,
+        "n_components": n_factors,
+        "variables": variables,
+        "components": fac_labels,
+        "loadings": loadings,
+    }
+    if n_observations is not None:
+        fields["n_observations"] = int(n_observations)
+    if communalities:            fields["communalities"] = communalities
+    if uniqueness:               fields["uniqueness"] = uniqueness
+    if eigenvalues:              fields["eigenvalues"] = eigenvalues
+    if explained_variance:       fields["explained_variance"] = explained_variance
+    if explained_variance_ratio: fields["explained_variance_ratio"] = explained_variance_ratio
+    if cumulative_variance:      fields["cumulative_variance"] = cumulative_variance
+
+    # Goodness-of-fit scalars when available. factor_analyzer 0.4+
+    # exposes a ``sufficiency`` test that ships chi² + p; not
+    # universally present so probe quietly.
+    suf_fn = _safe_attr(fit, "sufficiency")
+    if callable(suf_fn):
+        try:
+            chi2, dof, pval = suf_fn(n_observations or 0)
+            if math.isfinite(float(chi2)):
+                fields["chi_squared"] = float(chi2)
+            if math.isfinite(float(pval)):
+                fields["chi_squared_p_value"] = float(pval)
+            if int(dof) > 0:
+                fields["degrees_of_freedom"] = int(dof)
+        except Exception:  # noqa: BLE001
+            pass
+
+    if label is not None:
+        fields["label"] = str(label)
+    fields.update(extra)
+    result(**fields)
+
+
 def from_callaway_santanna(
     attgt: Any,
     fit_result: Any | None = None,
@@ -1246,6 +1739,197 @@ def from_callaway_santanna(
     except Exception:  # noqa: BLE001
         pass
 
+    fields.update(extra)
+    result(**fields)
+
+
+def from_sun_abraham(
+    fit: Any,
+    n_treated: int,
+    *,
+    outcome_variable: str | None = None,
+    treatment_variable: str | None = None,
+    label: str | None = None,
+    **extra: Any,
+) -> None:
+    """Emit a ``did_event_study`` payload from a Sun-Abraham
+    interaction-weighted (IW) event study fit produced by
+    ``pyfixest.event_study(..., estimator="saturated")``.
+
+    The Sun-Abraham (2021) IW estimator solves the bias TWFE event
+    studies pick up under treatment-effect heterogeneity. pyfixest's
+    ``event_study`` with ``estimator="saturated"`` produces a
+    cohort-saturated fit and binds an ``aggregate(agg, weighting)``
+    method onto the returned Feols object that collapses the
+    cohort × event-time grid to per-period IW estimates (the
+    Sun-Abraham aggregate).
+
+    Like the R helper, this emits a single synthetic cohort
+    ``"all"`` because the aggregation happens inside the estimator;
+    the model sees one ATT per event-time. ``n_treated`` is the
+    total count of treated units across all cohorts — required,
+    because the cohort-N gate has no input without it.
+
+    Stata's ``eventstudyinteract`` is the SSC port of Sun-Abraham;
+    a dedicated Stata helper is deferred (same SSC-auth + maintenance-
+    lag posture as ``csdid``). For Stata-side Sun-Abraham today,
+    emit via ``nora.result(type="did_event_study",
+    estimator="sun_abraham", ...)``.
+
+    Example:
+        import pyfixest as pf
+        # cohort variable ``g``; never-treated coded as a far-future
+        # value (e.g. 10000) or as 0 per the package convention.
+        fit = pf.event_study(
+            df, yname="y", idname="id", tname="period", gname="g",
+            estimator="saturated",
+        )
+        n_t = df.loc[df["g"] > 0, "id"].nunique()
+        nora.from_sun_abraham(fit, n_treated=n_t,
+                              outcome_variable="y",
+                              treatment_variable="g",
+                              label="Sun-Abraham IW")
+    """
+    if not isinstance(n_treated, int) or n_treated < 0:
+        raise ValueError(
+            "nora.from_sun_abraham: ``n_treated`` (total treated units) "
+            "is required and must be a non-negative int"
+        )
+    aggregate_fn = getattr(fit, "aggregate", None)
+    if not callable(aggregate_fn):
+        raise TypeError(
+            "nora.from_sun_abraham: ``fit`` must expose an "
+            "``aggregate`` method (pyfixest saturated event study "
+            "shape). Run ``pyfixest.event_study(..., "
+            "estimator='saturated')`` first."
+        )
+    method_attr = getattr(fit, "_method", None)
+    if isinstance(method_attr, str) and method_attr not in (
+        "saturated", "sun_abraham"
+    ):
+        raise TypeError(
+            "nora.from_sun_abraham: ``fit._method`` is "
+            f"{method_attr!r} — expected 'saturated' (Sun-Abraham). "
+            "Did you mean ``from_twfe_event_study`` for the TWFE fit?"
+        )
+    try:
+        print(fit)
+    except Exception:  # noqa: BLE001
+        pass
+
+    try:
+        agg_df = aggregate_fn(agg="period", weighting="shares")
+    except Exception as e:  # noqa: BLE001
+        raise RuntimeError(
+            "nora.from_sun_abraham: fit.aggregate(agg='period', "
+            f"weighting='shares') failed: {e}"
+        ) from e
+    if agg_df is None or not hasattr(agg_df, "iterrows"):
+        raise RuntimeError(
+            "nora.from_sun_abraham: aggregate() did not return a "
+            "DataFrame — pyfixest version mismatch?"
+        )
+
+    cn = list(agg_df.columns)
+
+    def _pick(candidates: tuple[str, ...]) -> str | None:
+        for c in candidates:
+            if c in cn:
+                return c
+        return None
+
+    est_col = _pick(("Estimate", "estimate"))
+    se_col  = _pick(("Std. Error", "std_error", "std.error", "se"))
+    p_col   = _pick(("Pr(>|t|)", "Pr(>|z|)", "p_value", "p.value"))
+    lo_col  = _pick(("2.5%", "conf_low", "conf.low"))
+    hi_col  = _pick(("97.5%", "conf_high", "conf.high"))
+    if est_col is None:
+        raise RuntimeError(
+            "nora.from_sun_abraham: aggregate() output missing an "
+            "Estimate column — pyfixest version mismatch?"
+        )
+
+    att_all: dict[str, float] = {}
+    se_all:  dict[str, float] = {}
+    p_all:   dict[str, float] = {}
+    ci_lo:   dict[str, float] = {}
+    ci_hi:   dict[str, float] = {}
+    event_times: list[int] = []
+    for period_label, row in agg_df.iterrows():
+        try:
+            et = int(period_label)
+        except (TypeError, ValueError):
+            continue
+        est_raw = row[est_col]
+        try:
+            est = float(est_raw)
+        except (TypeError, ValueError):
+            continue
+        if not math.isfinite(est):
+            continue
+        lab = str(et)
+        att_all[lab] = est
+        event_times.append(et)
+        if se_col is not None:
+            try:
+                se = float(row[se_col])
+            except (TypeError, ValueError):
+                se = float("nan")
+            if math.isfinite(se):
+                se_all[lab] = se
+        if p_col is not None:
+            try:
+                pv = float(row[p_col])
+            except (TypeError, ValueError):
+                pv = float("nan")
+            if math.isfinite(pv):
+                p_all[lab] = pv
+        if lo_col is not None:
+            try:
+                lo = float(row[lo_col])
+            except (TypeError, ValueError):
+                lo = float("nan")
+            if math.isfinite(lo):
+                ci_lo[lab] = lo
+        if hi_col is not None:
+            try:
+                hi = float(row[hi_col])
+            except (TypeError, ValueError):
+                hi = float("nan")
+            if math.isfinite(hi):
+                ci_hi[lab] = hi
+        # Synthesize ±1.96 SE CI when pyfixest didn't ship explicit
+        # CI columns and SE is present.
+        if lab not in ci_lo and lab in se_all:
+            ci_lo[lab] = est - 1.96 * se_all[lab]
+        if lab not in ci_hi and lab in se_all:
+            ci_hi[lab] = est + 1.96 * se_all[lab]
+
+    if not event_times:
+        raise RuntimeError(
+            "nora.from_sun_abraham: aggregate() returned no rows with "
+            "integer period labels"
+        )
+
+    fields: dict[str, Any] = {
+        "type": "did_event_study",
+        "estimator": "sun_abraham",
+        "aggregation_method": "dynamic",
+        "groups": ["all"],
+        "event_times": sorted(event_times),
+        "att": {"all": att_all},
+        "standard_errors": {"all": se_all},
+        "p_values": {"all": p_all},
+        "ci_lower": {"all": ci_lo},
+        "ci_upper": {"all": ci_hi},
+        "n_treated_per_group": {"all": int(n_treated)},
+    }
+    if outcome_variable is not None:
+        fields["outcome_variable"] = str(outcome_variable)
+    if treatment_variable is not None:
+        fields["treatment_variable"] = str(treatment_variable)
+    if label is not None:
+        fields["label"] = str(label)
     fields.update(extra)
     result(**fields)
 

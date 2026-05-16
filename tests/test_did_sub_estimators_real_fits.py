@@ -21,6 +21,7 @@ and have maintenance-lag risk.
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import subprocess
 import sys
@@ -34,6 +35,19 @@ from nora.sanitizer import sanitize  # noqa: E402
 _REPO_ROOT = Path(__file__).resolve().parents[1]
 _NORA_R = _REPO_ROOT / "src" / "nora" / "runtime" / "nora.R"
 _RSCRIPT = shutil.which("Rscript")
+
+
+def _pyfixest_available() -> bool:
+    try:
+        import pyfixest  # noqa: F401
+        return True
+    except ImportError:
+        return False
+
+
+requires_pyfixest = pytest.mark.skipif(
+    not _pyfixest_available(), reason="pyfixest not installed",
+)
 
 
 def _r_pkg_available(pkg: str) -> bool:
@@ -205,6 +219,120 @@ tryCatch({{
     proc = subprocess.run(
         [_RSCRIPT, str(script_path)],
         capture_output=True, text=True, timeout=60,
+    )
+    out = proc.stdout + proc.stderr
+    assert "ERR:" in out and "n_treated" in out, f"unexpected output:\n{out}"
+
+
+_PY_SUNAB_SCRIPT = r"""
+import os, sys, warnings
+sys.path.insert(0, "{runtime_dir}")
+warnings.filterwarnings("ignore")
+import nora as nora_runtime
+import numpy as np
+import pandas as pd
+import pyfixest as pf
+
+rng = np.random.default_rng(20260516)
+n_units = 240
+n_periods = 8
+# pyfixest's saturated estimator uses 0 as the never-treated sentinel.
+g_options = [0, 4, 6]
+unit_g = rng.choice(g_options, n_units, p=[0.4, 0.3, 0.3])
+
+rows = []
+for i in range(n_units):
+    g = unit_g[i]
+    for t in range(1, n_periods + 1):
+        treated = int(g > 0 and t >= g)
+        y = (1 + 0.05 * t
+             + treated * 0.5 * (t - g + 1)
+             + rng.normal(0, 0.3))
+        rows.append(dict(id=i, period=t, g=g, y=y))
+df = pd.DataFrame(rows)
+
+fit = pf.event_study(
+    df, yname="y", idname="id", tname="period", gname="g",
+    estimator="saturated",
+)
+n_t = df[df["g"] > 0]["id"].nunique()
+nora_runtime.from_sun_abraham(
+    fit, n_treated=int(n_t),
+    outcome_variable="y", treatment_variable="g",
+    label="Sun-Abraham Python real-fit pin",
+)
+"""
+
+
+@requires_pyfixest
+def test_python_from_sun_abraham_real_fit(tmp_path: Path) -> None:
+    result_path = tmp_path / "sa_py.jsonl"
+    script_path = tmp_path / "audit.py"
+    runtime_dir = (_REPO_ROOT / "src" / "nora" / "runtime").resolve()
+    script_path.write_text(_PY_SUNAB_SCRIPT.format(
+        runtime_dir=str(runtime_dir).replace("\\", "/"),
+    ))
+    env = os.environ.copy()
+    env["NORA_RUN_TOKEN"] = "test-token-not-secret"
+    env["NORA_RESULT_PATH"] = str(result_path)
+    proc = subprocess.run(
+        [sys.executable, str(script_path)],
+        env=env, capture_output=True, text=True, timeout=120,
+    )
+    assert proc.returncode == 0, proc.stderr
+    res = sanitize(_read_one(result_path))
+    assert res.ok, res.rejection_reason
+    s = res.sanitized
+    assert s["type"] == "did_event_study"
+    assert s["estimator"] == "sun_abraham"
+    # Single synthetic cohort matches the R helper's shape.
+    assert s["groups"] == ["all"]
+    assert "all" in s["n_treated_per_group"]
+    assert s["n_treated_per_group"]["all"] >= 10
+    att_all = s["att"]["all"]
+    # Treatment-effect signal: ATT(0) should be roughly 0.5 on the DGP.
+    assert "0" in att_all
+    assert 0.2 < att_all["0"] < 1.0
+    # Pre-trend should be small for a correctly-specified Sun-Abraham fit.
+    if "-3" in att_all:
+        assert abs(att_all["-3"]) < 0.2
+
+
+@requires_pyfixest
+def test_python_sun_abraham_requires_n_treated(tmp_path: Path) -> None:
+    """The cohort-N gate has no input without ``n_treated``. Helper
+    must raise rather than emit a payload that bypasses the gate."""
+    runtime_dir = (_REPO_ROOT / "src" / "nora" / "runtime").resolve()
+    script = r"""
+import os, sys, warnings
+sys.path.insert(0, "{runtime_dir}")
+warnings.filterwarnings("ignore")
+import nora as nora_runtime
+import numpy as np
+import pandas as pd
+import pyfixest as pf
+
+rng = np.random.default_rng(42)
+df = pd.DataFrame([
+    dict(id=i, period=t, g=int(rng.choice([0, 2, 4])), y=float(rng.normal()))
+    for i in range(60) for t in range(1, 6)
+])
+fit = pf.event_study(df, yname="y", idname="id", tname="period",
+                     gname="g", estimator="saturated")
+try:
+    nora_runtime.from_sun_abraham(fit, outcome_variable="y", n_treated=None)
+    print("FAIL_NO_ERROR")
+except (TypeError, ValueError) as e:
+    print("ERR:", e)
+""".format(runtime_dir=str(runtime_dir).replace("\\", "/"))
+    script_path = tmp_path / "refuse.py"
+    script_path.write_text(script)
+    env = os.environ.copy()
+    env["NORA_RUN_TOKEN"] = "test-token-not-secret"
+    env["NORA_RESULT_PATH"] = str(tmp_path / "out.jsonl")
+    proc = subprocess.run(
+        [sys.executable, str(script_path)],
+        env=env, capture_output=True, text=True, timeout=60,
     )
     out = proc.stdout + proc.stderr
     assert "ERR:" in out and "n_treated" in out, f"unexpected output:\n{out}"
