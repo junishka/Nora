@@ -69,6 +69,22 @@ dev = [
     # Packaging: PyInstaller produces a self-contained macOS binary the
     # .app launcher wraps. See packaging/ for the build pipeline.
     "pyinstaller>=6.0",
+    # Real-fit audit tests for ``nora.from_lm`` (Python helper). The
+    # runtime itself never requires statsmodels — only researcher
+    # scripts that fit GLMs do, and the executor reports a clean
+    # install hint when it's missing. Pulling it into the dev group
+    # lets ``tests/test_from_lm_python_real_fits.py`` fit real
+    # ``OLS`` / ``Logit`` / ``Probit`` / ``Poisson`` / ``NegativeBinomial``
+    # / ``PHReg`` / ``IV2SLS`` / ``MixedLM`` models and assert the
+    # helper emits sanitizer-valid + inference-adequate payloads,
+    # rather than relying on the older mocked-fit tests (which proved
+    # silent helper failures on Cox PH and feols are easy to ship).
+    # scipy is a transitive (statsmodels needs it for distributions).
+    "statsmodels>=0.14",
+    "scipy>=1.11",
+    "rdrobust>=2.0.0",
+    "differences>=0.3.0",
+    "scikit-learn>=1.7.2",
 ]
 
 [build-system]

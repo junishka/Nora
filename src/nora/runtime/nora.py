@@ -209,13 +209,30 @@ def result(*, type: str, **fields: Any) -> None:  # noqa: A002 — match R API
 
 def from_lm(model: Any, **extra: Any) -> None:
     """Emit a ``linear_regression`` payload from a fitted statsmodels
-    result (e.g. ``sm.OLS(y, X).fit()`` or ``smf.ols(...).fit()``).
+    result.
 
-    Extracts coefficients, SEs, t-statistics, p-values, R^2,
-    adjusted R^2, F, F p-value, residual SE, and degrees of
-    freedom. The exact attribute names below are the statsmodels
-    conventions — sklearn models don't expose them; for sklearn
-    use ``result(type="linear_regression", ...)`` directly.
+    Supports the regression-shape estimators statsmodels exposes:
+    ``OLS``, ``GLM`` (Binomial / Poisson / Gaussian / Gamma / …),
+    ``Logit``, ``Probit``, ``Poisson``, ``NegativeBinomial``,
+    ``PHReg`` (Cox proportional hazards), and ``IV2SLS``. Each class
+    needs a slightly different attribute mix:
+
+      * OLS exposes ``rsquared`` / ``rsquared_adj`` / ``fvalue`` /
+        ``f_pvalue`` / ``scale``; ``llf`` / ``aic`` / ``bic`` are
+        also present.
+      * GLM-family results (Logit, Probit, Poisson, NegBin, GLM)
+        expose ``prsquared`` (McFadden's R²), ``llf``, ``aic``,
+        ``bic``; ``rsquared`` is **not present** — the old helper
+        would emit it as ``null`` and ship every GLM payload missing
+        all fit metrics.
+      * PHReg exposes ``llf`` and the censoring status via
+        ``model.status``; ``aic`` / ``bic`` are not on the result
+        wrapper (omit cleanly). ``nobs`` is also **not present** on
+        ``PHRegResults`` — derive ``n`` from ``model.endog`` shape
+        so the sanitizer's required-field check accepts the payload.
+
+    Sklearn models don't expose any of these conventions; for
+    sklearn use ``result(type="linear_regression", ...)`` directly.
 
     Also prints ``model.summary()`` to stdout so the researcher
     sees the conventional regression table in the TUI's raw log
@@ -227,35 +244,74 @@ def from_lm(model: Any, **extra: Any) -> None:
     except Exception:  # noqa: BLE001 — never let printing block the emit
         pass
 
-    coefs = _to_dict(getattr(model, "params"))
-    ses = _to_dict(getattr(model, "bse"))
-    tvals = _to_dict(getattr(model, "tvalues"))
-    pvals = _to_dict(getattr(model, "pvalues"))
+    # Per-class dispatch by capability probe rather than ``isinstance``
+    # (avoids importing statsmodels at module load — the runtime is
+    # imported on every script, and pulling in statsmodels there
+    # would charge the import cost on descriptive-only scripts too).
+    inner = _safe_attr(model, "model")
+    cls_name = type(model).__name__
+    # PHReg: result is ``PHRegResults`` (no -Wrapper suffix); the
+    # ``status`` attribute on ``model.model`` is the censoring flag.
+    is_cox = cls_name.startswith("PHReg") or (
+        inner is not None and hasattr(inner, "status")
+    )
+    # MixedLM detection. ``MixedLMResultsWrapper`` exposes ``cov_re``
+    # (the random-effects covariance matrix) — no other result class
+    # does. Goes BEFORE the GLM check so a future ``MixedGLM`` shape
+    # doesn't get misclassified.
+    is_mixed = (not is_cox) and _safe_attr(model, "cov_re") is not None
+    # GLM family. Two paths:
+    #   * ``Logit`` / ``Probit`` / ``Poisson`` / ``NegativeBinomial``
+    #     result wrappers ship ``prsquared`` (McFadden's R²).
+    #   * ``smf.glm(... family=Binomial())`` returns ``GLMResultsWrapper``
+    #     which does NOT expose ``prsquared`` but ships ``deviance``
+    #     and ``null_deviance`` — compute pseudo-R² from those.
+    has_prsq = _safe_float(_safe_attr(model, "prsquared")) is not None
+    has_deviance_pair = (
+        _safe_float(_safe_attr(model, "deviance")) is not None
+        and _safe_float(_safe_attr(model, "null_deviance")) is not None
+    )
+    is_glm = (not is_cox) and (not is_mixed) and (has_prsq or has_deviance_pair)
+    # OLS-shape: anything with finite ``rsquared`` that isn't the
+    # above. IV2SLS lands here too — it exposes ``rsquared`` but
+    # NotImplementedError on ``llf`` / ``aic`` / ``bic``; ``_safe_attr``
+    # absorbs those so the helper still emits the OLS fields it can.
+    is_ols = (
+        (not is_cox) and (not is_glm) and (not is_mixed)
+        and _safe_float(_safe_attr(model, "rsquared")) is not None
+    )
 
     # ``statsmodels`` exposes the design as ``model.model.exog_names``;
     # the response is ``model.model.endog_names``. The first column
     # is "Intercept" for formula-fit models and "const" for
     # ``add_constant(X)`` setups — we keep whichever name was used.
-    inner = getattr(model, "model", None)
     response = getattr(inner, "endog_names", None) if inner is not None else None
     exog_names = list(getattr(inner, "exog_names", []) or []) if inner else []
     # predictor_variables = exog minus the intercept (sanitizer wants
     # the regressors of interest, not the intercept).
     predictors = [n for n in exog_names if n not in ("const", "Intercept")]
 
-    n = _safe_int(getattr(model, "nobs", None))
-    df_resid = _safe_int(getattr(model, "df_resid", None))
-    r2 = _safe_float(getattr(model, "rsquared", None))
-    adj_r2 = _safe_float(getattr(model, "rsquared_adj", None))
-    f = _safe_float(getattr(model, "fvalue", None))
-    f_p = _safe_float(getattr(model, "f_pvalue", None))
-    sigma = _safe_float(
-        # statsmodels names the residual SE differently across model
-        # families; check both.
-        getattr(model, "scale", None)
-    )
-    if sigma is not None:
-        sigma = math.sqrt(sigma) if sigma >= 0 else None
+    # Coefficient table. PHReg ships these as bare ndarrays — pair
+    # with ``exog_names`` rather than letting ``dict(ndarray)`` raise
+    # the helper into silent oblivion.
+    coefs = _to_dict(_safe_attr(model, "params"), names=exog_names)
+    ses   = _to_dict(_safe_attr(model, "bse"),    names=exog_names)
+    tvals = _to_dict(_safe_attr(model, "tvalues"), names=exog_names)
+    pvals = _to_dict(_safe_attr(model, "pvalues"), names=exog_names)
+
+    # Sample size. ``nobs`` on the result wrapper works for OLS / GLM
+    # but is absent on ``PHRegResults``. Fall back to ``endog`` shape
+    # so Cox payloads carry ``n`` instead of failing the sanitizer's
+    # ``n`` required-int check.
+    n = _safe_int(_safe_attr(model, "nobs"))
+    if n is None and inner is not None:
+        endog = getattr(inner, "endog", None)
+        if endog is not None:
+            try:
+                n = int(getattr(endog, "shape", (len(endog),))[0])
+            except (TypeError, AttributeError):
+                n = None
+    df_resid = _safe_int(_safe_attr(model, "df_resid"))
 
     fields: dict[str, Any] = {
         "n": n,
@@ -265,13 +321,188 @@ def from_lm(model: Any, **extra: Any) -> None:
         "standard_errors": ses,
         "t_statistics": tvals,
         "p_values": pvals,
-        "r_squared": r2,
-        "adj_r_squared": adj_r2,
-        "f_statistic": f,
-        "f_p_value": f_p,
         "degrees_of_freedom": df_resid,
-        "residual_std_error": sigma,
     }
+
+    # Class-specific fit metrics — only emit fields meaningful for
+    # this estimator. Shipping ``r_squared: null`` from a GLM (the
+    # old behaviour) made every GLM payload trigger a sanitizer
+    # transformation "dropped 'r_squared': not a finite number",
+    # while leaving the actual fit metrics absent.
+    if is_ols:
+        for src, dst in (
+            ("rsquared",     "r_squared"),
+            ("rsquared_adj", "adj_r_squared"),
+            ("fvalue",       "f_statistic"),
+            ("f_pvalue",     "f_p_value"),
+            ("llf",          "log_likelihood"),
+            ("aic",          "aic"),
+            ("bic",          "bic"),
+        ):
+            v = _safe_float(_safe_attr(model, src))
+            if v is not None:
+                fields[dst] = v
+        # ``scale`` is the residual variance; sanitizer's
+        # ``residual_std_error`` slot expects the standard deviation.
+        sigma_sq = _safe_float(_safe_attr(model, "scale"))
+        if sigma_sq is not None and sigma_sq >= 0:
+            fields["residual_std_error"] = math.sqrt(sigma_sq)
+
+    if is_glm:
+        # Prefer ``prsquared`` when present; fall back to McFadden-
+        # equivalent computed from deviance ratio for ``GLMResultsWrapper``
+        # (``smf.glm(family=Binomial())`` and friends), which doesn't
+        # expose ``prsquared``.
+        pr2 = _safe_float(_safe_attr(model, "prsquared"))
+        if pr2 is None:
+            dev = _safe_float(_safe_attr(model, "deviance"))
+            null_dev = _safe_float(_safe_attr(model, "null_deviance"))
+            if dev is not None and null_dev is not None and null_dev > 0:
+                pr2 = 1.0 - dev / null_dev
+        if pr2 is not None:
+            fields["pseudo_r_squared"] = pr2
+        for src, dst in (
+            ("llf", "log_likelihood"), ("aic", "aic"), ("bic", "bic"),
+        ):
+            v = _safe_float(_safe_attr(model, src))
+            if v is not None:
+                fields[dst] = v
+        # Chi-squared LR test vs. the null model. ``llnull`` is the
+        # log-likelihood of the intercept-only model; chi² =
+        # 2 · (llf − llnull). Two sources by class:
+        #   * Logit / Poisson / NegBin result wrappers compute it
+        #     automatically and expose ``llnull``.
+        #   * ``GLMResultsWrapper`` exposes the same via ``llf`` and
+        #     the deviance pair: 2 · (llf - llnull) = null_dev - dev.
+        llf = _safe_float(_safe_attr(model, "llf"))
+        llnull = _safe_float(_safe_attr(model, "llnull"))
+        if llf is not None and llnull is not None and llf >= llnull:
+            fields["chi_squared"] = 2.0 * (llf - llnull)
+        elif "chi_squared" not in fields:
+            dev = _safe_float(_safe_attr(model, "deviance"))
+            null_dev = _safe_float(_safe_attr(model, "null_deviance"))
+            if dev is not None and null_dev is not None and null_dev >= dev:
+                fields["chi_squared"] = null_dev - dev
+
+    if is_mixed:
+        # statsmodels MixedLM. Fixed-effects coefficient table is
+        # already extracted above (Estimate / SE / z / P>|z|, since
+        # MixedLM uses z-tests like a GLM). Mixed-specific fields:
+        # variance components, per-level group counts, fit method,
+        # ICC for the one-level intercept-only common case.
+        #
+        # statsmodels' single-grouping MixedLM stashes the column
+        # values of the grouping factor in ``model.groups`` (an
+        # ndarray, no name). The original column name isn't reachable
+        # from the result, so the caller passes ``group_variable``
+        # via kwargs. If omitted, default to "group" — the model
+        # still gets the cardinality, just keyed by a generic name.
+        group_var_name = str(extra.pop("group_variable", None) or "group")
+        cov_re_attr = _safe_attr(model, "cov_re")
+        re_var: dict[str, float] = {}
+        if cov_re_attr is not None:
+            try:
+                # cov_re is a labelled DataFrame; diagonal entries
+                # are variances. For random-intercept-only (k_re=1)
+                # there's one diagonal entry. Random-slope adds more.
+                if hasattr(cov_re_attr, "iloc"):
+                    cov_arr = cov_re_attr.values
+                    re_names = list(cov_re_attr.index)
+                else:
+                    import numpy as _np
+                    cov_arr = _np.asarray(cov_re_attr)
+                    re_names = [f"re_{i+1}" for i in range(cov_arr.shape[0])]
+                for i, rn in enumerate(re_names):
+                    v = float(cov_arr[i, i])
+                    if not math.isfinite(v) or v < 0:
+                        continue
+                    # statsmodels labels the intercept random effect
+                    # as "Group" by default; remap to bare group name.
+                    if str(rn).lower() in ("group", "(intercept)", "intercept"):
+                        key = group_var_name
+                    else:
+                        key = f"{group_var_name}.{rn}"
+                    re_var[key] = v
+            except Exception:  # noqa: BLE001
+                pass
+        scale = _safe_float(_safe_attr(model, "scale"))
+        if scale is not None and scale >= 0:
+            re_var["residual"] = scale
+        if re_var:
+            fields["random_effects_variance"] = re_var
+        # n_groups_per_level: single-grouping statsmodels exposes
+        # ``model.model.n_groups`` (the inner-model's int).
+        if inner is not None:
+            n_g = _safe_int(_safe_attr(inner, "n_groups"))
+            if n_g is not None:
+                fields["n_groups_per_level"] = {group_var_name: n_g}
+        # Fit method.
+        reml = _safe_attr(model, "reml")
+        if isinstance(reml, bool):
+            fields["fit_method"] = "REML" if reml else "ML"
+        # ICC for the one-grouping intercept-only case.
+        if "random_effects_variance" in fields:
+            rev = fields["random_effects_variance"]
+            if len(rev) == 2 and "residual" in rev:
+                grp_keys = [k for k in rev if k != "residual"]
+                if len(grp_keys) == 1:
+                    s_u2 = rev[grp_keys[0]]
+                    s_e2 = rev["residual"]
+                    if s_u2 + s_e2 > 0:
+                        fields["icc"] = s_u2 / (s_u2 + s_e2)
+        for src, dst in (
+            ("llf", "log_likelihood"), ("aic", "aic"), ("bic", "bic"),
+        ):
+            v = _safe_float(_safe_attr(model, src))
+            if v is not None:
+                fields[dst] = v
+
+    if is_cox:
+        # ``PHRegResults`` carries ``llf`` but not ``aic`` / ``bic`` on
+        # the wrapper. Subject + failure counts come from the inner
+        # ``model`` — ``model.endog`` is the observed time vector,
+        # ``model.status`` the event indicator.
+        llf = _safe_float(_safe_attr(model, "llf"))
+        if llf is not None:
+            fields["log_likelihood"] = llf
+        if inner is not None:
+            endog = getattr(inner, "endog", None)
+            status = getattr(inner, "status", None)
+            try:
+                if endog is not None:
+                    fields["n_subjects"] = int(
+                        getattr(endog, "shape", (len(endog),))[0]
+                    )
+            except (TypeError, AttributeError):
+                pass
+            try:
+                if status is not None:
+                    fields["n_failures"] = int(sum(int(v != 0) for v in status))
+            except (TypeError, AttributeError):
+                pass
+
+    # Cluster-robust SE metadata. statsmodels signals clustering via
+    # ``cov_type == "cluster"`` and stashes the cluster assignment
+    # vector in ``cov_kwds["groups"]``. We emit:
+    #   * ``cluster_variables`` — the column name(s); for multi-way
+    #     clustering ``groups`` is a 2-D array, treat each axis as
+    #     a separate dimension.
+    #   * ``n_clusters`` — cardinality per dimension (the same shape
+    #     and disclosure profile as ``fixed_effects``).
+    # Listing the cluster level identities is forbidden — only
+    # cardinality and column names cross the boundary. Both are
+    # already in the dataset schema the model saw.
+    cov_type = _safe_attr(model, "cov_type")
+    if isinstance(cov_type, str) and cov_type.lower() == "cluster":
+        cov_kwds = _safe_attr(model, "cov_kwds") or {}
+        groups = cov_kwds.get("groups") if isinstance(cov_kwds, dict) else None
+        cluster_names, n_clusters = _extract_cluster_metadata(groups)
+        if cluster_names:
+            fields["cluster_variables"] = cluster_names
+        if n_clusters:
+            fields["n_clusters"] = n_clusters
+        fields["robust_se_type"] = "cluster"
+
     # Aggregate diagnostics. These derive from the design matrix and
     # residual sums — pure aggregates, no per-observation leak. Add
     # only when computable; if numpy is missing or the model object
@@ -287,7 +518,1112 @@ def from_lm(model: Any, **extra: Any) -> None:
     if vcov:
         fields["vcov"] = vcov
     fields.update(extra)
-    result(type="linear_regression", **fields)
+    # ``coefficient_table_with_fit_stats`` is the canonical bucket
+    # name covering OLS / GLM / Cox / IV / fixest. ``linear_regression``
+    # stays as a back-compat alias in the sanitizer for existing
+    # stored payloads; new emissions use the descriptive name.
+    result(type="coefficient_table_with_fit_stats", **fields)
+
+
+def _extract_cluster_metadata(
+    groups: Any,
+) -> tuple[list[str], dict[str, int]]:
+    """Pull ``(cluster_variables, n_clusters)`` from a statsmodels
+    ``cov_kwds["groups"]``.
+
+    The shape is one of:
+      * pandas Series — single-cluster, ``.name`` carries the column
+        name (or empty if the caller passed a bare ndarray).
+      * 1-D ndarray / list — single-cluster, no name available
+        (caller used a raw array). Emit a positional label.
+      * 2-D ndarray (rows × ndim) — multi-way clustering with
+        ``ndim`` dimensions. Each column is one clustering axis.
+      * pandas DataFrame — multi-way clustering with column names.
+
+    Returns ``([], {})`` when the groups object isn't recognisable —
+    the helper omits the fields rather than emitting incoherent
+    metadata.
+    """
+    if groups is None:
+        return [], {}
+    try:
+        import numpy as np
+    except Exception:  # noqa: BLE001
+        return [], {}
+    # pandas DataFrame: multi-column → multi-way.
+    if hasattr(groups, "columns"):
+        names: list[str] = [str(c) for c in groups.columns]
+        counts: dict[str, int] = {}
+        for c in groups.columns:
+            try:
+                counts[str(c)] = int(groups[c].nunique())
+            except Exception:  # noqa: BLE001
+                pass
+        return names, counts
+    # pandas Series: single-cluster with a name.
+    name_attr = getattr(groups, "name", None)
+    if name_attr is not None and not isinstance(groups, (list, tuple)):
+        try:
+            arr = np.asarray(groups)
+        except Exception:  # noqa: BLE001
+            return [], {}
+        if arr.ndim == 1:
+            return [str(name_attr)], {str(name_attr): int(np.unique(arr).size)}
+    # ndarray / list. 2-D → multi-way (no names); 1-D → single.
+    try:
+        arr = np.asarray(groups)
+    except Exception:  # noqa: BLE001
+        return [], {}
+    if arr.ndim == 1:
+        return ["cluster"], {"cluster": int(np.unique(arr).size)}
+    if arr.ndim == 2:
+        names = [f"cluster_{i+1}" for i in range(arr.shape[1])]
+        counts = {
+            names[i]: int(np.unique(arr[:, i]).size)
+            for i in range(arr.shape[1])
+        }
+        return names, counts
+    return [], {}
+
+
+def from_iv(
+    model: Any,
+    *,
+    instrument_variables: list[str] | None = None,
+    endogenous_variables: list[str] | None = None,
+    first_stage_f: float | None = None,
+    weak_instrument_p: float | None = None,
+    hansen_j: float | None = None,
+    hansen_j_p: float | None = None,
+    endogeneity_p: float | None = None,
+    **extra: Any,
+) -> None:
+    """Emit a regression-bucket payload from a 2SLS / IV fit, plus
+    the IV-specific diagnostic scalars.
+
+    Decision pinned in ``docs/direction.md`` "IV as regression-bucket
+    extension": 2SLS is structurally a regression-shape payload (the
+    structural-equation coefficient table) with a handful of extra
+    diagnostic scalars (first-stage F, Sargan / Hansen J,
+    Wu-Hausman). It does NOT need a composite shape — that territory
+    is reserved for genuine multi-stage estimators (3SLS, mediation,
+    control-function corrections) where the model needs two
+    independent coefficient tables.
+
+    statsmodels' ``sandbox.regression.gmm.IV2SLS`` does not compute
+    the first-stage F or Sargan / Wu-Hausman automatically — its
+    sandbox status reflects that incomplete diagnostics surface.
+    Compute them script-side and pass them through:
+
+        from statsmodels.sandbox.regression.gmm import IV2SLS
+        m = IV2SLS(y, exog, instruments).fit()
+        first_stage = sm.OLS(endo, instruments).fit()
+        nora.from_iv(
+            m,
+            instrument_variables=["z1", "z2"],
+            endogenous_variables=["x_endo"],
+            first_stage_f=float(first_stage.fvalue),
+        )
+
+    If you're using ``linearmodels.iv.IV2SLS`` (which DOES compute
+    these), pass ``model.first_stage.diagnostics["f.stat"]``,
+    ``model.sargan.stat`` / ``model.sargan.pval``, and
+    ``model.wu_hausman().stat`` / ``model.wu_hausman().pval``.
+    """
+    iv_extra: dict[str, Any] = {}
+    if instrument_variables is not None:
+        iv_extra["instrument_variables"] = list(instrument_variables)
+        iv_extra["n_instruments"] = len(instrument_variables)
+    if endogenous_variables is not None:
+        iv_extra["endogenous_variables"] = list(endogenous_variables)
+        iv_extra["n_endogenous"] = len(endogenous_variables)
+    for k, v in (
+        ("first_stage_f", first_stage_f),
+        ("weak_instrument_p", weak_instrument_p),
+        ("hansen_j", hansen_j),
+        ("hansen_j_p", hansen_j_p),
+        ("endogeneity_p", endogeneity_p),
+    ):
+        vf = _safe_float(v)
+        if vf is not None:
+            iv_extra[k] = vf
+    iv_extra.update(extra)
+    from_lm(model, **iv_extra)
+
+
+def from_cluster(
+    fit: Any,
+    X: Any = None,
+    *,
+    variables: list[str] | None = None,
+    label: str | None = None,
+) -> None:
+    """Emit a ``cluster_analysis`` payload from a sklearn clustering
+    fit. Dispatches on class:
+
+      * ``KMeans`` — cluster centers and labels read directly from
+        the fit; ``X`` not needed.
+      * ``AgglomerativeClustering`` — sklearn agglomerative fits
+        don't store cluster centers (they're not centroid-based),
+        so ``X`` (the matrix the fit was built on) is required.
+        Centroids and within-cluster SS computed post-hoc from
+        ``X[fit.labels_ == k].mean(axis=0)``.
+
+    DBSCAN and HDBSCAN are intentionally not supported. Their
+    inference-adequacy story (density parameters, noise points, no
+    centroids by construction) needs a separate design pass. The
+    helper raises with a clear pointer to the generic
+    ``nora.result(type="cluster_analysis", method="dbscan", ...)``
+    path.
+
+    Per-observation cluster assignments (``fit.labels_``) are NOT
+    emitted on any path — per-row data, no allowlist slot.
+
+    Examples:
+        from sklearn.cluster import KMeans, AgglomerativeClustering
+        X = df[["age", "income", "tenure"]].values
+        nora.from_cluster(KMeans(n_clusters=4, random_state=42,
+                                 n_init=10).fit(X),
+                         variables=["age", "income", "tenure"])
+        nora.from_cluster(AgglomerativeClustering(n_clusters=4,
+                                                  linkage="ward").fit(X),
+                         X=X, variables=["age", "income", "tenure"])
+    """
+    cls_name = type(fit).__name__
+    if cls_name == "KMeans":
+        _from_kmeans_impl(fit, variables=variables, label=label)
+        return
+    if cls_name == "AgglomerativeClustering":
+        if X is None:
+            raise ValueError(
+                "nora.from_cluster: AgglomerativeClustering fits don't store "
+                "centers — pass ``X`` (the matrix the fit was built on) so "
+                "the helper can compute centroids from "
+                "``X[fit.labels_ == k].mean(axis=0)``."
+            )
+        _from_agglomerative_impl(fit, X, variables=variables, label=label)
+        return
+    if cls_name in ("DBSCAN", "HDBSCAN"):
+        raise TypeError(
+            f"nora.from_cluster: dedicated {cls_name} helper not yet "
+            f"shipped. Construct the payload via "
+            f'`nora.result(type="cluster_analysis", method="dbscan", '
+            f"cluster_sizes=..., n_noise_points=..., variables=..., ...)` "
+            f"from the script — the cluster_analysis shape accepts dbscan "
+            f"with centroids absent."
+        )
+    raise TypeError(
+        f"nora.from_cluster: unknown clustering class {cls_name!r}. "
+        f"Supported: KMeans, AgglomerativeClustering. DBSCAN-family: "
+        f"use generic ``nora.result(type='cluster_analysis', ...)`` "
+        f"until a dedicated helper ships."
+    )
+
+
+def _from_kmeans_impl(
+    fit: Any,
+    *,
+    variables: list[str] | None = None,
+    label: str | None = None,
+) -> None:
+    try:
+        print(fit)
+    except Exception:  # noqa: BLE001
+        pass
+    import numpy as np
+    centers_attr = _safe_attr(fit, "cluster_centers_")
+    labels_attr = _safe_attr(fit, "labels_")
+    if centers_attr is None or labels_attr is None:
+        raise RuntimeError(
+            "nora.from_cluster: fit.cluster_centers_ or fit.labels_ missing"
+        )
+    centers = np.asarray(centers_attr)
+    labels = np.asarray(labels_attr)
+    n_clusters_actual, n_features = centers.shape
+
+    if variables is None:
+        variables = [f"feature_{i+1}" for i in range(n_features)]
+    variables = [str(v) for v in variables]
+    if len(variables) != n_features:
+        raise ValueError(
+            f"nora.from_cluster: variables has {len(variables)} entries "
+            f"but KMeans was fit on {n_features} features"
+        )
+
+    cluster_labels = [f"cluster_{i+1}" for i in range(n_clusters_actual)]
+    cluster_sizes: dict[str, int] = {}
+    for i in range(n_clusters_actual):
+        cluster_sizes[cluster_labels[i]] = int((labels == i).sum())
+
+    centroids: dict[str, dict[str, float]] = {}
+    for ci in range(n_clusters_actual):
+        row: dict[str, float] = {}
+        for fi, var in enumerate(variables):
+            v = float(centers[ci, fi])
+            if math.isfinite(v):
+                row[var] = v
+        if row:
+            centroids[cluster_labels[ci]] = row
+
+    inertia = _safe_float(_safe_attr(fit, "inertia_"))
+    n_iter = _safe_int(_safe_attr(fit, "n_iter_"))
+    n_obs = int(labels.size)
+    fields: dict[str, Any] = {
+        "type": "cluster_analysis",
+        "method": "kmeans",
+        "distance_metric": "euclidean",
+        "n_observations": n_obs,
+        "n_clusters": n_clusters_actual,
+        "n_features": n_features,
+        "variables": variables,
+        "cluster_labels": cluster_labels,
+        "cluster_sizes": cluster_sizes,
+        "centroids": centroids,
+    }
+    if inertia is not None:
+        fields["total_within_ss"] = inertia
+        fields["inertia"] = inertia
+    if n_iter is not None:
+        fields["n_iterations"] = n_iter
+    if label is not None:
+        fields["label"] = str(label)
+    result(**fields)
+
+
+def _from_agglomerative_impl(
+    fit: Any,
+    X: Any,
+    *,
+    variables: list[str] | None = None,
+    label: str | None = None,
+) -> None:
+    """sklearn ``AgglomerativeClustering`` doesn't store centroids
+    or within-cluster SS. Both are computed post-hoc from ``X``:
+        centroid_k = X[labels == k].mean(axis=0)
+        within_ss_k = ||X[labels == k] - centroid_k||²
+
+    The dendrogram (``fit.children_``, ``fit.distances_``) is
+    structurally absent from the payload — per-merge records over
+    the data, researcher-only by construction.
+    """
+    try:
+        print(fit)
+    except Exception:  # noqa: BLE001
+        pass
+    import numpy as np
+    X_arr = np.asarray(X, dtype=float)
+    if X_arr.ndim != 2:
+        raise ValueError(
+            "nora.from_cluster: ``X`` must be 2-D (n_observations × n_features)"
+        )
+    labels = np.asarray(_safe_attr(fit, "labels_"))
+    n_clusters_actual = int(_safe_attr(fit, "n_clusters_") or labels.max() + 1)
+    n_features = X_arr.shape[1]
+
+    if variables is None:
+        variables = [f"feature_{i+1}" for i in range(n_features)]
+    variables = [str(v) for v in variables]
+    if len(variables) != n_features:
+        raise ValueError(
+            f"nora.from_cluster: variables has {len(variables)} entries "
+            f"but X has {n_features} columns"
+        )
+
+    cluster_labels = [f"cluster_{i+1}" for i in range(n_clusters_actual)]
+    cluster_sizes: dict[str, int] = {}
+    centroids: dict[str, dict[str, float]] = {}
+    within_cluster_ss: dict[str, float] = {}
+    total_within_ss = 0.0
+    grand_mean = X_arr.mean(axis=0)
+    for i in range(n_clusters_actual):
+        cl = cluster_labels[i]
+        mask = labels == i
+        size = int(mask.sum())
+        cluster_sizes[cl] = size
+        if size == 0:
+            continue
+        sub = X_arr[mask]
+        centroid = sub.mean(axis=0)
+        centroids[cl] = {variables[fi]: float(centroid[fi]) for fi in range(n_features)}
+        wss = float(((sub - centroid) ** 2).sum())
+        within_cluster_ss[cl] = wss
+        total_within_ss += wss
+    total_ss = float(((X_arr - grand_mean) ** 2).sum())
+    between_ss = total_ss - total_within_ss
+
+    linkage_attr = _safe_attr(fit, "linkage")
+    linkage = str(linkage_attr) if isinstance(linkage_attr, str) else None
+    # sklearn distance defaults to euclidean for ward; the attribute
+    # is ``metric`` (newer) or ``affinity`` (older).
+    metric_attr = _safe_attr(fit, "metric") or _safe_attr(fit, "affinity")
+
+    fields: dict[str, Any] = {
+        "type": "cluster_analysis",
+        "method": "hierarchical",
+        "n_observations": int(X_arr.shape[0]),
+        "n_clusters": n_clusters_actual,
+        "n_features": n_features,
+        "variables": variables,
+        "cluster_labels": cluster_labels,
+        "cluster_sizes": cluster_sizes,
+        "centroids": centroids,
+        "within_cluster_ss": within_cluster_ss,
+        "total_within_ss": total_within_ss,
+        "inertia": total_within_ss,
+        "between_cluster_ss": between_ss,
+        "total_ss": total_ss,
+    }
+    if total_ss > 0:
+        fields["ss_ratio"] = between_ss / total_ss
+    if linkage:
+        fields["linkage"] = linkage
+    if isinstance(metric_attr, str):
+        fields["distance_metric"] = metric_attr
+    if label is not None:
+        fields["label"] = str(label)
+    result(**fields)
+
+
+# Back-compat alias. ``from_kmeans`` was the public name in earlier
+# releases; ``from_cluster`` with class dispatch is the new
+# canonical entry point.
+def from_kmeans(
+    fit: Any,
+    *,
+    variables: list[str] | None = None,
+    label: str | None = None,
+) -> None:
+    """Back-compat alias for ``from_cluster`` on KMeans fits."""
+    from_cluster(fit, variables=variables, label=label)
+
+
+def from_pca(
+    fit: Any,
+    *,
+    variables: list[str] | None = None,
+    n_components: int | None = None,
+    label: str | None = None,
+) -> None:
+    """Emit a ``factor_decomposition`` payload from a fitted
+    ``sklearn.decomposition.PCA``.
+
+    sklearn's PCA stores loadings transposed relative to R's prcomp:
+    ``components_`` is ``(n_components, n_features)`` (each row is a
+    component's loadings on the features). We pivot to the
+    ``{variable: {component: value}}`` shape the sanitizer's
+    ``loadings`` field expects.
+
+    Caller passes ``variables`` (the column-name list matching the
+    order of features the PCA was fit on). sklearn doesn't store
+    column names — its design takes a 2-D array — so the names must
+    come from the caller. If omitted, generic ``feature_1`` … fall-
+    backs are used; less useful to the model.
+
+    Privacy carve-out: ``fit.transform(X)`` (the per-observation
+    factor scores) is researcher-only by structural absence —
+    nothing in this helper emits it, and no field on the
+    ``factor_decomposition`` allowlist would accept it.
+
+    Example:
+        from sklearn.decomposition import PCA
+        pca = PCA(n_components=3).fit(df[["v1","v2","v3","v4","v5"]])
+        nora.from_pca(pca, variables=["v1","v2","v3","v4","v5"],
+                     label="five-variable PCA")
+    """
+    cls_name = type(fit).__name__
+    if cls_name != "PCA":
+        raise TypeError(
+            "nora.from_pca: ``fit`` must be a sklearn.decomposition.PCA "
+            f"instance; got {cls_name!r}"
+        )
+    try:
+        print(fit)
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        import numpy as np
+    except Exception as e:  # noqa: BLE001
+        raise RuntimeError("nora.from_pca requires numpy") from e
+
+    components_arr = _safe_attr(fit, "components_")
+    if components_arr is None:
+        raise RuntimeError(
+            "nora.from_pca: fit.components_ missing — was the PCA fitted?"
+        )
+    components_arr = np.asarray(components_arr)  # (n_components, n_features)
+    n_comp_full, n_feat = components_arr.shape
+
+    n_obs = _safe_int(_safe_attr(fit, "n_samples_"))
+    if n_obs is None:
+        raise RuntimeError(
+            "nora.from_pca: fit.n_samples_ missing — n_observations is required"
+        )
+
+    if variables is None:
+        variables = [f"feature_{i+1}" for i in range(n_feat)]
+    variables = [str(v) for v in variables]
+    if len(variables) != n_feat:
+        raise ValueError(
+            f"nora.from_pca: variables has {len(variables)} entries but "
+            f"PCA was fit on {n_feat} features"
+        )
+
+    n_comp = (
+        min(n_components, n_comp_full) if isinstance(n_components, int)
+        else n_comp_full
+    )
+    comp_labels = [f"PC{i+1}" for i in range(n_comp)]
+
+    # Loadings: pivot from (n_comp, n_feat) to {variable: {component: value}}.
+    loadings: dict[str, dict[str, float]] = {}
+    for fi, var in enumerate(variables):
+        row: dict[str, float] = {}
+        for ci, c_lab in enumerate(comp_labels):
+            v = float(components_arr[ci, fi])
+            if math.isfinite(v):
+                row[c_lab] = v
+        if row:
+            loadings[var] = row
+
+    # Explained variance / ratio / cumulative — sklearn exposes
+    # ``explained_variance_`` (eigenvalues) and
+    # ``explained_variance_ratio_`` (normalized to sum=1 over
+    # *retained* components). Compute cumulative from the ratio.
+    # ``or []`` doesn't compose with ndarrays — ``bool(array)`` raises
+    # for arrays with more than one element. Write the None check
+    # explicitly.
+    _ev = _safe_attr(fit, "explained_variance_")
+    ev_attr = np.asarray(_ev if _ev is not None else [])
+    _evr = _safe_attr(fit, "explained_variance_ratio_")
+    evr_attr = np.asarray(_evr if _evr is not None else [])
+    eigenvalues: dict[str, float] = {}
+    explained_variance: dict[str, float] = {}
+    explained_variance_ratio: dict[str, float] = {}
+    cumulative_variance: dict[str, float] = {}
+    cum = 0.0
+    for ci, c_lab in enumerate(comp_labels):
+        if ci < len(ev_attr) and math.isfinite(float(ev_attr[ci])):
+            eigenvalues[c_lab] = float(ev_attr[ci])
+            explained_variance[c_lab] = float(ev_attr[ci])
+        if ci < len(evr_attr) and math.isfinite(float(evr_attr[ci])):
+            r = float(evr_attr[ci])
+            explained_variance_ratio[c_lab] = r
+            cum += r
+            cumulative_variance[c_lab] = cum
+
+    # Communalities (PCA): sum of squared loadings across retained
+    # components, per variable.
+    communalities: dict[str, float] = {}
+    for fi, var in enumerate(variables):
+        h2 = float(np.sum(components_arr[:n_comp, fi] ** 2))
+        if math.isfinite(h2):
+            communalities[var] = h2
+
+    fields: dict[str, Any] = {
+        "type": "factor_decomposition",
+        "method": "pca",
+        "rotation": "none",
+        "n_observations": n_obs,
+        "n_variables": n_feat,
+        "n_components": n_comp,
+        "variables": variables,
+        "components": comp_labels,
+        "loadings": loadings,
+        "explained_variance": explained_variance,
+        "explained_variance_ratio": explained_variance_ratio,
+        "cumulative_variance": cumulative_variance,
+        "eigenvalues": eigenvalues,
+        "communalities": communalities,
+    }
+    if label is not None:
+        fields["label"] = str(label)
+    result(**fields)
+
+
+def from_callaway_santanna(
+    attgt: Any,
+    fit_result: Any | None = None,
+    *,
+    outcome_variable: str | None = None,
+    treatment_variable: str | None = None,
+    aggregation_method: str = "event",
+    label: str | None = None,
+    **extra: Any,
+) -> None:
+    """Emit a ``did_event_study`` payload from a Callaway-Sant'Anna
+    fit produced by the ``differences`` package.
+
+    Two-argument form keeps the ATTgt config (cohort column, data,
+    anticipation, base_period) reachable alongside the per-(g, t)
+    estimates the fitted result carries:
+
+        from differences import ATTgt
+        attgt = ATTgt(data=df.set_index(["id","period"]),
+                      cohort_column="G", base_period="varying",
+                      anticipation=0)
+        result = attgt.fit(formula="y", control_group="never_treated")
+        nora.from_callaway_santanna(attgt, result,
+                                    outcome_variable="y",
+                                    treatment_variable="G",
+                                    label="headline DiD")
+
+    If ``result`` is omitted, ``attgt`` is assumed to BE the fitted
+    result (``differences`` happens to allow this fluent shape too).
+    The helper pivots ATT(cohort, base_period, time) → ATT(cohort,
+    event_time), pulls per-cohort treated counts from ``attgt.data``,
+    and reads the aggregate ATT from
+    ``result.aggregate(type_of_aggregation="simple")``.
+
+    ``estimator`` is hard-coded to ``"callaway_santanna"`` for this
+    helper; Sun-Abraham / de Chaisemartin land under their own
+    helpers when those ship.
+    """
+    try:
+        import numpy as np
+        import pandas as pd
+    except Exception as e:  # noqa: BLE001
+        raise RuntimeError(
+            "nora.from_callaway_santanna requires numpy + pandas"
+        ) from e
+
+    # If only one argument was passed, treat it as the fitted result
+    # and try to recover the ATTgt config from it. Otherwise the
+    # caller must pass both.
+    if fit_result is None:
+        fit_result = attgt
+        attgt = None
+
+    # Per-cell ATT(g, t) table. differences exposes a multi-indexed
+    # DataFrame via ``result.to_pandas()`` with index levels
+    # (cohort, base_period, time). The cell value lives under the
+    # column tuple ('ATTgtElements', '', 'ATT'); SE under
+    # ('ATTgtElements', 'analytic', 'std_error'). The pointwise
+    # band columns are ('ATTgtElements', 'pointwise conf. band',
+    # 'lower' | 'upper').
+    if not hasattr(fit_result, "to_pandas"):
+        raise TypeError(
+            "nora.from_callaway_santanna: ``fit_result`` must be an "
+            "ATTgtResult (returned by differences.ATTgt.fit(...))"
+        )
+    table = fit_result.to_pandas()
+    # Robust column lookup — names rolled through the package version
+    # could shift; match by trailing element.
+    def _col(suffix: str) -> Any:
+        for c in table.columns:
+            if isinstance(c, tuple) and c[-1] == suffix:
+                return c
+        return None
+    col_att = _col("ATT")
+    col_se  = _col("std_error")
+    col_lo  = _col("lower")
+    col_hi  = _col("upper")
+    if col_att is None:
+        raise RuntimeError(
+            "nora.from_callaway_santanna: ``ATT`` column not found in "
+            "result.to_pandas() — package version mismatch?"
+        )
+
+    # Pivot to {cohort: {event_time: value}}. Index is
+    # (cohort, base_period, time); event_time = time - cohort.
+    att_dict: dict[str, dict[str, float]] = {}
+    se_dict: dict[str, dict[str, float]] = {}
+    ci_lo_dict: dict[str, dict[str, float]] = {}
+    ci_hi_dict: dict[str, dict[str, float]] = {}
+    cohorts_seen: set[int | float] = set()
+    event_times_seen: set[int] = set()
+    for idx, row in table.iterrows():
+        if not isinstance(idx, tuple) or len(idx) < 3:
+            continue
+        cohort = idx[0]
+        time   = idx[-1]
+        try:
+            e = int(time) - int(cohort)
+        except (TypeError, ValueError):
+            continue
+        # The same (cohort, event_time) can appear under multiple
+        # base periods when ``base_period="varying"``. Keep the
+        # last one (the immediately-pre-treatment base period —
+        # the conventional CS reporting).
+        c_lab = str(int(cohort) if float(cohort).is_integer() else cohort)
+        e_lab = str(e)
+        cohorts_seen.add(c_lab)
+        event_times_seen.add(e)
+        att_dict.setdefault(c_lab, {})[e_lab] = float(row[col_att])
+        if col_se is not None:
+            se_dict.setdefault(c_lab, {})[e_lab] = float(row[col_se])
+        if col_lo is not None:
+            ci_lo_dict.setdefault(c_lab, {})[e_lab] = float(row[col_lo])
+        if col_hi is not None:
+            ci_hi_dict.setdefault(c_lab, {})[e_lab] = float(row[col_hi])
+
+    # Per-cohort treated counts — number of distinct entity ids per
+    # cohort in the input panel. ``attgt.data`` is the indexed
+    # dataframe the fit was built from; entity id is the first level.
+    n_treated_per_group: dict[str, int] = {}
+    if attgt is not None and hasattr(attgt, "data") and hasattr(attgt, "cohort_column"):
+        try:
+            ent_name = attgt.data.index.names[0]
+            sizes = (
+                attgt.data.reset_index()
+                .drop_duplicates(subset=[ent_name])
+                .groupby(attgt.cohort_column)[ent_name].nunique()
+            )
+            for k, v in sizes.items():
+                if pd.isna(k):
+                    continue
+                kk = str(int(k) if float(k).is_integer() else k)
+                if kk in cohorts_seen:
+                    n_treated_per_group[kk] = int(v)
+        except Exception:  # noqa: BLE001
+            pass
+
+    fields: dict[str, Any] = {
+        "type": "did_event_study",
+        "estimator": "callaway_santanna",
+        "groups": sorted(cohorts_seen, key=lambda x: float(x)),
+        "event_times": sorted(event_times_seen),
+        "att": att_dict,
+        "standard_errors": se_dict,
+        "ci_lower": ci_lo_dict,
+        "ci_upper": ci_hi_dict,
+        "n_treated_per_group": n_treated_per_group,
+        "aggregation_method": str(aggregation_method),
+    }
+    if outcome_variable is not None:
+        fields["outcome_variable"] = str(outcome_variable)
+    if treatment_variable is not None:
+        fields["treatment_variable"] = str(treatment_variable)
+    if label is not None:
+        fields["label"] = str(label)
+
+    # Pass through CS configuration so the model knows the
+    # identification assumptions the estimator ran under.
+    if attgt is not None:
+        bp = _safe_attr(attgt, "base_period_type")
+        if isinstance(bp, str):
+            fields["base_period"] = bp
+        ant = _safe_attr(attgt, "anticipation")
+        if isinstance(ant, int):
+            fields["anticipation_periods"] = ant
+    # control_group lives on ``attgt.estimation_details()`` (a method
+    # returning a dict, populated after fit). Older versions exposed
+    # it as an attribute; probe both shapes.
+    if attgt is not None:
+        det = _safe_attr(attgt, "estimation_details")
+        if callable(det):
+            try:
+                det = det()
+            except Exception:  # noqa: BLE001
+                det = None
+        if isinstance(det, dict):
+            cg = det.get("control_group")
+            if isinstance(cg, str):
+                fields["comparison_group"] = cg
+
+    # Aggregate scalars via ``aggregate(type_of_aggregation="simple")``.
+    try:
+        simple = fit_result.aggregate(type_of_aggregation="simple")
+        # The aggregate is a DataFrame with one row.
+        simple_pd = (
+            simple.to_pandas() if hasattr(simple, "to_pandas") else simple
+        )
+        for c in simple_pd.columns:
+            tail = c[-1] if isinstance(c, tuple) else c
+            if tail == "ATT":
+                fields["aggregate_att"] = float(simple_pd[c].iloc[0])
+            elif tail == "std_error":
+                v = float(simple_pd[c].iloc[0])
+                fields["aggregate_se"] = v
+                if "aggregate_att" in fields and v > 0:
+                    z = abs(fields["aggregate_att"] / v)
+                    fields["aggregate_p_value"] = float(
+                        math.erfc(z / math.sqrt(2.0))
+                    )
+            elif tail == "lower":
+                fields["aggregate_ci_lower"] = float(simple_pd[c].iloc[0])
+            elif tail == "upper":
+                fields["aggregate_ci_upper"] = float(simple_pd[c].iloc[0])
+    except Exception:  # noqa: BLE001
+        pass
+
+    fields.update(extra)
+    result(**fields)
+
+
+def from_rdd(
+    fit: Any,
+    *,
+    running_variable: str | None = None,
+    outcome_variable: str | None = None,
+    fuzzy_treatment_variable: str | None = None,
+    first_stage_f: float | None = None,
+    label: str | None = None,
+    **extra: Any,
+) -> None:
+    """Emit an ``rdd`` payload from an ``rdrobust`` fit.
+
+    Wraps the rdrobust Python package (Calonico-Cattaneo-Titiunik
+    2014) — the standard cross-language implementation. The payload
+    carries the three-flavor τ table, bandwidth(s), kernel,
+    polynomial order, effective N per side, and the bandwidth
+    selector. For fuzzy RDD pass ``fuzzy_treatment_variable``; the
+    estimator is tagged ``fuzzy_2sls`` and the caller may also
+    supply ``first_stage_f``.
+
+    Privacy carve-out is structural. The helper signature does not
+    accept density / binscatter / mccrary keyword arguments — passing
+    one raises. McCrary density and binscatter near the cutoff are
+    visual diagnostics for the researcher; they have no field on
+    the ``rdd`` shape's allowlist so even hand-crafted payloads
+    through ``nora.result(type="rdd", ...)`` cannot smuggle them.
+
+    Example:
+        from rdrobust import rdrobust
+        m = rdrobust(y=df["voted"], x=df["income"], c=50000)
+        nora.from_rdd(m, running_variable="income",
+                     outcome_variable="voted", label="headline RDD")
+
+        # Fuzzy:
+        m = rdrobust(y=df["voted"], x=df["income"], c=50000,
+                     fuzzy=df["takeup"])
+        nora.from_rdd(m, running_variable="income",
+                     outcome_variable="voted",
+                     fuzzy_treatment_variable="takeup",
+                     first_stage_f=24.3)
+    """
+    # Privacy carve-out: reject density/binscatter kwargs that a
+    # script might try to slip through ``**extra``.
+    banned = (
+        "mccrary_density_curve", "mccrary_density",
+        "binscatter_bins", "binscatter", "density_curve",
+    )
+    for b in banned:
+        if b in extra:
+            raise ValueError(
+                f"nora.from_rdd: ``{b}`` is a visual diagnostic for the "
+                f"researcher and is not allowed on the rdd payload. The "
+                f"model sees the analytical fields (tau / bandwidth / "
+                f"effective N); ask the researcher qualitatively about "
+                f"manipulation evidence if it bears on the design."
+            )
+    # rdrobust's result class is rdrobust_output. Duck-type rather
+    # than importing rdrobust here (keeps the runtime import-light
+    # for non-RDD scripts).
+    cls = type(fit).__name__
+    if cls != "rdrobust_output":
+        raise TypeError(
+            "nora.from_rdd: ``fit`` must be an rdrobust_output (returned "
+            "by rdrobust.rdrobust(y, x, c=cutoff))."
+        )
+    try:
+        print(fit)
+    except Exception:  # noqa: BLE001
+        pass
+
+    fields: dict[str, Any] = {
+        "type": "rdd",
+        "estimator": (
+            "fuzzy_2sls" if fuzzy_treatment_variable is not None
+            else "local_polynomial"
+        ),
+    }
+    if running_variable is not None:
+        fields["running_variable"] = str(running_variable)
+    if outcome_variable is not None:
+        fields["outcome_variable"] = str(outcome_variable)
+    if label is not None:
+        fields["label"] = str(label)
+
+    # Pull the three-flavor row indexes from the DataFrame-shaped
+    # outputs. Python rdrobust uses the same row labels as R
+    # (Conventional / Bias-Corrected / Robust).
+    def _row(df: Any, label: str) -> float | None:
+        try:
+            v = df.loc[label].iloc[0]
+            f = float(v)
+            return f if math.isfinite(f) else None
+        except Exception:  # noqa: BLE001
+            return None
+
+    coef = _safe_attr(fit, "coef")
+    se   = _safe_attr(fit, "se")
+    pv   = _safe_attr(fit, "pv")
+    ci   = _safe_attr(fit, "ci")
+    if coef is not None:
+        for flavor, slot in (
+            ("Conventional", "tau_conventional"),
+            ("Bias-Corrected", "tau_bias_corrected"),
+            ("Robust", "tau_robust"),
+        ):
+            v = _row(coef, flavor)
+            if v is not None:
+                fields[slot] = v
+    if se is not None:
+        for flavor, slot in (
+            ("Conventional", "se_conventional"),
+            ("Bias-Corrected", "se_bias_corrected"),
+            ("Robust", "se_robust"),
+        ):
+            v = _row(se, flavor)
+            if v is not None:
+                fields[slot] = v
+    if pv is not None:
+        for flavor, slot in (
+            ("Conventional", "p_conventional"),
+            ("Bias-Corrected", "p_bias_corrected"),
+            ("Robust", "p_robust"),
+        ):
+            v = _row(pv, flavor)
+            if v is not None:
+                fields[slot] = v
+    if ci is not None:
+        for flavor, lo_slot, hi_slot in (
+            ("Conventional", "ci_lower_conventional", "ci_upper_conventional"),
+            ("Bias-Corrected", "ci_lower_bias_corrected", "ci_upper_bias_corrected"),
+            ("Robust", "ci_lower_robust", "ci_upper_robust"),
+        ):
+            try:
+                lo = float(ci.loc[flavor].iloc[0])
+                hi = float(ci.loc[flavor].iloc[1])
+                if math.isfinite(lo): fields[lo_slot] = lo
+                if math.isfinite(hi): fields[hi_slot] = hi
+            except Exception:  # noqa: BLE001
+                pass
+
+    # Bandwidths: rdrobust stores ``h`` (main) and ``b`` (bias-
+    # correction) as a DataFrame indexed by ["h", "b"] with columns
+    # ["left", "right"].
+    bws = _safe_attr(fit, "bws")
+    if bws is not None:
+        try:
+            fields["bandwidth_left"]  = float(bws.loc["h", "left"])
+            fields["bandwidth_right"] = float(bws.loc["h", "right"])
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            fields["bandwidth_bias_correction_left"]  = float(bws.loc["b", "left"])
+            fields["bandwidth_bias_correction_right"] = float(bws.loc["b", "right"])
+        except Exception:  # noqa: BLE001
+            pass
+
+    # Effective N inside the main bandwidth: ``N_h`` is a list /
+    # array of [left, right].
+    n_h = _safe_attr(fit, "N_h")
+    if n_h is not None:
+        try:
+            fields["effective_n_left"]  = int(n_h[0])
+            fields["effective_n_right"] = int(n_h[1])
+        except Exception:  # noqa: BLE001
+            pass
+
+    p_order = _safe_attr(fit, "p")
+    if p_order is not None:
+        try:
+            fields["polynomial_order"] = int(p_order)
+        except (TypeError, ValueError):
+            pass
+    cutoff = _safe_attr(fit, "c")
+    if cutoff is not None:
+        cf = _safe_float(cutoff)
+        if cf is not None:
+            fields["cutoff"] = cf
+
+    bwsel = _safe_attr(fit, "bwselect")
+    if isinstance(bwsel, str):
+        fields["bandwidth_selector"] = bwsel
+    kernel = _safe_attr(fit, "kernel")
+    if isinstance(kernel, str):
+        # rdrobust reports kernel capitalized ("Triangular"); the
+        # sanitizer accepts lowercase only.
+        fields["kernel"] = kernel.lower()
+
+    fs_f = _safe_float(first_stage_f)
+    if fs_f is not None:
+        fields["first_stage_f"] = fs_f
+
+    fields.update(extra)
+    result(**fields)
+
+
+def from_kaplan_meier(
+    fit: Any,
+    horizons: dict[str, float] | None = None,
+    *,
+    time_variable: str | None = None,
+    event_variable: str | None = None,
+    group_variable: str | None = None,
+    logrank_chi_squared: float | None = None,
+    logrank_p_value: float | None = None,
+    n_groups: int | None = None,
+    label: str | None = None,
+    **extra: Any,
+) -> None:
+    """Emit a ``kaplan_meier`` payload from a fitted survival curve.
+
+    Duck-typed on the attributes statsmodels' ``SurvfuncRight``
+    exposes; lifelines' ``KaplanMeierFitter`` works via the same
+    shape if the caller wraps it (rare in practice — most lifelines
+    users will already have ``KaplanMeierFitter.survival_function_``
+    and can pass a thin adapter).
+
+    Required attributes on ``fit``:
+        time         — 1-D array of observed times (the input
+                       duration vector)
+        status       — 1-D event indicator (1 = event, 0 = censored)
+        surv_times   — event-time array (post-fit, sorted)
+        surv_prob    — survival probability array, same length
+                       as ``surv_times``
+    Optional:
+        surv_prob_se — Greenwood SE per event time (enables CIs)
+        quantile     — callable for median (``fit.quantile(0.5)``)
+        quantile_ci  — callable for CI (``fit.quantile_ci(0.5)``)
+
+    ``horizons`` maps canonical labels (``"1y"`` / ``"3y"`` /
+    ``"5y"`` / ``"10y"`` — the only labels the sanitizer's
+    kaplan_meier shape accepts) to numeric time values in whatever
+    unit the fit was built in. The helper interpolates S(h) using
+    a step-look-up (KM is a step function) and computes n_at_risk(h)
+    from the original duration vector ``fit.time``.
+
+    Log-rank inference across groups isn't computed by statsmodels'
+    ``SurvfuncRight``. The caller computes it (manually or via
+    lifelines / R) and passes the chi² + p-value as kwargs.
+    """
+    try:
+        print(fit.summary() if callable(getattr(fit, "summary", None)) else fit)
+    except Exception:  # noqa: BLE001
+        pass
+
+    try:
+        import numpy as np
+    except Exception as e:  # noqa: BLE001
+        raise RuntimeError(
+            "nora.from_kaplan_meier requires numpy in the runtime"
+        ) from e
+
+    time_arr = _safe_attr(fit, "time")
+    status_arr = _safe_attr(fit, "status")
+    surv_times = _safe_attr(fit, "surv_times")
+    surv_prob = _safe_attr(fit, "surv_prob")
+    if surv_times is None or surv_prob is None:
+        raise TypeError(
+            "nora.from_kaplan_meier: ``fit`` must expose ``surv_times`` "
+            "and ``surv_prob`` (statsmodels.SurvfuncRight shape)"
+        )
+
+    surv_times = np.asarray(surv_times, dtype=float)
+    surv_prob  = np.asarray(surv_prob,  dtype=float)
+    surv_prob_se = _safe_attr(fit, "surv_prob_se")
+    if surv_prob_se is not None:
+        surv_prob_se = np.asarray(surv_prob_se, dtype=float)
+
+    fields: dict[str, Any] = {}
+    if time_variable is not None:   fields["time_variable"]  = str(time_variable)
+    if event_variable is not None:  fields["event_variable"] = str(event_variable)
+    if group_variable is not None:  fields["group_variable"] = str(group_variable)
+    if label is not None:           fields["label"]          = str(label)
+
+    if time_arr is not None and status_arr is not None:
+        time_arr   = np.asarray(time_arr,   dtype=float)
+        status_arr = np.asarray(status_arr, dtype=int)
+        fields["n_subjects"] = int(time_arr.size)
+        fields["n_failures"] = int((status_arr != 0).sum())
+    else:
+        # Fall back to derived counts when raw inputs aren't exposed
+        # (e.g., a thin adapter that only ships the curve). Total
+        # events = sum of n_events; total at-risk = n_risk at t=0.
+        n_events = _safe_attr(fit, "n_events")
+        n_risk   = _safe_attr(fit, "n_risk")
+        if n_events is not None and n_risk is not None:
+            n_events = np.asarray(n_events, dtype=int)
+            n_risk   = np.asarray(n_risk,   dtype=int)
+            if n_risk.size > 0:
+                fields["n_subjects"] = int(n_risk[0])
+                fields["n_failures"] = int(n_events.sum())
+
+    # Median + CI. ``SurvfuncRight.quantile(0.5)`` raises on heavily-
+    # censored curves where the median is undefined; absorb that.
+    qfn = _safe_attr(fit, "quantile")
+    if callable(qfn):
+        try:
+            med = float(qfn(0.5))
+            if math.isfinite(med):
+                fields["median_survival_time"] = med
+        except Exception:  # noqa: BLE001
+            pass
+    qcifn = _safe_attr(fit, "quantile_ci")
+    if callable(qcifn):
+        try:
+            lo, hi = qcifn(0.5)
+            if lo is not None and math.isfinite(float(lo)):
+                fields["median_survival_ci_lower"] = float(lo)
+            if hi is not None and math.isfinite(float(hi)):
+                fields["median_survival_ci_upper"] = float(hi)
+        except Exception:  # noqa: BLE001
+            pass
+
+    # Per-horizon scalars. KM is a step function — S(h) is the
+    # survival probability at the latest event time ≤ h. n_at_risk(h)
+    # is the count of subjects whose observed time ≥ h, computed from
+    # the original duration array (the SurvfuncRight's ``n_risk``
+    # attribute is at-event-time, not at-arbitrary-horizon).
+    if horizons:
+        z_975 = 1.959963984540054  # 97.5th percentile of N(0,1) for 95% CI
+        for label_str, h_time in horizons.items():
+            if not isinstance(label_str, str):
+                continue
+            try:
+                h = float(h_time)
+            except (TypeError, ValueError):
+                continue
+            if not math.isfinite(h):
+                continue
+            # Step look-up: largest event time ≤ h.
+            idx = int(np.searchsorted(surv_times, h, side="right")) - 1
+            if idx < 0:
+                # h precedes the first event time — S(h) = 1.
+                s_h = 1.0
+                se_h: float | None = 0.0
+            elif idx >= surv_prob.size:
+                idx = surv_prob.size - 1
+                s_h = float(surv_prob[idx])
+                se_h = (
+                    float(surv_prob_se[idx])
+                    if surv_prob_se is not None and idx < surv_prob_se.size
+                    else None
+                )
+            else:
+                s_h = float(surv_prob[idx])
+                se_h = (
+                    float(surv_prob_se[idx])
+                    if surv_prob_se is not None and idx < surv_prob_se.size
+                    else None
+                )
+            if math.isfinite(s_h):
+                fields[f"survival_at_{label_str}"] = s_h
+            # n_at_risk from raw durations when accessible.
+            if time_arr is not None:
+                n_risk_h = int((time_arr >= h).sum())
+                fields[f"n_at_risk_{label_str}"] = n_risk_h
+            # Linear Greenwood CI (clamped to [0, 1]).
+            if se_h is not None and math.isfinite(se_h) and math.isfinite(s_h):
+                lo = max(0.0, s_h - z_975 * se_h)
+                hi = min(1.0, s_h + z_975 * se_h)
+                fields[f"survival_at_{label_str}_ci_lower"] = lo
+                fields[f"survival_at_{label_str}_ci_upper"] = hi
+
+    for k, v in (
+        ("logrank_chi_squared", logrank_chi_squared),
+        ("logrank_p_value", logrank_p_value),
+    ):
+        vf = _safe_float(v)
+        if vf is not None:
+            fields[k] = vf
+    if isinstance(n_groups, int) and n_groups > 0:
+        fields["n_groups"] = n_groups
+
+    fields.update(extra)
+    result(type="kaplan_meier", **fields)
 
 
 def _compute_vcov(model: Any) -> dict[str, dict[str, float]] | None:
@@ -813,12 +2149,44 @@ def from_correlation(
 # ---------------------------------------------------------------------------
 
 
-def _to_dict(thing: Any) -> dict[str, Any]:
-    """Normalise a pandas Series / dict-like to a plain ``{name: value}``
-    dict the encoder can serialise without further coercion."""
+def _to_dict(thing: Any, names: list[str] | None = None) -> dict[str, Any]:
+    """Normalise a pandas Series / dict-like / ndarray to a plain
+    ``{name: value}`` dict the encoder can serialise without further
+    coercion.
+
+    ``names`` is used as a fallback labelling when ``thing`` doesn't
+    carry its own index — statsmodels ``PHRegResults`` ships params /
+    bse / tvalues / pvalues as bare ndarrays without column names, so
+    we pair them with the inner model's ``exog_names``. Without this,
+    ``dict(ndarray)`` raises ``TypeError: cannot convert dictionary
+    update sequence element #0 to a sequence`` and the helper aborts
+    before the payload is written — the same silent-failure mode the
+    R/Stata audits caught for Cox.
+    """
     if hasattr(thing, "to_dict"):
         return {str(k): v for k, v in thing.to_dict().items()}
-    return {str(k): v for k, v in dict(thing).items()}
+    # Index-less iterable (ndarray, list, tuple): require a names list.
+    try:
+        items = list(thing)
+    except TypeError:
+        return {str(k): v for k, v in dict(thing).items()}
+    if names is not None and len(names) == len(items):
+        return {str(names[i]): items[i] for i in range(len(items))}
+    # Last-resort positional naming so an unnamed numeric vector at
+    # least round-trips with deterministic keys rather than raising.
+    return {f"x{i}": items[i] for i in range(len(items))}
+
+
+def _safe_attr(obj: Any, name: str) -> Any:
+    """Attribute fetch that survives properties raising
+    ``NotImplementedError`` / ``ValueError`` etc. — statsmodels
+    ``IV2SLS`` results define ``llf`` / ``aic`` / ``bic`` as
+    properties that raise rather than missing, so a plain
+    ``getattr(obj, name, None)`` propagates and aborts the helper."""
+    try:
+        return getattr(obj, name, None)
+    except Exception:  # noqa: BLE001
+        return None
 
 
 def _safe_float(x: Any) -> float | None:

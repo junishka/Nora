@@ -100,7 +100,10 @@ nora$from_lm(lm(y ~ x, data = df), label = "ok")
     r = run_script("R", code, tmp_path)
     assert r.ok, f"script failed: error={r.error}\nstderr={r.raw_stderr}"
     assert r.result_payloads
-    assert r.result_payloads[0]["type"] == "linear_regression"
+    # Helper emits the canonical descriptive name; legacy alias
+    # ``linear_regression`` is accepted by the sanitizer for back-compat
+    # with stored payloads but is no longer the freshly-emitted form.
+    assert r.result_payloads[0]["type"] == "coefficient_table_with_fit_stats"
     assert r.result_payloads[0]["n"] == 12
 
 

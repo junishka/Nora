@@ -642,7 +642,316 @@ def _render_correlation_matrix(p: dict[str, Any]) -> str | None:
     return f"{table}\n\n{caption}" if caption else table
 
 
+def _render_did_event_study(p: dict[str, Any]) -> str | None:
+    """ATT(g, t) panel with one row per surviving cohort.
+
+    Renders the cohort × event-time matrix as a wide markdown table:
+    one column for the cohort label, one column for each event time,
+    cells carry ATT estimates. SE / p-values are summarised in the
+    caption rather than crowded into the matrix. The aggregate ATT
+    appears in the caption when present.
+
+    Pre-fix, payloads of this shape rendered as raw JSON in the
+    tool-result card; the model could read them but couldn't drop
+    a clean table directly into its reply.
+    """
+    att = p.get("att") or {}
+    if not isinstance(att, dict) or not att:
+        return None
+    event_times = p.get("event_times") or []
+    if not isinstance(event_times, list):
+        return None
+    # Normalize event-time keys to their str form for matrix lookup
+    # (the sanitizer stores them as ints when integer-valued).
+    et_keys = [str(t) for t in event_times]
+    header = ["Cohort"] + et_keys
+    rows: list[list[str]] = []
+    for cohort, cells in att.items():
+        if not isinstance(cells, dict):
+            continue
+        row = [str(cohort)]
+        for et in et_keys:
+            row.append(_fmt_num(cells.get(et)))
+        rows.append(row)
+    table = _markdown_table(header, rows)
+
+    cap_parts: list[str] = []
+    n_treated = p.get("n_treated_per_group") or {}
+    if isinstance(n_treated, dict) and n_treated:
+        total = sum(v for v in n_treated.values() if isinstance(v, int))
+        if total > 0:
+            cap_parts.append(f"treated N = {total:,} across {len(n_treated)} cohorts")
+    est = p.get("estimator")
+    if isinstance(est, str):
+        cap_parts.append(est.replace("_", "-"))
+    agg_att = p.get("aggregate_att")
+    if isinstance(agg_att, (int, float)) and math.isfinite(float(agg_att)):
+        leg = f"aggregate ATT = {_fmt_num(agg_att)}"
+        agg_p = p.get("aggregate_p_value")
+        if isinstance(agg_p, (int, float)) and math.isfinite(float(agg_p)):
+            leg += f" (p = {_fmt_pvalue(agg_p)})"
+        cap_parts.append(leg)
+    agg_method = p.get("aggregation_method")
+    if isinstance(agg_method, str):
+        cap_parts.append(f"aggregation: {agg_method}")
+    caption = " · ".join(cap_parts)
+    return f"{table}\n\n{caption}" if caption else table
+
+
+def _render_rdd(p: dict[str, Any]) -> str | None:
+    """Three-flavor τ table (conventional / bias-corrected / robust)
+    with bandwidth and effective-N diagnostics in the caption.
+
+    Calonico-Cattaneo-Titiunik's ``rdrobust`` reports three flavors
+    of the same parameter at a single fit. The model needs all three
+    to write the standard "robust τ = X (BC: Y, conv: Z)" line; this
+    renderer lays them out as one row per flavor.
+    """
+    flavors = (
+        ("conventional", "tau_conventional", "se_conventional",
+         "p_conventional", "ci_lower_conventional", "ci_upper_conventional"),
+        ("bias-corrected", "tau_bias_corrected", "se_bias_corrected",
+         "p_bias_corrected", "ci_lower_bias_corrected", "ci_upper_bias_corrected"),
+        ("robust", "tau_robust", "se_robust",
+         "p_robust", "ci_lower_robust", "ci_upper_robust"),
+    )
+    has_p = any(isinstance(p.get(f[3]), (int, float)) for f in flavors)
+    has_ci = any(isinstance(p.get(f[4]), (int, float)) for f in flavors)
+    header = ["Estimator", "τ", "SE"]
+    if has_p:
+        header.append("p-value")
+    if has_ci:
+        header.append("95% CI")
+    rows: list[list[str]] = []
+    for label, tau_k, se_k, p_k, lo_k, hi_k in flavors:
+        tau = p.get(tau_k)
+        if tau is None:
+            continue
+        row = [label, _fmt_num(tau), _fmt_num(p.get(se_k))]
+        if has_p:
+            row.append(_fmt_pvalue(p.get(p_k)))
+        if has_ci:
+            lo, hi = p.get(lo_k), p.get(hi_k)
+            row.append(
+                f"[{_fmt_num(lo)}, {_fmt_num(hi)}]"
+                if lo is not None and hi is not None else ""
+            )
+        rows.append(row)
+    if not rows:
+        return None
+    table = _markdown_table(header, rows)
+
+    cap_parts: list[str] = []
+    n_left = p.get("effective_n_left")
+    n_right = p.get("effective_n_right")
+    if isinstance(n_left, int) and isinstance(n_right, int):
+        cap_parts.append(f"effective N: {n_left:,} left · {n_right:,} right")
+    bw_l = p.get("bandwidth_left")
+    bw_r = p.get("bandwidth_right")
+    if isinstance(bw_l, (int, float)) and isinstance(bw_r, (int, float)):
+        if bw_l == bw_r:
+            cap_parts.append(f"bandwidth = {_fmt_num(bw_l)}")
+        else:
+            cap_parts.append(
+                f"bandwidth: {_fmt_num(bw_l)} left · {_fmt_num(bw_r)} right"
+            )
+    kernel = p.get("kernel")
+    po = p.get("polynomial_order")
+    if isinstance(kernel, str):
+        leg = kernel
+        if isinstance(po, int):
+            leg += f", deg {po}"
+        cap_parts.append(leg)
+    cutoff = p.get("cutoff")
+    rv = p.get("running_variable")
+    if cutoff is not None and isinstance(rv, str):
+        cap_parts.append(f"cutoff: {rv} = {_fmt_num(cutoff)}")
+    caption = " · ".join(cap_parts)
+    return f"{table}\n\n{caption}" if caption else table
+
+
+def _render_kaplan_meier(p: dict[str, Any]) -> str | None:
+    """Median survival + S(t) at preset horizons. The full step
+    function isn't in the payload by design (privacy carve-out);
+    this renderer shows the horizon-scalar safe form."""
+    rows: list[list[str]] = []
+    median = p.get("median_survival_time")
+    if isinstance(median, (int, float)) and math.isfinite(float(median)):
+        ci_lo = p.get("median_survival_ci_lower")
+        ci_hi = p.get("median_survival_ci_upper")
+        ci_str = (
+            f"[{_fmt_num(ci_lo)}, {_fmt_num(ci_hi)}]"
+            if ci_lo is not None and ci_hi is not None else ""
+        )
+        rows.append(["Median", _fmt_num(median), "", ci_str])
+    for h in ("1y", "3y", "5y", "10y"):
+        s = p.get(f"survival_at_{h}")
+        if not isinstance(s, (int, float)):
+            continue
+        n_risk = p.get(f"n_at_risk_{h}")
+        ci_lo = p.get(f"survival_at_{h}_ci_lower")
+        ci_hi = p.get(f"survival_at_{h}_ci_upper")
+        ci_str = (
+            f"[{_fmt_num(ci_lo)}, {_fmt_num(ci_hi)}]"
+            if ci_lo is not None and ci_hi is not None else ""
+        )
+        rows.append([
+            f"S({h})", _fmt_num(s),
+            _fmt_int(n_risk) if n_risk is not None else "",
+            ci_str,
+        ])
+    if not rows:
+        return None
+    header = ["Quantity", "Estimate", "N at risk", "95% CI"]
+    table = _markdown_table(header, rows)
+
+    cap_parts: list[str] = []
+    n_subj = p.get("n_subjects")
+    n_fail = p.get("n_failures")
+    if isinstance(n_subj, int):
+        leg = f"subjects = {n_subj:,}"
+        if isinstance(n_fail, int):
+            leg += f" · events = {n_fail:,}"
+        cap_parts.append(leg)
+    lr_chi = p.get("logrank_chi_squared")
+    lr_p = p.get("logrank_p_value")
+    n_groups = p.get("n_groups")
+    if isinstance(lr_chi, (int, float)) and math.isfinite(float(lr_chi)):
+        leg = f"log-rank χ² = {_fmt_num(lr_chi)}"
+        if isinstance(lr_p, (int, float)) and math.isfinite(float(lr_p)):
+            leg += f" (p = {_fmt_pvalue(lr_p)})"
+        if isinstance(n_groups, int):
+            leg += f" across {n_groups} groups"
+        cap_parts.append(leg)
+    caption = " · ".join(cap_parts)
+    return f"{table}\n\n{caption}" if caption else table
+
+
+def _render_factor_decomposition(p: dict[str, Any]) -> str | None:
+    """Loadings matrix (variable × component) with explained-variance
+    in the caption.
+
+    Renders one row per variable, one column per component, with
+    loadings as cell values. The explained-variance / cumulative-
+    variance / eigenvalues live in the caption since they're per-
+    component aggregates rather than per-variable. KMO + Bartlett +
+    chi² also land in the caption when present.
+    """
+    loadings = p.get("loadings") or {}
+    if not isinstance(loadings, dict) or not loadings:
+        return None
+    variables = p.get("variables") or sorted(loadings.keys())
+    components = p.get("components") or []
+    if not isinstance(variables, list) or not isinstance(components, list):
+        return None
+    header = ["Variable"] + list(components)
+    rows: list[list[str]] = []
+    for v in variables:
+        row = [str(v)]
+        v_loadings = loadings.get(v, {}) if isinstance(loadings.get(v), dict) else {}
+        for c in components:
+            row.append(_fmt_num(v_loadings.get(c)))
+        rows.append(row)
+    table = _markdown_table(header, rows)
+
+    cap_parts: list[str] = []
+    method = p.get("method")
+    if isinstance(method, str):
+        cap_parts.append(method.replace("_", " "))
+    rot = p.get("rotation")
+    if isinstance(rot, str) and rot != "none":
+        cap_parts.append(f"rotation: {rot}")
+    n_obs = p.get("n_observations")
+    if isinstance(n_obs, int):
+        cap_parts.append(f"n = {n_obs:,}")
+    # Variance summary per component.
+    evr = p.get("explained_variance_ratio") or {}
+    if isinstance(evr, dict) and evr:
+        parts = []
+        for c in components:
+            if c in evr:
+                parts.append(f"{c}: {evr[c]*100:.1f}%")
+        if parts:
+            cap_parts.append("variance: " + ", ".join(parts))
+    cum = p.get("cumulative_variance") or {}
+    if isinstance(cum, dict) and cum and components:
+        # Show only the final cumulative (most informative).
+        last = components[-1]
+        if last in cum:
+            cap_parts.append(f"cumulative: {cum[last]*100:.1f}%")
+    # Goodness-of-fit summary for ML-FA.
+    kmo = p.get("kmo")
+    if isinstance(kmo, (int, float)) and math.isfinite(float(kmo)):
+        cap_parts.append(f"KMO = {_fmt_num(kmo)}")
+    chi2 = p.get("chi_squared")
+    chi2_p = p.get("chi_squared_p_value")
+    if isinstance(chi2, (int, float)) and math.isfinite(float(chi2)):
+        leg = f"χ² = {_fmt_num(chi2)}"
+        if isinstance(chi2_p, (int, float)) and math.isfinite(float(chi2_p)):
+            leg += f" (p = {_fmt_pvalue(chi2_p)})"
+        cap_parts.append(leg)
+    caption = " · ".join(cap_parts)
+    return f"{table}\n\n{caption}" if caption else table
+
+
+def _render_cluster_analysis(p: dict[str, Any]) -> str | None:
+    """Centroids matrix (cluster × variable) with cluster sizes
+    column.
+
+    The "Size" column is the SDC-relevant info — small clusters
+    were already suppressed by the sanitizer, but the surviving
+    cluster sizes are still load-bearing context for the model.
+    Centroid values are precision-clamped per-cluster by the
+    sanitizer; the renderer just formats whatever survived.
+    """
+    centroids = p.get("centroids") or {}
+    if not isinstance(centroids, dict) or not centroids:
+        return None
+    cluster_labels = p.get("cluster_labels") or sorted(centroids.keys())
+    variables = p.get("variables") or []
+    if not isinstance(variables, list) or not isinstance(cluster_labels, list):
+        return None
+    sizes = p.get("cluster_sizes") or {}
+    header = ["Cluster", "Size"] + list(variables)
+    rows: list[list[str]] = []
+    for cl in cluster_labels:
+        row = [str(cl)]
+        row.append(_fmt_int(sizes.get(cl)))
+        cl_centroid = centroids.get(cl, {}) if isinstance(centroids.get(cl), dict) else {}
+        for v in variables:
+            row.append(_fmt_num(cl_centroid.get(v)))
+        rows.append(row)
+    table = _markdown_table(header, rows)
+
+    cap_parts: list[str] = []
+    method = p.get("method")
+    if isinstance(method, str):
+        cap_parts.append(method.replace("_", "-"))
+    n_obs = p.get("n_observations")
+    if isinstance(n_obs, int):
+        cap_parts.append(f"n = {n_obs:,}")
+    n_cl = p.get("n_clusters")
+    if isinstance(n_cl, int):
+        cap_parts.append(f"k = {n_cl}")
+    ss_ratio = p.get("ss_ratio")
+    if isinstance(ss_ratio, (int, float)) and math.isfinite(float(ss_ratio)):
+        cap_parts.append(f"between/total = {ss_ratio*100:.1f}%")
+    sil = p.get("silhouette_score")
+    if isinstance(sil, (int, float)) and math.isfinite(float(sil)):
+        cap_parts.append(f"silhouette = {_fmt_num(sil)}")
+    n_iter = p.get("n_iterations")
+    if isinstance(n_iter, int):
+        cap_parts.append(f"iter = {n_iter}")
+    caption = " · ".join(cap_parts)
+    return f"{table}\n\n{caption}" if caption else table
+
+
 _HANDLERS: dict[str, Any] = {
+    # Regression bucket — canonical descriptive name and legacy alias
+    # both render through the same function. Older stored results
+    # carry ``linear_regression``; new emissions carry the
+    # ``coefficient_table_with_fit_stats`` form.
+    "coefficient_table_with_fit_stats": _render_linear_regression,
     "linear_regression": _render_linear_regression,
     "t_test": _render_t_test,
     "descriptive": _render_descriptive,
@@ -650,6 +959,11 @@ _HANDLERS: dict[str, Any] = {
     "crosstab": _render_crosstab,
     "magnitude_table": _render_magnitude_table,
     "correlation_matrix": _render_correlation_matrix,
+    "did_event_study": _render_did_event_study,
+    "rdd": _render_rdd,
+    "kaplan_meier": _render_kaplan_meier,
+    "factor_decomposition": _render_factor_decomposition,
+    "cluster_analysis": _render_cluster_analysis,
 }
 
 

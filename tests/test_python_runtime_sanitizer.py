@@ -191,7 +191,10 @@ def test_from_lm_through_sanitizer(runtime) -> None:
     assert res.ok, (
         f"sanitizer rejected from_lm: {res.rejection_reason}"
     )
-    assert res.analysis_type == "linear_regression"
+    # Helper emits the canonical descriptive bucket name; legacy
+    # ``linear_regression`` is still accepted for back-compat with
+    # stored payloads but is no longer the freshly-emitted form.
+    assert res.analysis_type == "coefficient_table_with_fit_stats"
     assert "treatment" in res.sanitized.get("predictor_variables", [])
 
 

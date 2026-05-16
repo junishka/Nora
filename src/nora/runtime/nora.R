@@ -219,33 +219,62 @@ nora$result <- function(type, ...) {
 #' anything returns to the sanitizer), so printing here is only for
 #' the researcher's benefit.
 nora$from_lm <- function(model, ...) {
-  # Compute `summary` once — it's not free on large fits (it
-  # re-derives vcov, t/z stats, p-values), and the previous version
-  # called it twice (once for `print`, once to feed the helper). Pass
-  # the same object to `print` for the researcher's TUI panel.
   s <- summary(model)
   print(s)
-  ce <- as.data.frame(s$coefficients)
-  coefs <- as.list(ce[, "Estimate"])
-  names(coefs) <- rownames(ce)
-  ses <- as.list(ce[, "Std. Error"])
-  names(ses) <- rownames(ce)
-  # `lm` summaries name the test-stat columns "t value" / "Pr(>|t|)";
-  # `glm` summaries (logit, poisson, etc.) use "z value" / "Pr(>|z|)".
-  # Researchers naturally pass `glm(y ~ x, family = binomial)` to
-  # `from_lm` because `glm` extends `lm`, and the previous hardcoded
-  # column lookup failed with `Error: undefined columns selected`,
-  # aborting the script before the payload was written. Probe both
-  # naming conventions and fall back to positional access (col 3 is
-  # the test stat, col 4 the p-value) so other glm-like fits with
-  # exotic naming still emit a payload.
+
+  # Per-class dispatch — the previous version assumed an lm/glm shape
+  # ("Estimate" / "Std. Error" columns) and aborted with "undefined
+  # columns selected" on Cox (coxph) and fixest fits, both of which
+  # the comment block above claims to support. Now we detect class
+  # explicitly and route extraction.
+  is_cox    <- inherits(model, "coxph")
+  is_fixest <- inherits(model, "fixest")
+  is_mixed  <- inherits(model, "merMod")  # lmerMod, glmerMod, nlmerMod
+  is_glm    <- inherits(model, "glm") && !is_mixed
+  # ``glmerMod`` inherits from both glm and merMod; treat as mixed.
+  is_lm     <- inherits(model, "lm") && !is_glm && !is_cox && !is_fixest && !is_mixed
+
+  # Coefficient table location: fixest puts it in $coeftable, not
+  # $coefficients (the $coefficients slot on a fixest summary is the
+  # point-estimate vector).
+  ce <- if (is_fixest) {
+    as.data.frame(s$coeftable)
+  } else {
+    as.data.frame(s$coefficients)
+  }
   ce_cols <- colnames(ce)
+
+  # Estimate column: "Estimate" (lm/glm/fixest), "coef" (coxph), or
+  # positional fallback to col 1.
+  est_col <- if ("Estimate" %in% ce_cols) "Estimate" else
+             if ("coef"     %in% ce_cols) "coef"     else
+             ce_cols[1]
+  # SE column: "Std. Error" (lm/glm/fixest), "se(coef)" (coxph), or
+  # positional fallback to col 2 (Cox has exp(coef) in col 2 — that's
+  # wrong, but we never reach this branch because "se(coef)" is the
+  # only hit on coxph).
+  se_col  <- if ("Std. Error" %in% ce_cols) "Std. Error" else
+             if ("se(coef)"   %in% ce_cols) "se(coef)"   else
+             ce_cols[2]
+  # Test-stat column: t value (lm/fixest), z value (glm), z (coxph).
   stat_col <- if ("t value" %in% ce_cols) "t value" else
               if ("z value" %in% ce_cols) "z value" else
+              if ("z"       %in% ce_cols) "z"       else
               if (ncol(ce) >= 3) ce_cols[3] else NA_character_
+  # p-value column: prefer named matches, then fall back to the LAST
+  # column when there are at least 4 columns (Cox has 5 with
+  # Pr(>|z|) at position 5; lm/glm have 4 with Pr at position 4).
+  # ``lmer`` without ``lmerTest`` emits only 3 columns (no p-value
+  # at all) — the unconditional ``ce_cols[ncol(ce)]`` fallback used
+  # to land on "t value" and mis-stamp it as p_values. The
+  # ncol >= 4 guard refuses the fallback for the 3-column shape so
+  # the helper omits p_values rather than misreports them.
   p_col <- if ("Pr(>|t|)" %in% ce_cols) "Pr(>|t|)" else
            if ("Pr(>|z|)" %in% ce_cols) "Pr(>|z|)" else
-           if (ncol(ce) >= 4) ce_cols[4] else NA_character_
+           if (ncol(ce) >= 4) ce_cols[ncol(ce)] else NA_character_
+
+  coefs <- as.list(ce[, est_col]); names(coefs) <- rownames(ce)
+  ses   <- as.list(ce[, se_col]);  names(ses)   <- rownames(ce)
   tvals <- if (!is.na(stat_col)) {
     v <- as.list(ce[, stat_col]); names(v) <- rownames(ce); v
   } else NULL
@@ -253,50 +282,273 @@ nora$from_lm <- function(model, ...) {
     v <- as.list(ce[, p_col]); names(v) <- rownames(ce); v
   } else NULL
 
-  response <- as.character(attr(model$terms, "variables")[[2]])
-  # Wrap in `as.list(...)` so a single-predictor model serializes as the
-  # JSON array `["x"]` not the bare string `"x"` — the sanitizer's
-  # `predictor_variables` field expects a list of strings.
-  predictors <- as.list(as.character(attr(model$terms, "term.labels")))
+  # Response / predictors. For Cox the LHS is Surv(time, event) — a
+  # call, not a symbol. ``all.vars()`` returns the variable names in
+  # order, so all.vars(Surv(t_obs, cens))[1] = "t_obs" is the time
+  # variable, which is the right thing to report as the response.
+  lhs <- attr(terms(model), "variables")[[2]]
+  response <- all.vars(lhs)[1]
+  if (is_mixed) {
+    # ``term.labels`` for a merMod includes the random-effect
+    # grouping factors (e.g. "school" in ``y ~ x + (1 | school)``)
+    # alongside the fixed-effect predictors. fixef() returns just
+    # the fixed-effect coefficients; their names are the predictor
+    # surface the model thinks of as the "regressors of interest".
+    fe_names <- tryCatch(names(lme4::fixef(model)),
+                         error = function(e) character(0))
+    predictors <- as.list(fe_names[!fe_names %in%
+                                   c("(Intercept)", "intercept", "const")])
+  } else {
+    predictors <- as.list(as.character(attr(terms(model), "term.labels")))
+  }
 
-  f_value <- if (!is.null(s$fstatistic)) unname(s$fstatistic["value"]) else NULL
-  f_pvalue <- if (!is.null(s$fstatistic)) {
-    pf(s$fstatistic["value"], s$fstatistic["numdf"], s$fstatistic["dendf"],
-       lower.tail = FALSE)
-  } else NULL
-  if (!is.null(f_pvalue)) f_pvalue <- unname(f_pvalue)
+  # Sample size: nobs(coxph) returns the number of events, not records.
+  # m$n is records; m$nevent is failures. Use m$n for n on Cox so the
+  # SDC min-N gate sees the sample size, not the event count.
+  n_val <- if (is_cox) as.integer(model$n) else as.integer(nobs(model))
 
-  # Aggregate diagnostics — collinearity / numerical stability.
-  # Pure aggregates over the design matrix, no per-row leak.
-  # Computed natively in base R (no `car`, no `lmtest` dep) so the
-  # helper stays usable on minimal R installs. Failures are silent
-  # — the field is omitted rather than blowing up the emit.
-  vif_list <- tryCatch(nora$.compute_vif(model), error = function(e) NULL)
-  cond_num <- tryCatch(nora$.compute_condition_number(model),
-                       error = function(e) NULL)
-  vcov_nested <- tryCatch(nora$.compute_vcov(model), error = function(e) NULL)
+  # Aggregate diagnostics — collinearity / numerical stability. Pure
+  # aggregates over the design matrix, no per-row leak. Failures are
+  # silent — the field is omitted rather than blowing up the emit.
+  vif_list    <- tryCatch(nora$.compute_vif(model),               error = function(e) NULL)
+  cond_num    <- tryCatch(nora$.compute_condition_number(model),  error = function(e) NULL)
+  vcov_nested <- tryCatch(nora$.compute_vcov(model),              error = function(e) NULL)
 
   args <- list(
-    type = "linear_regression",
-    n = as.integer(nobs(model)),
+    # ``coefficient_table_with_fit_stats`` is the canonical bucket
+    # name (covers OLS / glm / coxph / fixest — anything that emits
+    # a coefficient table). ``linear_regression`` is kept as a
+    # legacy alias in the sanitizer's dispatch table for back-compat
+    # with stored payloads; new emissions use the descriptive name
+    # so the model sees a type that matches what's in the bucket.
+    type = "coefficient_table_with_fit_stats",
+    n = n_val,
     response_variable = response,
     predictor_variables = predictors,
     coefficients = coefs,
     standard_errors = ses,
     t_statistics = tvals,
-    p_values = pvals,
-    r_squared = s$r.squared,
-    adj_r_squared = s$adj.r.squared,
-    f_statistic = f_value,
-    f_p_value = f_pvalue,
-    degrees_of_freedom = as.integer(s$df[2]),
-    residual_std_error = s$sigma
+    p_values = pvals
   )
+
+  # Estimator-appropriate fit metrics. Each branch only emits fields
+  # that are meaningful for its class — emitting r_squared on a glm
+  # fit (where summary()$r.squared is NULL) used to ride along as a
+  # null and force the sanitizer to drop it with a transformation
+  # note on every GLM payload.
+  if (is_lm) {
+    args$r_squared          <- s$r.squared
+    args$adj_r_squared      <- s$adj.r.squared
+    args$residual_std_error <- s$sigma
+    args$degrees_of_freedom <- as.integer(s$df[2])
+    if (!is.null(s$fstatistic)) {
+      args$f_statistic <- unname(s$fstatistic["value"])
+      args$f_p_value   <- unname(pf(s$fstatistic["value"],
+                                    s$fstatistic["numdf"],
+                                    s$fstatistic["dendf"],
+                                    lower.tail = FALSE))
+    }
+  }
+  if (is_glm) {
+    # McFadden-equivalent for GLM: 1 - residual_deviance/null_deviance.
+    # Deviance ratio matches McFadden when the link is canonical; for
+    # non-canonical links it's the conventional GLM pseudo-R² reported
+    # by Stata's ``glm`` and statsmodels' ``.prsquared``.
+    if (!is.null(model$null.deviance) && !is.null(model$deviance) &&
+        is.finite(model$null.deviance) && is.finite(model$deviance) &&
+        model$null.deviance > 0) {
+      args$pseudo_r_squared <- 1 - model$deviance / model$null.deviance
+      chi2 <- model$null.deviance - model$deviance
+      df_chi <- tryCatch(
+        as.integer(model$df.null - model$df.residual),
+        error = function(e) NA_integer_
+      )
+      if (!is.na(df_chi) && df_chi > 0 && chi2 >= 0) {
+        args$chi_squared <- as.numeric(chi2)
+        args$chi_squared_p_value <- as.numeric(
+          pchisq(chi2, df = df_chi, lower.tail = FALSE)
+        )
+      }
+    }
+    if (!is.null(model$df.residual)) {
+      args$degrees_of_freedom <- as.integer(model$df.residual)
+    }
+    ll <- tryCatch(as.numeric(logLik(model)), error = function(e) NULL)
+    if (!is.null(ll) && is.finite(ll)) args$log_likelihood <- ll
+    aic_v <- tryCatch(as.numeric(AIC(model)), error = function(e) NULL)
+    if (!is.null(aic_v) && is.finite(aic_v)) args$aic <- aic_v
+    bic_v <- tryCatch(as.numeric(BIC(model)), error = function(e) NULL)
+    if (!is.null(bic_v) && is.finite(bic_v)) args$bic <- bic_v
+  }
+  if (is_cox) {
+    # Cox PH: subject + failure counts, Harrell's C, LR test, log-lik.
+    if (!is.null(model$n))      args$n_subjects <- as.integer(model$n)
+    if (!is.null(model$nevent)) args$n_failures <- as.integer(model$nevent)
+    cs <- tryCatch(s$concordance, error = function(e) NULL)
+    if (!is.null(cs) && length(cs) >= 1 && is.finite(cs[1])) {
+      args$concordance <- as.numeric(cs[1])
+    }
+    lr <- tryCatch(s$logtest, error = function(e) NULL)
+    if (!is.null(lr) && length(lr) >= 3 &&
+        is.finite(lr["test"]) && is.finite(lr["pvalue"])) {
+      args$chi_squared <- as.numeric(lr["test"])
+      args$chi_squared_p_value <- as.numeric(lr["pvalue"])
+    }
+    ll <- tryCatch(as.numeric(logLik(model)), error = function(e) NULL)
+    if (!is.null(ll) && is.finite(ll)) args$log_likelihood <- ll
+    aic_v <- tryCatch(as.numeric(AIC(model)), error = function(e) NULL)
+    if (!is.null(aic_v) && is.finite(aic_v)) args$aic <- aic_v
+    bic_v <- tryCatch(as.numeric(BIC(model)), error = function(e) NULL)
+    if (!is.null(bic_v) && is.finite(bic_v)) args$bic <- bic_v
+  }
+  if (is_mixed) {
+    # lme4::lmer / glmer / nlmer. Fixed-effects coefficient table is
+    # already extracted via the standard ``summary(m)$coefficients``
+    # path (Estimate / Std. Error / t-or-z / optional p). What's
+    # specific to mixed models: variance components, per-level
+    # group counts, REML vs ML fit method, ICC for one-level fits.
+    #
+    # Variance components live in ``VarCorr(model)`` — a list of
+    # per-group covariance matrices plus an ``sc`` attribute for
+    # residual SD. Each matrix's diagonal entries are variances
+    # (random-intercept variance, random-slope variance). We emit
+    # *variances* — sqrt'd values would duplicate signal and the
+    # intercept-slope covariance stays inside ``vcov`` for callers
+    # that genuinely need it.
+    vc <- tryCatch(lme4::VarCorr(model), error = function(e) NULL)
+    re_var <- list()
+    if (!is.null(vc)) {
+      for (grp_name in names(vc)) {
+        mat <- vc[[grp_name]]
+        if (!is.matrix(mat)) next
+        rn <- rownames(mat)
+        if (is.null(rn)) next
+        for (i in seq_along(rn)) {
+          v <- as.numeric(mat[i, i])
+          if (!is.finite(v) || v < 0) next
+          key <- if (rn[i] %in% c("(Intercept)", "intercept"))
+                    grp_name else paste0(grp_name, ".", rn[i])
+          re_var[[key]] <- v
+        }
+      }
+      sc <- attr(vc, "sc")
+      if (!is.null(sc) && length(sc) == 1 && is.finite(sc) && sc >= 0) {
+        re_var[["residual"]] <- as.numeric(sc^2)
+      }
+    }
+    if (length(re_var) > 0) args$random_effects_variance <- re_var
+
+    # Per-level group counts. lme4::ngrps() returns a named integer
+    # vector keyed by grouping-factor name. Same disclosure profile
+    # as ``fixed_effects`` and ``n_clusters`` — column name +
+    # cardinality, no level identities.
+    ng <- tryCatch(lme4::ngrps(model), error = function(e) NULL)
+    if (!is.null(ng) && length(ng) > 0) {
+      ng_dict <- list()
+      for (i in seq_along(ng)) {
+        ng_dict[[names(ng)[i]]] <- as.integer(ng[i])
+      }
+      args$n_groups_per_level <- ng_dict
+    }
+
+    # Fit method. ``isREML(m)`` for lmer, FALSE for glmer (always ML).
+    # ``getME(model, "is_REML")`` works across the merMod hierarchy.
+    is_reml <- tryCatch(lme4::isREML(model), error = function(e) NULL)
+    if (!is.null(is_reml)) {
+      args$fit_method <- if (isTRUE(is_reml)) "REML" else "ML"
+    }
+
+    # Intraclass correlation — only well-defined for one-grouping,
+    # intercept-only random-effect specifications. Compute as
+    # sigma_u² / (sigma_u² + sigma_e²) when there's exactly one
+    # group + a residual term in ``random_effects_variance``.
+    if (length(re_var) == 2 && "residual" %in% names(re_var)) {
+      grp_var_name <- setdiff(names(re_var), "residual")
+      if (length(grp_var_name) == 1) {
+        s_u2 <- re_var[[grp_var_name]]
+        s_e2 <- re_var[["residual"]]
+        if (is.finite(s_u2) && is.finite(s_e2) && (s_u2 + s_e2) > 0) {
+          args$icc <- as.numeric(s_u2 / (s_u2 + s_e2))
+        }
+      }
+    }
+
+    ll <- tryCatch(as.numeric(logLik(model)), error = function(e) NULL)
+    if (!is.null(ll) && is.finite(ll)) args$log_likelihood <- ll
+    aic_v <- tryCatch(as.numeric(AIC(model)), error = function(e) NULL)
+    if (!is.null(aic_v) && is.finite(aic_v)) args$aic <- aic_v
+    bic_v <- tryCatch(as.numeric(BIC(model)), error = function(e) NULL)
+    if (!is.null(bic_v) && is.finite(bic_v)) args$bic <- bic_v
+    n_obs <- tryCatch(as.integer(nobs(model)), error = function(e) NULL)
+    if (!is.null(n_obs)) args$n <- n_obs
+    df_resid <- tryCatch(as.integer(df.residual(model)), error = function(e) NULL)
+    if (!is.null(df_resid) && !is.na(df_resid)) args$degrees_of_freedom <- df_resid
+  }
+  if (is_fixest) {
+    # fixest::feols (and family). Coefficients and SE columns are
+    # already extracted above; here we add fit metrics, absorbed-FE
+    # cardinality, and cluster-robust metadata. Critically: emit
+    # FE-dimension SIZES, never the level identifiers themselves —
+    # listing the 1,247 firms is not OK, reporting "firm FE absorbed,
+    # 1,247 levels" is. Same rule for cluster cardinalities.
+    r2 <- tryCatch(
+      fixest::fitstat(model, type = "r2", verbose = FALSE)$r2,
+      error = function(e) NULL
+    )
+    if (!is.null(r2) && is.finite(r2)) args$r_squared <- as.numeric(r2)
+    ar2 <- tryCatch(
+      fixest::fitstat(model, type = "ar2", verbose = FALSE)$ar2,
+      error = function(e) NULL
+    )
+    if (!is.null(ar2) && is.finite(ar2)) args$adj_r_squared <- as.numeric(ar2)
+    ll <- tryCatch(as.numeric(logLik(model)), error = function(e) NULL)
+    if (!is.null(ll) && is.finite(ll)) args$log_likelihood <- ll
+    aic_v <- tryCatch(as.numeric(AIC(model)), error = function(e) NULL)
+    if (!is.null(aic_v) && is.finite(aic_v)) args$aic <- aic_v
+    bic_v <- tryCatch(as.numeric(BIC(model)), error = function(e) NULL)
+    if (!is.null(bic_v) && is.finite(bic_v)) args$bic <- bic_v
+    fv <- model$fixef_vars
+    fs <- model$fixef_sizes
+    if (!is.null(fv) && !is.null(fs) && length(fv) == length(fs) && length(fv) > 0) {
+      fe_summary <- list()
+      for (i in seq_along(fv)) {
+        fe_summary[[as.character(fv[i])]] <- as.integer(fs[i])
+      }
+      args$fixed_effects <- fe_summary
+    }
+    # Cluster-robust SE metadata. fixest stores the cluster formula
+    # in m$call$cluster (e.g. ``~g`` or ``~g + h`` for two-way).
+    # ``attr(summary(m)$cov.scaled, "G")`` carries per-dimension
+    # cluster counts as an integer vector when single-dim; for
+    # multi-way it collapses to a single value (the minimum count)
+    # so we can't always recover per-dim counts cleanly. Emit the
+    # NAME list always; emit ``n_clusters`` only when the count
+    # vector matches the name vector in length (single-dim case).
+    cl_call <- tryCatch(model$call$cluster, error = function(e) NULL)
+    if (!is.null(cl_call)) {
+      cl_names <- tryCatch(all.vars(cl_call), error = function(e) character(0))
+      if (length(cl_names) > 0) {
+        args$cluster_variables <- as.list(cl_names)
+        args$robust_se_type <- "cluster"
+        Gvec <- tryCatch(
+          attr(s$cov.scaled, "G"),
+          error = function(e) NULL
+        )
+        if (!is.null(Gvec) && length(Gvec) == length(cl_names)) {
+          nc <- list()
+          for (i in seq_along(cl_names)) {
+            nc[[cl_names[i]]] <- as.integer(Gvec[i])
+          }
+          args$n_clusters <- nc
+        }
+      }
+    }
+  }
+
   if (!is.null(vif_list) && length(vif_list) > 0) args$vif <- vif_list
   if (!is.null(cond_num)) args$condition_number <- cond_num
-  if (!is.null(vcov_nested) && length(vcov_nested) > 0) {
-    args$vcov <- vcov_nested
-  }
+  if (!is.null(vcov_nested) && length(vcov_nested) > 0) args$vcov <- vcov_nested
+
   do.call(nora$result, c(args, list(...)))
 }
 
@@ -365,6 +617,1052 @@ nora$.compute_condition_number <- function(model) {
   if (is.null(X)) return(NULL)
   k <- tryCatch(kappa(X, exact = TRUE), error = function(e) NULL)
   if (is.null(k) || !is.finite(k)) NULL else as.numeric(k)
+}
+
+
+#' From a clustering fit (``stats::kmeans`` or ``stats::hclust``),
+#' emit a cluster_analysis payload.
+#'
+#' Dispatches on class:
+#'   * ``kmeans`` — read cluster sizes, centroids, within-SS from
+#'     the fit directly; no extra data needed.
+#'   * ``hclust`` — hierarchical fits don't store the data or a
+#'     cluster assignment (just the dendrogram). The caller must
+#'     pass ``data`` (the matrix the dendrogram was built on) and
+#'     ``k`` (the cut point), and the helper computes assignments
+#'     via ``cutree(fit, k=k)`` plus centroids and within-SS from
+#'     the data.
+#'
+#' DBSCAN / HDBSCAN intentionally aren't supported by this helper
+#' — their inference-adequacy story (density parameters, noise-
+#' point handling, no centroids by construction) is a separate
+#' design pass. The helper raises with a clear pointer to the
+#' generic ``nora$result(type="cluster_analysis", method="dbscan",
+#' ...)`` path until a dedicated helper ships.
+#'
+#' Per-observation cluster assignments are NOT emitted on any path
+#' — they're per-row data and have no slot on the allowlist. The
+#' sanitizer's whole-cluster suppression gate fires on sizes below
+#' ``min_n_descriptive`` and per-cluster precision clamping fires
+#' on surviving centroids.
+#'
+#' Examples:
+#'   # k-means
+#'   m <- kmeans(df[, c("age","income","tenure")], centers = 4, nstart = 10)
+#'   nora$from_cluster(m, variables = c("age","income","tenure"),
+#'                     label = "customer segmentation")
+#'
+#'   # Hierarchical (Ward) — data + k required
+#'   d <- dist(df[, c("age","income","tenure")])
+#'   h <- hclust(d, method = "ward.D2")
+#'   nora$from_cluster(h, data = df[, c("age","income","tenure")],
+#'                     k = 4,
+#'                     variables = c("age","income","tenure"),
+#'                     linkage = "ward",
+#'                     label = "ward clustering")
+nora$from_cluster <- function(fit, variables = NULL, data = NULL,
+                              k = NULL, linkage = NULL, label = NULL) {
+  if (inherits(fit, "kmeans")) {
+    return(nora$.from_kmeans_impl(fit, variables = variables, label = label))
+  }
+  if (inherits(fit, "hclust")) {
+    if (is.null(data) || is.null(k)) {
+      stop(
+        "nora$from_cluster: hierarchical fits need ``data`` (the matrix ",
+        "the dendrogram was built on) and ``k`` (the cut point) — hclust ",
+        "doesn't store either."
+      )
+    }
+    return(nora$.from_hclust_impl(fit, data = data, k = k,
+                                  variables = variables,
+                                  linkage = linkage, label = label))
+  }
+  if (inherits(fit, "dbscan") || inherits(fit, "hdbscan")) {
+    stop(
+      "nora$from_cluster: dedicated DBSCAN / HDBSCAN helper not yet ",
+      "shipped. Construct the payload via ",
+      "``nora$result(type=\"cluster_analysis\", method=\"dbscan\", ",
+      "cluster_sizes=..., n_noise_points=..., variables=..., ...)`` ",
+      "from the script — the cluster_analysis shape accepts dbscan ",
+      "with centroids absent."
+    )
+  }
+  stop(
+    "nora$from_cluster: unknown clustering class ", class(fit)[1],
+    ". Supported: kmeans, hclust. DBSCAN-family: use generic ",
+    "``nora$result(type=\"cluster_analysis\", ...)`` until a ",
+    "dedicated helper ships."
+  )
+}
+
+
+# kmeans extraction — internal implementation of from_cluster's
+# kmeans branch.
+nora$.from_kmeans_impl <- function(fit, variables = NULL, label = NULL) {
+  print(fit)
+  centers <- fit$centers
+  if (is.null(centers) || !is.matrix(centers)) {
+    stop("nora$from_kmeans: fit$centers is missing or not a matrix")
+  }
+  n_clusters <- nrow(centers)
+  n_features <- ncol(centers)
+
+  # Variable names: prefer centers's column names; else accept the
+  # caller's list; else fall back to feature_i.
+  if (is.null(variables)) {
+    vnames <- colnames(centers)
+    if (is.null(vnames) || any(!nzchar(vnames))) {
+      variables <- paste0("feature_", seq_len(n_features))
+    } else {
+      variables <- vnames
+    }
+  } else {
+    variables <- as.character(variables)
+    if (length(variables) != n_features) {
+      stop(sprintf(
+        "nora$from_kmeans: variables has %d entries but kmeans was fit on %d features",
+        length(variables), n_features
+      ))
+    }
+  }
+
+  cluster_labels <- paste0("cluster_", seq_len(n_clusters))
+  cluster_sizes <- list()
+  centroids <- list()
+  within_cluster_ss <- list()
+  for (i in seq_len(n_clusters)) {
+    cl <- cluster_labels[i]
+    cluster_sizes[[cl]] <- as.integer(fit$size[i])
+    centroid_row <- list()
+    for (j in seq_len(n_features)) {
+      centroid_row[[variables[j]]] <- as.numeric(centers[i, j])
+    }
+    centroids[[cl]] <- centroid_row
+    if (!is.null(fit$withinss) && length(fit$withinss) >= i) {
+      within_cluster_ss[[cl]] <- as.numeric(fit$withinss[i])
+    }
+  }
+
+  # Total N is the sum of cluster sizes.
+  n_obs <- sum(fit$size)
+  totss <- fit$totss
+  twss <- fit$tot.withinss
+  bss <- fit$betweenss
+
+  args <- list(
+    type = "cluster_analysis",
+    method = "kmeans",
+    distance_metric = "euclidean",
+    n_observations = as.integer(n_obs),
+    n_clusters = as.integer(n_clusters),
+    n_features = as.integer(n_features),
+    variables = as.list(variables),
+    cluster_labels = as.list(cluster_labels),
+    cluster_sizes = cluster_sizes,
+    centroids = centroids
+  )
+  if (length(within_cluster_ss) > 0) args$within_cluster_ss <- within_cluster_ss
+  if (!is.null(twss) && is.finite(twss)) args$total_within_ss <- as.numeric(twss)
+  if (!is.null(twss) && is.finite(twss)) args$inertia <- as.numeric(twss)
+  if (!is.null(bss) && is.finite(bss)) args$between_cluster_ss <- as.numeric(bss)
+  if (!is.null(totss) && is.finite(totss)) args$total_ss <- as.numeric(totss)
+  if (!is.null(totss) && is.finite(totss) && totss > 0) {
+    args$ss_ratio <- as.numeric(bss / totss)
+  }
+  if (!is.null(fit$iter) && is.finite(fit$iter)) {
+    args$n_iterations <- as.integer(fit$iter)
+  }
+  if (!is.null(label)) args$label <- as.character(label)
+  do.call(nora$result, args)
+}
+
+
+# Hierarchical extraction — internal implementation of from_cluster's
+# hclust branch. hclust stores only the dendrogram (merge matrix +
+# heights), not the data or any cluster assignment. The caller
+# passes ``data`` (the matrix the dendrogram was built on) and
+# ``k`` (the cut point); the helper computes cluster assignments
+# via ``cutree(fit, k = k)`` and centroids + within-SS from the
+# data + assignments.
+#
+# Privacy carve-out: the linkage matrix (``fit$merge``) and merge
+# heights (``fit$height``) are NOT emitted — they're per-merge
+# records over the data, structurally absent from the
+# cluster_analysis allowlist. The dendrogram lives on the
+# researcher's local R session.
+nora$.from_hclust_impl <- function(fit, data, k, variables = NULL,
+                                   linkage = NULL, label = NULL) {
+  if (!is.numeric(k) || length(k) != 1 || k < 2 || k != as.integer(k)) {
+    stop("nora$from_cluster: ``k`` must be a positive integer >= 2")
+  }
+  data <- as.matrix(data)
+  if (nrow(data) < 2 || ncol(data) < 1) {
+    stop("nora$from_cluster: ``data`` must be a non-degenerate matrix")
+  }
+  k <- as.integer(k)
+  if (is.null(variables)) {
+    vnames <- colnames(data)
+    if (is.null(vnames) || any(!nzchar(vnames))) {
+      variables <- paste0("feature_", seq_len(ncol(data)))
+    } else {
+      variables <- vnames
+    }
+  } else {
+    variables <- as.character(variables)
+    if (length(variables) != ncol(data)) {
+      stop(sprintf(
+        "nora$from_cluster: variables has %d entries but data has %d columns",
+        length(variables), ncol(data)
+      ))
+    }
+  }
+  print(fit)
+
+  # cutree returns an integer vector of length nrow(data) with
+  # cluster ids 1..k. NEVER emitted — per-observation assignments
+  # are structurally absent from the allowlist.
+  assignments <- stats::cutree(fit, k = k)
+  cluster_labels <- paste0("cluster_", seq_len(k))
+  cluster_sizes <- list()
+  centroids <- list()
+  within_cluster_ss <- list()
+  total_within_ss <- 0
+  grand_mean <- colMeans(data)
+  for (i in seq_len(k)) {
+    cl <- cluster_labels[i]
+    members <- which(assignments == i)
+    n_i <- length(members)
+    cluster_sizes[[cl]] <- as.integer(n_i)
+    if (n_i == 0) next
+    sub <- data[members, , drop = FALSE]
+    centroid_row <- list()
+    centroid_vec <- colMeans(sub)
+    for (j in seq_len(ncol(data))) {
+      centroid_row[[variables[j]]] <- as.numeric(centroid_vec[j])
+    }
+    centroids[[cl]] <- centroid_row
+    # within-cluster SS for cluster i = sum over members of
+    # ||x - centroid||² (squared Euclidean distance).
+    deviations <- sweep(sub, 2, centroid_vec, FUN = "-")
+    wss_i <- sum(deviations^2)
+    within_cluster_ss[[cl]] <- as.numeric(wss_i)
+    total_within_ss <- total_within_ss + wss_i
+  }
+  # Total SS (centered at grand mean); between-cluster SS = total - within.
+  total_ss <- sum(sweep(data, 2, grand_mean, FUN = "-")^2)
+  between_ss <- total_ss - total_within_ss
+
+  # Cut height: the merge height at which exactly k clusters
+  # remain. hclust's heights are in fit$height (length n-1).
+  cut_height <- NA_real_
+  if (!is.null(fit$height) && length(fit$height) >= (nrow(data) - k)) {
+    # The cut for k clusters is between the (n-k)-th and (n-k+1)-th
+    # merge heights; report the (n-k+1)-th as the threshold height
+    # (the height ABOVE which only k clusters remain).
+    idx <- length(fit$height) - k + 1
+    if (idx >= 1 && idx <= length(fit$height)) {
+      cut_height <- fit$height[idx]
+    }
+  }
+
+  args <- list(
+    type = "cluster_analysis",
+    method = "hierarchical",
+    distance_metric = if (!is.null(fit$dist.method)) fit$dist.method else "euclidean",
+    n_observations = as.integer(nrow(data)),
+    n_clusters = k,
+    n_features = as.integer(ncol(data)),
+    variables = as.list(variables),
+    cluster_labels = as.list(cluster_labels),
+    cluster_sizes = cluster_sizes,
+    centroids = centroids
+  )
+  if (length(within_cluster_ss) > 0) {
+    args$within_cluster_ss <- within_cluster_ss
+  }
+  args$total_within_ss <- as.numeric(total_within_ss)
+  args$inertia <- as.numeric(total_within_ss)
+  args$between_cluster_ss <- as.numeric(between_ss)
+  args$total_ss <- as.numeric(total_ss)
+  if (total_ss > 0) {
+    args$ss_ratio <- as.numeric(between_ss / total_ss)
+  }
+  # Linkage method: prefer caller's argument; else read from the
+  # fit's ``method`` slot (hclust stores ``"ward.D"`` /
+  # ``"ward.D2"`` / ``"complete"`` / ``"average"`` / ``"single"`` /
+  # ``"centroid"`` / ``"median"``). Normalize ward.D / ward.D2 to
+  # ``"ward"`` since the sanitizer's enum doesn't distinguish.
+  if (is.null(linkage)) linkage <- fit$method
+  if (!is.null(linkage)) {
+    linkage <- as.character(linkage)
+    if (grepl("^ward", linkage)) linkage <- "ward"
+    args$linkage <- linkage
+  }
+  if (is.finite(cut_height)) args$cut_height <- as.numeric(cut_height)
+  if (!is.null(label)) args$label <- as.character(label)
+  do.call(nora$result, args)
+}
+
+
+# Back-compat: ``nora$from_kmeans`` was the public name in earlier
+# releases. The class-dispatched ``from_cluster`` is the new
+# canonical entry point. Keep both during the transition.
+nora$from_kmeans <- function(fit, variables = NULL, label = NULL) {
+  nora$from_cluster(fit, variables = variables, label = label)
+}
+
+
+#' From a ``stats::prcomp`` fit, emit a factor_decomposition payload.
+#'
+#' Wraps base R's ``prcomp`` (eigen-decomposition of the centered
+#' and optionally scaled data matrix). The payload carries the
+#' loadings matrix (variable × component), explained-variance
+#' ratios, cumulative variance, eigenvalues, and PCA-derived
+#' communalities. The full row × component factor-scores matrix
+#' (``fit$x``) is researcher-only by construction — no field in
+#' the sanitizer's ``factor_decomposition`` allowlist accepts it.
+#'
+#' By default we report all components prcomp computed (one per
+#' input variable). The ``n_components`` argument trims to the top-k
+#' for parsimony; the dropped components remain researcher-visible
+#' on the original fit object.
+#'
+#' Example:
+#'   m <- prcomp(df[, c("v1","v2","v3","v4","v5")], scale. = TRUE)
+#'   nora$from_pca(m, label = "five-variable PCA")
+#'
+#' To trim to the top three components:
+#'   nora$from_pca(m, n_components = 3)
+nora$from_pca <- function(fit, n_components = NULL, label = NULL) {
+  if (!inherits(fit, "prcomp")) {
+    stop("nora$from_pca: ``fit`` must be a prcomp object.")
+  }
+  print(fit)
+  rotation <- fit$rotation
+  if (is.null(rotation) || !is.matrix(rotation)) {
+    stop("nora$from_pca: fit$rotation is missing or not a matrix")
+  }
+  variables <- rownames(rotation)
+  comp_labels_full <- colnames(rotation)
+  total_k <- ncol(rotation)
+  if (is.null(n_components)) n_components <- total_k
+  n_components <- as.integer(min(n_components, total_k))
+  comp_labels <- comp_labels_full[seq_len(n_components)]
+
+  # nobs(fit) is the post-fit sample size. ``fit$x`` (the scores
+  # matrix) carries it row-wise; we never emit ``$x``, only the
+  # row count.
+  n_obs <- if (!is.null(fit$x)) nrow(fit$x) else NA_integer_
+
+  # Build loadings as {variable: {component: value}}.
+  loadings <- list()
+  for (v in variables) {
+    row <- list()
+    for (i in seq_len(n_components)) {
+      row[[comp_labels[i]]] <- as.numeric(rotation[v, i])
+    }
+    loadings[[v]] <- row
+  }
+
+  # Explained variance: sdev² is the variance per component (the
+  # eigenvalues when scale.=TRUE, since we work on the correlation
+  # matrix). Ratio = eigenvalue / sum(eigenvalues). Cumulative is
+  # the running sum.
+  eigenvalues_full <- as.numeric(fit$sdev^2)
+  total_var <- sum(eigenvalues_full)
+  ev_ratio_full <- eigenvalues_full / total_var
+  cum_var_full <- cumsum(ev_ratio_full)
+
+  eigenvalues <- list()
+  explained_variance <- list()
+  explained_variance_ratio <- list()
+  cumulative_variance <- list()
+  for (i in seq_len(n_components)) {
+    eigenvalues[[comp_labels[i]]] <- as.numeric(eigenvalues_full[i])
+    explained_variance[[comp_labels[i]]] <- as.numeric(eigenvalues_full[i])
+    explained_variance_ratio[[comp_labels[i]]] <- as.numeric(ev_ratio_full[i])
+    cumulative_variance[[comp_labels[i]]] <- as.numeric(cum_var_full[i])
+  }
+
+  # Communalities: sum of squared loadings across the retained
+  # components, per variable. = 1 when all components retained.
+  communalities <- list()
+  for (v in variables) {
+    h2 <- sum(rotation[v, seq_len(n_components)]^2)
+    communalities[[v]] <- as.numeric(h2)
+  }
+
+  args <- list(
+    type = "factor_decomposition",
+    method = "pca",
+    rotation = "none",
+    n_observations = as.integer(n_obs),
+    n_variables = as.integer(length(variables)),
+    n_components = n_components,
+    variables = as.list(variables),
+    components = as.list(comp_labels),
+    loadings = loadings,
+    explained_variance = explained_variance,
+    explained_variance_ratio = explained_variance_ratio,
+    cumulative_variance = cumulative_variance,
+    eigenvalues = eigenvalues,
+    communalities = communalities
+  )
+  if (!is.null(label)) args$label <- as.character(label)
+  do.call(nora$result, args)
+}
+
+
+#' From a Sun-Abraham interaction-weighted event-study fit, emit a
+#' did_event_study payload.
+#'
+#' Wraps ``fixest::feols()`` with ``fixest::sunab(cohort, time)`` in
+#' the formula — the interaction-weighted estimator from Sun &
+#' Abraham (2021). The estimator's natural output is one ATT per
+#' event-time (already aggregated across cohorts via IW weights),
+#' not per (cohort, event-time). We package this as a
+#' did_event_study payload with a single synthetic cohort ``"all"``
+#' whose ATT series IS the event-time aggregate; the
+#' ``estimator: "sun_abraham"`` field tells the model the
+#' aggregation happened inside the estimator.
+#'
+#' The caller passes ``n_treated`` (total treated units across the
+#' cohorts that fed the IW weights) so the cohort-N gate has its
+#' input. The helper can't recover this from the feols result
+#' without re-walking the data — better to make it explicit.
+#'
+#' Example:
+#'   m <- feols(y ~ sunab(cohort, period) | id + period,
+#'              data = df, cluster = ~id)
+#'   n_treated <- length(unique(df$id[df$cohort <= max(df$period)]))
+#'   nora$from_sun_abraham(m, n_treated = n_treated,
+#'                         outcome_variable = "y",
+#'                         treatment_variable = "cohort")
+nora$from_sun_abraham <- function(fit,
+                                  n_treated,
+                                  outcome_variable = NULL,
+                                  treatment_variable = NULL,
+                                  label = NULL,
+                                  event_time_pattern = "(period|event_time|rel_time|et)::([^:]+)") {
+  if (!inherits(fit, "fixest")) {
+    stop("nora$from_sun_abraham: ``fit`` must be a fixest::feols result")
+  }
+  if (missing(n_treated) || !is.numeric(n_treated) || n_treated < 0) {
+    stop("nora$from_sun_abraham: ``n_treated`` (total treated units) is required")
+  }
+  print(fit)
+
+  # fixest's aggregate() collapses the cohort-by-event-time
+  # interactions to per-event-time ATTs via IW weights. The
+  # pattern argument captures the event-time portion of the
+  # coefficient name (sunab produces names like "period::-3").
+  agg <- tryCatch(
+    aggregate(fit, event_time_pattern),
+    error = function(e) {
+      stop("nora$from_sun_abraham: aggregate(fit, ...) failed — was the fit ",
+           "produced via feols(y ~ sunab(cohort, time) | ...)? ",
+           "Error: ", conditionMessage(e))
+    }
+  )
+  if (is.null(agg) || nrow(agg) == 0) {
+    stop("nora$from_sun_abraham: aggregated coefficient table is empty")
+  }
+
+  # Extract event-time integer from each coefficient name.
+  coef_names <- rownames(agg)
+  m_extract <- regmatches(coef_names, regexec(event_time_pattern, coef_names))
+  # Use the LAST capture group as the event-time integer, regardless
+  # of how many groups the user supplied (default pattern has 2 groups
+  # — prefix + integer; caller may pass a pattern with 1 group).
+  # ``unname()`` strips any names ``sapply`` carries through from the
+  # matched coefficient names — without it, ``as.list(event_times)``
+  # would build a NAMED list, which the JSON serializer emits as an
+  # OBJECT, breaking the sanitizer's "event_times must be a list of
+  # finite numbers" check.
+  event_times <- unname(sapply(m_extract, function(x) {
+    if (length(x) >= 2) as.integer(x[length(x)]) else NA_integer_
+  }))
+  keep <- !is.na(event_times)
+  if (!any(keep)) {
+    stop("nora$from_sun_abraham: no event-time coefficients matched pattern")
+  }
+  event_times <- event_times[keep]
+  agg <- agg[keep, , drop = FALSE]
+
+  att_all <- list()
+  se_all  <- list()
+  p_all   <- list()
+  ci_lo   <- list()
+  ci_hi   <- list()
+  for (i in seq_along(event_times)) {
+    et_lab <- as.character(event_times[i])
+    est <- as.numeric(agg[i, "Estimate"])
+    se  <- as.numeric(agg[i, "Std. Error"])
+    pv  <- as.numeric(agg[i, "Pr(>|t|)"])
+    att_all[[et_lab]] <- est
+    se_all[[et_lab]]  <- se
+    p_all[[et_lab]]   <- pv
+    if (is.finite(est) && is.finite(se) && se > 0) {
+      ci_lo[[et_lab]] <- est - 1.96 * se
+      ci_hi[[et_lab]] <- est + 1.96 * se
+    }
+  }
+
+  args <- list(
+    type = "did_event_study",
+    estimator = "sun_abraham",
+    aggregation_method = "dynamic",
+    groups = list("all"),
+    event_times = as.list(sort(event_times)),
+    att = list(all = att_all),
+    standard_errors = list(all = se_all),
+    p_values = list(all = p_all),
+    ci_lower = list(all = ci_lo),
+    ci_upper = list(all = ci_hi),
+    n_treated_per_group = list(all = as.integer(n_treated))
+  )
+  if (!is.null(outcome_variable))   args$outcome_variable   <- as.character(outcome_variable)
+  if (!is.null(treatment_variable)) args$treatment_variable <- as.character(treatment_variable)
+  if (!is.null(label))              args$label              <- as.character(label)
+  do.call(nora$result, args)
+}
+
+
+#' From a TWFE event-study regression (any feols / lm with i(rel_time,
+#' treated, ref=0) style interactions), emit a did_event_study payload.
+#'
+#' Differs from Sun-Abraham only in the estimator label and the
+#' identification assumptions the model needs to know about
+#' (TWFE-ES is biased under treatment-effect heterogeneity; the
+#' Sun-Abraham IW estimator is the heterogeneity-robust version).
+#' Same single-synthetic-cohort payload shape.
+#'
+#' Caller passes ``event_time_pattern`` matching the coefficient
+#' names (regex with one capture group for the event-time integer).
+#' Default matches ``rel_time::N`` / ``event_time::N`` / ``period::N``.
+#'
+#' Example:
+#'   m <- feols(y ~ i(rel_time, treated, ref=-1) | id + period, data = df)
+#'   nora$from_twfe_event_study(m, n_treated = sum(df$treated > 0),
+#'                              outcome_variable = "y",
+#'                              event_time_pattern = "rel_time::([^:]+):")
+nora$from_twfe_event_study <- function(fit,
+                                       n_treated,
+                                       outcome_variable = NULL,
+                                       treatment_variable = NULL,
+                                       label = NULL,
+                                       event_time_pattern = "(rel_time|event_time|period|et)::([^:]+)") {
+  if (!inherits(fit, "fixest") && !inherits(fit, "lm")) {
+    stop("nora$from_twfe_event_study: ``fit`` must be feols or lm")
+  }
+  if (missing(n_treated) || !is.numeric(n_treated) || n_treated < 0) {
+    stop("nora$from_twfe_event_study: ``n_treated`` is required")
+  }
+  print(fit)
+
+  ct <- tryCatch(
+    if (inherits(fit, "fixest")) coeftable(fit) else as.data.frame(summary(fit)$coefficients),
+    error = function(e) stop("nora$from_twfe_event_study: coefficient table unreachable: ", conditionMessage(e))
+  )
+  if (is.null(ct) || nrow(ct) == 0) {
+    stop("nora$from_twfe_event_study: empty coefficient table")
+  }
+
+  coef_names <- rownames(ct)
+  m_extract <- regmatches(coef_names, regexec(event_time_pattern, coef_names))
+  # Use the LAST capture group as the event-time integer, regardless
+  # of how many groups the user supplied (default pattern has 2 groups
+  # — prefix + integer; caller may pass a pattern with 1 group).
+  # ``unname()`` strips any names ``sapply`` carries through from the
+  # matched coefficient names — without it, ``as.list(event_times)``
+  # would build a NAMED list, which the JSON serializer emits as an
+  # OBJECT, breaking the sanitizer's "event_times must be a list of
+  # finite numbers" check.
+  event_times <- unname(sapply(m_extract, function(x) {
+    if (length(x) >= 2) as.integer(x[length(x)]) else NA_integer_
+  }))
+  keep <- !is.na(event_times)
+  if (!any(keep)) {
+    stop("nora$from_twfe_event_study: no event-time coefficients matched ",
+         "the pattern. The default pattern matches rel_time::N / ",
+         "event_time::N / period::N — pass ``event_time_pattern`` if ",
+         "your design uses a different naming convention.")
+  }
+  event_times <- event_times[keep]
+  ct <- ct[keep, , drop = FALSE]
+
+  ce_cols <- colnames(ct)
+  est_col <- if ("Estimate" %in% ce_cols) "Estimate" else ce_cols[1]
+  se_col  <- if ("Std. Error" %in% ce_cols) "Std. Error" else ce_cols[2]
+  p_col   <- if ("Pr(>|t|)" %in% ce_cols) "Pr(>|t|)" else
+             if ("Pr(>|z|)" %in% ce_cols) "Pr(>|z|)" else
+             ce_cols[ncol(ct)]
+
+  att_all <- list(); se_all <- list(); p_all <- list()
+  ci_lo <- list(); ci_hi <- list()
+  for (i in seq_along(event_times)) {
+    et_lab <- as.character(event_times[i])
+    est <- as.numeric(ct[i, est_col])
+    se  <- as.numeric(ct[i, se_col])
+    pv  <- as.numeric(ct[i, p_col])
+    att_all[[et_lab]] <- est
+    se_all[[et_lab]]  <- se
+    p_all[[et_lab]]   <- pv
+    if (is.finite(est) && is.finite(se) && se > 0) {
+      ci_lo[[et_lab]] <- est - 1.96 * se
+      ci_hi[[et_lab]] <- est + 1.96 * se
+    }
+  }
+
+  args <- list(
+    type = "did_event_study",
+    estimator = "twfe_event_study",
+    aggregation_method = "dynamic",
+    groups = list("all"),
+    event_times = as.list(sort(event_times)),
+    att = list(all = att_all),
+    standard_errors = list(all = se_all),
+    p_values = list(all = p_all),
+    ci_lower = list(all = ci_lo),
+    ci_upper = list(all = ci_hi),
+    n_treated_per_group = list(all = as.integer(n_treated))
+  )
+  if (!is.null(outcome_variable))   args$outcome_variable   <- as.character(outcome_variable)
+  if (!is.null(treatment_variable)) args$treatment_variable <- as.character(treatment_variable)
+  if (!is.null(label))              args$label              <- as.character(label)
+  do.call(nora$result, args)
+}
+
+
+#' From a ``did::att_gt`` MP object, emit a did_event_study payload.
+#'
+#' Wraps the Callaway-Sant'Anna heterogeneous-treatment DiD estimator.
+#' The MP object carries pre-aggregation ATT(g, t) — one estimate per
+#' (cohort g, calendar time t). The helper:
+#'   * Pivots ATT(g, t) → ATT(g, event_time) where event_time = t - g
+#'   * Pulls per-cohort treated counts from
+#'     ``mp$DIDparams$cohort_counts`` (data.table with cohort + size)
+#'   * Optionally runs ``aggte(mp, type="dynamic")`` to add the
+#'     aggregate ATT and event-time-aggregated series
+#'   * Tags ``estimator: "callaway_santanna"``
+#'
+#' Privacy carve-out: the sanitizer's cohort-N gate fires on
+#' ``n_treated_per_group``. Cohorts below ``min_n_did_cohort`` are
+#' dropped *whole* (entire cohort row stripped from the ATT matrix);
+#' partial-cell publication would leak the cohort size through
+#' which cells survived. The helper emits the raw cohort sizes
+#' unchanged — the suppression decision belongs to the sanitizer.
+#'
+#' Example:
+#'   mp <- att_gt(yname = "y", tname = "period", idname = "id",
+#'                gname = "G", data = df,
+#'                control_group = "nevertreated")
+#'   nora$from_callaway_santanna(mp,
+#'     outcome_variable = "y", treatment_variable = "G",
+#'     label = "headline DiD")
+nora$from_callaway_santanna <- function(mp,
+                                        outcome_variable = NULL,
+                                        treatment_variable = NULL,
+                                        aggregation_method = "dynamic",
+                                        label = NULL, ...) {
+  if (!inherits(mp, "MP")) {
+    stop(
+      "nora$from_callaway_santanna: ``mp`` must be a did::att_gt result ",
+      "(an ``MP`` object). Run ``att_gt(...)`` first and pass the result."
+    )
+  }
+  print(mp)
+
+  # Cohort labels (treated cohorts in mp$group; sorted ascending).
+  cohorts <- sort(unique(mp$group))
+  if (length(cohorts) == 0) {
+    stop("nora$from_callaway_santanna: no treated cohorts found in mp$group")
+  }
+  cohort_labels <- as.character(cohorts)
+
+  # Event-time grid: union of (t - g) across all (g, t) entries.
+  event_times_all <- mp$t - mp$group
+  event_time_grid <- sort(unique(event_times_all))
+
+  # Build ATT(g, e) and SE(g, e) nested dicts.
+  att_dict <- list()
+  se_dict <- list()
+  ci_lo_dict <- list()
+  ci_hi_dict <- list()
+  for (g in cohorts) {
+    g_lab <- as.character(g)
+    att_dict[[g_lab]] <- list()
+    se_dict[[g_lab]] <- list()
+    ci_lo_dict[[g_lab]] <- list()
+    ci_hi_dict[[g_lab]] <- list()
+    idx <- which(mp$group == g)
+    # mp$c is the critical value for the CS uniform CI (one scalar);
+    # multiply by se to get per-cell CI half-widths.
+    crit <- if (!is.null(mp$c) && length(mp$c) >= 1 && is.finite(mp$c[1])) mp$c[1] else 1.96
+    for (i in idx) {
+      e <- mp$t[i] - mp$group[i]
+      e_lab <- as.character(e)
+      att_dict[[g_lab]][[e_lab]] <- as.numeric(mp$att[i])
+      se_dict[[g_lab]][[e_lab]] <- as.numeric(mp$se[i])
+      ci_lo_dict[[g_lab]][[e_lab]] <- as.numeric(mp$att[i] - crit * mp$se[i])
+      ci_hi_dict[[g_lab]][[e_lab]] <- as.numeric(mp$att[i] + crit * mp$se[i])
+    }
+  }
+
+  # Per-cohort treated counts. mp$DIDparams$cohort_counts is a
+  # data.table with rows {cohort, cohort_size}. Skip the never-
+  # treated row (cohort == Inf) and any cohort not in mp$group.
+  cc <- mp$DIDparams$cohort_counts
+  n_treated_per_group <- list()
+  if (!is.null(cc)) {
+    for (i in seq_len(nrow(cc))) {
+      g_val <- cc$cohort[i]
+      if (is.finite(g_val) && g_val %in% cohorts) {
+        n_treated_per_group[[as.character(g_val)]] <-
+          as.integer(cc$cohort_size[i])
+      }
+    }
+  }
+
+  args <- list(
+    type = "did_event_study",
+    estimator = "callaway_santanna",
+    groups = as.list(cohort_labels),
+    event_times = as.list(event_time_grid),
+    att = att_dict,
+    standard_errors = se_dict,
+    ci_lower = ci_lo_dict,
+    ci_upper = ci_hi_dict,
+    n_treated_per_group = n_treated_per_group,
+    aggregation_method = as.character(aggregation_method)
+  )
+  if (!is.null(outcome_variable))   args$outcome_variable   <- as.character(outcome_variable)
+  if (!is.null(treatment_variable)) args$treatment_variable <- as.character(treatment_variable)
+  if (!is.null(label))              args$label              <- as.character(label)
+
+  # Pass through CS config so the model knows the identification
+  # assumptions the estimator ran under.
+  ctrl_grp <- mp$DIDparams$control_group
+  if (!is.null(ctrl_grp) && nzchar(ctrl_grp)) {
+    args$comparison_group <- as.character(ctrl_grp)
+  }
+  antic <- mp$DIDparams$anticipation
+  if (!is.null(antic) && length(antic) == 1 && is.finite(antic)) {
+    args$anticipation_periods <- as.integer(antic)
+  }
+  bp <- mp$DIDparams$base_period
+  if (!is.null(bp) && nzchar(bp)) {
+    args$base_period <- as.character(bp)
+  }
+
+  # Aggregate scalars via aggte() — wrap in tryCatch because some
+  # data shapes (single cohort, balanced-only requests) can fail
+  # inside aggte; omit aggregate fields rather than blowing up the
+  # whole emit.
+  es <- tryCatch(
+    did::aggte(mp, type = aggregation_method),
+    error = function(e) NULL
+  )
+  if (!is.null(es)) {
+    if (!is.null(es$overall.att) && is.finite(es$overall.att)) {
+      args$aggregate_att <- as.numeric(es$overall.att)
+    }
+    if (!is.null(es$overall.se) && is.finite(es$overall.se)) {
+      args$aggregate_se <- as.numeric(es$overall.se)
+      # Two-sided z-test p-value for the aggregate.
+      if (es$overall.se > 0) {
+        z <- abs(es$overall.att / es$overall.se)
+        args$aggregate_p_value <- as.numeric(2 * pnorm(-z))
+        crit <- if (!is.null(es$crit.val.egt) && length(es$crit.val.egt) >= 1
+                    && is.finite(es$crit.val.egt[1])) es$crit.val.egt[1] else 1.96
+        args$aggregate_ci_lower <- as.numeric(es$overall.att - crit * es$overall.se)
+        args$aggregate_ci_upper <- as.numeric(es$overall.att + crit * es$overall.se)
+      }
+    }
+  }
+
+  do.call(nora$result, c(args, list(...)))
+}
+
+
+#' From an ``rdrobust`` fit, emit an ``rdd`` payload.
+#'
+#' Wraps the rdrobust package (CCT 2014) — the standard cross-language
+#' implementation maintained by Calonico-Cattaneo-Titiunik. The
+#' payload carries the three-flavor τ table (conventional, bias-
+#' corrected, robust), bandwidth(s), kernel, polynomial order,
+#' effective N per side, and the bandwidth selector name. For fuzzy
+#' RDD pass ``fuzzy_treatment_variable`` (the endogenous treatment
+#' indicator) so the estimator is tagged ``fuzzy_2sls``.
+#'
+#' Privacy carve-out is structural: the helper signature does not
+#' accept density / binscatter / mccrary arguments at all (not even
+#' to drop them). McCrary density tests and binscatter near the
+#' cutoff are visual diagnostics for the researcher; they have no
+#' field on the ``rdd`` shape's allowlist either, so even hand-
+#' crafted payloads through ``nora$result(type="rdd", ...)`` cannot
+#' smuggle them.
+#'
+#' Example:
+#'   m <- rdrobust(y, x, c = 50000)
+#'   nora$from_rdd(m, running_variable = "income",
+#'                 outcome_variable = "voted", label = "headline RDD")
+#'
+#'   # Fuzzy RDD: pass the treatment-receipt indicator.
+#'   m <- rdrobust(y, x, c = 50000, fuzzy = takeup)
+#'   nora$from_rdd(m, running_variable = "income",
+#'                 outcome_variable = "voted",
+#'                 fuzzy_treatment_variable = "takeup")
+nora$from_rdd <- function(fit,
+                          running_variable = NULL,
+                          outcome_variable = NULL,
+                          fuzzy_treatment_variable = NULL,
+                          first_stage_f = NULL,
+                          label = NULL, ...) {
+  if (!inherits(fit, "rdrobust")) {
+    stop(
+      "nora$from_rdd: ``fit`` must be an rdrobust object. ",
+      "Use rdrobust::rdrobust(y, x, c = cutoff) and pass the result."
+    )
+  }
+  # Privacy carve-out: refuse density/binscatter arguments if a
+  # researcher tries to pass them through ``...`` — these are
+  # researcher-only diagnostics for an RDD, not analytical fields.
+  extra <- list(...)
+  banned <- c("mccrary_density_curve", "mccrary_density",
+              "binscatter_bins", "binscatter", "density_curve")
+  for (b in banned) {
+    if (!is.null(extra[[b]])) {
+      stop(
+        "nora$from_rdd: ``", b, "`` is a visual diagnostic for the ",
+        "researcher and is not allowed on the rdd payload. The model ",
+        "sees the analytical fields (tau / bandwidth / effective N); ",
+        "ask the researcher qualitatively about manipulation evidence ",
+        "if it bears on the design."
+      )
+    }
+  }
+  print(fit)
+
+  args <- list(
+    type = "rdd",
+    estimator = if (!is.null(fuzzy_treatment_variable))
+                  "fuzzy_2sls" else "local_polynomial"
+  )
+  if (!is.null(running_variable))  args$running_variable  <- as.character(running_variable)
+  if (!is.null(outcome_variable))  args$outcome_variable  <- as.character(outcome_variable)
+  if (!is.null(label))             args$label             <- as.character(label)
+
+  # rdrobust's ``Estimate`` row is [tau.us, tau.bc, se.us, se.rb]:
+  #   tau.us = conventional point estimate
+  #   tau.bc = bias-corrected point estimate (also used for robust)
+  #   se.us  = conventional SE
+  #   se.rb  = robust SE
+  # rdrobust's ``se`` / ``pv`` / ``ci`` rows map to:
+  #   [1] Conventional, [2] Bias-Corrected, [3] Robust
+  if (!is.null(fit$Estimate) && is.matrix(fit$Estimate) && ncol(fit$Estimate) >= 4) {
+    args$tau_conventional   <- as.numeric(fit$Estimate[1, 1])
+    args$tau_bias_corrected <- as.numeric(fit$Estimate[1, 2])
+    args$tau_robust         <- as.numeric(fit$Estimate[1, 2])
+  }
+  if (!is.null(fit$se) && length(fit$se) >= 3) {
+    args$se_conventional   <- as.numeric(fit$se[1])
+    args$se_bias_corrected <- as.numeric(fit$se[2])
+    args$se_robust         <- as.numeric(fit$se[3])
+  }
+  if (!is.null(fit$pv) && length(fit$pv) >= 3) {
+    args$p_conventional   <- as.numeric(fit$pv[1])
+    args$p_bias_corrected <- as.numeric(fit$pv[2])
+    args$p_robust         <- as.numeric(fit$pv[3])
+  }
+  if (!is.null(fit$ci) && is.matrix(fit$ci) && nrow(fit$ci) >= 3 && ncol(fit$ci) >= 2) {
+    args$ci_lower_conventional   <- as.numeric(fit$ci[1, 1])
+    args$ci_upper_conventional   <- as.numeric(fit$ci[1, 2])
+    args$ci_lower_bias_corrected <- as.numeric(fit$ci[2, 1])
+    args$ci_upper_bias_corrected <- as.numeric(fit$ci[2, 2])
+    args$ci_lower_robust         <- as.numeric(fit$ci[3, 1])
+    args$ci_upper_robust         <- as.numeric(fit$ci[3, 2])
+  }
+
+  # Bandwidth(s): h = main, b = bias-correction. rdrobust stores
+  # them as a 2x2 matrix (rows = h/b, cols = left/right).
+  if (!is.null(fit$bws) && is.matrix(fit$bws) && nrow(fit$bws) >= 2 && ncol(fit$bws) >= 2) {
+    args$bandwidth_left  <- as.numeric(fit$bws[1, 1])
+    args$bandwidth_right <- as.numeric(fit$bws[1, 2])
+    args$bandwidth_bias_correction_left  <- as.numeric(fit$bws[2, 1])
+    args$bandwidth_bias_correction_right <- as.numeric(fit$bws[2, 2])
+  }
+
+  # Effective N inside the main bandwidth — the SDC-relevant counts
+  # that gate the rdd payload. rdrobust's ``N_h`` is a 2-vector
+  # [left, right].
+  if (!is.null(fit$N_h) && length(fit$N_h) >= 2) {
+    args$effective_n_left  <- as.integer(fit$N_h[1])
+    args$effective_n_right <- as.integer(fit$N_h[2])
+  }
+  args$polynomial_order <- as.integer(fit$p)
+  args$cutoff           <- as.numeric(fit$c)
+
+  if (!is.null(fit$bwselect)) {
+    args$bandwidth_selector <- as.character(fit$bwselect)
+  }
+  # rdrobust reports kernel capitalized ("Triangular"); the sanitizer
+  # accepts lowercase only.
+  if (!is.null(fit$kernel)) {
+    args$kernel <- tolower(as.character(fit$kernel))
+  }
+
+  # Fuzzy first-stage F. rdrobust doesn't compute this automatically;
+  # the caller passes it via the kwarg (compute first-stage F by
+  # regressing the endogenous-treatment indicator on the running-
+  # variable polynomial inside the bandwidth, then F-test the cutoff
+  # dummy).
+  if (!is.null(first_stage_f) && is.finite(as.numeric(first_stage_f))) {
+    args$first_stage_f <- as.numeric(first_stage_f)
+  }
+
+  do.call(nora$result, args)
+}
+
+
+#' From a survival::survfit fit, emit a kaplan_meier payload (safe form).
+#'
+#' The sanitizer's ``kaplan_meier`` shape ships median survival (with
+#' CI) plus survival at preset canonical horizons (``1y`` / ``3y`` /
+#' ``5y`` / ``10y``) — each gated by per-horizon ``n_at_risk_h``.
+#' The full step function (S(t) at every event time) is researcher-only
+#' by construction; this helper does NOT emit it.
+#'
+#' Time-unit translation is the caller's responsibility. The
+#' ``horizons`` argument is a named numeric vector mapping canonical
+#' labels to the numeric time in whatever units the fit was built in:
+#'
+#'   # Data measured in years
+#'   nora$from_kaplan_meier(fit, horizons = c("1y" = 1, "3y" = 3, "5y" = 5),
+#'                          time_variable = "t_obs", event_variable = "cens")
+#'
+#'   # Data measured in months
+#'   nora$from_kaplan_meier(fit, horizons = c("1y" = 12, "3y" = 36),
+#'                          time_variable = "follow_up_months",
+#'                          event_variable = "dead")
+#'
+#' For grouped / log-rank inference, pass the unstratified ``survfit``
+#' for the horizon scalars and the ``survdiff`` result separately so
+#' the helper can extract the chi² and df.
+#'
+#'   sd <- survdiff(Surv(t, e) ~ arm, data = df)
+#'   nora$from_kaplan_meier(survfit(Surv(t, e) ~ 1, data = df),
+#'                          horizons = c("1y" = 1, "3y" = 3),
+#'                          time_variable = "t", event_variable = "e",
+#'                          group_variable = "arm", survdiff = sd)
+nora$from_kaplan_meier <- function(fit, horizons = NULL,
+                                   time_variable = NULL,
+                                   event_variable = NULL,
+                                   group_variable = NULL,
+                                   survdiff = NULL,
+                                   label = NULL, ...) {
+  if (!inherits(fit, "survfit")) {
+    stop("nora$from_kaplan_meier: ``fit`` must be a survival::survfit object")
+  }
+  print(fit)
+  if (!is.null(fit$strata)) {
+    stop(
+      "nora$from_kaplan_meier: ``fit`` is stratified. Fit an UNSTRATIFIED ",
+      "survfit (e.g. ``survfit(Surv(t, e) ~ 1, data = df)``) for the ",
+      "horizon scalars and pass the ``survdiff`` result separately for ",
+      "log-rank inference."
+    )
+  }
+
+  args <- list(type = "kaplan_meier")
+  if (!is.null(time_variable))   args$time_variable   <- as.character(time_variable)
+  if (!is.null(event_variable))  args$event_variable  <- as.character(event_variable)
+  if (!is.null(group_variable))  args$group_variable  <- as.character(group_variable)
+  if (!is.null(label))           args$label           <- as.character(label)
+
+  args$n_subjects <- as.integer(fit$n)
+  args$n_failures <- as.integer(sum(fit$n.event))
+
+  # Median + CI. ``quantile.survfit`` returns NA when the curve doesn't
+  # cross 0.5 (heavily censored studies); omit those fields gracefully
+  # rather than emitting null and provoking a sanitizer transformation
+  # note on every KM payload.
+  med <- tryCatch(
+    quantile(fit, 0.5, conf.int = TRUE),
+    error = function(e) NULL
+  )
+  if (!is.null(med)) {
+    mq <- med$quantile; ml <- med$lower; mh <- med$upper
+    if (length(mq) >= 1 && is.finite(mq[1])) args$median_survival_time <- as.numeric(mq[1])
+    if (length(ml) >= 1 && is.finite(ml[1])) args$median_survival_ci_lower <- as.numeric(ml[1])
+    if (length(mh) >= 1 && is.finite(mh[1])) args$median_survival_ci_upper <- as.numeric(mh[1])
+  }
+
+  # Per-horizon S(t) and n.risk. ``horizons`` maps canonical labels
+  # to numeric time values in the fit's units. ``summary(fit, times=)``
+  # with ``extend = TRUE`` ensures lookups past the last event time
+  # return NA rather than dropping the row.
+  if (!is.null(horizons) && length(horizons) > 0) {
+    labels <- names(horizons)
+    if (is.null(labels) || any(!nzchar(labels))) {
+      stop(
+        "nora$from_kaplan_meier: ``horizons`` must be a NAMED vector ",
+        "mapping canonical labels (\"1y\", \"3y\", \"5y\", \"10y\") to ",
+        "numeric time values in the fit's units. Unnamed entries would ",
+        "ship without horizon labels the sanitizer can recognise."
+      )
+    }
+    times_at <- as.numeric(unname(horizons))
+    s <- tryCatch(
+      summary(fit, times = times_at, extend = TRUE),
+      error = function(e) NULL
+    )
+    if (!is.null(s)) {
+      for (i in seq_along(times_at)) {
+        lab <- labels[i]
+        s_val <- s$surv[i]
+        n_val <- s$n.risk[i]
+        if (!is.na(s_val) && is.finite(s_val)) {
+          args[[paste0("survival_at_", lab)]] <- as.numeric(s_val)
+        }
+        if (!is.na(n_val) && is.finite(n_val)) {
+          args[[paste0("n_at_risk_", lab)]] <- as.integer(n_val)
+        }
+        if (!is.null(s$lower)) {
+          lo <- s$lower[i]
+          if (!is.na(lo) && is.finite(lo)) {
+            args[[paste0("survival_at_", lab, "_ci_lower")]] <- as.numeric(lo)
+          }
+        }
+        if (!is.null(s$upper)) {
+          hi <- s$upper[i]
+          if (!is.na(hi) && is.finite(hi)) {
+            args[[paste0("survival_at_", lab, "_ci_upper")]] <- as.numeric(hi)
+          }
+        }
+      }
+    }
+  }
+
+  # Log-rank χ² across groups. ``survdiff`` from survival reports
+  # the chi² stat as ``$chisq`` and the df as ``length($n) - 1``
+  # (one DF per group beyond the reference). Compute the p-value
+  # via ``pchisq`` (chi² distribution upper tail).
+  if (!is.null(survdiff)) {
+    chi2 <- tryCatch(as.numeric(survdiff$chisq), error = function(e) NULL)
+    if (!is.null(chi2) && is.finite(chi2)) {
+      args$logrank_chi_squared <- chi2
+      df <- length(survdiff$n) - 1L
+      if (df >= 1) {
+        args$logrank_p_value <- as.numeric(
+          pchisq(chi2, df = df, lower.tail = FALSE)
+        )
+      }
+      args$n_groups <- as.integer(length(survdiff$n))
+    }
+  }
+
+  do.call(nora$result, c(args, list(...)))
 }
 
 
