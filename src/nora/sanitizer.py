@@ -292,6 +292,35 @@ _OLS_ALLOWED_NUMERIC_FIELDS: frozenset[str] = frozenset((
     # "ρ = 0.42, school explains 42% of variance" without the
     # researcher computing it post-hoc.
     "icc",
+    # Panel-data post-estimation diagnostics. All four are scalar
+    # test statistics + p-values derived from the fitted residual /
+    # within-transformed design — pure aggregates, no per-observation
+    # leak. Researchers report them alongside coefficient tables when
+    # justifying FE vs RE / homoskedasticity / serial correlation
+    # assumptions; without these slots the model has to ask the
+    # researcher to re-run the test rather than reading it from the
+    # payload.
+    #
+    #   * hausman_chi2 / hausman_p — Hausman test for FE vs RE.
+    #     H_0: random effects estimator is consistent. Reject → use FE.
+    #     R: plm::phtest(fixed, random); Python: linearmodels'
+    #     PanelOLS / RandomEffects comparison; Stata: hausman fe re.
+    #   * f_test_fe_chi2 / f_test_fe_p — F-test on the joint
+    #     significance of the fixed effects. Tests pooled OLS
+    #     versus FE; significant → FE is needed.
+    #     R: plm::pFtest(fixed, pooled); Stata: regress + xtreg, fe
+    #     reports as F( N-1, N(T-1)-k ) at the bottom of the table.
+    #   * breusch_pagan_chi2 / breusch_pagan_p — Breusch-Pagan LM test
+    #     for random effects. Significant → RE is preferred over
+    #     pooled OLS. R: plm::plmtest; Stata: xttest0.
+    #   * wooldridge_ar1_chi2 / wooldridge_ar1_p — Wooldridge test
+    #     for first-order serial correlation in idiosyncratic errors
+    #     in panel data. Significant → cluster SEs by panel unit are
+    #     mandatory. R: plm::pwartest / pbgtest; Stata: xtserial.
+    "hausman_chi2", "hausman_p",
+    "f_test_fe_chi2", "f_test_fe_p",
+    "breusch_pagan_chi2", "breusch_pagan_p",
+    "wooldridge_ar1_chi2", "wooldridge_ar1_p",
 ))
 _OLS_ALLOWED_INT_FIELDS: frozenset[str] = frozenset((
     "n", "degrees_of_freedom",
@@ -440,6 +469,32 @@ _OLS_ALLOWED_LIST_STRING: frozenset[str] = frozenset((
     # Helpers should emit this going forward; ``cluster_variable``
     # singular is kept for back-compat with stored payloads.
     "cluster_variables",
+))
+
+
+# Robust SE flavour enum. ``robust_se_type`` is already in the
+# string allowlist above; this set pins it to a small, documented
+# vocabulary so the model can interpret the variance estimator at a
+# glance without parsing free text. Helpers auto-detect from the
+# fit object (statsmodels ``cov_type``, fixest / sandwich attrs,
+# Stata ``e(vcetype)``) and map onto these canonical names; values
+# outside the set are dropped with a transformation note rather
+# than rejecting the whole payload (researchers running niche SE
+# variants get the coefficients through; only the label is
+# withheld).
+#
+#   * ``classical``       — model-based (homoskedastic) OLS SEs.
+#   * ``hc0`` / ``hc1``   — White / MacKinnon-White heteroskedastic.
+#   * ``hc2`` / ``hc3``   — leverage-adjusted heteroskedastic.
+#   * ``hac_newey_west``  — Newey-West HAC.
+#   * ``cluster``         — Cameron-Gelbach-Miller one/two-way.
+#   * ``bootstrap``       — case / wild / pairs bootstrap.
+_OLS_VALID_ROBUST_SE_TYPE: frozenset[str] = frozenset((
+    "classical",
+    "hc0", "hc1", "hc2", "hc3",
+    "hac_newey_west",
+    "cluster",
+    "bootstrap",
 ))
 
 
@@ -1452,6 +1507,22 @@ def _sanitize_linear_regression(
                 f"controlled and could carry raw data bytes)"
             )
         out[dict_field] = kept
+
+    # ``robust_se_type`` enum validation. The string allowlist above
+    # accepts the field; this gate normalises the value to the
+    # canonical small vocabulary so the model can interpret the
+    # variance estimator at a glance. Free-text values still pass
+    # ``safe_text`` and could fit in 40 chars, but a non-enum value
+    # is more likely a typo or a niche flavour we haven't pinned
+    # than something the model should reason on — drop it with a
+    # transformation note instead of leaking ambiguous strings.
+    rse = out.get("robust_se_type")
+    if rse is not None and rse not in _OLS_VALID_ROBUST_SE_TYPE:
+        transformations.append(
+            f"dropped 'robust_se_type' value (must be one of "
+            f"{sorted(_OLS_VALID_ROBUST_SE_TYPE)})"
+        )
+        del out["robust_se_type"]
 
     # Variance-covariance matrix (vcov). Optional, dict-of-dict-of-
     # numeric keyed on the same coefficient names. Pure aggregate from
@@ -3811,6 +3882,302 @@ def _sanitize_kaplan_meier(
 
 
 # ---------------------------------------------------------------------------
+# Marginal effects — per-variable AME / MEM / at-representative
+# ---------------------------------------------------------------------------
+#
+# Distinct from the regression bucket: marginal effects are scalars
+# of interest *derived* from a fitted model rather than the model's
+# raw coefficients. For a non-linear estimator (logit, probit,
+# Poisson, mixed-effects with non-identity link), the coefficient is
+# on the link scale; the model wants the marginal effect on the
+# response scale to interpret magnitude. Methods:
+#
+#   * **AME (average marginal effect)**: average of ∂E[y|x]/∂x_j
+#     across the sample. The de facto default for applied work; it
+#     reports the typical effect under the observed covariate
+#     distribution.
+#   * **MEM (marginal effect at the means)**: ∂E[y|x]/∂x_j evaluated
+#     at the sample mean covariate vector. Cheaper to compute and
+#     interpret but less honest when covariates have heavy-tailed
+#     distributions.
+#   * **At representative values**: evaluated at a caller-specified
+#     covariate vector (e.g. "treatment effect for a 45-year-old
+#     female"). The representative values are researcher-chosen
+#     constants — they ride alongside the effects as ``at_values``
+#     so the model knows the conditioning point.
+#
+# Wire shape: per-variable scalars in flat dicts keyed by variable
+# name. Cross-field validation pins every dict's keys to the
+# declared ``variables`` list — same defense as the regression
+# bucket's coefficient-key gate. Privacy: the per-variable AME /
+# MEM / SE / p / CI are pure aggregates over the fitted model and
+# the sample's covariate distribution; no per-observation leak.
+# Required ``n`` drives the min-N gate; precision clamps by ``n``.
+#
+# Helper coverage at v0: R via ``marginaleffects::avg_slopes`` (the
+# actively-maintained successor to ``margins``) and Python via
+# ``statsmodels`` ``get_margeff()``. Stata's ``margins`` covers the
+# same surface but needs ``e()`` post-estimation parsing; deferral
+# pattern matching the other Stata gaps.
+
+_ME_REQUIRED: frozenset[str] = frozenset((
+    "type", "n", "method", "variables", "effects",
+))
+
+_ME_ALLOWED_NUMERIC_FIELDS: frozenset[str] = frozenset((
+    # No scalar floats at top level today. Per-variable scalars all
+    # ride through the dict-numeric slots below. Reserved for a
+    # future joint-test scalar (Wald χ² across all marginal effects)
+    # if researcher demand surfaces it.
+))
+_ME_ALLOWED_INT_FIELDS: frozenset[str] = frozenset((
+    "n",
+))
+_ME_ALLOWED_STRING_FIELDS: frozenset[str] = frozenset((
+    "type", "method",
+    # Names of the underlying fit's response + family for context.
+    # ``outcome_variable`` is the dependent variable; ``model_family``
+    # is the estimator that produced the fit (``logit`` / ``probit``
+    # / ``poisson`` / ``ols`` / ``glm`` / …). Both are short
+    # identifiers the model needs to interpret the marginal effect
+    # scale (probability change for logit, count change for Poisson,
+    # etc.).
+    "outcome_variable", "model_family",
+))
+_ME_ALLOWED_LIST_STRING: frozenset[str] = frozenset((
+    "variables",
+))
+_ME_ALLOWED_DICT_NUMERIC: frozenset[str] = frozenset((
+    "effects",
+    "standard_errors",
+    "z_statistics",
+    "p_values",
+    "ci_lower", "ci_upper",
+    # Representative-values dict for ``method="at_representative"``.
+    # Keys must be in ``variables``; values are the covariate vector
+    # the marginal effect was evaluated at.
+    #
+    # **Disclosure threat.** ``at_values`` is script-controlled, so a
+    # researcher (or prompt-injected helper call) could in principle
+    # pass an exact-precision value pulled from a single row
+    # (``income=847239`` identifies the one observation with that
+    # income; combined with the other conditioning variables it pins
+    # the individual). Naïve pass-through would let a script publish
+    # near-identifiers under the legitimate-looking
+    # ``method="at_representative"`` slot.
+    #
+    # **Structural rule.** Each at_values entry is precision-clamped
+    # by the sample N — the same ``clamp_precision_dict`` pass the
+    # other dict-numeric fields use, gated by ``sigfigs_for_n(n)``.
+    # At n=1000 that's 4 sigfigs; at n=100 it drops to 3. The
+    # clamp transformation lands in the log so the model and the
+    # researcher both see "conditioned at income=847,200 (clamped
+    # from 847,239)" — they can decide if the conditioning point
+    # is still meaningful at that precision. Higher-precision
+    # caller-supplied values are rounded; they cannot survive as
+    # raw bytes through this slot.
+    #
+    # **Researcher-side guidance** (system prompt and docstrings):
+    # pass interpretable summary points — means, medians, percentiles,
+    # round reference values from the literature. Don't pass
+    # exact-value rows from individual observations. The helper
+    # signature on both languages stays a thin pass-through; the
+    # disclosure floor is enforced here, structurally, by the
+    # precision clamp.
+    "at_values",
+))
+
+_ME_VALID_METHODS: frozenset[str] = frozenset((
+    "ame", "mem", "at_representative",
+))
+
+# Structural cap. A real marginal-effects table on a paper-grade
+# regression covers a handful of focal variables, not the whole
+# design — same envelope as the regression bucket's predictor cap
+# (50) for consistency. Bigger payloads are almost always engineered.
+_ME_MAX_VARIABLES = 50
+
+
+def _sanitize_marginal_effects(
+    raw: dict[str, Any], config: SDCConfig
+) -> SanitizerResult:
+    missing_reason = _require_fields(raw, _ME_REQUIRED, "marginal_effects")
+    if missing_reason:
+        return SanitizerResult(
+            ok=False, analysis_type="marginal_effects",
+            rejection_reason=missing_reason,
+        )
+
+    n_raw = raw.get("n")
+    if not isinstance(n_raw, int) or isinstance(n_raw, bool) or n_raw < 0:
+        return SanitizerResult(
+            ok=False, analysis_type="marginal_effects",
+            rejection_reason=(
+                f"n must be a non-negative int, got {type(n_raw).__name__}"
+            ),
+        )
+    try:
+        require_minimum_n(n_raw, config.min_n_regression, "n")
+    except MinimumNViolation as e:
+        return SanitizerResult(
+            ok=False, analysis_type="marginal_effects",
+            rejection_reason=str(e),
+        )
+
+    method = raw.get("method")
+    if not isinstance(method, str) or method not in _ME_VALID_METHODS:
+        return SanitizerResult(
+            ok=False, analysis_type="marginal_effects",
+            rejection_reason=(
+                f"method must be one of {sorted(_ME_VALID_METHODS)}; "
+                f"got {method!r}"
+            ),
+        )
+
+    raw_vars = raw.get("variables")
+    if not isinstance(raw_vars, list) or not all(
+        isinstance(v, str) for v in raw_vars
+    ):
+        return SanitizerResult(
+            ok=False, analysis_type="marginal_effects",
+            rejection_reason="variables must be a list of strings",
+        )
+    if len(raw_vars) == 0:
+        return SanitizerResult(
+            ok=False, analysis_type="marginal_effects",
+            rejection_reason="variables list is empty",
+        )
+    if len(raw_vars) > _ME_MAX_VARIABLES:
+        return SanitizerResult(
+            ok=False, analysis_type="marginal_effects",
+            rejection_reason=(
+                f"variables has {len(raw_vars)} entries; the structural "
+                f"cap is {_ME_MAX_VARIABLES}. A marginal-effects table "
+                f"with that many entries isn't interpretable output."
+            ),
+        )
+
+    transformations: list[str] = []
+    out = _collect_allowed(
+        raw,
+        numeric=_ME_ALLOWED_NUMERIC_FIELDS,
+        integer=_ME_ALLOWED_INT_FIELDS,
+        string=_ME_ALLOWED_STRING_FIELDS,
+        dict_numeric=_ME_ALLOWED_DICT_NUMERIC,
+        list_string=_ME_ALLOWED_LIST_STRING,
+        transformations=transformations,
+    )
+
+    # ``effects`` is required-after-filter — if it shipped as
+    # something other than a dict, ``_collect_allowed`` dropped it
+    # and we'd otherwise return an ok-but-empty payload.
+    missing_after = _require_after_filter(
+        out, _ME_REQUIRED, "marginal_effects",
+        pre_validated=frozenset(("n", "method", "variables")),
+    )
+    if missing_after:
+        return SanitizerResult(
+            ok=False, analysis_type="marginal_effects",
+            rejection_reason=missing_after,
+        )
+
+    # Identifier-shape gates on the variable list and the outcome /
+    # model_family scalars. Same primitives as the regression
+    # bucket — keeps the disclosure profile uniform.
+    _enforce_identifier_string_fields(
+        out, frozenset(("outcome_variable", "model_family")),
+        transformations, type_label="marginal_effects",
+    )
+    _enforce_identifier_list_field(
+        out, "variables", transformations, type_label="marginal_effects",
+    )
+
+    # Cross-field key validation. Each dict-of-numeric field's keys
+    # must reference a declared variable; alien keys are dropped
+    # with a transformations-log entry. Same defense as the OLS
+    # coefficient-name gate.
+    declared = set(out.get("variables") or [])
+    for dict_field in _ME_ALLOWED_DICT_NUMERIC:
+        if dict_field not in out:
+            continue
+        d = out[dict_field]
+        if not isinstance(d, dict):
+            continue
+        kept: dict[str, float] = {}
+        dropped: list[str] = []
+        for k, v in d.items():
+            if k in declared:
+                kept[k] = v
+            else:
+                dropped.append(k)
+        if dropped:
+            # Names withheld — keys are caller-controlled and could
+            # carry raw data bytes if echoed.
+            transformations.append(
+                f"dropped {len(dropped)} undeclared key(s) from "
+                f"{dict_field!r} (names withheld — keys are caller-"
+                f"controlled and could carry raw data bytes)"
+            )
+        out[dict_field] = kept
+
+    # Method-specific gates.
+    #
+    # ``at_representative`` requires the ``at_values`` dict so the
+    # model can interpret the marginal effect at a specific point
+    # (otherwise "MEM evaluated at … nothing?" is an interpretation
+    # trap). For ``ame`` / ``mem``, ``at_values`` is structurally
+    # absent — drop it with a transformation note if present, since
+    # there's no conditioning point to interpret it against.
+    if method == "at_representative":
+        if "at_values" not in out or not out.get("at_values"):
+            return SanitizerResult(
+                ok=False, analysis_type="marginal_effects",
+                rejection_reason=(
+                    "method='at_representative' requires non-empty "
+                    "at_values (the covariate vector the effect was "
+                    "evaluated at)"
+                ),
+            )
+    else:
+        if "at_values" in out:
+            transformations.append(
+                f"dropped 'at_values' (method={method!r} has no "
+                f"conditioning point)"
+            )
+            del out["at_values"]
+
+    # ``effects`` non-empty after cross-field filter — a payload
+    # whose only kept effect keys were undeclared would otherwise
+    # ship with effects={} and look successful. Make the failure
+    # explicit.
+    if not out.get("effects"):
+        return SanitizerResult(
+            ok=False, analysis_type="marginal_effects",
+            rejection_reason=(
+                "effects dict empty after sanitization — keys did "
+                "not match the declared variables list"
+            ),
+        )
+
+    # Precision clamp by total sample n. Per-variable marginal
+    # effects share precision with the underlying coefficients
+    # they're derived from; the same sigfigs scaling applies.
+    n = out["n"]
+    sigfigs = sigfigs_for_n(n)
+    for key in _ME_ALLOWED_DICT_NUMERIC:
+        if key in out:
+            out[key] = clamp_precision_dict(out[key], n)
+    transformations.append(
+        f"clamped all numeric fields to {sigfigs} significant figures (n={n})"
+    )
+
+    return SanitizerResult(
+        ok=True, analysis_type="marginal_effects",
+        sanitized=out, transformations=transformations,
+    )
+
+
+# ---------------------------------------------------------------------------
 # Factor decomposition — PCA + factor analysis as one shape
 # ---------------------------------------------------------------------------
 #
@@ -4761,6 +5128,7 @@ _HANDLERS: dict[str, _HANDlerFn] = {
     "kaplan_meier": _sanitize_kaplan_meier,
     "factor_decomposition": _sanitize_factor_decomposition,
     "cluster_analysis": _sanitize_cluster_analysis,
+    "marginal_effects": _sanitize_marginal_effects,
 }
 
 
