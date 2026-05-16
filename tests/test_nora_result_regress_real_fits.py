@@ -203,6 +203,25 @@ def test_stata_xtreg_fe_emits_fixed_effects(
 
 
 @requires_stata
+def test_stata_xtreg_fe_emits_panel_f_test(
+    stata_payloads: dict[str, dict],
+) -> None:
+    """Panel-diagnostic auto-emit pin: ``xtreg, fe`` populates
+    ``e(F_f)`` (F-test on joint significance of the unit fixed
+    effects). The helper auto-emits it into ``f_test_fe_chi2`` /
+    ``f_test_fe_p``, mirroring R's ``plm::pFtest`` and giving the
+    model the FE-vs-pooled test result without a separate call."""
+    assert "xtreg_fe" in stata_payloads
+    res = sanitize(stata_payloads["xtreg_fe"])
+    s = res.sanitized or {}
+    assert isinstance(s.get("f_test_fe_chi2"), (int, float))
+    assert s["f_test_fe_chi2"] > 0
+    # p-value rides alongside when df_a / df_r are both populated.
+    if "f_test_fe_p" in s:
+        assert 0.0 <= s["f_test_fe_p"] <= 1.0
+
+
+@requires_stata
 def test_stata_areg_emits_fixed_effects_with_correct_cardinality(
     stata_payloads: dict[str, dict],
 ) -> None:

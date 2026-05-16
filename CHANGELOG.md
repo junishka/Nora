@@ -7,7 +7,7 @@ versions follow semver, pre-1.0.
 ## [0.10.0] — 2026-05-16
 
 Late-beta release. Expands the sanitized analysis surface from
-seven shapes to twelve, **ships Stata parity for the four
+seven shapes to thirteen, **ships Stata parity for the four
 high-usage shapes that were previously R+Python-only**
 (mixed-effects, cluster, factor, KM), renames the regression
 bucket to a name that reads honestly when applied to GLM / Cox PH

@@ -256,7 +256,7 @@ stale.
 
 #### Current per-shape distribution surface
 
-Twelve analysis shapes cross the boundary today. The composition
+Thirteen analysis shapes cross the boundary today. The composition
 deferral has to be evaluated against this whole surface, not
 against the smaller set the older threat-model writeup assumed.
 One-line SDC summary per shape:
@@ -319,8 +319,14 @@ One-line SDC summary per shape:
     `n_at_risk_h`; the KM step function itself does not cross —
     only the horizon-summarized survival probabilities and an
     optional cross-group log-rank χ².
+13. **`marginal_effects`** — AME / MEM / at-representative scalars
+    from non-linear fits (logit / probit / Poisson / GLM). SDC:
+    `at_values` entries precision-clamped by sample N so an
+    exact-precision conditioning value cannot leak as a
+    near-identifier; cross-field key validation pins every
+    per-variable dict to the declared `variables` list.
 
-Plot vision adds a thirteenth surface: four model-output helpers
+Plot vision adds a fourteenth surface: four model-output helpers
 (`plot_coefficients`, `plot_interaction`, `plot_estimate_comparison`,
 `plot_residuals`) that emit PNG/PDF/EPS via a manifest-allowlisted
 capture path. Helper-allowlist gated; no file-allowlist API exists

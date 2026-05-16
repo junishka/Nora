@@ -84,7 +84,24 @@ dev = [
     "scipy>=1.11",
     "rdrobust>=2.0.0",
     "differences>=0.3.0",
-    "scikit-learn>=1.7.2",
+    # scikit-learn upper-bound pinned <1.7 for factor_analyzer 0.5.1
+    # compatibility. DO NOT BUMP without verifying factor_analyzer
+    # has shipped a release that calls ``check_array(ensure_all_finite=...)``
+    # instead of the removed ``force_all_finite=...`` kwarg. Symptom of
+    # an unsafe bump: ``nora.from_factor_analyzer`` and
+    # ``tests/test_from_factor_analyzer_real_fits.py`` start failing with
+    # ``TypeError: check_array() got an unexpected keyword argument
+    # 'force_all_finite'`` — the FA helper goes silent rather than
+    # surfacing a clean error, so this guard is load-bearing.
+    "scikit-learn>=1.5,<1.7",
+    # Sun-Abraham IW event study, used by ``tests/test_from_sun_abraham_real_fits.py``.
+    # pyfixest mirrors R fixest's ``sunab()`` API (Borusyak-Jaravel-Spiess
+    # 2024 reference; pin loose so a maintenance release flows through).
+    "pyfixest>=0.18",
+    # Python-side exploratory factor analysis (the analogue of R
+    # psych::fa). Powers ``nora.from_factor_analyzer`` and its real-fit
+    # pin under ``tests/test_from_factor_analyzer_real_fits.py``.
+    "factor_analyzer>=0.5",
 ]
 
 [build-system]

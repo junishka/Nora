@@ -2,7 +2,7 @@
 
 How to extend the sanitizer's coverage in the two ways it gets
 extended: **adding a field to an existing shape**, and **adding a
-new shape**. Worked from the patterns the existing 12 shapes
+new shape**. Worked from the patterns the existing 13 shapes
 already establish; reference, not tutorial.
 
 The standard for "extension is done" is a two-bar test, applied
@@ -27,12 +27,12 @@ non-trivial.
 
 ## What's already in
 
-The sanitizer accepts 12 shapes ([src/nora/sanitizer.py:_HANDLERS](../src/nora/sanitizer.py)).
+The sanitizer accepts 13 shapes ([src/nora/sanitizer.py:_HANDLERS](../src/nora/sanitizer.py)).
 Roughly grouped:
 
 | Shape | Covers | Helpers |
 |---|---|---|
-| `coefficient_table_with_fit_stats` (legacy alias `linear_regression`) | OLS, logit, probit, Poisson, NegBin, Cox PH, fixest with absorbed FE, IV/2SLS, mixed-effects (lmer / glmer / mixedlm / mixed / meglm) | R `from_lm` + `from_iv`; Python `from_lm` + `from_iv`; Stata `nora_result_regress` (covers `regress`/`logit`/`probit`/`poisson`/`stcox`/`xtreg fe`/`areg`/`ivregress`/`mixed`/`meglm`) |
+| `coefficient_table_with_fit_stats` (legacy alias `linear_regression`) | OLS, logit, probit, Poisson, NegBin, Cox PH, fixest with absorbed FE, IV/2SLS, mixed-effects (lmer / glmer / mixedlm / mixed / meglm), plus panel-data diagnostics (Hausman, F-test FE, Breusch-Pagan LM, Wooldridge AR(1)) and a typed `robust_se_type` enum | R `from_lm` + `from_iv`; Python `from_lm` + `from_iv`; Stata `nora_result_regress` (covers `regress`/`logit`/`probit`/`poisson`/`stcox`/`xtreg fe`/`areg`/`ivregress`/`mixed`/`meglm`/`newey`) |
 | `t_test` | one-sample / two-sample / Welch / paired | `from_t_test` (R, Python), `nora_ttest` (Stata) |
 | `descriptive` | `from_summarize` univariate | each language |
 | `frequency_table` | 1-D counts | each language |
@@ -40,10 +40,11 @@ Roughly grouped:
 | `magnitude_table` | sum/mean by group with dominance | each language |
 | `correlation_matrix` | Pearson / Spearman / Kendall | each language |
 | `cluster_analysis` | kmeans + hierarchical (Ward / complete / average / single linkage) | R `from_cluster`; Python `from_cluster`; Stata `nora_result_cluster` (after `cluster kmeans` / `cluster wardslinkage` / etc.) |
-| `factor_decomposition` | PCA + factor analysis (pcf / pf / ml / ipf) | R `from_pca`; Python `from_pca`; Stata `nora_result_factor` (after `pca` or `factor`) |
-| `did_event_study` | Callaway-Sant'Anna (helpers); Sun-Abraham + TWFE-ES (R helpers); de Chaisemartin + Python sub-estimators via generic `result()` | R `from_callaway_santanna` + `from_sun_abraham` + `from_twfe_event_study`; Python `from_callaway_santanna`. Stata deferred — no realistic workflow yet (see [handoff Stata coverage matrix](handoff.md#stata-coverage-matrix-release-status)) |
+| `factor_decomposition` | PCA + factor analysis (pcf / pf / ml / ipf) | R `from_pca` + `from_fa` (psych); Python `from_pca` + `from_factor_analyzer`; Stata `nora_result_factor` (after `pca` or `factor`) |
+| `did_event_study` | Callaway-Sant'Anna + Sun-Abraham (helpers); TWFE-ES R helper; de Chaisemartin + Python TWFE-ES via generic `result()` | R `from_callaway_santanna` + `from_sun_abraham` + `from_twfe_event_study`; Python `from_callaway_santanna` + `from_sun_abraham` (pyfixest). Stata deferred — no realistic workflow yet (see [handoff Stata coverage matrix](handoff.md#stata-coverage-matrix-release-status)) |
 | `rdd` | sharp + fuzzy local-polynomial (via rdrobust) | R + Python `from_rdd`. Stata helper targeted 0.10.1 pending cross-language numerics verification (see [CHANGELOG.md](../CHANGELOG.md) deferred section for the protocol) |
 | `kaplan_meier` | safe-form survival (median + horizon scalars) | R + Python + Stata `from_kaplan_meier` / `nora_result_km` |
+| `marginal_effects` | AME / MEM / at-representative scalars from logit / probit / Poisson / GLM fits; `at_values` precision-clamped by sample N | R `from_marginal_effects` (wraps `marginaleffects::avg_slopes` / `slopes`); Python `from_marginal_effects` (wraps `fit.get_margeff`). Stata `nora_result_margins.ado` deferred |
 
 All have real-fit pins under `tests/test_from_*_real_fits.py` and
 `tests/test_nora_result_*_real_fits.py`. The 16+16+16 property

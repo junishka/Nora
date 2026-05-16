@@ -509,6 +509,74 @@ def test_ols_precision_clamped_to_expected_sigfigs():
     assert result.sanitized["coefficients"]["x"] == 4.123
 
 
+@pytest.mark.parametrize("test_field,p_field", [
+    ("hausman_chi2", "hausman_p"),
+    ("f_test_fe_chi2", "f_test_fe_p"),
+    ("breusch_pagan_chi2", "breusch_pagan_p"),
+    ("wooldridge_ar1_chi2", "wooldridge_ar1_p"),
+])
+def test_ols_panel_diagnostics_pass_through(test_field, p_field):
+    """The four panel-data post-estimation diagnostics (Hausman,
+    F-test on FE, Breusch-Pagan LM, Wooldridge AR1) are scalar
+    aggregates over the fitted residuals — pure aggregates, no
+    per-observation leak. All four should pass through the OLS
+    sanitizer's numeric allowlist together with their p-values."""
+    p = {
+        "type": "linear_regression",
+        "n": 500,
+        "response_variable": "y",
+        "predictor_variables": ["x1", "x2"],
+        "coefficients": {"(Intercept)": 1.0, "x1": 0.5, "x2": -0.3},
+        "standard_errors": {"(Intercept)": 0.1, "x1": 0.05, "x2": 0.04},
+        test_field: 12.34,
+        p_field: 0.002,
+    }
+    res = sanitize(p)
+    assert res.ok, res.rejection_reason
+    assert res.sanitized.get(test_field) is not None
+    assert res.sanitized.get(p_field) is not None
+
+
+@pytest.mark.parametrize("rse", [
+    "classical", "hc0", "hc1", "hc2", "hc3",
+    "hac_newey_west", "cluster", "bootstrap",
+])
+def test_ols_robust_se_type_enum_values_pass(rse):
+    """Each canonical robust_se_type label round-trips through the
+    sanitizer. The set lives in ``_OLS_VALID_ROBUST_SE_TYPE`` and is
+    pinned here so a future drift drops a test rather than silently
+    widening the wire-format vocabulary."""
+    result = sanitize({
+        "type": "linear_regression",
+        "n": 1000,
+        "response_variable": "y",
+        "predictor_variables": ["x"],
+        "coefficients": {"(Intercept)": 1.0, "x": 2.0},
+        "standard_errors": {"(Intercept)": 0.1, "x": 0.2},
+        "robust_se_type": rse,
+    })
+    assert result.ok
+    assert result.sanitized.get("robust_se_type") == rse
+
+
+def test_ols_robust_se_type_unknown_value_dropped():
+    """A non-enum string for ``robust_se_type`` is dropped with a
+    transformation note; the payload otherwise sanitizes cleanly so
+    coefficients still cross."""
+    result = sanitize({
+        "type": "linear_regression",
+        "n": 1000,
+        "response_variable": "y",
+        "predictor_variables": ["x"],
+        "coefficients": {"(Intercept)": 1.0, "x": 2.0},
+        "standard_errors": {"(Intercept)": 0.1, "x": 0.2},
+        "robust_se_type": "fancy_sandwich_v7",
+    })
+    assert result.ok
+    assert "robust_se_type" not in result.sanitized
+    assert any("robust_se_type" in t for t in result.transformations)
+
+
 def test_freq_suppression_marker_format():
     result = sanitize({
         "type": "frequency_table",

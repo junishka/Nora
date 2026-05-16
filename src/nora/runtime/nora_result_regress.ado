@@ -569,6 +569,36 @@ program define nora_result_regress
             file write `fh' `","n_clusters":{"`e(clustvar)'":`=e(N_clust)'}"'
         }
     }
+    else {
+        * Non-cluster variance estimators. Map Stata's ``e(vce)`` /
+        * ``e(cmd)`` vocabulary onto the sanitizer's canonical
+        * ``robust_se_type`` enum so the model can tell at a glance
+        * which variance flavour produced the SEs. Classical /
+        * unset / OLS is omitted (absence already implies
+        * model-based SEs). Each emit goes through a tiny
+        * if-else ladder rather than an interpolated local so a
+        * future spelling drift doesn't leak free text past the
+        * sanitizer's enum gate.
+        local _rse = ""
+        if "`e(cmd)'" == "newey" {
+            local _rse = "hac_newey_west"
+        }
+        else if "`e(vce)'" == "robust" | "`e(vce)'" == "hc1" {
+            local _rse = "hc1"
+        }
+        else if "`e(vce)'" == "hc2" {
+            local _rse = "hc2"
+        }
+        else if "`e(vce)'" == "hc3" {
+            local _rse = "hc3"
+        }
+        else if "`e(vce)'" == "bootstrap" {
+            local _rse = "bootstrap"
+        }
+        if "`_rse'" != "" {
+            file write `fh' `","robust_se_type":"`_rse'""'
+        }
+    }
 
     * fixed_effects — absorbed FE dimension cardinality.
     *
@@ -588,6 +618,38 @@ program define nora_result_regress
     else if "`e(cmd)'" == "areg" & "`e(absvar)'" != "" & "`e(df_a)'" != "" & !missing(`=e(df_a)') {
         local _nlevels = `=e(df_a)' + 1
         file write `fh' `","fixed_effects":{"`e(absvar)'":`_nlevels'}"'
+    }
+
+    * Panel-data post-estimation diagnostics. ``xtreg, fe`` stores
+    * the F-test on the joint significance of the panel-level FE
+    * in ``e(F_f)`` with its denominator df in ``e(df_a)``. The
+    * test is "are the unit fixed effects jointly zero" — a small
+    * F means pooled OLS suffices; a big F says the FE matter.
+    * Mirrors R's ``plm::pFtest`` and the sanitizer's
+    * ``f_test_fe_chi2`` slot.
+    *
+    * Breusch-Pagan LM (RE vs pooled) and Wooldridge AR(1) come
+    * from ``xttest0`` and ``xtserial`` post-estimation commands;
+    * those reset ``r()`` and would clobber prior state, so the
+    * researcher runs them in their script and passes the chi² + p
+    * via this helper's caller — same pattern Cox concordance uses
+    * with ``estat concordance``. Future enhancement: run them
+    * inside ``capture quietly`` here, after the VIF / estat-ic
+    * blocks finish their state writes.
+    if "`e(cmd)'" == "xtreg" & "`e(F_f)'" != "" & !missing(`=e(F_f)') {
+        local _x = strofreal(`=e(F_f)', "%21.17e")
+        file write `fh' `","f_test_fe_chi2":`_x'"'
+        * Compute the p-value via Ftail when df components are
+        * available. ``e(df_a)`` is the absorbed-FE df (numerator
+        * minus 1); ``e(df_r)`` is the residual df.
+        if "`e(df_a)'" != "" & !missing(`=e(df_a)') ///
+                & "`e(df_r)'" != "" & !missing(`=e(df_r)') {
+            local _fp = Ftail(`=e(df_a)', `=e(df_r)', `=e(F_f)')
+            if !missing(`_fp') {
+                local _x = strofreal(`_fp', "%21.17e")
+                file write `fh' `","f_test_fe_p":`_x'"'
+            }
+        }
     }
 
     * Mixed-effects variance components, group counts, fit method, ICC.
