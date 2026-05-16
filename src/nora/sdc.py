@@ -126,6 +126,35 @@ def clamp_precision_dict(d: dict[str, float], n: int) -> dict[str, float]:
     return {k: clamp_precision(v, n) for k, v in d.items()}
 
 
+def clamp_dict_by_per_key_n(
+    d: dict[str, float], n_by_key: dict[str, int],
+) -> dict[str, float]:
+    """Apply clamp_precision per-entry using a key-specific N.
+
+    For flat ``{subgroup: scalar}`` aggregates where each subgroup's
+    value should be clamped by that subgroup's OWN N rather than a
+    global total — per-cluster within-SS, per-stratum statistics,
+    per-cohort means. Each value's precision floor scales with its
+    own subgroup's sample size.
+
+    Keys present in ``d`` but missing from ``n_by_key`` are dropped
+    (no N → no safe precision floor → safer to omit than to guess
+    a default).
+
+    For nested ``{outer: {inner: value}}`` shapes where the precision
+    should scale with the OUTER key's N (cluster centroids over
+    cluster N: the inner dict is variable → value, the per-cluster
+    N applies to the whole inner dict), iterate the outer keys
+    in the caller and use ``clamp_precision_dict(inner_dict, n_for_outer)``
+    per outer key — the existing flat helper handles that case.
+    """
+    return {
+        k: clamp_precision(v, n_by_key[k])
+        for k, v in d.items()
+        if k in n_by_key
+    }
+
+
 # ---------------------------------------------------------------------------
 # Cell suppression (primary only — secondary suppression is step 5)
 # ---------------------------------------------------------------------------

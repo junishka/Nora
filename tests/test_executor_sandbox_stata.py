@@ -105,7 +105,10 @@ nora_result_regress, label("stata-happy-path")
     assert r.ok, f"Stata script failed: error={r.error}\nstdout tail={r.raw_stdout[-500:]}"
     assert r.result_payloads
     payload = r.result_payloads[0]
-    assert payload["type"] == "linear_regression"
+    # ``nora_result_regress`` emits the canonical descriptive bucket
+    # name; the legacy ``linear_regression`` alias still round-trips
+    # for stored payloads via the sanitizer dispatch table.
+    assert payload["type"] == "coefficient_table_with_fit_stats"
     assert payload["n"] == 74
     pvals = payload.get("p_values")
     assert isinstance(pvals, dict) and set(pvals) == {"mpg", "_cons"}

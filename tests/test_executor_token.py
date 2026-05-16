@@ -354,7 +354,8 @@ def test_legitimate_script_with_token_succeeds(tmp_path: Path):
     r = run_script("R", code, tmp_path)
     assert r.ok, f"legitimate script failed: {r.error}"
     assert r.result_payloads
-    assert r.result_payloads[0]["type"] == "linear_regression"
+    # Helper emits the canonical descriptive bucket name.
+    assert r.result_payloads[0]["type"] == "coefficient_table_with_fit_stats"
     # The token must be stripped from what the caller receives.
     assert RESULT_TOKEN_FIELD not in r.result_payloads[0]
 

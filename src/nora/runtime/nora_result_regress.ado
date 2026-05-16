@@ -69,7 +69,10 @@ program define nora_result_regress
     tempname fh
     file open `fh' using `"`path'"', write text append
 
-    file write `fh' `"{"type":"linear_regression""'
+    * ``coefficient_table_with_fit_stats`` is the canonical bucket
+    * name. ``linear_regression`` remains a back-compat alias in the
+    * sanitizer dispatch so stored payloads keep working.
+    file write `fh' `"{"type":"coefficient_table_with_fit_stats""'
     file write `fh' `","_token":"`_nora_token'""'
     if `"`label'"' != "" {
         file write `fh' `","label":"`label'""'
@@ -448,6 +451,133 @@ program define nora_result_regress
             local _x = strofreal(`_vifj', "%21.17e")
             file write `fh' `""`v'":`_x'"'
             local _vfirst = 0
+        }
+        file write `fh' "}"
+    }
+
+    * AIC / BIC via ``estat ic``. Stata stores them in a 1x6 matrix
+    * ``r(S)`` with columns [N, ll0, ll, df, AIC, BIC] — neither e()
+    * nor ``estat ic``'s scalar returns expose them directly. R and
+    * Python both ship aic/bic on every regression card; without
+    * this block Stata payloads drop both fields and the model can't
+    * compare model fit across estimators that don't share R².
+    * Placed AFTER the VIF block: ``count`` and ``summarize`` inside
+    * VIF write to ``r()`` and ``estat ic`` would clobber that
+    * state. Inside ``capture`` because ``estat ic`` errors on a
+    * handful of estimators (no log-likelihood, perfect fit, etc.);
+    * the helper omits the field rather than aborting the script.
+    tempname _icS
+    capture quietly estat ic
+    if !_rc {
+        capture matrix `_icS' = r(S)
+        if !_rc & rowsof(`_icS') >= 1 & colsof(`_icS') >= 6 {
+            if !missing(`_icS'[1, 5]) {
+                local _x = strofreal(`_icS'[1, 5], "%21.17e")
+                file write `fh' `","aic":`_x'"'
+            }
+            if !missing(`_icS'[1, 6]) {
+                local _x = strofreal(`_icS'[1, 6], "%21.17e")
+                file write `fh' `","bic":`_x'"'
+            }
+        }
+    }
+
+    * Harrell's C-index for stcox. ``concordance`` is not in
+    * ``e()`` after ``stcox`` — Stata requires the follow-up
+    * ``estat concordance`` call, which sets ``r(C)``. R's
+    * coxph emits this via ``summary()$concordance``; without it
+    * the Stata Cox card was missing the standard "C =" diagnostic
+    * researchers report alongside hazard ratios.
+    * ``stcox`` posts ``e(cmd) == "cox"`` (the "st" is the
+    * survival-time prefix syntax, not the e(cmd) value). Gating
+    * on "stcox" would silently skip every Cox fit. Verified
+    * empirically against Stata 19.5.
+    if "`e(cmd)'" == "cox" {
+        capture quietly estat concordance
+        if !_rc & "`r(C)'" != "" & !missing(`=r(C)') {
+            local _x = strofreal(`=r(C)', "%21.17e")
+            file write `fh' `","concordance":`_x'"'
+        }
+    }
+
+    * Cluster-robust SE metadata. ``vce(cluster id)`` populates
+    * ``e(vce) == "cluster"``, ``e(clustvar)`` (single name), and
+    * ``e(N_clust)`` (cluster count). Same disclosure profile as
+    * the fixed-effects block: emit the variable NAME (already in
+    * the schema) and the cluster CARDINALITY; do NOT emit the
+    * cluster labels themselves. Helper-side decision pinned in
+    * ``docs/direction.md`` — bounded aggregates go in the existing
+    * allowlist (``cluster_variables`` plural list,
+    * ``n_clusters`` dict-of-counts), not in a new sub-shape.
+    *
+    * Stata exposes single-dimension clustering through these
+    * macros; Cameron-Gelbach-Miller two-way is available via
+    * ``cgmreg`` or ``reghdfe`` (third-party), not core ``regress``.
+    * The helper handles the single-cluster case from core Stata;
+    * two-way emission from third-party commands would follow the
+    * same pattern when populated.
+    if "`e(vce)'" == "cluster" & "`e(clustvar)'" != "" {
+        file write `fh' `","robust_se_type":"cluster""'
+        file write `fh' `","cluster_variables":["`e(clustvar)'"]"'
+        if "`e(N_clust)'" != "" & !missing(`=e(N_clust)') {
+            file write `fh' `","n_clusters":{"`e(clustvar)'":`=e(N_clust)'}"'
+        }
+    }
+
+    * fixed_effects — absorbed FE dimension cardinality.
+    *
+    *   xtreg, fe:  e(ivar) names the panel id, e(N_g) carries the
+    *               panel-dim cardinality (= the absorbed FE count).
+    *   areg:       e(absvar) names the absorbed variable, e(df_a)
+    *               carries (N_groups - 1) after dropping one base
+    *               level, so we report e(df_a) + 1 as the level count.
+    *
+    * Listing the actual levels is forbidden — only cardinality
+    * crosses the boundary. This mirrors the fixest-FE handling in
+    * R's from_lm (helper emits sizes via model$fixef_sizes; never
+    * the level labels).
+    if "`e(cmd)'" == "xtreg" & "`e(ivar)'" != "" & "`e(N_g)'" != "" & !missing(`=e(N_g)') {
+        file write `fh' `","fixed_effects":{"`e(ivar)'":`=e(N_g)'}"'
+    }
+    else if "`e(cmd)'" == "areg" & "`e(absvar)'" != "" & "`e(df_a)'" != "" & !missing(`=e(df_a)') {
+        local _nlevels = `=e(df_a)' + 1
+        file write `fh' `","fixed_effects":{"`e(absvar)'":`_nlevels'}"'
+    }
+
+    * vcov — full variance-covariance matrix of the coefficient
+    * estimates. Diagonals equal SE²; off-diagonals enable Wald /
+    * joint-significance tests the model can run itself. Pure
+    * aggregate from sigma² · (X'X)^-1 (or the sandwich estimator
+    * under robust/cluster) — no per-observation leak. R and Python
+    * both ship it; Stata used to drop it entirely.
+    *
+    * Emitted as a nested {row: {col: value}} dict so the sanitizer's
+    * dict-of-dict vcov handler can clamp precision and run the
+    * symmetry / diagonal=SE² invariant check. Missing diagonals
+    * (collinear / dropped columns) are written as ``null`` per the
+    * same convention coefficients / standard_errors use.
+    if `k' > 0 {
+        file write `fh' `","vcov":{"'
+        local _rfirst = 1
+        forvalues i = 1/`k' {
+            local vi : word `i' of `vnames'
+            if !`_rfirst' file write `fh' ","
+            file write `fh' `""`vi'":{"'
+            local _cfirst = 1
+            forvalues j = 1/`k' {
+                local vj : word `j' of `vnames'
+                if !`_cfirst' file write `fh' ","
+                if missing(`Vmat'[`i', `j']) {
+                    file write `fh' `""`vj'":null"'
+                }
+                else {
+                    local _x = strofreal(`Vmat'[`i', `j'], "%21.17e")
+                    file write `fh' `""`vj'":`_x'"'
+                }
+                local _cfirst = 0
+            }
+            file write `fh' "}"
+            local _rfirst = 0
         }
         file write `fh' "}"
     }

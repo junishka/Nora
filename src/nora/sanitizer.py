@@ -106,6 +106,7 @@ from typing import Any, Callable
 from nora.sdc import (
     DOMINANCE_THRESHOLD_DEFAULT,
     MinimumNViolation,
+    clamp_dict_by_per_key_n,
     clamp_precision,
     clamp_precision_dict,
     dominance_fails,
@@ -139,6 +140,17 @@ class SDCConfig:
     min_n_ttest_group: int = 10
     # Cell-size threshold for frequency-table primary suppression.
     cell_suppression_threshold: int = 10
+    # Treated-cohort size threshold for DiD event-study suppression.
+    # The new SDC primitive Callaway-Sant'Anna / de Chaisemartin /
+    # Sun-Abraham introduce: min-N gate on the *treated-cohort size*
+    # (carried in ``n_treated_per_group``), not on the cell count of
+    # the ATT panel. A balanced panel can make cell counts look
+    # comfortable (4 firms × 8 quarters = 32 cells) while the actual
+    # disclosure unit is the 4 firms whose entire outcome trajectories
+    # are summarized by the cohort's ATT series. Cohorts below this
+    # threshold are dropped *whole* — partial-cell publication would
+    # leak the cohort size through which cells survived.
+    min_n_did_cohort: int = 10
     # Dominance threshold for magnitude tables. If any single contributor
     # in a group accounts for more than this fraction of the cell's
     # total, the cell's value is suppressed. See sdc.py.
@@ -244,6 +256,42 @@ _OLS_ALLOWED_NUMERIC_FIELDS: frozenset[str] = frozenset((
     # smallest singular value of the design; high values flag
     # numerical instability and hidden collinearity.
     "condition_number",
+    # IV / 2SLS / GMM diagnostics. All bounded scalars; none reach
+    # into per-observation data. Decision made in
+    # ``docs/direction.md`` "IV as regression-bucket extension":
+    # 2SLS produces a single structural coefficient table plus a
+    # handful of diagnostic scalars; the *first-stage* coefficient
+    # table is rarely what the model needs (it just needs to know
+    # whether the instruments are strong). Composite-shape territory
+    # is reserved for genuine multi-stage estimators (3SLS,
+    # mediation with separate exposure→mediator and mediator→outcome
+    # regressions, control-function corrections).
+    #   - first_stage_f: minimum F-statistic across endogenous
+    #     variables, testing joint significance of excluded
+    #     instruments in the first stage. Stock-Yogo rule of thumb
+    #     flags weak instruments below ~10.
+    #   - weak_instrument_p: p-value associated with first_stage_f
+    #     (when computed) — sometimes more useful than the F itself
+    #     for non-standard sample sizes.
+    #   - hansen_j / hansen_j_p: overidentification test statistic
+    #     and its p-value. Hansen J under heteroskedasticity;
+    #     Sargan under homoskedasticity. Only defined when the
+    #     number of instruments exceeds the number of endogenous
+    #     regressors (overidentified case).
+    #   - endogeneity_p: Wu-Hausman / Durbin-Wu-Hausman test
+    #     p-value — whether OLS and IV estimates diverge enough to
+    #     justify using IV at all.
+    "first_stage_f", "weak_instrument_p",
+    "hansen_j", "hansen_j_p",
+    "endogeneity_p",
+    # Intraclass correlation — fraction of total variance attributable
+    # to the random-effects group. For a one-level model:
+    # icc = sigma_u² / (sigma_u² + sigma_e²). Bounded [0, 1], no
+    # disclosure surface beyond what ``random_effects_variance`` already
+    # carries; emitted for inference adequacy so the model can cite
+    # "ρ = 0.42, school explains 42% of variance" without the
+    # researcher computing it post-hoc.
+    "icc",
 ))
 _OLS_ALLOWED_INT_FIELDS: frozenset[str] = frozenset((
     "n", "degrees_of_freedom",
@@ -253,9 +301,25 @@ _OLS_ALLOWED_INT_FIELDS: frozenset[str] = frozenset((
     # actually reads off a Cox table — "324 subjects, 178 events" — so
     # they need to reach the model alongside the coefficients.
     "n_subjects", "n_failures",
+    # IV: count of instruments and count of endogenous regressors.
+    # Both are dimension cardinalities of the design (overidentification
+    # = ``n_instruments > n_endogenous``), not data-derived quantities.
+    "n_instruments", "n_endogenous",
 ))
 _OLS_ALLOWED_STRING_FIELDS: frozenset[str] = frozenset((
+    # ``cluster_variable`` (singular) kept as back-compat — older
+    # payloads in the SQLite store carry it. New helpers emit the
+    # plural list form via ``cluster_variables`` below so multi-way
+    # clustering (Cameron-Gelbach-Miller two-way and beyond) round-
+    # trips natively without a schema change.
     "type", "response_variable", "robust_se_type", "cluster_variable",
+    # Estimation method, primarily for mixed-effects: ``REML`` or
+    # ``ML``. Also useful on GLM family fits if the caller wants to
+    # surface the link function or scale-estimator choice. Free-text
+    # is bounded to ~40 chars via ``safe_text``; for known enum
+    # values the model interprets directly, others are still safe
+    # because they go through text-safety.
+    "fit_method",
 ))
 _OLS_ALLOWED_DICT_NUMERIC: frozenset[str] = frozenset((
     "coefficients", "standard_errors", "t_statistics", "p_values",
@@ -265,9 +329,117 @@ _OLS_ALLOWED_DICT_NUMERIC: frozenset[str] = frozenset((
     # intercept aliases, so this dict can't be used to smuggle
     # arbitrary numeric channels.
     "vif",
+    # Absorbed fixed-effects cardinality, one entry per FE dimension.
+    # Keys are FE-variable names (dataset column names); values are
+    # the count of distinct levels in that dimension. The cardinality
+    # is the disclosure-relevant quantity ("firm FE absorbed, 1,247
+    # levels"); the level identities themselves are NOT in this dict
+    # by construction — fixest emits sizes, not labels. Excluded from
+    # the coefficient-name cross-field check below because FE-var keys
+    # are exactly the names NOT in predictor_variables (they're
+    # absorbed, not regressors of interest).
+    "fixed_effects",
+    # Cluster-robust SE cardinality, one entry per clustering
+    # dimension. Same shape and disclosure profile as
+    # ``fixed_effects`` — keys are clustering-variable names (dataset
+    # columns the model already saw in the schema), values are
+    # cluster counts ("clustered at firm, 1,247 clusters"; for two-
+    # way clustering, both entries are present). Decision codified
+    # here per the previous turn's "modifier vs new sub-shape" rule:
+    # bounded aggregate scalars and counts go in the existing OLS
+    # allowlist, structured shapes get their own type. Clustering
+    # cardinalities are bounded counts → allowlist, not a new shape.
+    "n_clusters",
+    # Mixed-effects variance components, one entry per random-effect
+    # group (and one ``residual`` entry for the residual variance).
+    # Keys are random-effects-factor names (dataset column names);
+    # values are variance components from the random-effects
+    # covariance matrix. Random-slope models contribute multiple
+    # entries per group keyed like ``school.x`` (slope on x within
+    # school). The intercept-slope covariance is NOT emitted in this
+    # field — keep the disclosure surface to variances only; the
+    # full random-effects covariance is reachable through ``vcov``
+    # if a researcher genuinely needs it. Same skip-coef-key-check
+    # treatment as fixed_effects — keys are NOT predictor names.
+    "random_effects_variance",
+    # Per-level group counts for mixed-effects models — dataset
+    # column names → number of distinct groups in that level. Two-
+    # level model ``y ~ x + (1|school) + (1|classroom)`` emits
+    # ``{school: 30, classroom: 60}``. Same disclosure profile and
+    # treatment as ``fixed_effects`` and ``n_clusters``.
+    "n_groups_per_level",
 ))
+# Dict-numeric fields whose keys are NOT coefficient names, so the
+# coefficient-name cross-field validation below must skip them.
+# ``fixed_effects`` keys = absorbed-FE-var names; ``n_clusters`` keys
+# = clustering-var names. Both are dataset column names that are
+# deliberately NOT coefficients of interest. VIF, coefficients,
+# standard_errors, t_statistics, p_values all use coefficient names
+# and must remain inside the cross-field check.
+_OLS_DICT_FIELDS_SKIP_COEF_KEY_CHECK: frozenset[str] = frozenset((
+    "fixed_effects", "n_clusters",
+    # Random-effects entries are keyed by RE-factor name (possibly
+    # with a ``.term`` suffix for random slopes); never by coefficient
+    # name. Same exclusion as fixed_effects.
+    "random_effects_variance", "n_groups_per_level",
+))
+# Dict-numeric fields holding integer COUNTS (cardinalities) rather
+# than data-precision measurements. Skipped from the sigfigs clamp
+# (1247 firms shouldn't round to 1250 at sigfigs=3) and coerced to
+# int rather than left as float. Same rule for FE level counts,
+# cluster counts, and mixed-effects per-level group counts.
+_OLS_DICT_FIELDS_INT_COUNTS: frozenset[str] = frozenset((
+    "fixed_effects", "n_clusters", "n_groups_per_level",
+))
+# Canonical name of the regression-bucket payload type, plus its
+# legacy alias. The bucket holds OLS / logit / probit / Poisson /
+# negative binomial / Cox PH / fixest / 2SLS — anything that emits a
+# coefficient table with associated fit statistics. The original
+# name ``linear_regression`` misled both readers and the model into
+# thinking the scope was OLS-only (see the audit arc that found
+# Cox hard-failing through the helper and GLMs shipping no fit
+# metrics). The descriptive name ``coefficient_table_with_fit_stats``
+# is the new canonical; ``linear_regression`` is kept as an alias
+# so payloads from older sessions, older helpers, and the existing
+# SQLite stores on researcher disks still sanitize and render.
+_REGRESSION_TYPE_CANONICAL: str = "coefficient_table_with_fit_stats"
+_REGRESSION_TYPE_LEGACY: str = "linear_regression"
+_REGRESSION_TYPE_ALIASES: frozenset[str] = frozenset((
+    _REGRESSION_TYPE_CANONICAL, _REGRESSION_TYPE_LEGACY,
+))
+
+
+def _emitted_regression_type(raw: dict[str, Any]) -> str:
+    """Return the type string to stamp on the sanitized output for a
+    regression-bucket payload.
+
+    Round-trips the input's ``type`` field if it's one of the
+    recognised aliases. Defaults to the legacy name so the value
+    never appears unset — but a well-formed payload always carries
+    one of the aliases here because the dispatch table only routes
+    those two strings to this sanitizer.
+    """
+    raw_type = raw.get("type")
+    if isinstance(raw_type, str) and raw_type in _REGRESSION_TYPE_ALIASES:
+        return raw_type
+    return _REGRESSION_TYPE_LEGACY
+
+
 _OLS_ALLOWED_LIST_STRING: frozenset[str] = frozenset((
     "predictor_variables",
+    # IV / 2SLS supplementary identifiers. ``instrument_variables``
+    # names the excluded instruments (their cardinality goes through
+    # ``n_instruments``); ``endogenous_variables`` names which of
+    # the predictors are treated as endogenous. Both are bounded
+    # name lists — each entry goes through ``safe_key`` (40-char
+    # cap, control-char stripping) — so they live in the same
+    # disclosure-budget envelope as ``predictor_variables``.
+    "instrument_variables", "endogenous_variables",
+    # Plural cluster-variable list — multi-way clustering shows up
+    # by emitting a list rather than the singular string field.
+    # Helpers should emit this going forward; ``cluster_variable``
+    # singular is kept for back-compat with stored payloads.
+    "cluster_variables",
 ))
 
 
@@ -1076,7 +1248,7 @@ def _sanitize_linear_regression(
     missing_reason = _require_fields(raw, _OLS_REQUIRED, "linear_regression")
     if missing_reason:
         return SanitizerResult(
-            ok=False, analysis_type="linear_regression",
+            ok=False, analysis_type=_emitted_regression_type(raw),
             rejection_reason=missing_reason,
         )
 
@@ -1088,7 +1260,7 @@ def _sanitize_linear_regression(
         # the inline result and the persisted diagnostic row). The
         # type name leaks zero bits of payload content.
         return SanitizerResult(
-            ok=False, analysis_type="linear_regression",
+            ok=False, analysis_type=_emitted_regression_type(raw),
             rejection_reason=(
                 f"n must be a non-negative int, got {type(n_raw).__name__}"
             ),
@@ -1098,7 +1270,7 @@ def _sanitize_linear_regression(
         require_minimum_n(n_raw, config.min_n_regression, "n")
     except MinimumNViolation as e:
         return SanitizerResult(
-            ok=False, analysis_type="linear_regression",
+            ok=False, analysis_type=_emitted_regression_type(raw),
             rejection_reason=str(e),
         )
 
@@ -1111,7 +1283,7 @@ def _sanitize_linear_regression(
     raw_predictors = raw.get("predictor_variables")
     if isinstance(raw_predictors, list) and len(raw_predictors) > _OLS_MAX_PREDICTORS:
         return SanitizerResult(
-            ok=False, analysis_type="linear_regression",
+            ok=False, analysis_type=_emitted_regression_type(raw),
             rejection_reason=(
                 f"predictor_variables has {len(raw_predictors)} entries; "
                 f"the structural cap is {_OLS_MAX_PREDICTORS}. A regression "
@@ -1144,7 +1316,7 @@ def _sanitize_linear_regression(
     )
     if missing_after_filter:
         return SanitizerResult(
-            ok=False, analysis_type="linear_regression",
+            ok=False, analysis_type=_emitted_regression_type(raw),
             rejection_reason=missing_after_filter,
         )
 
@@ -1201,7 +1373,7 @@ def _sanitize_linear_regression(
                 suspicious_keys.add(k)
     if suspicious_keys:
         return SanitizerResult(
-            ok=False, analysis_type="linear_regression",
+            ok=False, analysis_type=_emitted_regression_type(raw),
             rejection_reason=(
                 "regression payload contains formula-categorical "
                 "coefficient name(s) — patsy / statsmodels formula "
@@ -1242,6 +1414,11 @@ def _sanitize_linear_regression(
     }
     for dict_field in _OLS_ALLOWED_DICT_NUMERIC:
         if dict_field not in out:
+            continue
+        # ``fixed_effects`` (and any future dict-numeric field whose
+        # keys aren't coefficient names) lives outside this check by
+        # design — see _OLS_DICT_FIELDS_SKIP_COEF_KEY_CHECK.
+        if dict_field in _OLS_DICT_FIELDS_SKIP_COEF_KEY_CHECK:
             continue
         d = out[dict_field]
         if not isinstance(d, dict):
@@ -1394,7 +1571,20 @@ def _sanitize_linear_regression(
             out[key] = clamp_precision(out[key], n)
     for key in _OLS_ALLOWED_DICT_NUMERIC:
         if key in out:
-            out[key] = clamp_precision_dict(out[key], n)
+            # Cardinality dicts (FE level counts, cluster counts)
+            # carry integer counts describing dataset structure, not
+            # data-derived measurements that scale precision with N.
+            # Round to int rather than running through the sigfig
+            # clamp, which would distort small counts (1247 → 1250
+            # at sigfigs=3). Same rule applies to any future
+            # cardinality-dict field — extend the set, not the branch.
+            if key in _OLS_DICT_FIELDS_INT_COUNTS:
+                out[key] = {
+                    k: int(round(v)) for k, v in out[key].items()
+                    if isinstance(v, (int, float)) and v >= 0
+                }
+            else:
+                out[key] = clamp_precision_dict(out[key], n)
     # vcov is dict-of-dict; clamp each inner dict's values.
     if "vcov" in out:
         out["vcov"] = {
@@ -1426,7 +1616,7 @@ def _sanitize_linear_regression(
     _coarsen_small_cox_counts(out, transformations, config)
 
     return SanitizerResult(
-        ok=True, analysis_type="linear_regression",
+        ok=True, analysis_type=_emitted_regression_type(raw),
         sanitized=out, transformations=transformations,
     )
 
@@ -2783,19 +2973,1794 @@ def _sanitize_correlation_matrix(
 
 
 # ---------------------------------------------------------------------------
+# DiD event study (Callaway-Sant'Anna / de Chaisemartin-D'Haultfœuille /
+# Sun-Abraham / TWFE event study)
+# ---------------------------------------------------------------------------
+#
+# The modern-DiD literature has moved decisively to heterogeneous-
+# treatment estimators that decompose into ATT(g, t) — average
+# treatment effect on the treated, indexed by treatment cohort g and
+# event time t (calendar time relative to treatment). Callaway-
+# Sant'Anna (the ``did`` R package), de Chaisemartin-
+# D'Haultfœuille (``DIDmultiplegt``), and Sun-Abraham (the
+# ``fixest::sunab`` interaction-weighted estimator) all produce
+# this shape, plus the older TWFE event-study with leads-and-lags
+# coefficients indexed by event time.
+#
+# **The new SDC primitive this shape introduces** is min-N gated by
+# the treated-cohort size, NOT by the cell count of the ATT panel.
+# Concrete reason: in strategy / finance / applied micro, treated
+# cohorts of 3-10 firms are normal (mergers, IPOs, regulatory
+# events). A balanced panel can make the cell count of ATT(g, t)
+# look comfortable (4 firms × 8 quarters = 32 "observations") while
+# the actual disclosure unit is those 4 firms whose outcome
+# trajectories are summarized by the ATT series for cohort g.
+# Combined with knowledge that the cohort was treated at calendar
+# time T (often public), the ATT series leaks firm-level outcome
+# changes if the cohort is small.
+#
+# Suppression rule: any cohort g with ``n_treated_per_group[g] <
+# min_n_did`` gets ALL its cells dropped from ``att`` and the
+# per-cell SE / p / CI dicts. Whole-cohort suppression is
+# mandatory — partial-cell publication would leak the cohort size
+# through *which* cells survived. The cohort label itself is also
+# withheld (the marker key is ``[suppressed]``), since the
+# cohort label is data-derived (it's typically the treatment date
+# / cohort id and identifies the cohort directly).
+#
+# Cross-field validation: ``att`` is a nested {group: {event_time:
+# value}} dict. Every outer key must be in ``groups``; every inner
+# key must be in ``event_times``. ``standard_errors`` / ``p_values``
+# / ``ci_lower`` / ``ci_upper`` mirror that shape and validate the
+# same way. ``n_treated_per_group`` outer keys must equal ``groups``.
+
+# Required structural fields. ``att`` and ``n_treated_per_group``
+# are load-bearing — without the latter the cohort-N gate has no
+# input and SDC degenerates to "trust the script". The aggregate
+# ATT block is optional (a study might only report the matrix).
+_DID_EVENT_REQUIRED: frozenset[str] = frozenset((
+    "type", "groups", "event_times", "att", "n_treated_per_group",
+))
+_DID_EVENT_ALLOWED_NUMERIC_FIELDS: frozenset[str] = frozenset((
+    "aggregate_att", "aggregate_se", "aggregate_p_value",
+    "aggregate_ci_lower", "aggregate_ci_upper",
+    "pre_trends_chi_squared", "pre_trends_p_value",
+))
+_DID_EVENT_ALLOWED_INT_FIELDS: frozenset[str] = frozenset((
+    # Anticipation window the estimator was told to assume. Callaway-
+    # Sant'Anna's ``anticipation`` arg specifies how many periods
+    # before treatment the treatment effect may "leak in" — shifting
+    # which pre-periods are usable as controls. A scalar count, no
+    # disclosure risk; surfaced so the model can report "...assuming
+    # zero anticipation" or call out a non-default value.
+    "anticipation_periods",
+    "n_pre_treatment_periods", "n_post_treatment_periods",
+))
+_DID_EVENT_ALLOWED_STRING_FIELDS: frozenset[str] = frozenset((
+    "type", "estimator", "outcome_variable", "treatment_variable",
+    "aggregation_method",
+    # Which units serve as the control group during the differencing
+    # step. CS / dCdH let you pick:
+    #   * ``nevertreated`` — only units that NEVER receive treatment.
+    #     Stricter but loses data when the never-treated cohort is
+    #     small or absent.
+    #   * ``notyettreated`` — units that will be treated later are
+    #     also valid controls until their own treatment date.
+    # Pinned by ``_DID_VALID_COMPARISON_GROUP`` below.
+    "comparison_group",
+    # CS / dCdH ``base_period`` rule: which pre-treatment period
+    # serves as the reference for each cohort. ``varying`` (the R
+    # ``did`` package default) re-bases for each (g, t) pair to the
+    # immediately-pre-treatment period. ``universal`` fixes the base
+    # period across all (g, t) pairs to a single period.
+    "base_period",
+))
+_DID_VALID_COMPARISON_GROUP: frozenset[str] = frozenset((
+    "nevertreated", "notyettreated",
+    # snake_case variants — accept both so the helper doesn't have
+    # to choose between the R package's no-underscore form and the
+    # more readable Python idiom.
+    "never_treated", "not_yet_treated",
+))
+_DID_VALID_BASE_PERIOD: frozenset[str] = frozenset((
+    "varying", "universal",
+))
+_DID_EVENT_ALLOWED_LIST_STRING: frozenset[str] = frozenset((
+    "groups",
+))
+_DID_EVENT_ALLOWED_LIST_NUMERIC: frozenset[str] = frozenset((
+    "event_times",
+))
+# Nested-dict (group → event_time → value) fields. Each gets the
+# same cohort suppression and cross-field validation pass.
+_DID_EVENT_NESTED_DICT_FIELDS: frozenset[str] = frozenset((
+    "att", "standard_errors", "p_values", "ci_lower", "ci_upper",
+))
+# Flat per-group dicts. ``n_treated_per_group`` is the SDC-relevant
+# one (drives the cohort gate); ``n_control_per_cell`` is optional
+# secondary metadata if the script computed cell-level control N.
+_DID_EVENT_PER_GROUP_INT_FIELDS: frozenset[str] = frozenset((
+    "n_treated_per_group",
+))
+# Structural caps on the panel dimensions. A real Callaway-Sant'Anna
+# study reports a handful of cohorts (treatment-year cohorts in a
+# DiD design) over a window of event times (typically ±5 to ±10).
+# A 50-cohort × 30-event-time panel is already 1500 cells of
+# disclosure surface; bigger numbers are almost always a sign the
+# script is shipping disaggregated data through this channel.
+_DID_EVENT_MAX_GROUPS: int = 50
+_DID_EVENT_MAX_EVENT_TIMES: int = 30
+_DID_EVENT_VALID_AGGREGATION: frozenset[str] = frozenset((
+    "overall", "by_group", "by_event_time", "simple",
+    "dynamic", "calendar",  # Callaway-Sant'Anna aggregator names
+    # ``event`` is the Python ``differences`` package's name for the
+    # same event-time aggregation R's ``did`` calls ``dynamic``.
+    # Accept both so the helper doesn't have to normalize.
+    "event", "group",
+))
+_DID_EVENT_VALID_ESTIMATOR: frozenset[str] = frozenset((
+    "callaway_santanna", "de_chaisemartin", "sun_abraham",
+    "twfe_event_study", "twfe",
+))
+
+
+def _sanitize_did_event_study(
+    raw: dict[str, Any], config: SDCConfig
+) -> SanitizerResult:
+    missing_reason = _require_fields(raw, _DID_EVENT_REQUIRED, "did_event_study")
+    if missing_reason:
+        return SanitizerResult(
+            ok=False, analysis_type="did_event_study",
+            rejection_reason=missing_reason,
+        )
+
+    # Validate groups list shape and cap before anything else — the
+    # cohort identifiers gate the cross-field key validation below.
+    groups_raw = raw.get("groups")
+    if not isinstance(groups_raw, list) or not all(
+        isinstance(x, str) for x in groups_raw
+    ):
+        return SanitizerResult(
+            ok=False, analysis_type="did_event_study",
+            rejection_reason=(
+                "groups must be a list of strings (cohort identifiers); "
+                f"got {type(groups_raw).__name__}"
+            ),
+        )
+    if len(groups_raw) > _DID_EVENT_MAX_GROUPS:
+        return SanitizerResult(
+            ok=False, analysis_type="did_event_study",
+            rejection_reason=(
+                f"groups has {len(groups_raw)} cohorts; the structural "
+                f"cap is {_DID_EVENT_MAX_GROUPS}. A real Callaway-Sant'Anna "
+                f"/ event-study analysis ships a handful of cohorts; "
+                f"larger payloads are rejected as probable adversarial."
+            ),
+        )
+    if len(groups_raw) == 0:
+        return SanitizerResult(
+            ok=False, analysis_type="did_event_study",
+            rejection_reason="groups is empty",
+        )
+
+    # Validate event_times — list of finite numbers (typically ints
+    # but allow floats; sanitize to int when integer-valued for nice
+    # JSON, otherwise keep float).
+    event_times_raw = raw.get("event_times")
+    if not isinstance(event_times_raw, list) or not all(
+        _is_finite_number(x) for x in event_times_raw
+    ):
+        return SanitizerResult(
+            ok=False, analysis_type="did_event_study",
+            rejection_reason=(
+                "event_times must be a list of finite numbers; "
+                f"got {type(event_times_raw).__name__}"
+            ),
+        )
+    if len(event_times_raw) > _DID_EVENT_MAX_EVENT_TIMES:
+        return SanitizerResult(
+            ok=False, analysis_type="did_event_study",
+            rejection_reason=(
+                f"event_times has {len(event_times_raw)} entries; the "
+                f"structural cap is {_DID_EVENT_MAX_EVENT_TIMES}."
+            ),
+        )
+
+    # n_treated_per_group: required, dict[str, int]. This is the
+    # SDC primitive's input — every cohort must declare its treated
+    # size or the cohort-N gate can't run.
+    n_treated_raw = raw.get("n_treated_per_group")
+    if not isinstance(n_treated_raw, dict):
+        return SanitizerResult(
+            ok=False, analysis_type="did_event_study",
+            rejection_reason=(
+                "n_treated_per_group must be a dict mapping cohort id "
+                "to treated-unit count; "
+                f"got {type(n_treated_raw).__name__}"
+            ),
+        )
+
+    transformations: list[str] = []
+
+    # Sanitize group labels and build the declared-cohort set after
+    # safe_key normalization. Reject safe_key collisions outright
+    # mirrors the magnitude_table / crosstab pattern.
+    safe_groups: list[str] = []
+    safe_groups_set: set[str] = set()
+    for raw_g in groups_raw:
+        sg = safe_key(raw_g)
+        if sg in safe_groups_set:
+            return SanitizerResult(
+                ok=False, analysis_type="did_event_study",
+                rejection_reason=(
+                    "cohort label collision after sanitization in "
+                    "did_event_study.groups: two distinct raw labels "
+                    "sanitize to the same safe_key, which would silently "
+                    "overwrite ATT entries. Disambiguate labels in the "
+                    "source script. Colliding labels withheld."
+                ),
+            )
+        safe_groups_set.add(sg)
+        safe_groups.append(sg)
+
+    # Sanitize event_time labels. Use a string form (so JSON keys are
+    # stable: "-3", "-2", ...). Strip non-finite; coerce ints to int.
+    safe_event_times: list[Any] = []
+    safe_event_times_str_set: set[str] = set()
+    for raw_t in event_times_raw:
+        t = float(raw_t)
+        if not math.isfinite(t):
+            continue
+        if t == int(t):
+            t_norm: Any = int(t)
+        else:
+            t_norm = t
+        safe_event_times.append(t_norm)
+        safe_event_times_str_set.add(str(t_norm))
+
+    # Apply the cohort-N gate. Map safe-group → treated count; drop
+    # the entire cohort when count < threshold (using the same
+    # threshold as descriptive's min_n for consistency; the SDC
+    # config has a single ``min_n`` that drives all suppression).
+    cohort_min_n = config.min_n_did_cohort
+    suppressed_cohorts: set[str] = set()
+    cleaned_n_treated: dict[str, int] = {}
+
+    for raw_g_key, count in n_treated_raw.items():
+        if not isinstance(raw_g_key, str):
+            continue
+        sg = safe_key(raw_g_key)
+        if sg not in safe_groups_set:
+            # Cohort key not in declared groups — drop silently,
+            # don't name it (would echo a data-derived label).
+            continue
+        if not isinstance(count, int) or isinstance(count, bool) or count < 0:
+            return SanitizerResult(
+                ok=False, analysis_type="did_event_study",
+                rejection_reason=(
+                    "n_treated_per_group values must be non-negative "
+                    f"ints; got {type(count).__name__} for one entry "
+                    "(cohort label withheld)"
+                ),
+            )
+        if count < cohort_min_n:
+            suppressed_cohorts.add(sg)
+        else:
+            cleaned_n_treated[sg] = count
+
+    # Every declared cohort must have a count entry. A cohort named
+    # in ``groups`` but missing from ``n_treated_per_group`` would
+    # bypass the gate — reject the payload rather than guess.
+    declared_safe_in_n = {
+        safe_key(k) for k in n_treated_raw.keys()
+        if isinstance(k, str) and safe_key(k) in safe_groups_set
+    }
+    missing_n = [g for g in safe_groups if g not in declared_safe_in_n]
+    if missing_n:
+        return SanitizerResult(
+            ok=False, analysis_type="did_event_study",
+            rejection_reason=(
+                f"{len(missing_n)} declared cohort(s) have no "
+                f"n_treated_per_group entry. The cohort-N gate cannot "
+                f"run without per-cohort sizes. Cohort labels withheld."
+            ),
+        )
+
+    surviving_cohorts: set[str] = safe_groups_set - suppressed_cohorts
+    if suppressed_cohorts:
+        transformations.append(
+            f"cohort suppression: {len(suppressed_cohorts)} cohort(s) "
+            f"with n_treated < {cohort_min_n} dropped entirely (labels "
+            f"withheld — cohort identities are disclosive)"
+        )
+
+    if not surviving_cohorts:
+        return SanitizerResult(
+            ok=False, analysis_type="did_event_study",
+            rejection_reason=(
+                f"all cohorts have n_treated < {cohort_min_n}; nothing "
+                f"survives the cohort-N gate. No ATT panel published."
+            ),
+        )
+
+    # Build the output. Top-level allowed fields first.
+    out: dict[str, Any] = _collect_allowed(
+        raw,
+        numeric=_DID_EVENT_ALLOWED_NUMERIC_FIELDS,
+        integer=_DID_EVENT_ALLOWED_INT_FIELDS,
+        string=_DID_EVENT_ALLOWED_STRING_FIELDS,
+        list_string=_DID_EVENT_ALLOWED_LIST_STRING,
+        list_numeric=_DID_EVENT_ALLOWED_LIST_NUMERIC,
+        transformations=transformations,
+    )
+
+    # Validate string-enum fields (aggregation_method, estimator,
+    # comparison_group, base_period).
+    aggm = out.get("aggregation_method")
+    if aggm is not None and aggm not in _DID_EVENT_VALID_AGGREGATION:
+        transformations.append(
+            f"dropped 'aggregation_method' value (not in valid set)"
+        )
+        del out["aggregation_method"]
+    est = out.get("estimator")
+    if est is not None and est not in _DID_EVENT_VALID_ESTIMATOR:
+        transformations.append(
+            f"dropped 'estimator' value (not in valid set)"
+        )
+        del out["estimator"]
+    cmp_group = out.get("comparison_group")
+    if cmp_group is not None and cmp_group not in _DID_VALID_COMPARISON_GROUP:
+        transformations.append(
+            "dropped 'comparison_group' value (must be one of "
+            "nevertreated / notyettreated / never_treated / not_yet_treated)"
+        )
+        del out["comparison_group"]
+    bperiod = out.get("base_period")
+    if bperiod is not None and bperiod not in _DID_VALID_BASE_PERIOD:
+        transformations.append(
+            "dropped 'base_period' value (must be 'varying' or 'universal')"
+        )
+        del out["base_period"]
+
+    # Re-place the sanitized identifier lists (use safe forms).
+    out["groups"] = sorted(surviving_cohorts)
+    out["event_times"] = safe_event_times
+    out["n_treated_per_group"] = cleaned_n_treated
+
+    # Process each nested dict-of-dict field (att / SE / p / CI
+    # lower+upper). Apply: (a) outer key must be a surviving cohort,
+    # (b) inner key must be in event_times, (c) values finite, then
+    # precision-clamp by aggregate treated N.
+    total_treated_n = sum(cleaned_n_treated.values())
+    sigfigs_n = total_treated_n if total_treated_n > 0 else cohort_min_n
+
+    for field in _DID_EVENT_NESTED_DICT_FIELDS:
+        v = raw.get(field)
+        if v is None:
+            continue
+        if not isinstance(v, dict):
+            transformations.append(
+                f"dropped {field!r}: expected nested dict, "
+                f"got {type(v).__name__}"
+            )
+            continue
+        cleaned: dict[str, dict[str, float]] = {}
+        dropped_outer = 0
+        dropped_inner = 0
+        for outer_k, inner_v in v.items():
+            if not isinstance(outer_k, str):
+                dropped_outer += 1
+                continue
+            sg = safe_key(outer_k)
+            if sg not in surviving_cohorts:
+                # Either the cohort was suppressed or it's not in
+                # ``groups`` at all. Either way: drop, don't name.
+                dropped_outer += 1
+                continue
+            if not isinstance(inner_v, dict):
+                dropped_outer += 1
+                continue
+            cleaned_inner: dict[str, float] = {}
+            for inner_k, cell_v in inner_v.items():
+                # Inner key may be str or int (event times); normalize
+                # to str-form to match safe_event_times_str_set.
+                k_str = str(inner_k)
+                if k_str not in safe_event_times_str_set:
+                    dropped_inner += 1
+                    continue
+                if not _is_finite_number(cell_v):
+                    dropped_inner += 1
+                    continue
+                cleaned_inner[k_str] = clamp_precision(
+                    float(cell_v), sigfigs_n
+                )
+            if cleaned_inner:
+                cleaned[sg] = cleaned_inner
+        if dropped_outer:
+            transformations.append(
+                f"dropped {dropped_outer} undeclared/suppressed outer "
+                f"key(s) from {field!r} (cohort labels withheld)"
+            )
+        if dropped_inner:
+            transformations.append(
+                f"dropped {dropped_inner} undeclared event-time key(s) "
+                f"from {field!r}"
+            )
+        out[field] = cleaned
+
+    # Aggregate-att scalars: precision-clamp at total-treated-N.
+    for key in _DID_EVENT_ALLOWED_NUMERIC_FIELDS:
+        if key in out:
+            out[key] = clamp_precision(out[key], sigfigs_n)
+
+    transformations.append(
+        f"clamped numeric fields to precision matching total treated "
+        f"n={sigfigs_n}"
+    )
+
+    return SanitizerResult(
+        ok=True, analysis_type="did_event_study",
+        sanitized=out, transformations=transformations,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Regression discontinuity design (RDD)
+# ---------------------------------------------------------------------------
+#
+# The RDD shape ships the local-polynomial point estimate(s) plus
+# bandwidth and effective-N diagnostics — what the model needs to
+# evaluate an RDD design. The Calonico-Cattaneo-Titiunik (rdrobust)
+# convention reports three flavors of τ at one fit: the conventional
+# local-polynomial estimate, the bias-corrected variant, and the
+# robust variant whose standard error accounts for bias-correction
+# noise. The model sees all three so it can report the standard
+# table conventional / bc / robust users expect.
+#
+# **Privacy carve-out, made structural via the allowlist:**
+# Two RDD diagnostics are deliberately excluded from the shape:
+#
+#   1.  The **McCrary density test**'s estimated density curve.
+#       The test statistic itself is a single scalar (log-discontinuity
+#       in density at the cutoff); the *curve* — density evaluated at
+#       a grid of points around the cutoff — is essentially a
+#       histogram of the running variable in the most identifying
+#       region (a few bandwidths either side of c). The running
+#       variable in an RDD is by construction sensitive: income at a
+#       tax-credit cutoff, test score at an admissions threshold,
+#       date-of-birth at a school-entry cutoff. Surfacing the density
+#       curve to the model would invert the privacy claim ("the
+#       model never sees a raw cell value") on the exact slice where
+#       individual identification is most likely. Even the bare
+#       statistic at the cutoff has a cutoff-scan attack: re-run at
+#       placebo cutoffs c±δ and the sequence of statistics maps the
+#       density. We exclude the test ENTIRELY from this shape.
+#
+#   2.  **Binscatter near the cutoff** — by construction, bins shrink
+#       toward the cutoff to make the discontinuity visible. Small
+#       bins mean cells of small N over the most sensitive variable
+#       slice. Same disclosure surface as McCrary's curve.
+#
+# Both are researcher-only by construction — they have no field in
+# the ``rdd`` allowlist below. A script can still produce them
+# visually for the researcher (the executor's raw-log panel and the
+# helper-error JSONL surface stay intact), but no path through the
+# sanitizer carries them to the model. This matches the helper-
+# allowlist precedent set for plot vision (the only paths to the
+# model run through ``plot_residuals`` / ``plot_interaction`` /
+# ``plot_coefficients`` / ``plot_estimate_comparison`` — bespoke
+# plots stay researcher-only).
+#
+# Binscatter AWAY from cutoffs, with min-N-per-bin guarantees, fits
+# the existing ``magnitude_table`` shape and can ship through that
+# channel. The exclusion here is specifically for the cutoff-
+# proximity case where binwidths shrink by construction.
+
+_RDD_REQUIRED: frozenset[str] = frozenset((
+    "type", "running_variable", "cutoff",
+    "tau_robust", "se_robust",
+    "effective_n_left", "effective_n_right",
+))
+_RDD_ALLOWED_NUMERIC_FIELDS: frozenset[str] = frozenset((
+    # CCT three-flavor estimates
+    "tau_conventional", "tau_bias_corrected", "tau_robust",
+    "se_conventional", "se_bias_corrected", "se_robust",
+    "p_conventional", "p_bias_corrected", "p_robust",
+    "ci_lower_conventional", "ci_upper_conventional",
+    "ci_lower_bias_corrected", "ci_upper_bias_corrected",
+    "ci_lower_robust", "ci_upper_robust",
+    # Cutoff (the threshold value) — a researcher-chosen constant,
+    # not a data-derived quantity. Surfaced so the model can echo
+    # "discontinuity at age 65 = ..." rather than guessing.
+    "cutoff",
+    # Bandwidth(s). Left/right bandwidth differ when the optimal
+    # MSE-minimizing bandwidth is computed separately on each side
+    # (rdrobust's default).
+    "bandwidth_left", "bandwidth_right",
+    "bandwidth_bias_correction_left", "bandwidth_bias_correction_right",
+    # Fuzzy-RDD diagnostic: first-stage F-statistic for joint
+    # significance of the cutoff dummy in the first-stage regression
+    # of the endogenous-treatment indicator on the running variable.
+    # Below ~10 flags a weak first-stage and renders the Wald-ratio
+    # τ unstable. Same primitive as IV's ``first_stage_f``; the
+    # field name is duplicated here so RDD payloads don't have to
+    # route through the regression-bucket schema. Whether the fit
+    # is sharp or fuzzy is communicated via the ``estimator`` enum
+    # below (``fuzzy_2sls`` vs ``local_polynomial``).
+    "first_stage_f",
+))
+_RDD_ALLOWED_INT_FIELDS: frozenset[str] = frozenset((
+    # Effective N inside the bandwidth window — the SDC-relevant
+    # quantity. RDD inference is local; the effective sample sizes
+    # are what bound how tightly the local fit can identify
+    # individuals. Required, so the min-N gate has its inputs.
+    "effective_n_left", "effective_n_right", "effective_n_total",
+    "polynomial_order",
+))
+_RDD_ALLOWED_STRING_FIELDS: frozenset[str] = frozenset((
+    "type", "estimator", "running_variable", "outcome_variable",
+    "kernel",
+    # rdrobust's bandwidth-selection rule. Each is a documented CCT /
+    # CER selector with different optimality criteria:
+    #   * ``mserd``: single MSE-optimal bandwidth, same on both sides.
+    #   * ``msetwo``: MSE-optimal bandwidth selected separately per side.
+    #   * ``msesum`` / ``msecomb1`` / ``msecomb2``: MSE variants.
+    #   * ``cerrd`` / ``certwo`` / ``cercomb1`` / ``cercomb2``: coverage-
+    #     error-rate (CER) optimal — narrower bandwidth, lower bias,
+    #     wider CIs.
+    #   * ``manual``: caller-supplied bandwidth (no automatic selection).
+    # The validation set below pins these as the only legal values; the
+    # field passes ``safe_text`` regardless, but limiting to known
+    # selectors prevents a script from smuggling free-text into the
+    # model via this slot.
+    "bandwidth_selector",
+))
+_RDD_VALID_ESTIMATOR: frozenset[str] = frozenset((
+    "local_polynomial", "sharp_parametric", "fuzzy_2sls",
+    "rdrobust", "rdlocrand",
+))
+_RDD_VALID_KERNEL: frozenset[str] = frozenset((
+    "triangular", "uniform", "epanechnikov",
+))
+_RDD_VALID_BANDWIDTH_SELECTOR: frozenset[str] = frozenset((
+    "mserd", "msetwo", "msesum", "msecomb1", "msecomb2",
+    "cerrd", "certwo", "cercomb1", "cercomb2",
+    "manual",
+))
+
+
+def _sanitize_rdd(
+    raw: dict[str, Any], config: SDCConfig
+) -> SanitizerResult:
+    missing_reason = _require_fields(raw, _RDD_REQUIRED, "rdd")
+    if missing_reason:
+        return SanitizerResult(
+            ok=False, analysis_type="rdd",
+            rejection_reason=missing_reason,
+        )
+
+    # Effective-N gate. Local-polynomial RDD identifies τ from
+    # observations inside the bandwidth on each side of the cutoff;
+    # the local sample sizes must each pass the min-N threshold or
+    # the inference isn't trustworthy. Apply per-side, not just to
+    # the total — a 50/2 split can hit total ≥ threshold while one
+    # side has unbounded uncertainty.
+    for side_field in ("effective_n_left", "effective_n_right"):
+        v = raw.get(side_field)
+        if not isinstance(v, int) or isinstance(v, bool) or v < 0:
+            return SanitizerResult(
+                ok=False, analysis_type="rdd",
+                rejection_reason=(
+                    f"{side_field} must be a non-negative int; "
+                    f"got {type(v).__name__}"
+                ),
+            )
+        try:
+            require_minimum_n(v, config.min_n_regression, side_field)
+        except MinimumNViolation as e:
+            return SanitizerResult(
+                ok=False, analysis_type="rdd",
+                rejection_reason=str(e),
+            )
+
+    transformations: list[str] = []
+    out = _collect_allowed(
+        raw,
+        numeric=_RDD_ALLOWED_NUMERIC_FIELDS,
+        integer=_RDD_ALLOWED_INT_FIELDS,
+        string=_RDD_ALLOWED_STRING_FIELDS,
+        transformations=transformations,
+    )
+
+    # Validate enum string fields.
+    est = out.get("estimator")
+    if est is not None and est not in _RDD_VALID_ESTIMATOR:
+        transformations.append(
+            "dropped 'estimator' value (not in valid set)"
+        )
+        del out["estimator"]
+    krn = out.get("kernel")
+    if krn is not None and krn not in _RDD_VALID_KERNEL:
+        transformations.append(
+            "dropped 'kernel' value (not in valid set)"
+        )
+        del out["kernel"]
+    bwsel = out.get("bandwidth_selector")
+    if bwsel is not None and bwsel not in _RDD_VALID_BANDWIDTH_SELECTOR:
+        transformations.append(
+            "dropped 'bandwidth_selector' value (not in valid set — "
+            "must be one of mserd / msetwo / msesum / msecomb1 / "
+            "msecomb2 / cerrd / certwo / cercomb1 / cercomb2 / manual)"
+        )
+        del out["bandwidth_selector"]
+    po = out.get("polynomial_order")
+    if po is not None:
+        if po < 0 or po > 4:
+            transformations.append(
+                "dropped 'polynomial_order' value (must be 0..4; "
+                "local-polynomial RDD with degree > 4 is suspect)"
+            )
+            del out["polynomial_order"]
+
+    # ``running_variable`` is identifier-shape gated. ``rejection_reason``
+    # withholds bad names — the running variable is data-derived (the
+    # column name the researcher chose).
+    _enforce_identifier_string_fields(
+        out, frozenset(("running_variable", "outcome_variable")),
+        transformations, type_label="rdd",
+    )
+
+    # Re-check required after type filtering.
+    missing_after = _require_after_filter(
+        out, _RDD_REQUIRED, "rdd",
+        pre_validated=frozenset(("effective_n_left", "effective_n_right")),
+    )
+    if missing_after:
+        return SanitizerResult(
+            ok=False, analysis_type="rdd",
+            rejection_reason=missing_after,
+        )
+
+    # Precision clamp by total effective N (sum of sides if total
+    # absent). Total drives the precision of τ; per-side N drives
+    # the per-side gate already enforced above.
+    n_total = out.get("effective_n_total")
+    if n_total is None:
+        n_total = out["effective_n_left"] + out["effective_n_right"]
+        out["effective_n_total"] = n_total
+    for key in _RDD_ALLOWED_NUMERIC_FIELDS:
+        if key in out:
+            out[key] = clamp_precision(out[key], n_total)
+
+    transformations.append(
+        f"clamped numeric fields to precision matching effective n={n_total}"
+    )
+
+    return SanitizerResult(
+        ok=True, analysis_type="rdd",
+        sanitized=out, transformations=transformations,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Kaplan-Meier (safe-form: scalars at preset horizons, no curve)
+# ---------------------------------------------------------------------------
+#
+# The full KM step function — survival probability at every observed
+# event time — is too granular near small risk sets. With small
+# n_at_risk, the survival drop from a single event identifies that
+# event's timing and (combined with covariate distribution) the
+# individual. The shape published here is the *safe form* described
+# in ``docs/direction.md``: median survival with CI, plus survival
+# at a small set of preset horizons (e.g., 1y, 3y, 5y) each gated by
+# its own n_at_risk threshold. Dedicated shape, not a coefficient
+# table sub-type, because the cross-field invariant is different
+# (per-horizon N gate, not per-coefficient name match).
+#
+# The curve itself (per-event-time S(t) values, the Greenwood SE
+# series, KM-by-group log-rank chi²) is researcher-only by
+# construction — it has no field in this allowlist. Same exclusion
+# pattern as McCrary in the RDD shape: structurally absent from the
+# allowlist means it can't be smuggled through the generic
+# ``result(type="kaplan_meier", ...)`` path.
+
+_KM_REQUIRED: frozenset[str] = frozenset((
+    "type", "time_variable", "event_variable",
+    "n_subjects", "n_failures",
+))
+_KM_ALLOWED_NUMERIC_FIELDS: frozenset[str] = frozenset((
+    "median_survival_time", "median_survival_ci_lower",
+    "median_survival_ci_upper",
+    # Pre-specified horizon survival probabilities. We allowlist a
+    # small fixed set — enough to cover the conventional 1y / 3y /
+    # 5y reporting plus a couple extra — rather than letting the
+    # caller name arbitrary horizons (which would be a covert-channel
+    # surface for raw time values).
+    "survival_at_1y", "survival_at_3y", "survival_at_5y",
+    "survival_at_10y",
+    "survival_at_1y_ci_lower", "survival_at_1y_ci_upper",
+    "survival_at_3y_ci_lower", "survival_at_3y_ci_upper",
+    "survival_at_5y_ci_lower", "survival_at_5y_ci_upper",
+    "survival_at_10y_ci_lower", "survival_at_10y_ci_upper",
+    # Log-rank omnibus across groups (when KM-by-group requested).
+    "logrank_chi_squared", "logrank_p_value",
+))
+_KM_ALLOWED_INT_FIELDS: frozenset[str] = frozenset((
+    "n_subjects", "n_failures",
+    # n_at_risk at each pre-specified horizon — drives the per-
+    # horizon gate. Each horizon needs ≥ min_n_regression at-risk
+    # subjects or its S(t) is dropped.
+    "n_at_risk_1y", "n_at_risk_3y", "n_at_risk_5y", "n_at_risk_10y",
+    # Group count for log-rank-by-group setups.
+    "n_groups",
+))
+_KM_ALLOWED_STRING_FIELDS: frozenset[str] = frozenset((
+    "type", "time_variable", "event_variable", "group_variable",
+))
+
+
+def _sanitize_kaplan_meier(
+    raw: dict[str, Any], config: SDCConfig
+) -> SanitizerResult:
+    missing_reason = _require_fields(raw, _KM_REQUIRED, "kaplan_meier")
+    if missing_reason:
+        return SanitizerResult(
+            ok=False, analysis_type="kaplan_meier",
+            rejection_reason=missing_reason,
+        )
+
+    n_sub = raw.get("n_subjects")
+    if not isinstance(n_sub, int) or isinstance(n_sub, bool) or n_sub < 0:
+        return SanitizerResult(
+            ok=False, analysis_type="kaplan_meier",
+            rejection_reason=(
+                f"n_subjects must be a non-negative int; "
+                f"got {type(n_sub).__name__}"
+            ),
+        )
+    try:
+        require_minimum_n(n_sub, config.min_n_regression, "n_subjects")
+    except MinimumNViolation as e:
+        return SanitizerResult(
+            ok=False, analysis_type="kaplan_meier",
+            rejection_reason=str(e),
+        )
+
+    n_fail = raw.get("n_failures")
+    if not isinstance(n_fail, int) or isinstance(n_fail, bool) or n_fail < 0:
+        return SanitizerResult(
+            ok=False, analysis_type="kaplan_meier",
+            rejection_reason=(
+                f"n_failures must be a non-negative int; "
+                f"got {type(n_fail).__name__}"
+            ),
+        )
+    if n_fail > n_sub:
+        return SanitizerResult(
+            ok=False, analysis_type="kaplan_meier",
+            rejection_reason=(
+                f"n_failures ({n_fail}) cannot exceed n_subjects ({n_sub})"
+            ),
+        )
+
+    transformations: list[str] = []
+    out = _collect_allowed(
+        raw,
+        numeric=_KM_ALLOWED_NUMERIC_FIELDS,
+        integer=_KM_ALLOWED_INT_FIELDS,
+        string=_KM_ALLOWED_STRING_FIELDS,
+        transformations=transformations,
+    )
+
+    _enforce_identifier_string_fields(
+        out, frozenset(("time_variable", "event_variable", "group_variable")),
+        transformations, type_label="kaplan_meier",
+    )
+
+    missing_after = _require_after_filter(
+        out, _KM_REQUIRED, "kaplan_meier",
+        pre_validated=frozenset(("n_subjects", "n_failures")),
+    )
+    if missing_after:
+        return SanitizerResult(
+            ok=False, analysis_type="kaplan_meier",
+            rejection_reason=missing_after,
+        )
+
+    # Per-horizon n_at_risk gate. For each horizon h whose S(h) field
+    # is populated, the corresponding n_at_risk_h must be present
+    # and pass min_n_regression. If the gate fails, drop the S(h)
+    # AND its CI bounds — partial publication leaks at-risk count
+    # through "this horizon survives, that one doesn't".
+    horizons = ("1y", "3y", "5y", "10y")
+    for h in horizons:
+        s_field = f"survival_at_{h}"
+        if s_field not in out:
+            continue
+        n_risk_field = f"n_at_risk_{h}"
+        n_risk = out.get(n_risk_field)
+        if (n_risk is None
+            or not isinstance(n_risk, int)
+            or n_risk < config.min_n_regression):
+            # Drop this horizon's S(h) and CI bounds together.
+            dropped_fields = [s_field]
+            for suffix in ("_ci_lower", "_ci_upper"):
+                key = s_field + suffix
+                if key in out:
+                    dropped_fields.append(key)
+                    del out[key]
+            del out[s_field]
+            transformations.append(
+                f"dropped horizon {h}: n_at_risk_{h} below "
+                f"min_n_regression ({config.min_n_regression}) "
+                f"or absent"
+            )
+
+    # Precision clamp by total n_subjects.
+    for key in _KM_ALLOWED_NUMERIC_FIELDS:
+        if key in out:
+            out[key] = clamp_precision(out[key], n_sub)
+    transformations.append(
+        f"clamped numeric fields to precision matching n_subjects={n_sub}"
+    )
+
+    return SanitizerResult(
+        ok=True, analysis_type="kaplan_meier",
+        sanitized=out, transformations=transformations,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Factor decomposition — PCA + factor analysis as one shape
+# ---------------------------------------------------------------------------
+#
+# Covers principal-components analysis (PCA), classical factor
+# analysis (factanal / sklearn.decomposition.FactorAnalyzer), and
+# maximum-likelihood factor analysis. The disclosure-relevant
+# quantities are all aggregates over the full sample:
+#   * Loadings (variable × component matrix) — eigenvectors of the
+#     correlation / covariance matrix. Bounded roughly [-1, 1] for
+#     standardized inputs. The variable names are dataset columns
+#     the model has already seen; component names ("PC1", "factor1",
+#     etc.) are synthetic.
+#   * Eigenvalues / explained variance / cumulative variance — one
+#     scalar per component. Aggregate scalars.
+#   * Communalities / uniqueness — one scalar per variable.
+#   * Goodness-of-fit (KMO, Bartlett, chi²) — aggregate test stats.
+#
+# Privacy carve-out, structural: factor SCORES (per-observation
+# projections onto the components) are NOT in this allowlist. Scores
+# are essentially raw observations transformed; emitting them would
+# undo the privacy claim on the exact axis PCA/FA defines. Stays
+# researcher-only by construction.
+#
+# The same shape carries PCA, classical FA, and ML-FA outputs;
+# ``method`` distinguishes. Helpers per method × language; the
+# sanitizer doesn't dispatch on it.
+
+_FACTOR_REQUIRED: frozenset[str] = frozenset((
+    "type", "method", "n_observations", "n_variables", "n_components",
+    "variables", "loadings",
+))
+_FACTOR_ALLOWED_NUMERIC_FIELDS: frozenset[str] = frozenset((
+    # Goodness-of-fit scalars (mostly for ML factor analysis):
+    "kmo",                       # Kaiser-Meyer-Olkin sampling adequacy
+    "bartlett_chi_squared",      # Bartlett's test of sphericity
+    "bartlett_p_value",
+    "chi_squared",               # ML-FA goodness-of-fit
+    "chi_squared_p_value",
+    "log_likelihood",
+    "rmsea",                     # Root mean square error of approximation
+    "tli",                       # Tucker-Lewis index
+))
+_FACTOR_ALLOWED_INT_FIELDS: frozenset[str] = frozenset((
+    "n_observations", "n_variables", "n_components",
+    "degrees_of_freedom",
+))
+_FACTOR_ALLOWED_STRING_FIELDS: frozenset[str] = frozenset((
+    "type", "method", "rotation",
+))
+_FACTOR_ALLOWED_LIST_STRING: frozenset[str] = frozenset((
+    # Variable names participating in the decomposition. Each goes
+    # through ``safe_key``; the list is bounded by ``_FACTOR_MAX_VARIABLES``.
+    "variables",
+    # Component labels ("PC1", "PC2", ..., or "factor1", "factor2", ...).
+    # Synthetic — generated by the helper rather than data-derived —
+    # but allowlisted for consistency so the sanitizer's cross-field
+    # check has the component keys to validate against.
+    "components",
+))
+# Nested-dict-of-dict field: loadings is {variable: {component: value}}.
+# Processed separately after the top-level filter, mirroring the
+# ``did_event_study`` pattern.
+_FACTOR_NESTED_DICT_FIELDS: frozenset[str] = frozenset((
+    "loadings",
+))
+# Flat dict-numeric fields. Two key conventions live here:
+#   * Component-keyed: ``explained_variance`` / ``explained_variance_ratio``
+#     / ``cumulative_variance`` / ``eigenvalues``. Keys must match the
+#     declared ``components`` list.
+#   * Variable-keyed: ``communalities`` / ``uniqueness``. Keys must
+#     match the declared ``variables`` list.
+_FACTOR_PER_COMPONENT_DICTS: frozenset[str] = frozenset((
+    "explained_variance", "explained_variance_ratio",
+    "cumulative_variance", "eigenvalues",
+))
+_FACTOR_PER_VARIABLE_DICTS: frozenset[str] = frozenset((
+    "communalities", "uniqueness",
+))
+_FACTOR_VALID_METHODS: frozenset[str] = frozenset((
+    "pca",                          # principal components
+    "factor_analysis",              # generic
+    "principal_factor",             # principal-factor extraction
+    "maximum_likelihood",           # ML factor analysis
+    "minimum_residual",             # MinRes
+))
+_FACTOR_VALID_ROTATIONS: frozenset[str] = frozenset((
+    "none", "varimax", "promax", "oblimin", "quartimax",
+    "equamax", "geomin", "bentlerT", "bifactor",
+))
+# Structural caps. A real PCA / FA published in a paper uses ≤ ~50
+# variables and ≤ ~20 components; bigger shapes are almost always
+# data-shaped objects masquerading as aggregates.
+_FACTOR_MAX_VARIABLES: int = 100
+_FACTOR_MAX_COMPONENTS: int = 50
+
+
+def _sanitize_factor_decomposition(
+    raw: dict[str, Any], config: SDCConfig
+) -> SanitizerResult:
+    missing_reason = _require_fields(raw, _FACTOR_REQUIRED, "factor_decomposition")
+    if missing_reason:
+        return SanitizerResult(
+            ok=False, analysis_type="factor_decomposition",
+            rejection_reason=missing_reason,
+        )
+
+    # n_observations gates the precision clamp; ``min_n_descriptive``
+    # is the same threshold used for descriptive payloads (PCA / FA on
+    # tiny samples is statistically meaningless anyway).
+    n_obs = raw.get("n_observations")
+    if not isinstance(n_obs, int) or isinstance(n_obs, bool) or n_obs < 0:
+        return SanitizerResult(
+            ok=False, analysis_type="factor_decomposition",
+            rejection_reason=(
+                f"n_observations must be a non-negative int; "
+                f"got {type(n_obs).__name__}"
+            ),
+        )
+    try:
+        require_minimum_n(n_obs, config.min_n_descriptive, "n_observations")
+    except MinimumNViolation as e:
+        return SanitizerResult(
+            ok=False, analysis_type="factor_decomposition",
+            rejection_reason=str(e),
+        )
+
+    # Method enum check before any further work.
+    method = raw.get("method")
+    if not isinstance(method, str) or method not in _FACTOR_VALID_METHODS:
+        return SanitizerResult(
+            ok=False, analysis_type="factor_decomposition",
+            rejection_reason=(
+                f"method must be one of {sorted(_FACTOR_VALID_METHODS)}; "
+                f"got {method!r}"
+            ),
+        )
+
+    # Variable list — required, bounded, names go through safe_key.
+    raw_vars = raw.get("variables")
+    if not isinstance(raw_vars, list) or not all(
+        isinstance(v, str) for v in raw_vars
+    ):
+        return SanitizerResult(
+            ok=False, analysis_type="factor_decomposition",
+            rejection_reason=(
+                "variables must be a list of strings (dataset column names)"
+            ),
+        )
+    if len(raw_vars) == 0:
+        return SanitizerResult(
+            ok=False, analysis_type="factor_decomposition",
+            rejection_reason="variables list is empty",
+        )
+    if len(raw_vars) > _FACTOR_MAX_VARIABLES:
+        return SanitizerResult(
+            ok=False, analysis_type="factor_decomposition",
+            rejection_reason=(
+                f"variables has {len(raw_vars)} entries; structural cap "
+                f"is {_FACTOR_MAX_VARIABLES}"
+            ),
+        )
+
+    # n_components claim must match the actual declared structure.
+    n_comp_claim = raw.get("n_components")
+    if not isinstance(n_comp_claim, int) or n_comp_claim <= 0:
+        return SanitizerResult(
+            ok=False, analysis_type="factor_decomposition",
+            rejection_reason=(
+                f"n_components must be a positive int; got {n_comp_claim!r}"
+            ),
+        )
+    if n_comp_claim > _FACTOR_MAX_COMPONENTS:
+        return SanitizerResult(
+            ok=False, analysis_type="factor_decomposition",
+            rejection_reason=(
+                f"n_components is {n_comp_claim}; structural cap is "
+                f"{_FACTOR_MAX_COMPONENTS}"
+            ),
+        )
+
+    # n_variables claim must match the variables list length.
+    n_var_claim = raw.get("n_variables")
+    if not isinstance(n_var_claim, int) or n_var_claim != len(raw_vars):
+        return SanitizerResult(
+            ok=False, analysis_type="factor_decomposition",
+            rejection_reason=(
+                f"n_variables claim ({n_var_claim}) does not match "
+                f"variables list length ({len(raw_vars)})"
+            ),
+        )
+
+    transformations: list[str] = []
+
+    # Sanitize variable + component label lists; reject safe_key
+    # collisions outright (the same pattern as crosstab / DiD).
+    safe_vars: list[str] = []
+    safe_var_set: set[str] = set()
+    for raw_v in raw_vars:
+        sv = safe_key(raw_v)
+        if sv in safe_var_set:
+            return SanitizerResult(
+                ok=False, analysis_type="factor_decomposition",
+                rejection_reason=(
+                    "variable label collision after sanitization "
+                    "(two distinct raw labels sanitize to the same "
+                    "safe_key; would silently overwrite loadings rows). "
+                    "Labels withheld."
+                ),
+            )
+        safe_var_set.add(sv)
+        safe_vars.append(sv)
+
+    raw_comps = raw.get("components") or [f"PC{i+1}" for i in range(n_comp_claim)]
+    if not isinstance(raw_comps, list) or not all(isinstance(c, str) for c in raw_comps):
+        return SanitizerResult(
+            ok=False, analysis_type="factor_decomposition",
+            rejection_reason="components must be a list of strings",
+        )
+    if len(raw_comps) != n_comp_claim:
+        return SanitizerResult(
+            ok=False, analysis_type="factor_decomposition",
+            rejection_reason=(
+                f"components list length ({len(raw_comps)}) does not "
+                f"match n_components ({n_comp_claim})"
+            ),
+        )
+    safe_comps: list[str] = []
+    safe_comp_set: set[str] = set()
+    for raw_c in raw_comps:
+        sc = safe_key(raw_c)
+        if sc in safe_comp_set:
+            return SanitizerResult(
+                ok=False, analysis_type="factor_decomposition",
+                rejection_reason=(
+                    "component label collision after sanitization"
+                ),
+            )
+        safe_comp_set.add(sc)
+        safe_comps.append(sc)
+
+    out: dict[str, Any] = _collect_allowed(
+        raw,
+        numeric=_FACTOR_ALLOWED_NUMERIC_FIELDS,
+        integer=_FACTOR_ALLOWED_INT_FIELDS,
+        string=_FACTOR_ALLOWED_STRING_FIELDS,
+        list_string=_FACTOR_ALLOWED_LIST_STRING,
+        transformations=transformations,
+    )
+    out["type"] = "factor_decomposition"
+    out["method"] = method
+    out["variables"] = safe_vars
+    out["components"] = safe_comps
+    out["n_observations"] = n_obs
+    out["n_variables"] = n_var_claim
+    out["n_components"] = n_comp_claim
+
+    # Validate rotation enum if supplied.
+    rot = out.get("rotation")
+    if rot is not None and rot not in _FACTOR_VALID_ROTATIONS:
+        transformations.append(
+            f"dropped 'rotation' value (must be one of "
+            f"{sorted(_FACTOR_VALID_ROTATIONS)})"
+        )
+        del out["rotation"]
+
+    # Loadings: nested {variable: {component: value}}. Outer keys
+    # must be in safe_vars; inner keys must be in safe_comps.
+    loadings_raw = raw.get("loadings")
+    if not isinstance(loadings_raw, dict):
+        return SanitizerResult(
+            ok=False, analysis_type="factor_decomposition",
+            rejection_reason=(
+                f"loadings must be a nested dict {{variable: {{component: value}}}};"
+                f" got {type(loadings_raw).__name__}"
+            ),
+        )
+    cleaned_loadings: dict[str, dict[str, float]] = {}
+    dropped_outer = 0
+    dropped_inner = 0
+    for outer_k, inner_v in loadings_raw.items():
+        if not isinstance(outer_k, str):
+            dropped_outer += 1
+            continue
+        sv = safe_key(outer_k)
+        if sv not in safe_var_set:
+            dropped_outer += 1
+            continue
+        if not isinstance(inner_v, dict):
+            dropped_outer += 1
+            continue
+        cleaned_inner: dict[str, float] = {}
+        for inner_k, val in inner_v.items():
+            if not isinstance(inner_k, str):
+                dropped_inner += 1
+                continue
+            sc = safe_key(inner_k)
+            if sc not in safe_comp_set:
+                dropped_inner += 1
+                continue
+            if not _is_finite_number(val):
+                dropped_inner += 1
+                continue
+            cleaned_inner[sc] = clamp_precision(float(val), n_obs)
+        if cleaned_inner:
+            cleaned_loadings[sv] = cleaned_inner
+    if dropped_outer:
+        transformations.append(
+            f"dropped {dropped_outer} undeclared variable(s) from loadings"
+        )
+    if dropped_inner:
+        transformations.append(
+            f"dropped {dropped_inner} undeclared component entry(ies) from loadings"
+        )
+    if not cleaned_loadings:
+        return SanitizerResult(
+            ok=False, analysis_type="factor_decomposition",
+            rejection_reason=(
+                "loadings dict empty after sanitization — keys didn't match "
+                "the declared variables/components"
+            ),
+        )
+    out["loadings"] = cleaned_loadings
+
+    # Per-component dicts (explained_variance, eigenvalues, …) — outer
+    # keys must be in safe_comps.
+    for field in _FACTOR_PER_COMPONENT_DICTS:
+        v = raw.get(field)
+        if v is None:
+            continue
+        if not isinstance(v, dict):
+            transformations.append(
+                f"dropped {field!r}: expected dict, got {type(v).__name__}"
+            )
+            continue
+        cleaned: dict[str, float] = {}
+        for k, val in v.items():
+            if not isinstance(k, str):
+                continue
+            sc = safe_key(k)
+            if sc not in safe_comp_set:
+                continue
+            if not _is_finite_number(val):
+                continue
+            cleaned[sc] = clamp_precision(float(val), n_obs)
+        if cleaned:
+            out[field] = cleaned
+
+    # Per-variable dicts (communalities, uniqueness) — outer keys
+    # must be in safe_vars.
+    for field in _FACTOR_PER_VARIABLE_DICTS:
+        v = raw.get(field)
+        if v is None:
+            continue
+        if not isinstance(v, dict):
+            transformations.append(
+                f"dropped {field!r}: expected dict, got {type(v).__name__}"
+            )
+            continue
+        cleaned = {}
+        for k, val in v.items():
+            if not isinstance(k, str):
+                continue
+            sv = safe_key(k)
+            if sv not in safe_var_set:
+                continue
+            if not _is_finite_number(val):
+                continue
+            cleaned[sv] = clamp_precision(float(val), n_obs)
+        if cleaned:
+            out[field] = cleaned
+
+    # Precision-clamp scalar numeric fields.
+    for key in _FACTOR_ALLOWED_NUMERIC_FIELDS:
+        if key in out:
+            out[key] = clamp_precision(out[key], n_obs)
+
+    transformations.append(
+        f"clamped numeric fields to precision matching n_observations={n_obs}"
+    )
+
+    return SanitizerResult(
+        ok=True, analysis_type="factor_decomposition",
+        sanitized=out, transformations=transformations,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Cluster analysis (k-means, k-medoids, hierarchical, …)
+# ---------------------------------------------------------------------------
+#
+# The shape ships per-cluster centroids and quality metrics from a
+# fitted clustering. Two new SDC primitives the existing shapes
+# don't have:
+#
+#   1.  **Whole-cluster suppression by size.** Clusters below
+#       ``min_n_cluster`` are dropped entirely — their entry in
+#       ``cluster_sizes``, their centroid row, their within-cluster
+#       SS, every per-cluster dict. Partial publication would leak
+#       the cluster size through which clusters survived. Same
+#       pattern as DiD's cohort gate.
+#
+#   2.  **Per-cluster precision clamping on centroids.** Centroids
+#       are means over the cluster's members; their precision
+#       scales with that cluster's N, not the global N. A centroid
+#       of a 12-person cluster on income should be clamped to
+#       ~3 sigfigs; a centroid of a 12,000-person cluster on income
+#       can carry ~5. The existing shapes all clamp by global N
+#       (``clamp_precision_dict(d, n_total)``); this shape
+#       walks per-row and clamps with the row-specific N.
+#
+# Privacy carve-out, structural: per-observation cluster assignments
+# (sklearn's ``labels_``, R kmeans's ``$cluster``) are NOT in this
+# allowlist. Assignments are per-row data — emitting them would tell
+# the model which row went where, which combined with the centroid
+# is enough to identify individuals in small clusters. The
+# researcher's local R / Python session sees them; the model
+# doesn't.
+
+_CLUSTER_REQUIRED: frozenset[str] = frozenset((
+    "type", "method", "n_observations", "n_clusters", "n_features",
+    "variables", "cluster_labels", "cluster_sizes",
+    # ``centroids`` is conditionally required — required for every
+    # method that has centroids by construction (kmeans / hierarchical
+    # / pam / agglomerative), absent-OK for DBSCAN / HDBSCAN (density-
+    # based; no centroids by design). The conditional check fires
+    # below in ``_sanitize_cluster_analysis``. If a DBSCAN payload
+    # includes centroids anyway (caller computed them post-hoc from
+    # the labels array), the field is still validated against the
+    # cross-field rules.
+))
+_CLUSTER_METHODS_WITHOUT_CENTROIDS: frozenset[str] = frozenset((
+    "dbscan", "hdbscan",
+))
+_CLUSTER_ALLOWED_NUMERIC_FIELDS: frozenset[str] = frozenset((
+    # Sum-of-squares decomposition. Scalars over the whole fit;
+    # aggregate quantities, no per-row leak.
+    "total_within_ss", "between_cluster_ss", "total_ss",
+    "ss_ratio",                # between / total — fraction explained
+    "inertia",                 # sklearn alias for total_within_ss
+    # Cluster quality scalars.
+    "silhouette_score",        # global mean silhouette
+    "calinski_harabasz_score",
+    "davies_bouldin_score",
+    # Hierarchical-specific: the dendrogram cut height that produced
+    # the n_clusters partition. A scalar over the data; the
+    # dendrogram itself (linkage matrix / merge heights series) is
+    # structurally absent from the allowlist.
+    "cut_height",
+))
+_CLUSTER_ALLOWED_INT_FIELDS: frozenset[str] = frozenset((
+    "n_observations", "n_clusters", "n_features", "n_iterations",
+    # DBSCAN / HDBSCAN: count of points labeled noise (outside any
+    # cluster). Aggregate scalar; the noise points' identities don't
+    # cross — same disclosure profile as ``n_clusters``.
+    "n_noise_points",
+))
+_CLUSTER_ALLOWED_STRING_FIELDS: frozenset[str] = frozenset((
+    "type", "method", "distance_metric", "linkage",
+))
+_CLUSTER_ALLOWED_LIST_STRING: frozenset[str] = frozenset((
+    "variables",
+    "cluster_labels",          # synthetic identifiers like "cluster_1"
+))
+# Per-cluster flat dicts. ``cluster_sizes`` drives the suppression
+# gate so it's required. The others are optional metrics; their keys
+# must match the declared (surviving) cluster labels.
+_CLUSTER_PER_CLUSTER_INT_DICTS: frozenset[str] = frozenset((
+    "cluster_sizes",
+))
+_CLUSTER_PER_CLUSTER_NUMERIC_DICTS: frozenset[str] = frozenset((
+    "within_cluster_ss", "silhouette_per_cluster",
+))
+# Per-variable numeric dict: ``f_statistic_per_variable`` carries
+# the between-cluster F-statistic for each input variable —
+# diagnostic for which variables most discriminate clusters.
+# Aggregate scalar per variable; keys validated against the
+# declared ``variables`` list (not cluster_sizes).
+_CLUSTER_PER_VARIABLE_NUMERIC_DICTS: frozenset[str] = frozenset((
+    "f_statistic_per_variable",
+))
+# Nested-dict (cluster × variable) — centroids. Per-cluster precision
+# clamping fires on this field.
+_CLUSTER_NESTED_DICT_FIELDS: frozenset[str] = frozenset((
+    "centroids",
+))
+_CLUSTER_VALID_METHODS: frozenset[str] = frozenset((
+    "kmeans",
+    "hierarchical",      # use the ``linkage`` field for ward / complete /
+                         # average / single / centroid / median
+    "agglomerative",     # alias for hierarchical bottom-up; same payload
+    "pam",               # partitioning around medoids — literature-standard
+                         # name for k-medoids
+    "kmedoids",          # legacy alias retained; ``pam`` is the canonical
+    "dbscan",            # density-based — no centroids by construction;
+                         # centroids field becomes optional below
+    "hdbscan",           # hierarchical density-based; same payload shape
+    "gaussian_mixture",  # accepted today; per-component variances + mixture
+                         # weights aren't well-represented in this shape and
+                         # the inference-adequacy story for GMM payloads is
+                         # an open follow-up. Helper deferred.
+    "spectral",
+))
+_CLUSTER_VALID_LINKAGE: frozenset[str] = frozenset((
+    "ward", "complete", "average", "single", "centroid", "median",
+))
+_CLUSTER_VALID_DISTANCE: frozenset[str] = frozenset((
+    "euclidean", "manhattan", "cosine", "mahalanobis", "chebyshev",
+    "minkowski", "hamming", "jaccard",
+))
+_CLUSTER_MAX_CLUSTERS: int = 50
+_CLUSTER_MAX_FEATURES: int = 100
+
+
+def _sanitize_cluster_analysis(
+    raw: dict[str, Any], config: SDCConfig
+) -> SanitizerResult:
+    missing_reason = _require_fields(raw, _CLUSTER_REQUIRED, "cluster_analysis")
+    if missing_reason:
+        return SanitizerResult(
+            ok=False, analysis_type="cluster_analysis",
+            rejection_reason=missing_reason,
+        )
+
+    n_obs = raw.get("n_observations")
+    if not isinstance(n_obs, int) or isinstance(n_obs, bool) or n_obs < 0:
+        return SanitizerResult(
+            ok=False, analysis_type="cluster_analysis",
+            rejection_reason=(
+                f"n_observations must be a non-negative int; "
+                f"got {type(n_obs).__name__}"
+            ),
+        )
+    try:
+        require_minimum_n(n_obs, config.min_n_descriptive, "n_observations")
+    except MinimumNViolation as e:
+        return SanitizerResult(
+            ok=False, analysis_type="cluster_analysis",
+            rejection_reason=str(e),
+        )
+
+    method = raw.get("method")
+    if not isinstance(method, str) or method not in _CLUSTER_VALID_METHODS:
+        return SanitizerResult(
+            ok=False, analysis_type="cluster_analysis",
+            rejection_reason=(
+                f"method must be one of {sorted(_CLUSTER_VALID_METHODS)}; "
+                f"got {method!r}"
+            ),
+        )
+
+    raw_vars = raw.get("variables")
+    if not isinstance(raw_vars, list) or not all(
+        isinstance(v, str) for v in raw_vars
+    ):
+        return SanitizerResult(
+            ok=False, analysis_type="cluster_analysis",
+            rejection_reason="variables must be a list of strings",
+        )
+    if len(raw_vars) == 0:
+        return SanitizerResult(
+            ok=False, analysis_type="cluster_analysis",
+            rejection_reason="variables list is empty",
+        )
+    if len(raw_vars) > _CLUSTER_MAX_FEATURES:
+        return SanitizerResult(
+            ok=False, analysis_type="cluster_analysis",
+            rejection_reason=(
+                f"variables has {len(raw_vars)} entries; structural cap "
+                f"is {_CLUSTER_MAX_FEATURES}"
+            ),
+        )
+
+    n_clusters_claim = raw.get("n_clusters")
+    if not isinstance(n_clusters_claim, int) or n_clusters_claim <= 0:
+        return SanitizerResult(
+            ok=False, analysis_type="cluster_analysis",
+            rejection_reason=(
+                f"n_clusters must be a positive int; got {n_clusters_claim!r}"
+            ),
+        )
+    if n_clusters_claim > _CLUSTER_MAX_CLUSTERS:
+        return SanitizerResult(
+            ok=False, analysis_type="cluster_analysis",
+            rejection_reason=(
+                f"n_clusters is {n_clusters_claim}; structural cap is "
+                f"{_CLUSTER_MAX_CLUSTERS}"
+            ),
+        )
+
+    n_features_claim = raw.get("n_features")
+    if not isinstance(n_features_claim, int) or n_features_claim != len(raw_vars):
+        return SanitizerResult(
+            ok=False, analysis_type="cluster_analysis",
+            rejection_reason=(
+                f"n_features ({n_features_claim}) does not match "
+                f"variables list length ({len(raw_vars)})"
+            ),
+        )
+
+    raw_labels = raw.get("cluster_labels")
+    if not isinstance(raw_labels, list) or not all(
+        isinstance(c, str) for c in raw_labels
+    ):
+        return SanitizerResult(
+            ok=False, analysis_type="cluster_analysis",
+            rejection_reason="cluster_labels must be a list of strings",
+        )
+    if len(raw_labels) != n_clusters_claim:
+        return SanitizerResult(
+            ok=False, analysis_type="cluster_analysis",
+            rejection_reason=(
+                f"cluster_labels length ({len(raw_labels)}) does not "
+                f"match n_clusters ({n_clusters_claim})"
+            ),
+        )
+
+    transformations: list[str] = []
+
+    # Sanitize variable + cluster labels.
+    safe_vars: list[str] = []
+    safe_var_set: set[str] = set()
+    for raw_v in raw_vars:
+        sv = safe_key(raw_v)
+        if sv in safe_var_set:
+            return SanitizerResult(
+                ok=False, analysis_type="cluster_analysis",
+                rejection_reason=(
+                    "variable label collision after sanitization"
+                ),
+            )
+        safe_var_set.add(sv)
+        safe_vars.append(sv)
+
+    safe_labels: list[str] = []
+    safe_label_set: set[str] = set()
+    for raw_c in raw_labels:
+        sl = safe_key(raw_c)
+        if sl in safe_label_set:
+            return SanitizerResult(
+                ok=False, analysis_type="cluster_analysis",
+                rejection_reason=(
+                    "cluster label collision after sanitization"
+                ),
+            )
+        safe_label_set.add(sl)
+        safe_labels.append(sl)
+
+    # Validate cluster_sizes structure + run the whole-cluster
+    # suppression gate. Clusters below ``min_n_descriptive`` are
+    # dropped whole — their entry in cluster_sizes, their centroid
+    # row, their within-cluster SS, every per-cluster entry.
+    raw_sizes = raw.get("cluster_sizes")
+    if not isinstance(raw_sizes, dict):
+        return SanitizerResult(
+            ok=False, analysis_type="cluster_analysis",
+            rejection_reason="cluster_sizes must be a dict",
+        )
+
+    cluster_n: dict[str, int] = {}
+    declared_sizes: set[str] = set()
+    for raw_k, raw_n in raw_sizes.items():
+        if not isinstance(raw_k, str):
+            continue
+        sl = safe_key(raw_k)
+        if sl not in safe_label_set:
+            continue
+        declared_sizes.add(sl)
+        if not isinstance(raw_n, int) or isinstance(raw_n, bool) or raw_n < 0:
+            return SanitizerResult(
+                ok=False, analysis_type="cluster_analysis",
+                rejection_reason=(
+                    "cluster_sizes values must be non-negative ints"
+                ),
+            )
+        cluster_n[sl] = raw_n
+
+    # Every declared cluster_label needs a size entry — the gate
+    # can't run otherwise.
+    missing_sizes = [c for c in safe_labels if c not in declared_sizes]
+    if missing_sizes:
+        return SanitizerResult(
+            ok=False, analysis_type="cluster_analysis",
+            rejection_reason=(
+                f"{len(missing_sizes)} cluster_label(s) have no "
+                f"cluster_sizes entry. Labels withheld."
+            ),
+        )
+
+    min_n_cluster = config.min_n_descriptive
+    suppressed: set[str] = set()
+    surviving: list[str] = []
+    cleaned_sizes: dict[str, int] = {}
+    for sl in safe_labels:
+        size = cluster_n[sl]
+        if size < min_n_cluster:
+            suppressed.add(sl)
+        else:
+            surviving.append(sl)
+            cleaned_sizes[sl] = size
+
+    if suppressed:
+        transformations.append(
+            f"cluster suppression: {len(suppressed)} cluster(s) with "
+            f"size < {min_n_cluster} dropped entirely (labels withheld "
+            f"— cluster identities are disclosive when small)"
+        )
+
+    if not surviving:
+        return SanitizerResult(
+            ok=False, analysis_type="cluster_analysis",
+            rejection_reason=(
+                f"all clusters have size < {min_n_cluster}; nothing "
+                f"survives the cluster-size gate"
+            ),
+        )
+
+    out: dict[str, Any] = _collect_allowed(
+        raw,
+        numeric=_CLUSTER_ALLOWED_NUMERIC_FIELDS,
+        integer=_CLUSTER_ALLOWED_INT_FIELDS,
+        string=_CLUSTER_ALLOWED_STRING_FIELDS,
+        list_string=_CLUSTER_ALLOWED_LIST_STRING,
+        transformations=transformations,
+    )
+    out["type"] = "cluster_analysis"
+    out["method"] = method
+    out["variables"] = safe_vars
+    out["n_observations"] = n_obs
+    out["n_variables"] = n_features_claim  # back-compat synonym
+    out["n_features"] = n_features_claim
+    # cluster_labels list is the surviving set (alphabetized to
+    # match the per-dict keys' order).
+    out["cluster_labels"] = sorted(surviving)
+    out["n_clusters"] = len(surviving)
+    if len(surviving) != n_clusters_claim:
+        transformations.append(
+            f"n_clusters reduced from {n_clusters_claim} to "
+            f"{len(surviving)} after cluster-size suppression"
+        )
+    out["cluster_sizes"] = cleaned_sizes
+
+    # Linkage / distance_metric enum validation.
+    lk = out.get("linkage")
+    if lk is not None and lk not in _CLUSTER_VALID_LINKAGE:
+        transformations.append(
+            f"dropped 'linkage' value (must be one of "
+            f"{sorted(_CLUSTER_VALID_LINKAGE)})"
+        )
+        del out["linkage"]
+    dm = out.get("distance_metric")
+    if dm is not None and dm not in _CLUSTER_VALID_DISTANCE:
+        transformations.append(
+            f"dropped 'distance_metric' value (must be one of "
+            f"{sorted(_CLUSTER_VALID_DISTANCE)})"
+        )
+        del out["distance_metric"]
+
+    # Centroids: nested {cluster: {variable: value}}. Outer keys
+    # must be surviving clusters; inner keys in safe_vars.
+    #
+    # Conditionally required: methods in
+    # ``_CLUSTER_METHODS_WITHOUT_CENTROIDS`` (DBSCAN, HDBSCAN) have
+    # no centroids by construction — absent-OK. If a DBSCAN payload
+    # ships centroids anyway (caller computed them post-hoc from the
+    # labels), the structure is still validated below: cross-field
+    # rules apply identically so the field can't smuggle anything
+    # past the gate.
+    #
+    # Per-cluster precision clamping fires on the surviving
+    # centroids — each value clamped by the cluster's OWN N rather
+    # than the global n_observations. The 12-member cluster gets
+    # fewer sigfigs than the 12,000-member cluster.
+    centroids_raw = raw.get("centroids")
+    centroids_absent_ok = method in _CLUSTER_METHODS_WITHOUT_CENTROIDS
+
+    if centroids_raw is None:
+        if not centroids_absent_ok:
+            return SanitizerResult(
+                ok=False, analysis_type="cluster_analysis",
+                rejection_reason=(
+                    f"centroids is required for method={method!r}; "
+                    f"only DBSCAN-family methods may omit centroids"
+                ),
+            )
+        # DBSCAN-family with no centroids — skip the centroid block.
+    else:
+        if not isinstance(centroids_raw, dict):
+            return SanitizerResult(
+                ok=False, analysis_type="cluster_analysis",
+                rejection_reason="centroids must be a nested dict",
+            )
+        cleaned_centroids: dict[str, dict[str, float]] = {}
+        dropped_outer = 0
+        dropped_inner = 0
+        surviving_set = set(surviving)
+        for outer_k, inner_v in centroids_raw.items():
+            if not isinstance(outer_k, str):
+                dropped_outer += 1
+                continue
+            sl = safe_key(outer_k)
+            if sl not in surviving_set:
+                dropped_outer += 1
+                continue
+            if not isinstance(inner_v, dict):
+                dropped_outer += 1
+                continue
+            cleaned_inner: dict[str, float] = {}
+            for inner_k, val in inner_v.items():
+                if not isinstance(inner_k, str):
+                    dropped_inner += 1
+                    continue
+                sv = safe_key(inner_k)
+                if sv not in safe_var_set:
+                    dropped_inner += 1
+                    continue
+                if not _is_finite_number(val):
+                    dropped_inner += 1
+                    continue
+                cleaned_inner[sv] = float(val)
+            if cleaned_inner:
+                # Per-cluster clamp via the named primitive: each
+                # variable's centroid value gets clamped by THIS
+                # cluster's N rather than the global n_observations.
+                cleaned_centroids[sl] = clamp_precision_dict(
+                    cleaned_inner, cleaned_sizes[sl],
+                )
+        if dropped_outer:
+            transformations.append(
+                f"dropped {dropped_outer} undeclared/suppressed cluster(s) "
+                f"from centroids (labels withheld)"
+            )
+        if dropped_inner:
+            transformations.append(
+                f"dropped {dropped_inner} undeclared variable entry(ies) "
+                f"from centroids"
+            )
+        # For non-DBSCAN methods, centroids must be non-empty after
+        # the gate; for DBSCAN, an empty centroids dict (e.g. all
+        # centroid clusters were sub-min-N) is acceptable since
+        # centroids weren't required.
+        if not cleaned_centroids and not centroids_absent_ok:
+            return SanitizerResult(
+                ok=False, analysis_type="cluster_analysis",
+                rejection_reason=(
+                    "centroids dict empty after sanitization — keys did "
+                    "not match declared (and surviving) "
+                    "clusters/variables"
+                ),
+            )
+        if cleaned_centroids:
+            out["centroids"] = cleaned_centroids
+            transformations.append(
+                "centroid precision clamped per-cluster (each value's "
+                "sigfigs scales with that cluster's size, not global N)"
+            )
+
+    # Per-cluster numeric dicts (within_cluster_ss, silhouette_per_cluster):
+    # keys must be surviving clusters; values precision-clamped by
+    # the cluster's OWN N via the named ``clamp_dict_by_per_key_n``
+    # primitive. Each metric is an aggregate over the cluster's
+    # members (within-SS is a sum over the cluster's points;
+    # silhouette is a mean over them), so local N is the right
+    # precision floor — same reasoning as the centroid clamp.
+    for field in _CLUSTER_PER_CLUSTER_NUMERIC_DICTS:
+        v = raw.get(field)
+        if v is None:
+            continue
+        if not isinstance(v, dict):
+            transformations.append(
+                f"dropped {field!r}: expected dict, got {type(v).__name__}"
+            )
+            continue
+        cleaned: dict[str, float] = {}
+        for k, val in v.items():
+            if not isinstance(k, str):
+                continue
+            sl = safe_key(k)
+            if sl not in set(surviving):
+                continue
+            if not _is_finite_number(val):
+                continue
+            cleaned[sl] = float(val)
+        if cleaned:
+            # Per-cluster precision clamp via the named primitive.
+            out[field] = clamp_dict_by_per_key_n(cleaned, cleaned_sizes)
+
+    # Per-variable numeric dicts (f_statistic_per_variable): keys
+    # must be declared variable names; values are aggregate scalars
+    # (between-cluster F-stat per variable) — global-N clamp is the
+    # right precision floor since the F is computed over the full
+    # sample, not a subgroup.
+    for field in _CLUSTER_PER_VARIABLE_NUMERIC_DICTS:
+        v = raw.get(field)
+        if v is None:
+            continue
+        if not isinstance(v, dict):
+            transformations.append(
+                f"dropped {field!r}: expected dict, got {type(v).__name__}"
+            )
+            continue
+        cleaned_var: dict[str, float] = {}
+        for k, val in v.items():
+            if not isinstance(k, str):
+                continue
+            sv = safe_key(k)
+            if sv not in safe_var_set:
+                continue
+            if not _is_finite_number(val):
+                continue
+            cleaned_var[sv] = clamp_precision(float(val), n_obs)
+        if cleaned_var:
+            out[field] = cleaned_var
+
+    # Precision-clamp scalar numeric fields (total_within_ss, etc.)
+    # by global N.
+    for key in _CLUSTER_ALLOWED_NUMERIC_FIELDS:
+        if key in out:
+            out[key] = clamp_precision(out[key], n_obs)
+
+    return SanitizerResult(
+        ok=True, analysis_type="cluster_analysis",
+        sanitized=out, transformations=transformations,
+    )
+
+
+# ---------------------------------------------------------------------------
 # Handler registry
 # ---------------------------------------------------------------------------
 
 _HANDlerFn = Callable[[dict[str, Any], SDCConfig], SanitizerResult]
 
 _HANDLERS: dict[str, _HANDlerFn] = {
-    "linear_regression": _sanitize_linear_regression,
+    # Regression bucket — canonical name and legacy alias both
+    # dispatch to the same sanitizer. The output's ``analysis_type``
+    # mirrors whichever name the input used, so existing stored
+    # payloads keep their old name on read and new emissions carry
+    # the canonical name.
+    _REGRESSION_TYPE_CANONICAL: _sanitize_linear_regression,
+    _REGRESSION_TYPE_LEGACY:    _sanitize_linear_regression,
     "t_test": _sanitize_t_test,
     "descriptive": _sanitize_descriptive,
     "frequency_table": _sanitize_frequency_table,
     "crosstab": _sanitize_crosstab,
     "magnitude_table": _sanitize_magnitude_table,
     "correlation_matrix": _sanitize_correlation_matrix,
+    "did_event_study": _sanitize_did_event_study,
+    "rdd": _sanitize_rdd,
+    "kaplan_meier": _sanitize_kaplan_meier,
+    "factor_decomposition": _sanitize_factor_decomposition,
+    "cluster_analysis": _sanitize_cluster_analysis,
 }
 
 
