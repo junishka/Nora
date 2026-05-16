@@ -44,6 +44,61 @@ Also needs:
   The first launch shows an auth screen and stores the credential in
   the system keyring.
 
+### Analysis-side packages (R / Python)
+
+The `.app` bundle ships Python plus the Nora runtime, but it does
+not bundle the analysis stacks the model writes scripts against —
+those have to be present in whichever language(s) you want Nora to
+run. Most missing packages can be installed live from chat via the
+`install_packages` tool (an Approve / Deny modal lists the
+packages before anything runs). The reference below lists which
+packages back which analysis shape so you know what to install.
+
+**Python** (system `python3`; Nora invokes whichever interpreter
+`python3` resolves to):
+
+- Required for any script run: `pandas`, `numpy`, `statsmodels`,
+  `scipy`. The executor refuses to start a Python subprocess if
+  any of these are missing.
+- Plots: `matplotlib`. Probed at session open; missing it makes
+  `plot_*` helpers fail with a clear install hint.
+- Cluster analysis / PCA: `scikit-learn`. Needed for
+  `nora.from_cluster` and `nora.from_pca`.
+- RDD: `rdrobust` (Python package). Needed for `nora.from_rdd`.
+- Callaway-Sant'Anna DiD: `differences`. Needed for
+  `nora.from_callaway_santanna`.
+
+```bash
+python3 -m pip install pandas numpy statsmodels scipy matplotlib \
+                       scikit-learn rdrobust differences
+```
+
+**R** (`Rscript` on PATH; Nora's helpers reach into installed user
+libraries via `library(pkg)` / `pkg::fn`):
+
+- Common: `haven` (for `.dta` reading), `ggplot2` (for plot
+  helpers' graphics fallback). Both are probed at session open
+  and a missing one is surfaced in the runtime panel of the
+  system prompt.
+- Mixed-effects (`lmer` / `glmer` via `from_lm`): `lme4`.
+- Fixed-effects + cluster-robust regression + Sun-Abraham +
+  TWFE event study: `fixest`.
+- Kaplan-Meier + Cox PH: `survival`.
+- Callaway-Sant'Anna DiD (`from_callaway_santanna`): `did`.
+- RDD (`from_rdd`): `rdrobust` (R package).
+
+```r
+install.packages(c(
+  "haven", "ggplot2", "lme4", "fixest", "survival", "did", "rdrobust"
+))
+```
+
+**Stata.** Nora's Stata helpers ship under `src/nora/runtime/`
+(`.ado` files); the executor places them on the `adopath` for each
+script run. No SSC installs are required. The DiD `csdid` and RDD
+`rdrobust` SSC ports are deferred; for those analyses, run the
+script through R or Python in the same session.
+
 ## Install
 
 If you have a `Nora.dmg`, see [`docs/install.md`](docs/install.md)

@@ -122,6 +122,47 @@ keep streaming.
 | **Apple Developer Program signing + notarization for distributable .dmg** | ✅ done — release `.dmg` is signed (Developer ID Application) and notarized |
 | **Stata batch wrapper around `_cons` "omitted" edge case** | ⏭ named, low-priority |
 
+### Stata coverage gap (release decision)
+
+The sanitizer recognises twelve analysis shapes. Stata runtime
+helpers do not cover all of them — three shapes are R+Python only,
+and one regression sub-feature is partial. Listed here explicitly
+because shipping without a written decision was flagged as the
+problem; the decision below resolves it.
+
+| Shape / feature | R helper | Python helper | Stata helper | Decision for this release |
+|---|---|---|---|---|
+| `coefficient_table_with_fit_stats` (regress / GLM / Cox PH / fixest / IV-2SLS) | ✓ `from_lm` / `from_iv` | ✓ `from_lm` / `from_iv` | ✓ `nora_result_regress` (covers regress/logit/probit/poisson/stcox/xtreg fe/areg/ivregress) | shipped |
+| `t_test` | ✓ `from_t_test` | ✓ `from_t_test` | ✓ `nora_ttest` (legacy `nora_result_ttest` kept) | shipped |
+| `descriptive` | ✓ `from_summarize` | ✓ `from_summarize` | ✓ `nora_result_sum` | shipped |
+| `frequency_table` | ✓ `from_table` | ✓ `from_table` | ✓ `nora_result_tab` (1-way) | shipped |
+| `crosstab` | ✓ `from_crosstab` | ✓ `from_crosstab` | ✓ `nora_result_tab <v1> <v2>` | shipped |
+| `magnitude_table` | ✓ `from_magnitude_table` | ✓ `from_magnitude_table` | ✓ `nora_result_magnitude` | shipped |
+| `correlation_matrix` | ✓ `from_correlation` | ✓ `from_correlation` | ✓ `nora_result_correlation` | shipped |
+| `kaplan_meier` | ✓ `from_kaplan_meier` | ✓ `from_kaplan_meier` | ✓ `nora_result_km` | shipped |
+| `did_event_study` | ✓ `from_callaway_santanna` + `from_sun_abraham` + `from_twfe_event_study`; de Chaisemartin via `nora$result(...)` | ✓ `from_callaway_santanna`; sun_abraham / twfe_event_study / de_chaisemartin via `nora.result(...)` | ✗ no helper; `csdid` (SSC) deferred for maintenance-lag risk | **deferred pending demand** — Stata DiD users emit via R or Python runtime in the same session; revisit when a Stata-only pilot user surfaces |
+| `rdd` | ✓ `from_rdd` (wraps `rdrobust::rdrobust`) | ✓ `from_rdd` (wraps `rdrobust` Python) | ✗ no helper; Stata `rdrobust` port has known maintenance lag | **deferred pending demand** — same as DiD; rare in Stata-first pipelines |
+| `factor_decomposition` | ✓ `from_pca`; factor analysis via `nora$result(...)` | ✓ `from_pca`; factor analysis via `nora.result(...)` | ✗ no helper | **deferred pending demand** — Stata `factor` / `pca` users emit via R or Python |
+| `cluster_analysis` | ✓ `from_cluster` (kmeans + hierarchical); DBSCAN via `nora$result(...)` | ✓ `from_cluster` (KMeans + AgglomerativeClustering); DBSCAN via `nora.result(...)` | ✗ no helper | **deferred pending demand** — clustering in Stata is rare |
+| Mixed-effects (sub-feature of `coefficient_table_with_fit_stats`: `random_effects_variance`, `n_groups_per_level`, `icc`, `fit_method`) | ✓ via `from_lm` on `lmer` / `glmer` | ✓ via `from_lm` on `statsmodels.mixedlm` | ✗ Stata `mixed` / `meglm` not routed through `nora_result_regress` | **queued for next release** — small adapter inside `nora_result_regress.ado` after `mixed`; finite, well-scoped |
+| Cluster-robust SE (sub-feature) | ✓ fixest `cluster=~var` | ✓ `cov_type="cluster"` | ✓ `vce(cluster id)` auto-emits `cluster_variables` + `n_clusters` | shipped |
+
+**Operational meaning of "deferred pending demand":** a Stata-only
+researcher who needs `did_event_study` / `rdd` /
+`factor_decomposition` / `cluster_analysis` today opens a
+second-language path inside the same session (R or Python — both
+run under the same sandbox + sanitizer). The data stays on the
+machine; only the helper is in a different runtime. The release
+ships without these Stata helpers; the decision to add them
+returns to the queue when a concrete pilot user requests one,
+not on speculative completion.
+
+**Operational meaning of "queued for next release":** the
+mixed-effects adapter is small (post-`mixed` `e()` scrape into the
+existing `nora_result_regress` payload shape) and the gap is more
+likely to be hit than the R+Py-only shapes. Targeted for the next
+patch release, not this one.
+
 **1312 pytest cases collected** via `uv run pytest --collect-only -q`
 on 2026-05-15. Full pass/fail depends on local sandbox/runtime
 availability. Coverage spans SDK lockdown (Anthropic) +

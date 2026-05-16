@@ -6,7 +6,12 @@
 - **Analysis runtime(s)** — install the tools you want Nora to run:
   R (`Rscript` on PATH), Stata (`stata-mp` / `stata-se` / `stata`
   on PATH or `/Applications/Stata`), or Python with the packages
-  your analysis needs.
+  your analysis needs. See
+  [the analysis-side package list in the README](../README.md#analysis-side-packages-r--python)
+  for which R / Python packages back which analyses (mixed-effects,
+  DiD, RDD, survival, PCA, …) — most can be installed live from chat
+  via the `install_packages` tool, which surfaces an Approve / Deny
+  modal before anything runs.
 - **A model credential** — use an Anthropic account/API key or an
   OpenAI API key. The auth screen stores credentials in the system
   keyring.
