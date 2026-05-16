@@ -184,13 +184,21 @@ because Nora invokes them as subprocesses.
   - `store.py` for the SQLite result store and audit log.
   - `session_state.py` for the per-session "at a glance" snapshot.
   - `runtime/` for the R library, the Python library, and the
-    thirteen Stata `.ado` helpers scripts call.
+    sixteen Stata `.ado` helpers scripts call (result helpers for
+    every shape with Stata coverage — regress / ttest / sum / tab /
+    magnitude / correlation / km / cluster / factor — plus the four
+    plot helpers, the export-fallback chain, and the ad-hoc safe
+    exporter).
   - `provider/` for the Anthropic and OpenAI session adapters.
   - `chat_service.py` for the typed event stream the frontend
     consumes.
-- `tests/` for 1312 pytest cases collected as of 2026-05-15.
+- `tests/` for 1312+ pytest cases (the 0.10.0 Stata-parity pass
+  added cluster / factor / mixed-effects real-fit pins plus the
+  disk↔staging invariant test; run
+  `uv run pytest --collect-only -q` for the current count).
   `test_sanitizer.py` is the property-test backbone.
-  `test_executor_*` cover the sandbox profile.
+  `test_executor_*` cover the sandbox profile and the executor's
+  staging contract.
   `test_concurrent_sessions.py` covers multi-runner isolation.
 - `docs/` for handoff, overview, direction, install, verification.
 - `packaging/` for the PyInstaller spec and the `.app` / `.dmg`

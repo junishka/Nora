@@ -7,9 +7,14 @@ versions follow semver, pre-1.0.
 ## [0.10.0] — 2026-05-16
 
 Late-beta release. Expands the sanitized analysis surface from
-seven shapes to twelve, renames the regression bucket to a name
-that reads honestly when applied to GLM / Cox PH / fixest / IV,
-and adds reusable per-subgroup SDC infrastructure.
+seven shapes to twelve, **ships Stata parity for the four
+high-usage shapes that were previously R+Python-only**
+(mixed-effects, cluster, factor, KM), renames the regression
+bucket to a name that reads honestly when applied to GLM / Cox PH
+/ fixest / IV, and adds reusable per-subgroup SDC infrastructure.
+Two remaining shapes stay Stata-deferred for substantive reasons
+(DiD: SSC install flow documented; RDD: numerics not yet verified
+against the CCT 2014 reference).
 
 ### Renamed (load-bearing, read first)
 
@@ -65,30 +70,43 @@ and adds reusable per-subgroup SDC infrastructure.
   Per-cluster precision clamping via `_clamp_dict_by_per_key_n`;
   clusters below the size threshold drop whole. Per-observation
   `labels_` / `cluster_membership` are structurally absent from
-  the allowlist. Helpers: R `from_cluster` (kmeans +
-  hierarchical), Python `from_cluster` (KMeans +
-  AgglomerativeClustering). DBSCAN supported via
-  `nora.result(type="cluster_analysis", method="dbscan", ...)`.
+  the allowlist. Helpers across all three languages: R
+  `from_cluster` (kmeans + hierarchical), Python `from_cluster`
+  (KMeans + AgglomerativeClustering), and **Stata
+  `nora_result_cluster`** (kmeans + hierarchical with linkage;
+  centroids + within-SS computed from the dataset directly since
+  Stata's cluster commands don't store them natively). DBSCAN
+  supported via `nora.result(type="cluster_analysis",
+  method="dbscan", ...)`.
 - **`factor_decomposition`** — PCA + factor analysis as one
   shape. Per-component eigenvalue / variance clamps; per-variable
   loading clamps; per-observation factor scores
   (`fit.transform(X)` / `fit$x`) structurally absent from the
-  allowlist. Helpers: R `from_pca`, Python `from_pca`. Factor
-  analysis variants (`factanal`, `factor_analyzer`,
-  `statsmodels.multivariate.factor`) emit via `nora.result(...)`.
+  allowlist. Helpers across all three languages: R `from_pca`,
+  Python `from_pca`, and **Stata `nora_result_factor`** (PCA +
+  factor with pcf / pf / ml / ipf extraction; reads loadings,
+  eigenvalues, explained-variance ratios from `e()`; ML-FA
+  goodness-of-fit fields from `e(chi2_ms)` / `e(p_ms)` /
+  `e(df_ms)` / `e(ll)`). R / Python factor-analysis variants
+  beyond PCA (`factanal`, `factor_analyzer`,
+  `statsmodels.multivariate.factor`) still emit via
+  `nora.result(...)` until dedicated helpers ship.
 
 ### Added — regression bucket sub-features
 
-- **Mixed-effects diagnostics.** R `lmer` / `glmer` and Python
-  `statsmodels.mixedlm` fits emit `random_effects_variance`
-  (`{varname: variance}` plus a `residual` entry), `n_groups_per_level`
-  (same disclosure profile as `fixed_effects`), `fit_method`
-  (`"REML"` / `"ML"`), and `icc` for the intercept-only single-grouping
-  case. Python `from_lm` accepts `group_variable="..."` so the
-  helper knows which dataset column the grouping factor came from
-  (R extracts it from the formula automatically). **Stata `mixed` /
-  `meglm`** are not yet routed through `nora_result_regress`; queued
-  for next release.
+- **Mixed-effects diagnostics across all three languages.** R `lmer` /
+  `glmer`, Python `statsmodels.mixedlm`, **and Stata `mixed` /
+  `meglm`** all emit `random_effects_variance` (`{varname: variance}`
+  plus a `residual` entry for Gaussian families), `n_groups_per_level`
+  (same disclosure profile as `fixed_effects`), `fit_method` (`"REML"`
+  / `"ML"`), and `icc` for the intercept-only single-grouping case.
+  Python `from_lm` accepts `group_variable="..."` so the helper knows
+  which dataset column the grouping factor came from (R extracts it
+  from the formula; Stata reads `e(ivars)`). Stata's path runs
+  `estat recovariance` for natural-scale RE covariance matrices and
+  `estat icc` for the ICC, and restricts the coefficient submatrix to
+  the fixed-effects equation (`e(k_f)` leading columns) so transformed
+  variance components don't appear as "coefficients" in the payload.
 - **Cluster-robust SE auto-emission.** R fixest `cluster=~var`,
   Python `cov_type="cluster"`, and Stata `vce(cluster id)` all
   auto-emit `cluster_variables`, `n_clusters: {varname: cluster_count}`,
@@ -233,19 +251,47 @@ The MCP tool surface is now fourteen tools (was nine).
 - **NaN correlation on constant columns** — rejected with named
   culprit instead of producing a NaN cell.
 
+### Fixed (silent infrastructure bug)
+
+- **Stata `nora_result_km` was unreachable under 0.9.x.** The
+  `.ado` file existed in `src/nora/runtime/` but was never added
+  to the executor's `_stage_runtime_library` `stata_ados` tuple,
+  so the helper never landed on the runtime adopath at script
+  time. Researchers calling `nora_result_km` got "command
+  unknown" with no obvious cause. Fixed in `executor.py` (both
+  the staging list and the `capture program drop` shadowing
+  defense) and pinned by `test_executor_profile.py`.
+
 ### Deferred (named, post-release roadmap)
 
-- **Stata coverage for `did_event_study` / `rdd` /
-  `factor_decomposition` / `cluster_analysis`.** Stata-only
-  researchers open R or Python inside the same session — same
-  sandbox + sanitizer — until concrete pilot demand surfaces a
-  Stata helper.
-- **Stata `mixed` / `meglm` mixed-effects route through
-  `nora_result_regress`.** Queued for next release; the gap is
-  more likely to be hit than the R+Py-only shapes.
+- **Stata `did_event_study` via `csdid` (SSC).** Nora's
+  `install_packages` tool does not reach SSC; the system prompt
+  now instructs the model to direct the researcher to
+  `ssc install csdid` in their own Stata window first. Once
+  installed, a Stata script can fit csdid and emit via
+  `nora.result(...)`; no opinionated helper is provided. R or
+  Python in the same session remains the recommended path.
+- **Stata `rdd` via SSC `rdrobust` — targeted for 0.10.1.** The
+  Stata SSC `rdrobust` port has maintenance lag and the output
+  has not been verified against the CCT 2014 reference that R and
+  Python `rdrobust` already reproduce (we have those two pinned
+  cross-language in `tests/test_from_rdd_real_fits.py`). Shipping a
+  Stata helper whose numerics are not trusted would be worse than
+  no helper. **Concrete go/no-go for 0.10.1:** on a Stata-equipped
+  machine, fit `rdrobust y x, c(0)` in Stata and the equivalent
+  call in R / Python on the same simulated DGP (e.g., `y = 0.5 *
+  (x > 0) + 0.3*x + ε`, `n = 2000`, `seed = 42`); compare
+  conventional / bias-corrected / robust τ, SE, and the
+  CCT-optimal bandwidths within 0.5% relative tolerance. If they
+  agree, write `nora_result_rdd.ado` following the same pattern as
+  `nora_result_factor.ado` (read `e()` macros, JSONL append-mode
+  emit, `%21.17e` floats); ship in 0.10.1. If they disagree,
+  document the divergence in `direction.md` and keep the deferral.
+  This is roughly a one-hour task for anyone with Stata installed,
+  not an open-ended research question.
 - **Sub-estimator helpers in Python** for Sun-Abraham
   (`pyfixest`) and TWFE-ES (`linearmodels`); de Chaisemartin
-  `DIDmultiplegt` and Stata `csdid` in any language.
+  `DIDmultiplegt` in any language.
 - **Composition-attack hardening / release ledger.** Inherent to
   every interactive analysis system; see `docs/direction.md`
   §"Cumulative-inference / cross-query composition" for the DP /

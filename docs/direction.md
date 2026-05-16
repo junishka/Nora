@@ -1,7 +1,21 @@
 # Nora — architectural direction
 
-Working document. Last substantive update **2026-05-15**, after
-the audit-fixes pass: install-packages consent is modal-only, the
+Working document. Last substantive update **2026-05-16**, after
+the 0.10.0 Stata-parity pass: extended `nora_result_regress` to
+emit mixed-effects variance components / group counts / fit method
+/ ICC for `mixed` and `meglm` fits; new `nora_result_cluster.ado`
+covers `cluster kmeans` / `cluster wardslinkage` and family with
+centroids + within-SS computed from the dataset directly; new
+`nora_result_factor.ado` covers `pca` and `factor` (pcf / pf / ml /
+ipf) with loadings + eigenvalues + explained-variance ratios; the
+runtime-staging gap that left `nora_result_km.ado` physically
+present but unreachable under 0.9.x is fixed in the executor and
+pinned by a new disk↔staging invariant test; the DiD Stata path is
+reframed in the system prompt as no-realistic-workflow (recommend
+R / Python in the same session), and RDD Stata is targeted for
+0.10.1 with a documented cross-language numerics protocol. The
+previous substantive update **2026-05-15** was the audit-fixes
+pass: install-packages consent is modal-only, the
 script-failure `debug_excerpt` is documented at its stricter
 redaction posture (exception bodies redacted wholesale, only
 parser-anchored framing crosses), `load_data` and the schema fast
@@ -83,7 +97,7 @@ researcher use case demands it.
 
 ## What's built
 
-As of 2026-05-15, the implementation covers:
+As of 2026-05-16, the implementation covers:
 
 - Spine + full SDK lockdown (14 MCP tools — get_schema, search_schema,
   request_data, submit_script, submit_script_file, expand_result,
@@ -110,8 +124,29 @@ As of 2026-05-15, the implementation covers:
   exactly 2); structural size caps on every dict / list payload
   field; filename + variable-name sanitization at every
   prompt-injection surface.
+- **Stata parity for the four high-usage shapes that were
+  previously R+Python-only (0.10.0):** mixed-effects via
+  `nora_result_regress` (`mixed` / `meglm` paths run
+  `estat recovariance` + `estat icc`), cluster analysis via
+  `nora_result_cluster` (kmeans + hierarchical with linkage;
+  centroids + within-SS computed from the dataset directly since
+  Stata's cluster commands don't store them natively), factor
+  decomposition via `nora_result_factor` (PCA + factor with
+  pcf / pf / ml / ipf extraction), and Kaplan-Meier via
+  `nora_result_km` (the helper existed under 0.9.x but the
+  staging tuple gap kept it unreachable until 0.10.0). DiD and
+  RDD stay Stata-deferred for substantive reasons documented in
+  the `handoff.md` Stata coverage matrix and the 0.10.0 CHANGELOG;
+  RDD is targeted for 0.10.1 pending a cross-language numerics
+  check, DiD waits on a contributor pinning the `csdid` API.
 - Runtime libraries for R, Python, and Stata with JSON-escaped
-  labels and CR/LF/TAB handling.
+  labels and CR/LF/TAB handling. The runtime-directory ↔ executor
+  staging invariant is now pinned by
+  `test_every_runtime_helper_file_is_in_executor_staging_lists`
+  in `tests/test_executor_profile.py` — adding a new helper file
+  without wiring it into `_stage_runtime_library`'s tuple fails
+  the test, so the silent-orphan failure mode that hid
+  `nora_result_km.ado` under 0.9.x cannot recur.
 - SQLite result store, keyed by resolved cwd (no cross-session leak
   in the same process).
 - Memory stack: every turn persisted to `.nora/chat_history.jsonl`

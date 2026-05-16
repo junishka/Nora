@@ -2,7 +2,7 @@
 
 How to extend the sanitizer's coverage in the two ways it gets
 extended: **adding a field to an existing shape**, and **adding a
-new shape**. Worked from the patterns the existing 10 shapes
+new shape**. Worked from the patterns the existing 12 shapes
 already establish; reference, not tutorial.
 
 The standard for "extension is done" is a two-bar test, applied
@@ -27,20 +27,22 @@ non-trivial.
 
 ## What's already in
 
-The sanitizer accepts 10 shapes ([src/nora/sanitizer.py:_HANDLERS](../src/nora/sanitizer.py)).
+The sanitizer accepts 12 shapes ([src/nora/sanitizer.py:_HANDLERS](../src/nora/sanitizer.py)).
 Roughly grouped:
 
 | Shape | Covers | Helpers |
 |---|---|---|
-| `coefficient_table_with_fit_stats` (legacy alias `linear_regression`) | OLS, logit, probit, Poisson, NegBin, Cox PH, fixest with absorbed FE, IV/2SLS structural equation | R `from_lm` + `from_iv`; Python `from_lm` + `from_iv`; Stata `nora_result_regress` |
+| `coefficient_table_with_fit_stats` (legacy alias `linear_regression`) | OLS, logit, probit, Poisson, NegBin, Cox PH, fixest with absorbed FE, IV/2SLS, mixed-effects (lmer / glmer / mixedlm / mixed / meglm) | R `from_lm` + `from_iv`; Python `from_lm` + `from_iv`; Stata `nora_result_regress` (covers `regress`/`logit`/`probit`/`poisson`/`stcox`/`xtreg fe`/`areg`/`ivregress`/`mixed`/`meglm`) |
 | `t_test` | one-sample / two-sample / Welch / paired | `from_t_test` (R, Python), `nora_ttest` (Stata) |
 | `descriptive` | `from_summarize` univariate | each language |
 | `frequency_table` | 1-D counts | each language |
 | `crosstab` | 2-D counts | each language |
 | `magnitude_table` | sum/mean by group with dominance | each language |
 | `correlation_matrix` | Pearson / Spearman / Kendall | each language |
-| `did_event_study` | Callaway-Sant'Anna (helpers); Sun-Abraham / de Chaisemartin / TWFE-ES via generic `result()` | R `from_callaway_santanna` (`did` package); Python `from_callaway_santanna` (`differences` package) |
-| `rdd` | sharp + fuzzy local-polynomial (via rdrobust) | R + Python `from_rdd` |
+| `cluster_analysis` | kmeans + hierarchical (Ward / complete / average / single linkage) | R `from_cluster`; Python `from_cluster`; Stata `nora_result_cluster` (after `cluster kmeans` / `cluster wardslinkage` / etc.) |
+| `factor_decomposition` | PCA + factor analysis (pcf / pf / ml / ipf) | R `from_pca`; Python `from_pca`; Stata `nora_result_factor` (after `pca` or `factor`) |
+| `did_event_study` | Callaway-Sant'Anna (helpers); Sun-Abraham + TWFE-ES (R helpers); de Chaisemartin + Python sub-estimators via generic `result()` | R `from_callaway_santanna` + `from_sun_abraham` + `from_twfe_event_study`; Python `from_callaway_santanna`. Stata deferred — no realistic workflow yet (see [handoff Stata coverage matrix](handoff.md#stata-coverage-matrix-release-status)) |
+| `rdd` | sharp + fuzzy local-polynomial (via rdrobust) | R + Python `from_rdd`. Stata helper targeted 0.10.1 pending cross-language numerics verification (see [CHANGELOG.md](../CHANGELOG.md) deferred section for the protocol) |
 | `kaplan_meier` | safe-form survival (median + horizon scalars) | R + Python + Stata `from_kaplan_meier` / `nora_result_km` |
 
 All have real-fit pins under `tests/test_from_*_real_fits.py` and
@@ -326,9 +328,12 @@ section of [src/nora/system_prompt.py](../src/nora/system_prompt.py)
 listing required fields, both helper signatures with their
 canonical `aggregation_method` defaults per language ("dynamic"
 for R `did`, "event" for Python `differences`), the
-`estimator: "callaway_santanna"` scope note, and the deferred-
-language workaround for Stata (`nora_result_regress` on the
-structural-equation regression).
+`estimator: "callaway_santanna"` scope note, and an honest framing
+of the deferred Stata path: the only Stata route today is
+hand-authoring JSON to `NORA_RESULT_PATH` against the field schema,
+which is a contributor escape hatch (not an end-user workflow), so
+the model is told to recommend opening R or Python in the same
+session and loading the `.dta` via `haven` / `pyreadstat`.
 
 ### Privacy carve-out patterns
 
@@ -390,12 +395,22 @@ packages them. Two reasons:
 Two patterns surface in the current shapes:
 
 - **Defer with a workaround** — Stata RDD and Stata CS DiD don't
-  have helpers shipped today (the `ssc install rdrobust` /
-  `ssc install csdid` path needs explicit authorization and the
-  Stata ports have maintenance-lag risk). System prompt directs
-  the model to fall back to `nora_result_regress` on the
-  structural equation, or to work in R / Python. Skip-cleanly
-  pattern in the real-fit tests.
+  have helpers shipped today. The two deferrals have different
+  reasons:
+  - **RDD: numerics-unverified, targeted 0.10.1.** SSC `rdrobust`
+    has maintenance-lag risk; cross-language numerics check
+    (Stata vs R vs Python `rdrobust` on the same DGP at 0.5%
+    relative tolerance) is the go/no-go gate. Protocol in
+    [CHANGELOG.md](../CHANGELOG.md) deferred section.
+  - **DiD: no realistic Stata workflow.** `csdid` is
+    SSC-distributed and `install_packages` does not reach SSC, so
+    Nora cannot install it. Even if a researcher runs
+    `ssc install csdid` themselves, the only path to emit a
+    `did_event_study` payload from Stata is hand-authoring JSON
+    against the field schema — that's a contributor escape hatch,
+    not an end-user workflow. System prompt directs the model to
+    recommend opening R or Python in the same session
+    (the `.dta` opens via `haven` / `pyreadstat`).
 - **Implement a minimal version** — the runtime helper itself
   doesn't need a package; if the canonical package is unavailable
   but the math is tractable, compute it. KM survival probabilities
