@@ -304,13 +304,25 @@ PLIST_VERSION="$(
     /usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' \
         "$APP/Contents/Info.plist" 2>/dev/null || true
 )"
-PYPROJECT_VERSION="$(
-    /usr/bin/python3 - <<'PY'
+# ``tomllib`` is stdlib only in Python 3.11+; macOS ships with
+# 3.9 (Big Sur) or 3.10 (Ventura) at /usr/bin/python3, both of
+# which raise ``ModuleNotFoundError`` on import. Prefer ``uv run
+# python`` (the project's pinned interpreter, 3.11+ by default)
+# and fall back to ``awk`` on pyproject.toml directly when uv is
+# absent — the version line is unambiguous (``version = "X.Y.Z"``
+# at the top of the [project] table) and that path avoids the
+# Python-version trap entirely.
+if command -v uv >/dev/null 2>&1; then
+    PYPROJECT_VERSION="$(uv run python -c '
 import tomllib
 with open("pyproject.toml", "rb") as f:
     print(tomllib.load(f)["project"]["version"])
-PY
-)"
+')"
+else
+    PYPROJECT_VERSION="$(
+        /usr/bin/awk -F'"' '/^version[[:space:]]*=/ {print $2; exit}' pyproject.toml
+    )"
+fi
 if [[ -z "$PLIST_VERSION" || -z "$PYPROJECT_VERSION" ]]; then
     echo "  ✗ Could not read both versions (plist='$PLIST_VERSION', pyproject='$PYPROJECT_VERSION')." >&2
     exit 1
