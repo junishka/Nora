@@ -1551,6 +1551,16 @@ def _build_response_envelope(
     # model isn't misled by a fake zero.
     if exec_result.exit_code is not None:
         response["exit_code"] = exec_result.exit_code
+    # Structured runtime-environment snapshot from the executor.
+    # Surfaced on every response (success and failure) so the model
+    # can self-diagnose environment-shaped failures without
+    # speculating: which interpreter Nora picked, which required
+    # packages it provided, whether the sandbox-health probe
+    # rejected any python3 candidates, etc. Phase-safe by
+    # construction — none of these fields read researcher data.
+    env_metadata = getattr(exec_result, "environment", None)
+    if env_metadata:
+        response["_environment"] = env_metadata
     if shared_transformations:
         response["transformations_summary"] = shared_transformations
     if inline_payload_omitted:
@@ -1616,6 +1626,9 @@ def _attach_status_metadata(
             exec_result.raw_stderr,
             exec_result.exit_code,
             language,
+            run_dir=exec_result.run_dir,
+            pre_user_stderr=getattr(exec_result, "pre_user_stderr", None),
+            user_stderr=getattr(exec_result, "user_stderr", None),
         )
         if not excerpt:
             excerpt = (

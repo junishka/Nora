@@ -184,12 +184,20 @@ _PYTHON_OPTIONAL_PACKAGES: tuple[str, ...] = (
 def find_python() -> Tool | None:
     """Return the discovered Python 3 interpreter, or None.
 
-    Tries ``python3`` then ``python`` on PATH. Probes the discovered
-    interpreter for the scientific-stack packages the runtime library
-    requires; missing ones are recorded on ``Tool.missing_packages``
-    so the executor can refuse with a clear message rather than
-    letting the script crash with ``ModuleNotFoundError`` after the
-    sandbox is up.
+    Tries ``python3`` then ``python`` on PATH. For each candidate that
+    exists and reports a Python 3 version, runs a sandbox-health probe
+    (``_probe_sandbox_health``, cached in-memory) before accepting it.
+    An interpreter that runs fine outside the sandbox but can't start
+    under it — canonically Apple's ``/usr/bin/python3``, an
+    ``xcselect`` stub that dlopens ``/Library/Developer/CommandLine
+    Tools/usr/lib/libxcrun.dylib`` at startup, a path the executor's
+    profile doesn't allow — is rejected so the executor doesn't
+    accept a Python it will then fail to run.
+
+    Missing required / optional packages are recorded on
+    ``Tool.missing_packages`` so the executor can refuse with a
+    clear message rather than letting the script crash with
+    ``ModuleNotFoundError`` after the sandbox is up.
 
     Refuses to consider Python 2 (still installed on some macOS
     setups via Homebrew) — the runtime library uses dataclasses and
@@ -201,6 +209,16 @@ def find_python() -> Tool | None:
             continue
         version = _python_version(path)
         if version is None or not version.startswith("Python 3"):
+            continue
+        # Sandbox-health probe before accepting. The probe lazily
+        # populates ``_SANDBOX_PROBE_CACHE`` so the first ``find_python``
+        # call pays ~200ms once, and downstream callers (system_prompt,
+        # ui banner, executor's preamble lookup) hit the cache. Failed
+        # candidates stay in the cache so ``python_sandbox_probe_results``
+        # can explain the rejection to the doctor / UI layer.
+        if path not in _SANDBOX_PROBE_CACHE:
+            _SANDBOX_PROBE_CACHE[path] = _probe_sandbox_health(path)
+        if not _SANDBOX_PROBE_CACHE[path][0]:
             continue
         missing = _python_missing_packages(path, _PYTHON_REQUIRED_PACKAGES)
         optional_missing = _python_missing_packages(path, _PYTHON_OPTIONAL_PACKAGES)
@@ -214,6 +232,222 @@ def find_python() -> Tool | None:
             extra_read_paths=prefixes,
         )
     return None
+
+
+# ---------------------------------------------------------------------------
+# Sandbox-health probe for candidate Python interpreters
+# ---------------------------------------------------------------------------
+#
+# Why this exists: outside the sandbox, ``binary -c "print(1)"`` answers
+# "does this interpreter respond to ``-c``" — and that's exactly the
+# question Apple's ``/usr/bin/python3`` (an ``xcselect`` stub that
+# dispatches via libxcrun) passes cleanly. Inside the sandbox, the
+# stub dies before main() because libxcrun's dylib lives outside the
+# read allowlist. The two checks have different threat models, and the
+# gap is where every script-startup failure of this class hides.
+#
+# The probe closes that gap by running the candidate under the SAME
+# profile builder the executor uses for real script runs
+# (``executor._sandbox_profile_string``). Drift between probe and run
+# would defeat the purpose; sharing the builder is the invariant.
+#
+# In-memory cache only, lazy on first call. Disk persistence doesn't
+# earn its keep — a stale "good" cache pointing at an uninstalled
+# interpreter is a worse failure than a 200ms cold-start probe, and
+# probe cost is small enough that within-process caching covers the
+# realistic cases (system_prompt, ui banner, the executor's preamble
+# lookup all hit the same path within one Nora session).
+_SANDBOX_PROBE_CACHE: dict[str, tuple[bool, str]] = {}
+
+# Separate cache for the SANDBOX layer's own health (phase A of the
+# probe). The interpreter probe runs ``sandbox-exec -f <profile>
+# <binary> ...`` — if sandbox-exec or the profile compiler is itself
+# broken, every interpreter candidate fails identically and the doctor
+# would mis-attribute the failure to the interpreter. Caching the
+# baseline check separately lets us report "sandbox is broken" without
+# blaming the (possibly fine) Python install.
+_SANDBOX_BASELINE_CACHE: "tuple[bool, str] | None" = None
+
+
+def _check_sandbox_baseline() -> tuple[bool, str]:
+    """Verify ``sandbox-exec`` can apply a minimal profile at all.
+
+    The interpreter probe builds a real Nora profile and runs the
+    candidate binary under it. That sequence can fail for two
+    distinct reasons:
+
+      * **Sandbox layer broken** — sandbox-exec is missing or
+        misconfigured, the SBPL compiler rejects the profile, the
+        OS doesn't honour ``sandbox_apply`` (nested-sandbox
+        harnesses, exotic macOS variants). Every interpreter
+        probed under such a sandbox fails identically.
+      * **Interpreter rejected by a working sandbox** — the Apple
+        xcrun stub class of failure, what the doctor was originally
+        built to catch.
+
+    Without distinguishing these, a researcher whose sandbox is
+    broken would see "install Homebrew Python" advice that won't
+    help. This function runs a minimal ``(allow default)`` profile
+    against ``/usr/bin/true`` — the simplest possible sandbox
+    invocation. If that fails, sandbox-exec itself is the problem,
+    and ``_probe_sandbox_health`` short-circuits with the baseline
+    error instead of running per-candidate probes.
+
+    Cached in-memory for the lifetime of the process (the sandbox
+    layer's health doesn't change mid-session). Non-macOS hosts
+    return ``(True, "")`` — the executor doesn't sandbox there, so
+    the baseline question is moot and the "sandbox not present"
+    case is reported separately by the doctor's sandbox-runtime
+    row.
+    """
+    global _SANDBOX_BASELINE_CACHE
+    if _SANDBOX_BASELINE_CACHE is not None:
+        return _SANDBOX_BASELINE_CACHE
+
+    sandbox_exec = find_sandbox_exec()
+    if sandbox_exec is None:
+        _SANDBOX_BASELINE_CACHE = (True, "")
+        return _SANDBOX_BASELINE_CACHE
+
+    try:
+        out = subprocess.run(
+            [
+                sandbox_exec, "-p", "(version 1)(allow default)",
+                "/usr/bin/true",
+            ],
+            capture_output=True, text=True, timeout=5,
+        )
+    except (OSError, subprocess.TimeoutExpired) as e:
+        _SANDBOX_BASELINE_CACHE = (
+            False, f"sandbox-exec failed to launch: {e}",
+        )
+        return _SANDBOX_BASELINE_CACHE
+    if out.returncode != 0:
+        _SANDBOX_BASELINE_CACHE = (
+            False,
+            (
+                "sandbox-exec rejected a minimal allow-default profile "
+                f"(exit {out.returncode}). stderr: "
+                f"{(out.stderr or '').strip() or '(empty)'}"
+            ),
+        )
+        return _SANDBOX_BASELINE_CACHE
+    _SANDBOX_BASELINE_CACHE = (True, "")
+    return _SANDBOX_BASELINE_CACHE
+
+
+def sandbox_baseline_result() -> tuple[bool, str]:
+    """Public accessor for the sandbox-baseline cache.
+
+    Used by the doctor's ``_sandbox_report`` to surface "sandbox
+    layer broken" as a distinct failure from "sandbox-exec not
+    present", and by tests that need to pre-seed the cache to
+    simulate either branch.
+    """
+    return _check_sandbox_baseline()
+
+
+def _probe_sandbox_health(binary: str) -> tuple[bool, str]:
+    """Run a trivial ``binary -I -c "print(1)"`` under a representative
+    Nora sandbox profile and report whether it succeeded.
+
+    Returns ``(ok, stderr_excerpt)``:
+      * ``ok=True`` and empty stderr when the sandboxed subprocess
+        exited 0 with ``"1"`` on stdout.
+      * ``ok=False`` with up to ~4 KB of the failing stderr (the tail,
+        which is what carries the actual error). Callers — the doctor
+        command and the executor's error path — pass this back to the
+        researcher unredacted: at this phase no researcher data has
+        been touched, so launcher / dlopen / sandbox-denial output is
+        safe to surface.
+
+    On non-macOS systems (no ``sandbox-exec``) the probe is a no-op
+    and returns ``(True, "")``. The executor doesn't sandbox there, so
+    probing for sandbox compatibility is moot.
+
+    Profile shape: built by ``executor._sandbox_profile_string`` so
+    the probe and the executor's per-run profile share one source of
+    truth. The probe's ephemeral cwd / run_dir live under
+    ``tempfile.mkdtemp()``; both are added to the read allowlist by
+    the same code the real run uses, so a candidate that passes here
+    starts cleanly under the real run too (modulo cwd-specific
+    paths, which don't affect interpreter startup).
+    """
+    sandbox_exec = find_sandbox_exec()
+    if sandbox_exec is None:
+        return True, ""
+
+    # Phase A: is the sandbox layer itself usable? If a minimal
+    # ``(allow default)`` profile against ``/usr/bin/true`` already
+    # fails, every interpreter probe would fail identically and the
+    # diagnostic (and the doctor's downstream rendering) would
+    # mis-attribute the failure to the interpreter rather than the
+    # sandbox. Short-circuit here with the baseline error so the
+    # rejection cache carries an explicit "sandbox layer broken"
+    # signal instead of N copies of the same downstream symptom.
+    baseline_ok, baseline_err = _check_sandbox_baseline()
+    if not baseline_ok:
+        return False, (
+            "sandbox-exec itself is unusable; this rejection is not "
+            "specific to the interpreter at "
+            f"{binary}. {baseline_err}"
+        )
+
+    # Lazy local imports to avoid an import-cycle with executor /
+    # package_installer at module load. Same pattern as
+    # ``_python_missing_packages`` / ``_python_prefixes`` below.
+    import tempfile
+    from nora.executor import _filter_env, _sandbox_profile_string
+
+    prefixes = _python_prefixes(binary)
+    with tempfile.TemporaryDirectory(prefix="nora-probe-") as scratch_str:
+        # ``.resolve()`` is required on macOS: /var/folders/... is
+        # reached as /private/var/folders/... at the kernel level,
+        # and SBPL matches resolved paths. Without resolve(), the
+        # profile's ``(subpath "/var/folders/...")`` allow doesn't
+        # cover the kernel-side path the probe actually accesses.
+        scratch = Path(scratch_str).resolve()
+        run_dir = scratch / ".nora" / "runs" / "probe"
+        run_dir.mkdir(parents=True)
+        profile_text = _sandbox_profile_string(
+            run_dir=run_dir, cwd=scratch, extra_read_paths=prefixes,
+        )
+        profile_path = run_dir / "sandbox.sb"
+        profile_path.write_text(profile_text)
+
+        try:
+            out = subprocess.run(
+                [
+                    sandbox_exec, "-f", str(profile_path),
+                    binary, "-I", "-c", "print(1)",
+                ],
+                capture_output=True, text=True, timeout=10,
+                env=_filter_env(dict(os.environ)),
+                cwd=str(scratch),
+            )
+        except (OSError, subprocess.TimeoutExpired) as e:
+            return False, f"probe could not launch: {e}"
+
+    if out.returncode == 0 and (out.stdout or "").strip() == "1":
+        return True, ""
+    # Tail of stderr — most launcher / dlopen errors emit a single
+    # short line, but Python's traceback formatter and SBPL's deny
+    # messages can run long. Cap at ~4 KB so the UI / doctor output
+    # doesn't balloon, but keep the tail (the proximate cause is
+    # almost always the last line).
+    return False, (out.stderr or "")[-4000:]
+
+
+def python_sandbox_probe_results() -> dict[str, tuple[bool, str]]:
+    """Return a snapshot of the in-memory sandbox-probe cache.
+
+    Each key is a probed interpreter path; value is
+    ``(ok, stderr_excerpt)``. Used by the ``nora doctor`` command and
+    by the executor's "no python3 found" error path to explain why a
+    candidate Python was rejected — without this, every script
+    silently dies and the researcher has no clue why.
+    """
+    return dict(_SANDBOX_PROBE_CACHE)
 
 
 def find_sandbox_exec() -> str | None:
