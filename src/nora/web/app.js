@@ -1469,6 +1469,17 @@ function renderMentionPopup() {
     hint.className = 'mention-hint';
     hint.textContent = '↑↓ navigate · ↵ insert · esc dismiss';
     mentionPopup.appendChild(hint);
+    // Keep the selected row in view when arrow-key navigation
+    // moves past the visible window. ``.mention-popup`` is the
+    // scroll container (max-height 280px, overflow-y: auto), and
+    // without this the highlighted row slides off the top/bottom
+    // as the user holds ↓ — the visual selection just disappears.
+    // ``block: 'nearest'`` scrolls only when the row is actually
+    // off-screen, so rows that are already in view don't bounce.
+    const selectedRow = list.querySelector('.mention-row.selected');
+    if (selectedRow && typeof selectedRow.scrollIntoView === 'function') {
+      selectedRow.scrollIntoView({ block: 'nearest' });
+    }
   }
   mentionPopup.classList.remove('hidden');
   positionMentionPopup();

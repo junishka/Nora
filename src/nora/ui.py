@@ -1987,19 +1987,14 @@ class NoraBridge:
             text = target.read_text(encoding="utf-8", errors="replace")
         except OSError as e:
             return {"ok": False, "reason": f"read failed: {e}"}
-        # Strip the executor's bootstrap (adopath / sys.path insert /
-        # cd) before handing the script to the clipboard. The
-        # preamble depends on ``NORA_LIB_DIR`` / ``NORA_CWD`` and a
-        # run-dir-specific ``sys.path`` entry — outside Nora those
-        # references don't resolve, and the stated purpose of this
-        # button ("grab the script and use it in Stata/RStudio") is
-        # only well-served if what lands on the clipboard is the
-        # researcher's code, not Nora's plumbing. Detection is by
-        # the unique separator line the executor writes
-        # (``executor._write_script``); files that don't have it
-        # (R scripts, researcher-uploaded scripts) pass through
-        # unchanged.
-        text = _strip_executor_preamble(text)
+        # The Files-panel "Copy" button surfaces researcher-uploaded
+        # scripts (run-dir scripts are hidden from the panel by
+        # design). Researcher uploads never carry Nora's preamble,
+        # and the run-dir ``script.do`` / ``script.py`` files the
+        # executor writes are themselves clean (preamble lives in a
+        # sibling ``_nora_wrapper.*`` file). So the bytes already on
+        # disk are exactly what the researcher wants on the
+        # clipboard — no further processing required.
         return {
             "ok": True,
             "name": target.name,
@@ -4507,51 +4502,6 @@ def _classify_kind(ext: str) -> str:
     to ``"data"`` so the chat-bubble renderer always has a kind."""
     from nora.session_files import classify_ext
     return classify_ext(ext, include_data=True, default="data")
-
-
-# Exact marker lines the executor writes between its bootstrap and
-# the researcher's code (see ``executor._write_script``). Stata uses
-# ``*!`` and Python uses ``#`` as the comment prefix; both are
-# anchored to start-of-line and verbose enough that no researcher
-# would write either form by accident.
-_EXECUTOR_PREAMBLE_MARKERS = (
-    "*! ----- Nora preamble above; researcher code below -----",
-    "# ----- Nora preamble above; researcher code below -----",
-)
-
-
-def _strip_executor_preamble(text: str) -> str:
-    """Drop the executor's bootstrap from a Stata / Python ``script.do``
-    or ``script.py`` so the body the researcher gets on their
-    clipboard is portable.
-
-    The on-disk script that the runner executes opens with
-    ``adopath +`` / ``cd`` (Stata) or a ``sys.path.insert`` (Python)
-    that resolves against the run dir's ``lib/`` and the per-session
-    ``NORA_CWD`` / ``NORA_LIB_DIR`` env vars. Outside Nora those names
-    don't exist, so a copied raw file fails on the first line. The
-    stated purpose of the Files-panel "copy" button is "grab the
-    script and use it in Stata/RStudio," which only works if the
-    bootstrap is gone.
-
-    Detection is by the exact marker line the executor writes between
-    bootstrap and user code, anchored to the start of a line. If
-    none of the markers match (R scripts have no preamble;
-    researcher-uploaded ``.py`` / ``.do`` files won't either), the
-    text is returned unchanged.
-    """
-    lines = text.split("\n")
-    for i, line in enumerate(lines):
-        if line in _EXECUTOR_PREAMBLE_MARKERS:
-            # Drop everything up through this marker line, plus a
-            # single trailing blank that the executor pads in for
-            # readability. ``"\n".join`` reconstructs the rest with
-            # original line endings preserved.
-            rest = lines[i + 1:]
-            if rest and rest[0] == "":
-                rest = rest[1:]
-            return "\n".join(rest)
-    return text
 
 
 def _attach_as_announcement(

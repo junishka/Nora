@@ -110,7 +110,12 @@ gen sy = school_eff + 0.4 * sx + 0.4 * rnormal()
 file open ah using "`_path'", write text append
 file write ah `"{"_audit_label":"mixed_re_intercept"}"' _newline
 file close ah
-quietly mixed sy sx || school:
+* `, reml` pinned explicitly. Stata's `mixed` default flipped to ML
+* around Stata 18, but the cross-language sanitizer contract pinned by
+* the R lme4 / Python statsmodels.MixedLM real-fit tests uses REML.
+* Without this option the test would assert fit_method=="REML" against
+* an ML fit on newer Stata installs.
+quietly mixed sy sx || school:, reml
 nora_result_regress
 
 * meglm logistic with random intercept. Same variance-components

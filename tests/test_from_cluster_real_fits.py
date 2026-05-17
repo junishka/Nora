@@ -481,11 +481,11 @@ _STATA_KMEANS_SCRIPT = r"""
 adopath ++ "{runtime_dir}"
 local _path : env NORA_RESULT_PATH
 capture erase "`_path'"
-sysuse auto, clear
-quietly drop if missing(price, mpg, weight, length)
-quietly cluster kmeans price mpg weight length, k(3) name(kmclus) start(random(42))
-nora_result_cluster price mpg weight length, clusvar(kmclus) ///
-    method("kmeans") label("Stata auto kmeans k=3")
+sysuse citytemp, clear
+quietly drop if missing(tempjan, tempjuly, heatdd, cooldd)
+quietly cluster kmeans tempjan tempjuly heatdd cooldd, k(3) name(kmclus) start(random(42))
+nora_result_cluster tempjan tempjuly heatdd cooldd, clusvar(kmclus) ///
+    method("kmeans") label("Stata citytemp kmeans k=3")
 """
 
 
@@ -493,14 +493,23 @@ _STATA_WARD_SCRIPT = r"""
 adopath ++ "{runtime_dir}"
 local _path : env NORA_RESULT_PATH
 capture erase "`_path'"
-sysuse auto, clear
-quietly drop if missing(price, mpg, weight, length)
-quietly cluster wardslinkage price mpg weight length, name(wardlink)
+sysuse citytemp, clear
+quietly drop if missing(tempjan, tempjuly, heatdd, cooldd)
+quietly cluster wardslinkage tempjan tempjuly heatdd cooldd, name(wardlink)
 quietly cluster generate wardclus = groups(3), name(wardlink)
-nora_result_cluster price mpg weight length, clusvar(wardclus) ///
+nora_result_cluster tempjan tempjuly heatdd cooldd, clusvar(wardclus) ///
     method("hierarchical") linkage("ward") ///
-    label("Stata auto Ward k=3")
+    label("Stata citytemp Ward k=3")
 """
+# Why citytemp + these four vars: `sysuse auto` was the original
+# fixture and produces clusters of sizes 6 / 9 / 59 on k=3, which
+# trips the sanitizer's `min_n_descriptive` (=10) cluster-suppression
+# gate and collapses two of the three clusters to "withheld". The
+# test then sees n_clusters=1 even though Stata fit three. Switching
+# to `citytemp` (953 cities, 4 continuous features) yields all-fat
+# clusters under both kmeans (423/270/260) and Ward (563/331/59),
+# so the SDC gate is satisfied and we actually exercise the
+# three-cluster path the test exists to pin.
 
 
 @requires_stata_cluster
@@ -543,7 +552,7 @@ def test_stata_nora_result_cluster_kmeans(tmp_path: Path) -> None:
     assert s["method"] == "kmeans"
     assert s["n_clusters"] == 3
     assert s["n_features"] == 4
-    assert set(s["variables"]) == {"price", "mpg", "weight", "length"}
+    assert set(s["variables"]) == {"tempjan", "tempjuly", "heatdd", "cooldd"}
     # Synthetic labels: cluster_1 / cluster_2 / cluster_3.
     assert set(s["cluster_labels"]) <= {"cluster_1", "cluster_2", "cluster_3"}
     # Cluster sizes sum to n_observations (modulo suppressed clusters).
@@ -553,7 +562,7 @@ def test_stata_nora_result_cluster_kmeans(tmp_path: Path) -> None:
     centroids = s.get("centroids", {})
     assert centroids
     for cluster_label, row in centroids.items():
-        assert set(row.keys()) <= {"price", "mpg", "weight", "length"}
+        assert set(row.keys()) <= {"tempjan", "tempjuly", "heatdd", "cooldd"}
 
 
 @requires_stata_cluster

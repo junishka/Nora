@@ -404,6 +404,110 @@ def test_mach_deny_appears_after_allow(example_profile: str):
 
 
 # ---------------------------------------------------------------------------
+# Stata ingress strip — model-emitted plumbing the wrapper already runs
+# ---------------------------------------------------------------------------
+
+def test_ingress_strip_removes_redundant_wrapper_lines(tmp_path):
+    """The model has a learned habit of opening a Stata submission
+    with ``capture program drop nora_<helper>`` + ``local lib : env
+    NORA_LIB_DIR`` + ``adopath + ...`` + ``local nora_cwd : env
+    NORA_CWD`` + ``cd ...``. The executor's wrapper already does all
+    of that before user code starts, so the lines are no-ops on
+    disk — but they appear in ``script.do`` every time the
+    researcher opens it, which is the visible-noise complaint this
+    strip closes. The strip targets exact-line matches against
+    Nora-internal patterns; researcher-authored cd / adopath lines
+    that reference their own paths are left alone.
+    """
+    from nora.executor import _write_script, _strip_redundant_wrapper_lines
+
+    polluted = (
+        "capture program drop nora_result_regress\n"
+        "local lib : env NORA_LIB_DIR\n"
+        "adopath + \"`lib'\"\n"
+        "local nora_cwd : env NORA_CWD\n"
+        "cd \"`nora_cwd'\"\n"
+        "\n"
+        "use \"data.dta\", clear\n"
+        "regress y x\n"
+    )
+
+    # Unit: the helper drops all five plumbing lines + the spacer
+    # blank that followed them.
+    cleaned = _strip_redundant_wrapper_lines("Stata", polluted)
+    assert cleaned == 'use "data.dta", clear\nregress y x\n', (
+        f"strip output not as expected:\n{cleaned!r}"
+    )
+
+    # End-to-end: the on-disk script.do is the cleaned version.
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    (run_dir / "lib").mkdir()
+    _write_script(run_dir, "Stata", polluted)
+    on_disk = (run_dir / "script.do").read_text(encoding="utf-8")
+    assert "NORA_LIB_DIR" not in on_disk
+    assert "nora_cwd" not in on_disk
+    assert "capture program drop nora_result_regress" not in on_disk
+    assert on_disk.startswith('use "data.dta", clear'), on_disk
+
+
+def test_ingress_strip_preserves_researcher_cd_and_adopath(tmp_path):
+    """A real ``cd "/path/to/project"`` or ``adopath + "/some/dir"``
+    that the researcher (or the model under researcher direction)
+    wrote intentionally must NOT be stripped. The strip's safety
+    rests on matching VERBATIM Nora-internal patterns (env var
+    names ``NORA_LIB_DIR`` / ``NORA_CWD``; local macros ``\\`lib'``
+    / ``\\`nora_cwd'``). Anything else passes through.
+    """
+    from nora.executor import _strip_redundant_wrapper_lines
+
+    legit = (
+        'cd "/Users/me/study"\n'
+        'adopath + "/some/personal/ado"\n'
+        'capture program drop my_helper\n'
+        'use "data.dta", clear\n'
+    )
+    assert _strip_redundant_wrapper_lines("Stata", legit) == legit
+
+
+def test_ingress_strip_is_noop_for_python_and_r():
+    """Python and R go through ``_strip_redundant_wrapper_lines``
+    too, but only Stata has a wrapper-shadow superstition the strip
+    targets. Other languages must pass through unchanged so we don't
+    silently mangle Python/R code that happens to mention NORA_*
+    env vars by coincidence.
+    """
+    from nora.executor import _strip_redundant_wrapper_lines
+
+    py = "import os\nos.environ.get('NORA_LIB_DIR')\nprint(1)\n"
+    assert _strip_redundant_wrapper_lines("Python", py) == py
+
+    r = 'lib <- Sys.getenv("NORA_LIB_DIR")\ncat(lib)\n'
+    assert _strip_redundant_wrapper_lines("R", r) == r
+
+
+def test_ingress_strip_leaves_mid_script_blanks_alone(tmp_path):
+    """A blank line BETWEEN two pieces of user code is layout the
+    researcher wrote; the strip must not collapse it. The blank-
+    swallowing logic only fires when the stripped line was already
+    preceded by a blank in the accumulated output OR was at the
+    very top of the file (where the leading-blank pop catches it).
+    """
+    from nora.executor import _strip_redundant_wrapper_lines
+
+    src = (
+        'use "data.dta", clear\n'
+        '\n'
+        'local lib : env NORA_LIB_DIR\n'
+        'regress y x\n'
+    )
+    out = _strip_redundant_wrapper_lines("Stata", src)
+    # The blank between `use` and the (now-stripped) plumbing block
+    # is preceded by user content, so it stays.
+    assert out == 'use "data.dta", clear\n\nregress y x\n', out
+
+
+# ---------------------------------------------------------------------------
 # Stata preamble — block ``~/ado/profile.do`` shadow attack
 # ---------------------------------------------------------------------------
 
@@ -569,6 +673,8 @@ def test_every_runtime_helper_file_is_in_executor_staging_lists():
     import re
     from pathlib import Path
 
+    from nora.executor import _STATA_NORA_HELPER_NAMES
+
     runtime_dir = (
         Path(__file__).resolve().parents[1] / "src" / "nora" / "runtime"
     )
@@ -587,6 +693,7 @@ def test_every_runtime_helper_file_is_in_executor_staging_lists():
 
     missing_from_staging: list[str] = []
     missing_from_program_drops: list[str] = []
+    helper_drop_set = set(_STATA_NORA_HELPER_NAMES)
     for name in on_disk:
         # Staging: the filename must appear as a string literal
         # somewhere in executor.py (in the stata_ados / r_names /
@@ -595,12 +702,16 @@ def test_every_runtime_helper_file_is_in_executor_staging_lists():
             missing_from_staging.append(name)
             continue
         # Program-drop list applies only to .ado helpers (the
-        # shadowing defense is Stata-specific).
+        # shadowing defense is Stata-specific). The wrapper builder
+        # generates the drop block by iterating
+        # ``_STATA_NORA_HELPER_NAMES``; the strip targets the same
+        # tuple. Checking the tuple directly keeps this test
+        # textual-form-independent so refactors of the wrapper
+        # builder don't make this invariant grep-fragile.
         if not name.endswith(".ado"):
             continue
         program_name = re.sub(r"\.ado$", "", name)
-        drop_line = f'"capture program drop {program_name}"'
-        if drop_line not in executor_text:
+        if program_name not in helper_drop_set:
             missing_from_program_drops.append(name)
 
     assert not missing_from_staging, (

@@ -3581,6 +3581,11 @@ async def read_attached_file(args: dict[str, Any]) -> dict[str, Any]:
                 "status": "error",
                 "reason": f"could not read {safe_name}: {e}",
             })
+        # ``script.do`` / ``script.py`` are written clean by the
+        # executor (preamble lives in a sibling ``_nora_wrapper.*``
+        # file invoked by the runner). No additional stripping is
+        # needed here — what's on disk is exactly the researcher's
+        # code.
         original_size = len(blob)
         truncated = False
         if original_size > _RECALL_SCRIPT_MAX_BYTES:
