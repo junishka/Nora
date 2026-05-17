@@ -41,18 +41,50 @@ set -euo pipefail
 # system-scope so a per-user override wins over a system install.
 #
 # The list covers Homebrew (Apple Silicon + Intel), Volta, Bun, the
-# default npm-global prefix, ``~/.local/bin``, and the two common
-# shell-shim managers (asdf, mise). Anything else (exotic prefixes,
-# custom ``$PREFIX`` builds) needs intervention beyond this launcher
-# — neither ``~/.zshrc`` nor ``~/.zshenv`` is sourced from a Finder/
-# launchd launch (the shebang above is bash, and launchd does not run
-# shell init files for .app launches), so editing those files will
-# NOT change the PATH this script sees. Researchers in that case
-# should either (a) symlink the missing tool into one of the listed
-# directories, (b) set the PATH via ``launchctl setenv PATH ...``
-# from a LaunchAgent, or (c) launch Nora from a terminal session
-# where the shell init has already assembled PATH.
-_NORA_EXTRA_PATH="$HOME/.local/bin:$HOME/.npm-global/bin:$HOME/.volta/bin:$HOME/.bun/bin:$HOME/.asdf/shims:$HOME/.local/share/mise/shims:/opt/homebrew/bin:/usr/local/bin"
+# default npm-global prefix, ``~/.local/bin``, the two common
+# shell-shim managers (asdf, mise), and Python-specific interpreter
+# managers (pyenv, uv, conda, python.org's framework installer).
+# Anything else (exotic prefixes, custom ``$PREFIX`` builds) needs
+# intervention beyond this launcher — neither ``~/.zshrc`` nor
+# ``~/.zshenv`` is sourced from a Finder/launchd launch (the shebang
+# above is bash, and launchd does not run shell init files for .app
+# launches), so editing those files will NOT change the PATH this
+# script sees. Researchers in that case should either (a) symlink the
+# missing tool into one of the listed directories, (b) set the PATH
+# via ``launchctl setenv PATH ...`` from a LaunchAgent, or (c) launch
+# Nora from a terminal session where the shell init has already
+# assembled PATH.
+#
+# Why the Python-specific paths matter: ``find_python()`` in
+# env_detect.py picks the first ``python3`` on PATH. On a fresh macOS
+# install with no developer tooling, that defaults to Apple's
+# ``/usr/bin/python3`` — an xcselect stub that fails the sandbox-
+# health probe (libxcrun lives outside Nora's read allowlist) and is
+# then rejected as unusable. Adding pyenv shims / uv-managed Pythons /
+# conda envs / python.org framework versions ahead of /usr/bin lets
+# the researcher's actual Python win the search instead of the stub.
+_NORA_EXTRA_PATH="$HOME/.local/bin:$HOME/.npm-global/bin:$HOME/.volta/bin:$HOME/.bun/bin:$HOME/.asdf/shims:$HOME/.local/share/mise/shims:$HOME/.pyenv/shims:$HOME/miniconda3/bin:$HOME/anaconda3/bin:$HOME/opt/miniconda3/bin:$HOME/opt/anaconda3/bin:/opt/miniconda3/bin:/opt/anaconda3/bin:/opt/homebrew/bin:/usr/local/bin"
+
+# Globbed paths: per-version subdirectories where uv and the python.org
+# framework installer place their interpreters. uv installs Pythons
+# under ``~/.local/share/uv/python/cpython-<version>-<platform>/bin``
+# and does NOT symlink ``python3`` into the user's bin by default;
+# the python.org installer puts the binary at
+# ``/Library/Frameworks/Python.framework/Versions/<version>/bin/python3``
+# and only adds that to PATH if the researcher ran the optional
+# ``Update Shell Profile.command`` (which most skip).
+#
+# Bash leaves unmatched globs as literal patterns by default, so the
+# ``-d`` test below correctly skips non-existent entries even when
+# the user has installed neither manager. ``set -u`` doesn't affect
+# pathname expansion.
+for _nora_glob_dir in \
+        "$HOME"/.local/share/uv/python/cpython-*/bin \
+        /Library/Frameworks/Python.framework/Versions/*/bin; do
+    [[ -d "$_nora_glob_dir" ]] || continue
+    _NORA_EXTRA_PATH="$_NORA_EXTRA_PATH:$_nora_glob_dir"
+done
+unset _nora_glob_dir
 export PATH="$_NORA_EXTRA_PATH:${PATH:-/usr/bin:/bin:/usr/sbin:/sbin}"
 
 # Resolve the .app's own path from wherever macOS launched us.

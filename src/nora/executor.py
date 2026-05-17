@@ -765,6 +765,114 @@ def clear_environment_cache() -> None:
     _cached_environment.cache_clear()
 
 
+def _build_environment_metadata(
+    env: Environment, language: "Language",
+) -> dict[str, Any]:
+    """Snapshot the detected runtime state for the model-visible
+    ``ExecutionResult.environment`` field.
+
+    Why this lives on every response: every diagnostic spiral we've
+    seen on script failures comes from the model not knowing which
+    interpreter Nora picked or what it provided. With this snapshot
+    the model can answer "is python3 even there", "is pandas
+    installed", "did the sandbox probe reject any candidate" without
+    speculating. None of the fields touch researcher data — they're
+    interpreter paths, version strings, package names, and the
+    probe's launcher stderr — so the snapshot is phase-safe to
+    forward unredacted regardless of where in script execution a
+    failure landed.
+
+    Language-relevant fields are at the top level; the other two
+    languages are summarised under ``other_runtimes`` so a Python run
+    doesn't bury Python state under a Stata block but the model can
+    still see what's installed if it wants to suggest switching
+    languages.
+    """
+    from nora.env_detect import (
+        _PYTHON_REQUIRED_PACKAGES,
+        python_sandbox_probe_results,
+    )
+
+    def _tool_view(tool, *, include_packages: bool) -> dict[str, Any]:
+        if tool is None:
+            return {"present": False}
+        view: dict[str, Any] = {
+            "present": True,
+            "binary": tool.binary,
+            "version": tool.version,
+        }
+        if include_packages:
+            view["installed_required"] = sorted(
+                set(_PYTHON_REQUIRED_PACKAGES if tool.name == "Python"
+                    else ())
+                - set(tool.missing_packages or ())
+            )
+            view["missing_required"] = sorted(tool.missing_packages or ())
+            view["missing_optional"] = sorted(
+                tool.optional_missing_packages or ()
+            )
+            # ``sys.prefix`` is the first entry of ``extra_read_paths``
+            # for the Python tool (see ``env_detect._python_prefixes``).
+            # Surfacing it tells the model exactly which interpreter
+            # install the executor is reading stdlib from, which is the
+            # missing puzzle piece when shadowed binaries (xcrun stub
+            # vs Homebrew) produce surprising behaviour.
+            if tool.name == "Python" and tool.extra_read_paths:
+                view["sys_prefix"] = tool.extra_read_paths[0]
+        return view
+
+    primary: dict[str, Any]
+    others: dict[str, Any]
+    if language == "Python":
+        primary = _tool_view(env.python, include_packages=True)
+        others = {
+            "R": _tool_view(env.r, include_packages=False),
+            "Stata": _tool_view(env.stata, include_packages=False),
+        }
+    elif language == "R":
+        primary = _tool_view(env.r, include_packages=False)
+        others = {
+            "Python": _tool_view(env.python, include_packages=True),
+            "Stata": _tool_view(env.stata, include_packages=False),
+        }
+    else:  # Stata
+        primary = _tool_view(env.stata, include_packages=False)
+        others = {
+            "Python": _tool_view(env.python, include_packages=True),
+            "R": _tool_view(env.r, include_packages=False),
+        }
+
+    metadata: dict[str, Any] = {
+        "language": language,
+        "interpreter": primary,
+        "sandbox_exec_present": env.sandbox_exec is not None,
+        "other_runtimes": others,
+    }
+
+    # python3 candidates the sandbox probe rejected — only relevant
+    # to Python runs and to "no python3 found" diagnostic paths, but
+    # included on every response so a researcher who switches
+    # languages mid-session still sees the rejection if it explains
+    # a prior Python failure. Each entry has the candidate binary and
+    # the *tail* of the failing stderr (the proximate cause); the
+    # stderr is phase-safe to forward verbatim because the probe runs
+    # ``binary -c "print(1)"`` against no researcher data.
+    probe_failures = [
+        {
+            "binary": path,
+            "stderr_excerpt": (stderr or "").strip().splitlines()[-1]
+            if (stderr or "").strip()
+            else "",
+        }
+        for path, (ok, stderr) in python_sandbox_probe_results().items()
+        if not ok
+    ]
+    if probe_failures:
+        metadata["python_sandbox_probe_failures"] = probe_failures
+
+    return metadata
+
+
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
@@ -798,6 +906,17 @@ class ExecutionResult:
       is treated as a script error in the success path.
     - ``run_dir`` and ``script_path`` are kept around for audit.
     - ``duration_seconds`` is wall-clock time inside the subprocess.
+    - ``environment`` is a snapshot of the detected runtime state at
+      the moment the executor decided to dispatch (or refused to):
+      the interpreter binary + version + sys.prefix, what packages
+      are installed vs missing, whether ``sandbox-exec`` is present,
+      and any rejected python3 candidates from the sandbox probe.
+      Surfacing this on every response lets the model self-diagnose
+      environment-shaped failures (Apple xcrun stub rejected,
+      pandas missing, etc.) without speculating — the most common
+      reason a diagnostic conversation spirals is the model can't
+      see which interpreter Nora actually picked or what it
+      provided.
     """
     ok: bool
     language: Language
@@ -810,6 +929,18 @@ class ExecutionResult:
     script_path: Path | None
     duration_seconds: float
     warnings: list[str] = field(default_factory=list)
+    environment: dict[str, Any] | None = None
+    # Buffer-split stderr (Python only today). ``pre_user_stderr`` is
+    # phase 0 + phase A — captured BEFORE user code ran, so the bytes
+    # cannot contain researcher data. Safe to forward unredacted to
+    # the model. ``user_stderr`` is phase B — captured during user
+    # code; potentially script-controlled, requires frame
+    # classification before any unredacted forwarding. For R / Stata
+    # the split isn't wired yet; pre_user_stderr carries the full
+    # pipe stderr and user_stderr is empty, which causes the error-
+    # summary layer to apply the legacy full-redaction posture.
+    pre_user_stderr: str = ""
+    user_stderr: str = ""
 
 
 def run_script(
@@ -840,6 +971,22 @@ def run_script(
     result_path = run_dir / "result.json"
     script_path: Path | None = None
 
+    # Build the environment metadata snapshot once per run. Attached
+    # to every ExecutionResult below — success, failure, and every
+    # preflight short-circuit — so the model gets the same shape on
+    # every response and can rely on it for diagnosis without
+    # branching on status. Phase-safe by construction: none of these
+    # fields touch researcher data.
+    env_metadata = _build_environment_metadata(env, language)
+
+    def _result(**kw: Any) -> ExecutionResult:
+        """Construct an ExecutionResult with this run's env metadata
+        already attached. Defined as a closure so every exit path
+        from ``run_script`` picks up the same snapshot without
+        repeating ``environment=env_metadata`` at every return site.
+        """
+        return ExecutionResult(environment=env_metadata, **kw)
+
     # Preflight: sandbox required. On macOS `/usr/bin/sandbox-exec`
     # should always be present; if it isn't (or we're not on macOS at
     # all), we refuse to run rather than falling through to an
@@ -848,7 +995,7 @@ def run_script(
     # unrestricted local file access and could smuggle file contents
     # out through result fields the sanitizer forwards.
     if env.sandbox_exec is None:
-        return ExecutionResult(
+        return _result(
             ok=False, language=language, raw_stdout="", raw_stderr="",
             exit_code=None, result_payloads=[],
             error=(
@@ -863,7 +1010,7 @@ def run_script(
 
     # Preflight: interpreter present.
     if language == "R" and env.r is None:
-        return ExecutionResult(
+        return _result(
             ok=False, language=language, raw_stdout="", raw_stderr="",
             exit_code=None, result_payloads=[],
             error=(
@@ -874,7 +1021,7 @@ def run_script(
             run_dir=run_dir, script_path=None, duration_seconds=0.0,
         )
     if language == "Stata" and env.stata is None:
-        return ExecutionResult(
+        return _result(
             ok=False, language=language, raw_stdout="", raw_stderr="",
             exit_code=None, result_payloads=[],
             error=(
@@ -885,15 +1032,49 @@ def run_script(
         )
     if language == "Python":
         if env.python is None:
-            return ExecutionResult(
-                ok=False, language=language, raw_stdout="", raw_stderr="",
-                exit_code=None, result_payloads=[],
-                error=(
+            # ``env.python is None`` has two distinct shapes: (a) no
+            # python3 on PATH at all, or (b) python3 was found but
+            # rejected by the sandbox-health probe (e.g., Apple's
+            # ``/usr/bin/python3`` xcselect stub). The probe cache
+            # tells us which — if it has entries with ok=False, we
+            # surface the failing path + stderr tail so the
+            # researcher knows what to fix instead of being told
+            # "not found" when the binary is literally there.
+            from nora.env_detect import python_sandbox_probe_results
+            probe_failures = [
+                (path, stderr)
+                for path, (ok, stderr) in python_sandbox_probe_results().items()
+                if not ok
+            ]
+            if probe_failures:
+                # One bullet per rejected interpreter. ``stderr`` is
+                # phase-safe to forward unredacted: launcher / dlopen
+                # output here precedes any user-code execution, so
+                # no researcher data has been touched.
+                lines = [
+                    "python3 was found on PATH but every candidate failed "
+                    "to start under the Nora sandbox. Install a real "
+                    "Python via Homebrew (``brew install python``) or "
+                    "python.org and re-launch Nora.",
+                    "",
+                    "Probe failures:",
+                ]
+                for path, stderr in probe_failures:
+                    tail = (stderr or "").strip().splitlines()
+                    snippet = tail[-1] if tail else "(no stderr captured)"
+                    lines.append(f"  {path}: {snippet}")
+                error = "\n".join(lines)
+            else:
+                error = (
                     "python3 not found on PATH. Install Python 3 (the "
                     "official installer from python.org or via Homebrew, "
                     "``brew install python``) and re-launch Nora, or "
                     "submit the script in R or Stata instead."
-                ),
+                )
+            return _result(
+                ok=False, language=language, raw_stdout="", raw_stderr="",
+                exit_code=None, result_payloads=[],
+                error=error,
                 run_dir=run_dir, script_path=None, duration_seconds=0.0,
             )
         # Hard-required packages: the runtime library imports them
@@ -903,7 +1084,7 @@ def run_script(
         # uses descriptive helpers doesn't have to install OLS deps.
         hard_missing = sorted(set(env.python.missing_packages) & _PYTHON_HARD_REQUIRED)
         if hard_missing:
-            return ExecutionResult(
+            return _result(
                 ok=False, language=language, raw_stdout="", raw_stderr="",
                 exit_code=None, result_payloads=[],
                 error=(
@@ -1035,7 +1216,7 @@ def run_script(
             start_new_session=True,
         )
     except FileNotFoundError as e:
-        return ExecutionResult(
+        return _result(
             ok=False, language=language, raw_stdout="", raw_stderr="",
             exit_code=None, result_payloads=[],
             error=f"interpreter not found: {e}",
@@ -1084,10 +1265,19 @@ def run_script(
         # all its plots — including ones the helper library wrote
         # legitimately seconds before the kill.
         register_run_token(run_dir, run_token)
-        return ExecutionResult(
+        # Even on timeout the buffer-split files may exist on disk:
+        # the preamble could have completed and user code been
+        # writing to phase B when the kill landed. Read them so the
+        # SDC posture stays consistent with the normal-exit path.
+        timeout_pre, timeout_user, timeout_raw = _split_stderr_buffers(
+            language, stderr or "", run_dir,
+        )
+        return _result(
             ok=False, language=language,
             raw_stdout=stdout or "",
-            raw_stderr=stderr or "",
+            raw_stderr=timeout_raw,
+            pre_user_stderr=timeout_pre,
+            user_stderr=timeout_user,
             exit_code=None, result_payloads=[],
             error=f"script timed out after {timeout_seconds}s",
             run_dir=run_dir, script_path=script_path,
@@ -1104,11 +1294,15 @@ def run_script(
     # 5. Collect output. For Stata batch mode, real output lives in a
     # .log file next to the .do script rather than stdout.
     raw_stdout = stdout or ""
-    raw_stderr = stderr or ""
+    pipe_stderr = stderr or ""
     if language == "Stata":
         log_contents = _read_stata_log(script_path)
         if log_contents:
             raw_stdout = log_contents + (("\n" + raw_stdout) if raw_stdout else "")
+
+    pre_user_stderr, user_stderr, raw_stderr = _split_stderr_buffers(
+        language, pipe_stderr, run_dir,
+    )
 
     # Persist the raw subprocess output to the run dir so the researcher
     # TUI (and, if needed, later audit) can display what R / Stata / Python
@@ -1240,9 +1434,11 @@ def run_script(
     # CAN fail without the token validation getting a second chance.
     register_run_token(run_dir, run_token)
 
-    return ExecutionResult(
+    return _result(
         ok=ok, language=language,
         raw_stdout=raw_stdout, raw_stderr=raw_stderr,
+        pre_user_stderr=pre_user_stderr,
+        user_stderr=user_stderr,
         exit_code=exit_code, result_payloads=payloads,
         error=error,
         run_dir=run_dir, script_path=script_path,
@@ -1371,8 +1567,51 @@ def _write_script(run_dir: Path, language: Language, code: str) -> Path:
         from nora.env_detect import find_python
         lib_dir = run_dir / "lib"
         py_tool = find_python()
+
+        # Two-buffer stderr split. The fd-level swap below is the
+        # load-bearing SDC invariant for phase-aware redaction:
+        #
+        #   Phase 0 (subprocess.PIPE stderr): everything that lands
+        #     on fd 2 BEFORE the preamble's first dup2 runs. That's
+        #     dyld / xcselect / libxcrun output and any sandbox-deny
+        #     messages from before Python's interpreter is even
+        #     alive. By construction no user code has touched data.
+        #     Safe to forward unredacted.
+        #   Phase A (stderr.phase_a file): writes between the first
+        #     dup2 and the marker-line dup2. Captures preamble-own
+        #     output. Still pre-user-code; the user's ``import nora``
+        #     happens AFTER the marker swap so even runtime-import
+        #     errors do not land here. Safe to forward unredacted.
+        #   Phase B (stderr.phase_b file): writes after the marker
+        #     swap. User code is running; anything in this buffer is
+        #     potentially script-controlled (``print(df.head(),
+        #     file=sys.stderr)`` followed by a segfault, for
+        #     instance — no Python traceback, but real cell content
+        #     in the buffer). The error-summary layer routes this
+        #     through frame classification and redacts bodies
+        #     except where the deepest frame is in Nora-owned code.
+        #
+        # The classifier that USED to live in error_summary leaned on
+        # "no traceback ⇒ pre-user-code", which leaks under
+        # signal-aborted user code that wrote to stderr before
+        # dying. The buffer split enforces the boundary at the
+        # kernel level via dup2 instead of inferring it from text
+        # shape — that's the part that doesn't depend on Python's
+        # traceback machinery being intact when the failure fires.
+        phase_a_path = run_dir / "stderr.phase_a"
+        phase_b_path = run_dir / "stderr.phase_b"
         preamble_lines = [
             "import sys as _nora_sys",
+            "import os as _nora_os",
+            # Open phase-A buffer and replace fd 2. dup2 closes the
+            # existing fd 2 (the pipe end inherited from the parent),
+            # so subprocess.PIPE stops receiving stderr at this
+            # point — phase 0 is exactly the bytes already on the
+            # pipe when this line runs.
+            f"_nora_pha_fd = _nora_os.open({str(phase_a_path)!r}, "
+            "_nora_os.O_WRONLY | _nora_os.O_CREAT | _nora_os.O_TRUNC, 0o644)",
+            "_nora_os.dup2(_nora_pha_fd, 2)",
+            "_nora_os.close(_nora_pha_fd)",
         ]
         if py_tool is not None:
             pkg_dir = nora_python_pkg_dir(py_tool.binary)
@@ -1382,10 +1621,22 @@ def _write_script(run_dir: Path, language: Language, code: str) -> Path:
         preamble_lines.append(
             f"_nora_sys.path.insert(0, {str(lib_dir)!r})"
         )
-        preamble_lines.append("del _nora_sys")
-        preamble_lines.append(
-            "# ----- Nora preamble above; researcher code below -----"
-        )
+        preamble_lines.extend([
+            # Swap to phase-B buffer just before user code starts.
+            # ``sys.stderr.flush()`` first so any Python-buffered
+            # bytes from the preamble are forced to phase A rather
+            # than leaking into phase B at the next implicit flush.
+            f"_nora_phb_fd = _nora_os.open({str(phase_b_path)!r}, "
+            "_nora_os.O_WRONLY | _nora_os.O_CREAT | _nora_os.O_TRUNC, 0o644)",
+            "_nora_sys.stderr.flush()",
+            "_nora_os.dup2(_nora_phb_fd, 2)",
+            "_nora_os.close(_nora_phb_fd)",
+            # Names cleaned up so the user's script sees a fresh
+            # namespace. The fd's are owned by the kernel now; no
+            # Python references remain.
+            "del _nora_sys, _nora_os, _nora_pha_fd, _nora_phb_fd",
+            "# ----- Nora preamble above; researcher code below -----",
+        ])
         preamble = "\n".join(preamble_lines) + "\n\n"
         path = run_dir / "script.py"
         path.write_text(preamble + code + "\n", encoding="utf-8")
@@ -1440,6 +1691,18 @@ def _write_script(run_dir: Path, language: Language, code: str) -> Path:
         "local nora_cwd : env NORA_CWD\n"
         "cd \"`nora_cwd'\"\n"
         "\n"
+        # Phase-boundary marker. Stata's batch log echoes every
+        # ``display`` to stdout, so this line is guaranteed to appear
+        # in the log at a known position. The error-summary layer
+        # finds the FIRST occurrence of this exact string in the log
+        # and classifies any failing command BEFORE that position as
+        # nora_owned (preamble), AFTER as user_code. The marker text
+        # is intentionally Nora-identifiable but not token-bearing —
+        # the attack surface is "user re-displays the marker to
+        # confuse classification", and the first-occurrence rule
+        # makes that ineffective: the real marker is always emitted
+        # before any user code runs.
+        "display \"_NORA_STATA_PREAMBLE_END_MARKER_\"\n"
         "*! ----- Nora preamble above; researcher code below -----\n"
         "\n"
     )
@@ -1518,6 +1781,59 @@ def _read_stata_log(script_path: Path | None) -> str:
         return log_path.read_text(encoding="utf-8", errors="replace")
     except OSError:
         return ""
+
+
+def _read_phase_file(path: Path) -> str:
+    """Read one of the buffer-split stderr files, returning '' if absent.
+
+    Phase files only exist for Python runs whose preamble got far
+    enough to ``os.open`` them. Missing files are normal for R /
+    Stata runs and for Python runs that crashed before the first
+    ``dup2``; in either case we want '' rather than an exception.
+    """
+    if not path.exists():
+        return ""
+    try:
+        return path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return ""
+
+
+def _split_stderr_buffers(
+    language: "Language", pipe_stderr: str, run_dir: Path,
+) -> tuple[str, str, str]:
+    """Return ``(pre_user_stderr, user_stderr, raw_stderr)``.
+
+    For Python the executor's preamble ``dup2``'d fd 2 onto
+    ``stderr.phase_a`` at startup and onto ``stderr.phase_b`` just
+    before the marker line. The pipe captured anything that hit
+    fd 2 BEFORE the first ``dup2`` (phase 0 — dyld / xcselect /
+    libxcrun / sandbox-deny output). All three streams concatenate
+    into ``raw_stderr`` for display, but the SDC posture differs:
+
+      * ``pre_user_stderr`` = phase 0 + phase A. No user code ran
+        by construction, so the bytes here cannot contain
+        researcher data. Safe to forward unredacted.
+      * ``user_stderr`` = phase B. User code was running when these
+        bytes were written; ``print(df.head(), file=sys.stderr)``
+        followed by a segfault lands here too. Must go through
+        frame classification before any unredacted forwarding.
+
+    R / Stata don't have a buffer split today; they get the pipe
+    stderr as ``pre_user_stderr`` and an empty ``user_stderr``,
+    which keeps the legacy SDC posture intact (the error-summary
+    layer falls back to full redaction whenever ``user_stderr``
+    is missing).
+    """
+    if language == "Python":
+        phase_a = _read_phase_file(run_dir / "stderr.phase_a")
+        phase_b = _read_phase_file(run_dir / "stderr.phase_b")
+        pre_user = pipe_stderr + phase_a
+        user = phase_b
+    else:
+        pre_user = pipe_stderr
+        user = ""
+    return pre_user, user, pre_user + user
 
 
 # ---------------------------------------------------------------------------

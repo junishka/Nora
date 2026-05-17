@@ -128,6 +128,10 @@ def extract_debug_excerpt(
     stderr: str,
     exit_code: int | None,
     language: str,
+    *,
+    run_dir: "Path | None" = None,
+    pre_user_stderr: "str | None" = None,
+    user_stderr: "str | None" = None,
 ) -> Optional[str]:
     """Return a short, human-readable error excerpt for the model
     or ``None`` if extraction couldn't locate a recognisable error.
@@ -139,10 +143,49 @@ def extract_debug_excerpt(
     excerpt comes from stderr exclusively. This keeps the SDC
     surface narrower (researchers ``print(df)`` in stdout, almost
     never in stderr).
+
+    Phase-aware redaction for Python relies on the executor's
+    buffer-split stderr capture:
+
+      * ``pre_user_stderr`` is what came through before user code
+        ran (phase 0 + phase A in ``executor._split_stderr_buffers``).
+        By construction these bytes can't contain researcher data,
+        so they're forwarded unredacted. This is the load-bearing
+        invariant: it's enforced at the kernel level via the
+        preamble's ``dup2``, NOT inferred from text shape. A
+        segfault during user code that wrote to stderr beforehand
+        used to look like ``pre_script`` to a traceback-based
+        classifier; with the buffer split it correctly routes
+        through the redacted path.
+      * ``user_stderr`` is everything written after the marker swap
+        (phase B). Python tracebacks from user code land here, as
+        do any ``print(df.head(), file=sys.stderr)`` writes. The
+        deepest traceback frame's path then decides whether the
+        exception body is safe to forward (nora-owned ⇒ yes,
+        researcher-authored ⇒ redacted).
+
+    Legacy callers that pass only ``stderr`` (no buffer split)
+    still work: the function treats the whole stderr as
+    ``user_stderr``, which matches the pre-buffer-split SDC
+    posture (full redaction).
     """
     raw: Optional[str] = None
     if language == "Python":
-        raw = _extract_python(stderr or "")
+        # Reconcile new buffer-split inputs with the legacy single-
+        # stderr signature. Callers that pass neither phase keyword
+        # fall through to the conservative posture (whole stderr is
+        # user-code phase, body always redacted).
+        if pre_user_stderr is None and user_stderr is None:
+            pre_user_stderr = ""
+            user_stderr = stderr or ""
+        else:
+            pre_user_stderr = pre_user_stderr or ""
+            user_stderr = user_stderr or ""
+        raw = _extract_python(
+            pre_user_stderr=pre_user_stderr,
+            user_stderr=user_stderr,
+            run_dir=run_dir,
+        )
     elif language == "R":
         raw = _extract_r(stderr or "")
     elif language == "Stata":
@@ -179,7 +222,108 @@ _PY_EXC_RE = re.compile(
 )
 
 
-def _extract_python(stderr: str) -> Optional[str]:
+def _classify_python_phase(
+    user_stderr: str,
+    frames: "list[re.Match[str]]",
+    run_dir: "Path | None",
+) -> str:
+    """Return ``"nora_owned"`` or ``"user_code"`` for a traceback
+    found in the buffer-split ``user_stderr`` stream.
+
+    The rule operates on the DEEPEST frame (the one that actually
+    raised), not on whether any user-code frame appears in the
+    chain. That distinction matters for the canonical "import nora"
+    case: the user wrote ``import nora`` on script.py line N, but
+    the failure raised inside the staged ``lib/nora.py``. The
+    deepest frame is in Nora-controlled code, so the body
+    (``"NORA_RUN_TOKEN not set"``, etc.) is Nora-authored and
+    safe to forward. A frame-anywhere rule would mis-redact this
+    body because line N counts as researcher-authored.
+
+    Concrete classification:
+      * ``run_dir`` is None → no way to identify user-code paths;
+        fall back to ``user_code`` for safety.
+      * Deepest frame's path is ``<run_dir>/script.py`` AND its
+        line is past the preamble marker → ``user_code``.
+      * Otherwise → ``nora_owned`` (deepest frame is in staged
+        ``lib/nora.py``, library / stdlib code, or in the
+        preamble lines of script.py).
+    """
+    if not frames or run_dir is None:
+        return "user_code"
+
+    # Python's traceback formatter prints frames in source order
+    # (oldest to newest), so the LAST match is the one that raised.
+    deepest = frames[-1]
+    path = deepest.group("path")
+    script_path_str = str(run_dir / "script.py")
+    if path == script_path_str:
+        try:
+            line_no = int(deepest.group("line"))
+        except (TypeError, ValueError):
+            line_no = 0
+        cutoff = _preamble_line_count(run_dir)
+        if line_no > cutoff:
+            return "user_code"
+    return "nora_owned"
+
+
+def _preamble_line_count(run_dir: "Path") -> int:
+    """Return the highest line number in ``script.py`` still owned by
+    Nora (i.e., before the researcher's code starts).
+
+    The executor's ``_write_script`` prepends a short preamble plus a
+    ``# ----- Nora preamble above; researcher code below -----``
+    marker line. The marker itself is Nora-owned; everything after
+    it is researcher-authored. Reading the marker line number is
+    cheaper and more robust than re-deriving the preamble length
+    from the executor's source: a future preamble change won't
+    invalidate the classifier.
+
+    Returns 0 on any read failure — the classifier then conservatively
+    treats every script.py frame as user code, which matches the
+    legacy (always-redact) behavior.
+    """
+    script = run_dir / "script.py"
+    try:
+        with script.open("r", encoding="utf-8", errors="replace") as fh:
+            for idx, line in enumerate(fh, start=1):
+                if "Nora preamble above; researcher code below" in line:
+                    return idx
+    except OSError:
+        return 0
+    return 0
+
+
+def _render_pre_user_stderr(pre_user_stderr: str) -> Optional[str]:
+    """Format the safe-by-construction pre-user-code stderr block.
+
+    Returned when ``user_stderr`` is empty: by the buffer-split
+    invariant, nothing in ``pre_user_stderr`` came from user code.
+    Includes launcher output (libxcrun / xcselect / dyld), sandbox
+    denials, and anything Python printed while running the preamble
+    itself — all phase-safe.
+
+    Returns ``None`` when the buffer is empty so the caller can fall
+    through to the executor's generic "script failed" fallback.
+    """
+    s = (pre_user_stderr or "").strip()
+    if not s:
+        return None
+    # Tail only — long launcher output rarely carries the proximate
+    # cause in its header. Cap at ~2 KB so the model gets enough
+    # context to diagnose but the response stays small.
+    tail = s[-2000:]
+    header = "(interpreter / preamble stderr, no user code executed):"
+    return f"{header}\n{tail}"
+
+
+def _extract_python(
+    *,
+    pre_user_stderr: str,
+    user_stderr: str,
+    run_dir: "Path | None" = None,
+) -> Optional[str]:
     """Pull the user-code call chain + final exception line.
 
     A typical Python traceback looks like::
@@ -202,13 +346,51 @@ def _extract_python(stderr: str) -> Optional[str]:
     Showing only the deepest user frame, as we used to, hid which
     callsite invoked the broken function and pushed the model to
     re-probe even when the chain was right there in the traceback.
+
+    Buffer-split flow:
+      * If ``user_stderr`` is empty, the failure was pre-user-code.
+        Forward ``pre_user_stderr`` tail unredacted via
+        ``_render_pre_user_stderr``. This is what closes the
+        diagnostic loop for libxcrun-style launcher failures: the
+        bytes came through before any user code, so by construction
+        they can't carry researcher data.
+      * If ``user_stderr`` has content, user code ran. We extract
+        the traceback from ``user_stderr`` only — ``pre_user_stderr``
+        is irrelevant once user code has started, because the
+        traceback lives in phase B too. ``_classify_python_phase``
+        looks at the deepest frame's path to decide whether the
+        exception body is forwardable.
     """
-    frames = list(_PY_FRAME_RE.finditer(stderr))
+    if not (user_stderr or "").strip():
+        # No user-code-phase stderr at all. ``pre_user_stderr`` may
+        # carry the launcher / preamble output that explains the
+        # failure (libxcrun dlopen, sandbox-deny, preamble syntax
+        # error). Forward it verbatim — buffer-split invariant
+        # guarantees no researcher data is in there.
+        return _render_pre_user_stderr(pre_user_stderr)
+
+    frames = list(_PY_FRAME_RE.finditer(user_stderr))
     if not frames:
-        # Bare exception (e.g. `raise SystemExit("x")` with no
-        # traceback formatting). Still try to pluck the last
-        # exception line.
-        return _last_python_exception_line(stderr)
+        # User-code phase has bytes but no parseable Python
+        # traceback. Two shapes land here, both unsafe to forward:
+        #   * Signal kill (segfault, OOM, SIGABRT) where Python
+        #     never got the chance to format a traceback; the
+        #     buffer may still contain ``print(df, file=sys.stderr)``
+        #     output from before the crash.
+        #   * ``os._exit()`` or ``sys.exit(int)`` with prior stderr
+        #     writes; same shape.
+        # The pre-user buffer is still safe to surface — it can name
+        # the failure (launcher / preamble) even when user_stderr
+        # has unsafe content.
+        rendered = _render_pre_user_stderr(pre_user_stderr)
+        if rendered is not None:
+            return rendered
+        # Last-ditch: try to pull an exception line from user_stderr.
+        # Treated as ``user_code`` for redaction since we have no
+        # frame to classify against.
+        return _last_python_exception_line(user_stderr, phase="user_code")
+
+    phase = _classify_python_phase(user_stderr, frames, run_dir)
 
     # "User code" heuristic: any path that does NOT live under a
     # site-packages / dist-packages / typeshed / .venv / lib/python
@@ -233,25 +415,36 @@ def _extract_python(stderr: str) -> Optional[str]:
         in_func = f", in {func}" if func else ""
         parts.append(f'File "{path}", line {line}{in_func}')
         # Grab the indented source-line that Python's formatter prints
-        # below the frame, when present.
-        after = stderr[frame.end():]
+        # below the frame, when present. Source line preview is
+        # taken from ``user_stderr`` — the same buffer the frame was
+        # parsed from — so we never accidentally splice content
+        # across phase boundaries.
+        after = user_stderr[frame.end():]
         nl = after.find("\n")
         if nl != -1:
             candidate = after[nl + 1:].split("\n", 1)[0]
             if candidate.startswith("    ") and candidate.strip():
                 parts.append(f"    {candidate.strip()}")
 
-    exc_line = _last_python_exception_line(stderr) or ""
+    exc_line = _last_python_exception_line(user_stderr, phase=phase) or ""
     if exc_line:
         parts.append(exc_line)
     return "\n".join(parts) if parts else None
 
 
-def _last_python_exception_line(stderr: str) -> Optional[str]:
+def _last_python_exception_line(
+    stderr: str, *, phase: str = "user_code",
+) -> Optional[str]:
     """Find the last line that matches the ExceptionType[: msg]
     shape. Python tracebacks always end with this line, and there
     can be multiple in a chained exception ("During handling of
-    the above..."). The LAST one is the one that propagated."""
+    the above..."). The LAST one is the one that propagated.
+
+    ``phase`` selects redaction posture for the message body. See
+    ``_classify_python_phase`` for the three values and what each
+    implies. Defaults to ``user_code`` so any caller that doesn't
+    pass phase information keeps the conservative redacted behavior.
+    """
     matches = list(_PY_EXC_RE.finditer(stderr))
     if not matches:
         return None
@@ -261,7 +454,7 @@ def _last_python_exception_line(stderr: str) -> Optional[str]:
     flush = [m for m in matches if not stderr[max(m.start() - 1, 0)].isspace()]
     chosen = flush[-1] if flush else matches[-1]
     msg = chosen.group("msg") or ""
-    msg = _scrub_exception_body(msg)
+    msg = _scrub_exception_body(msg, phase=phase)
     return f"{chosen.group('type')}: {msg}" if msg else chosen.group("type")
 
 
@@ -350,6 +543,15 @@ _STATA_CMD_RE = re.compile(r"^\. (?P<cmd>.+?)\s*$", re.MULTILINE)
 # the real error and only adds a duplicate r(<code>); line we
 # want to ignore.
 _STATA_EOF_RE = re.compile(r"^end of do-file\s*$", re.MULTILINE)
+# Phase-boundary marker the executor's Stata preamble ``display``s
+# right before the researcher's code starts. First occurrence in
+# the log marks the phase A → phase B boundary; any failing
+# command whose echo line appears BEFORE this offset is preamble
+# (nora_owned). The marker text is fixed-string and not token-
+# bearing: the attack is "user code emits the same string to
+# confuse classification", and the first-occurrence rule kills it
+# because real-marker output always precedes user code.
+_STATA_MARKER = "_NORA_STATA_PREAMBLE_END_MARKER_"
 
 
 def _extract_stata(stdout: str) -> Optional[str]:
@@ -390,6 +592,20 @@ def _extract_stata(stdout: str) -> Optional[str]:
     eof = _STATA_EOF_RE.search(stdout)
     scan = stdout[:eof.start()] if eof else stdout
 
+    # Phase-boundary classification. The preamble's ``display`` of
+    # ``_NORA_STATA_PREAMBLE_END_MARKER_`` is the first occurrence
+    # in a healthy run; any failing command whose echo appears
+    # BEFORE that offset is preamble (nora_owned: no user code
+    # has run, the failure body is Nora-authored). Any failing
+    # command AFTER the marker is user-code (legacy redacted
+    # posture). If the marker is missing, we conservatively treat
+    # the whole log as user-code — that handles older Stata runs
+    # without the marker line, scripts that bailed before the
+    # ``display`` reached the log, and the SDC-safe fallback when
+    # something interferes with the marker contract.
+    marker_offset = scan.find(_STATA_MARKER)
+    nora_owned_region = -1 if marker_offset < 0 else marker_offset
+
     rc_matches = list(_STATA_RC_RE.finditer(scan))
     if not rc_matches:
         return None
@@ -405,7 +621,33 @@ def _extract_stata(stdout: str) -> Optional[str]:
         # walk back over error-message lines (they may carry data).
         return f"[command body redacted]\nr({rc_code});"
 
-    cmd_text = cmd_matches[-1].group("cmd").strip()
+    cmd_match = cmd_matches[-1]
+    cmd_text = cmd_match.group("cmd").strip()
+
+    # Is the failing command in the nora-owned (preamble) region?
+    # We compare the command echo's offset to the marker's offset.
+    cmd_is_nora_owned = (
+        nora_owned_region >= 0 and cmd_match.start() < nora_owned_region
+    )
+
+    if cmd_is_nora_owned:
+        # Preamble failure: the failing command is one Nora wrote
+        # into the .do file (``adopath``, ``local lib : env ...``,
+        # one of the ``capture program drop nora_*`` lines). Its
+        # arguments and the Stata error message are both
+        # Nora-controlled — no researcher data has reached them.
+        # Forward both verbatim, capped, so the model can read the
+        # actual diagnostic instead of "[message body redacted]".
+        body = _stata_error_body_between(scan, cmd_match.end(), rc.start())
+        cmd_excerpt = cmd_text[:200]
+        return f". {cmd_excerpt}\n{body}\nr({rc_code});"
+
+    # User-code branch: redact as before. The command echo's args
+    # can macro-expand to data values (``regress y `secret_macro'``
+    # → ``regress y patient_42`` in the log) and the error body
+    # embeds variable / file names that may themselves be
+    # data-derived. Keep only the verb plus the rc line.
+    #
     # Stata's modifier prefixes (``capture``, ``quietly``, ``noisily``)
     # wrap another command. Keeping the first token verbatim makes a
     # form like ``capture noisily regress y x_missing`` summarize as
@@ -432,38 +674,67 @@ def _extract_stata(stdout: str) -> Optional[str]:
     return f"[command body redacted]\nr({rc_code});"
 
 
+def _stata_error_body_between(scan: str, start: int, end: int) -> str:
+    """Return the Stata error-message body that sits between a
+    failing command echo and the matching ``r(<code>);``.
+
+    Stata prints the error message on the line(s) between the
+    command echo and the rc line. There are no further command
+    echoes in this region by construction — Stata aborts after the
+    first failing command. Walk forward from ``start``, collect
+    non-empty lines, stop at the rc line position. Cap at the
+    standard exception-body length so a verbose Stata error
+    (multi-line error blocks from certain estimators) doesn't
+    inflate the response.
+    """
+    block = scan[start:end].strip("\n")
+    lines = [
+        line for line in block.splitlines()
+        if line.strip() and not line.startswith("end of do-file")
+    ]
+    body = "\n".join(lines)
+    if len(body) > MAX_EXCEPTION_MSG_BYTES * 4:
+        body = body[: MAX_EXCEPTION_MSG_BYTES * 4] + "[...]"
+    return body or "[no body emitted]"
+
+
 # -----------------------------------------------------------------
 # Exception-body scrub
 # -----------------------------------------------------------------
 
-def _scrub_exception_body(msg: str) -> str:
-    """Drop exception message bodies entirely.
+def _scrub_exception_body(msg: str, *, phase: str = "user_code") -> str:
+    """Redact exception message bodies that may carry researcher data.
 
-    The exception type (``KeyError``) and traceback frame (file +
-    line) are parser-owned — Python / R themselves emit those in a
-    fixed shape we can verify. The body that follows the type, on
-    the other hand, is whatever the script chose to put there.
-    Previous versions allowed short non-data-shaped bodies through
-    on the assumption that "column names and missing-file paths are
-    exactly what the model needs", but a 1-cell, sub-cap body
-    (``raise RuntimeError(df.iloc[0]['secret'])``) survived the cap
-    and the shape detector — a deliberate SDC bypass available to
-    any model-authored script.
+    Three phases (see ``extract_debug_excerpt``):
 
-    The threat model treats the model as untrusted with respect to
-    the researcher's data. So the body cannot be forwarded: only the
-    parser-owned framing (TYPE for Python, "Error :" template for R,
-    ``r(<code>);`` for Stata, plus the function / call chain) is
-    preserved. The model still gets enough framing to know what
-    KIND of failure happened and where in the script source it
-    fired — and it wrote the script, so it knows what the affected
-    identifier was without us having to echo it back.
+      * ``user_code`` — researcher's script raised. Body is
+        script-controlled and could exfiltrate any short cell value
+        (``raise RuntimeError(df.iloc[0]['secret'])``), so we
+        redact wholesale. This is the legacy posture and the
+        default for any caller that didn't pass phase info.
+      * ``nora_owned`` — the traceback fired inside the staged
+        runtime, the preamble, or library / stdlib code that
+        executed before user code touched data. The body is
+        Nora-controlled (``"NORA_RUN_TOKEN not set"``,
+        ``"fit.components_ missing"``, etc.) and cannot contain
+        researcher data. Forward verbatim, but length-cap as
+        defense in depth.
+      * ``pre_script`` — should not normally reach here (handled
+        upstream in ``_render_pre_script_stderr``), but mirror
+        nora_owned's posture for safety: body is launcher /
+        interpreter-startup output, no researcher data possible.
 
-    Researchers can still read the un-scrubbed stderr / stdout from
-    the on-disk run dir (``raw_log_path`` / the UI). This redaction
-    only applies to the model-visible ``debug_excerpt`` channel.
+    The body cap (``MAX_EXCEPTION_MSG_BYTES``) applies to the safe
+    phases too — defends against accidental verbose runtime
+    messages that would otherwise inflate the response.
     """
-    return _REDACTED_BODY if msg else msg
+    if not msg:
+        return msg
+    if phase in ("nora_owned", "pre_script"):
+        if len(msg) > MAX_EXCEPTION_MSG_BYTES:
+            return msg[:MAX_EXCEPTION_MSG_BYTES] + "[...]"
+        return msg
+    return _REDACTED_BODY
 
 
 _REDACTED_BODY = "[message body redacted]"

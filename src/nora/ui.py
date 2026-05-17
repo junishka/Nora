@@ -418,6 +418,45 @@ class NoraBridge:
         # the session is ready to chat.
         return {"state": "ready", **self._ready_payload(), "auth": status}
 
+    def doctor_report(self) -> dict[str, Any]:
+        """Return the environment health report as a JSON-safe dict.
+
+        Mirrors the data the ``nora --doctor`` CLI prints, so the UI
+        can render the same checks as a banner. Surfaced as a bridge
+        method (rather than baked into ``ui_ready``) because:
+
+          * ``ui_ready`` runs once per page load; the doctor report
+            can change mid-session (the researcher installs Homebrew
+            Python in a terminal, ``install_packages`` adds a
+            scientific-stack package). A separate method lets the
+            UI refresh on demand without re-running auth logic.
+          * Tests can assert against this method in isolation
+            without spinning up the auth flow.
+
+        The returned shape is stable JSON: every field is a
+        primitive (str / bool / list / dict). The frontend can
+        ``await window.pywebview.api.doctor_report()`` and render
+        the result directly.
+        """
+        from nora.doctor import run_doctor
+        report = run_doctor()
+        return {
+            "blocked": report.blocked,
+            "runtimes": [
+                {
+                    "runtime": r.runtime,
+                    "status": r.status,
+                    "detail": r.detail,
+                    "advice": list(r.advice),
+                }
+                for r in report.runtimes
+            ],
+            "rejected_python_candidates": [
+                {"binary": path, "stderr_excerpt": stderr}
+                for path, stderr in report.rejected_python_candidates
+            ],
+        }
+
     def _reconcile_active_provider_with_auth(self) -> None:
         """Ensure the bridge's *defaults* (used for new runners) name a
         provider the researcher can actually use right now. Also
@@ -5539,7 +5578,23 @@ def main() -> None:
             "omitted, the UI prompts for files or a folder on startup."
         ),
     )
+    parser.add_argument(
+        "--doctor", action="store_true",
+        help=(
+            "Run the environment health check and exit. Useful for "
+            "diagnosing why a script failed before launching the UI. "
+            "Exit code is non-zero when the environment is unusable."
+        ),
+    )
     args = parser.parse_args()
+
+    if args.doctor:
+        # Short-circuit before any UI / bridge setup. The doctor only
+        # needs ``env_detect`` and prints to stdout — keeps the
+        # command usable as a shell-init wrapper that gates the .app
+        # launch.
+        from nora.doctor import main_cli as _doctor_main
+        sys.exit(_doctor_main())
 
     cwd = _resolve_cwd(args.cwd)
     if cwd is not None:
