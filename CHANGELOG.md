@@ -343,6 +343,20 @@ model never saw the actual error.
   to it before crashing. Stata gets equivalent treatment via a
   preamble marker line; failing commands logged before the marker
   forward verbatim, commands after stay redacted.
+- **Clean on-disk `script.do` / `script.py` + `mixed`/`meglm`
+  helper parity.** The researcher's `<run_dir>/script.{do,py}` now
+  contains only the model's code; the executor's preamble (capture
+  drops, adopath, cd, fd-level stderr split) lives in a sibling
+  `_nora_wrapper.{do,py}` that the runner invokes. Opening the
+  script from Finder or the result card's "Open in Stata / Python"
+  button shows the bytes the model wrote. Also fixes
+  `nora_result_regress.ado` for `mixed` and `meglm` on Stata 18+
+  where the previous `r(Cov_<N>)` walk silently dropped variance
+  components after Stata's rename to `r(Cov<N>)`: variances are
+  now read from `e(b)` (`lns<L>_<E>_<T>` / `lnsig_e` /
+  `var(_cons[group])`), the meglm path is detected via
+  `e(cmd2) == "meglm"` (gsem-backed in newer Stata), and ICC
+  prefers `r(icc2)`.
 
 Researcher-visible: scripts that used to silently exit on Apple's
 xcselect stub now produce a clean message naming the actual cause,
