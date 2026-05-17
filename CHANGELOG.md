@@ -298,6 +298,61 @@ The MCP tool surface is now fourteen tools (was nine).
   τ-ARGUS / release-ledger options. Not urgent at the current
   single-researcher single-machine deployment shape.
 
+### Patch update — 2026-05-17
+
+Same `0.10.0` tag, new `.dmg`. Closes a class of "script silently
+fails at startup; model speculates" incidents triggered when the
+researcher's only `python3` was Apple's `/usr/bin/python3` (an
+xcselect stub that dlopens `libxcrun` from a path the Nora sandbox
+doesn't allow). Every script died before user code ran, and the
+redaction layer treated the failure as user-code-suspicious, so the
+model never saw the actual error.
+
+- **Sandbox-health probe in interpreter discovery.** Rejects Apple's
+  xcselect stub at detection time by running `python3 -c "print(1)"`
+  under a real Nora profile (sharing the executor's profile builder
+  so probe and run can't drift). A separate baseline check
+  distinguishes "sandbox itself is broken" from "interpreter
+  rejected by a working sandbox", so a researcher inside a
+  nested-sandbox harness doesn't get pointed at Homebrew.
+- **Broader interpreter PATH coverage.** Launcher now picks up
+  pyenv shims, uv-managed Pythons (per-version subdirs under
+  `~/.local/share/uv/python/cpython-*`), conda (`~/miniconda3` and
+  five other common roots), and python.org framework versions
+  (`/Library/Frameworks/Python.framework/Versions/*/bin`).
+- **`nora --doctor` CLI + bridge method.** Per-runtime report
+  (`ok` / `warning` / `blocked`) with concrete fix advice. Catches
+  the Apple-stub case at first-run before any script submission;
+  non-zero exit so a shell-init wrapper can gate `.app` launch. The
+  bridge method exposes the same data for a future UI banner.
+- **Structured `_environment` block on every `submit_script` response.**
+  Carries interpreter binary, version, `sys.prefix`, installed vs
+  missing required/optional packages, sandbox-exec presence, and
+  any sandbox-probe-rejected `python3` candidates. Phase-safe by
+  construction. The model can self-diagnose environment-shaped
+  failures instead of guessing from absence.
+- **Phase-aware redaction in `error_summary`** via a kernel-level
+  buffer-split stderr. The Python preamble `dup2`s fd 2 onto
+  `stderr.phase_a` at startup and `stderr.phase_b` just before user
+  code, so the SDC boundary is enforced at the file-descriptor
+  level. Pre-user-code failures (libxcrun, sandbox-deny, preamble
+  syntax) reach the model unredacted because no user code could
+  have touched data yet. User-code failures stay redacted as
+  before, and now correctly: the prior "no traceback means safe"
+  classifier would have leaked stderr from a segfault that wrote
+  to it before crashing. Stata gets equivalent treatment via a
+  preamble marker line; failing commands logged before the marker
+  forward verbatim, commands after stay redacted.
+
+Researcher-visible: scripts that used to silently exit on Apple's
+xcselect stub now produce a clean message naming the actual cause,
+with a concrete fix. The on-disk run logs in `.nora/runs/` keep
+the un-scrubbed stderr regardless of phase; only the model-visible
+`debug_excerpt` channel is affected by the redaction change.
+
+No data shape changes; no API breaks. Sessions saved under the
+original `0.10.0` `.dmg` resolve unchanged.
+
 ## [0.9.1] — 2026-05-15
 
 - Audit-fixes batch: install-packages consent modal-only,
