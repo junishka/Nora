@@ -3002,7 +3002,19 @@ kbd {
   padding: 5px 12px;
   border: 1px solid var(--accent);
   border-radius: 14px;
-  background: var(--accent-soft, rgba(214, 99, 122, 0.10));
+  /* Tinted accent fill so the 1px border reads in both themes.
+   * The previous ``var(--accent-soft)`` resolved to an OPAQUE
+   * blue-gray in light mode (the same hue family as the teal
+   * ``var(--accent)`` border), washing the border out and
+   * producing the "no accent ring in light mode" bug. The
+   * rgba fallback that lived here as the second arg to var()
+   * was never reachable because --accent-soft is always
+   * defined. ``color-mix`` derives a translucent tint of
+   * whichever accent the active theme has, so the solid
+   * border now contrasts against a lighter version of the
+   * same hue in both modes. */
+  background: var(--accent-soft);  /* fallback for engines without color-mix */
+  background: color-mix(in srgb, var(--accent) 8%, transparent);
   font-family: var(--font-mono);
   font-size: 12.5px;
   font-weight: 500;

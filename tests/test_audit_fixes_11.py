@@ -833,12 +833,19 @@ def test_clear_pending_for_session_drops_all_pending_lists(
 ) -> None:
     """Stage @-mention, script, plot, and mentioned-image entries on a
     runner, call ``clear_pending_for_session``, and confirm every
-    pending list is empty afterwards. The frontend wipes its staged
-    composer state when the researcher leaves a session; this bridge
-    method is the matching backend wipe. Without it, attachments
-    staged in A but never sent ride invisibly with the next plain
-    message in A — UI shows no chip, runner inlines the file
-    anyway.
+    USER-STAGED pending list is empty afterwards. The frontend wipes
+    its staged composer state when the researcher leaves a session;
+    this bridge method is the matching backend wipe. Without it,
+    attachments staged in A but never sent ride invisibly with the
+    next plain message in A — UI shows no chip, runner inlines the
+    file anyway.
+
+    Plot images captured by the previous turn's ``submit_script`` are
+    intentionally NOT cleared here — they are model output, not
+    researcher-staged, and a session-focus toggle must not erase the
+    image a returning "interpret the plot" message expects to find
+    attached. ``clear_pending_for_session``'s docstring spells out
+    the carve-out.
     """
     from nora.ui import NoraBridge
 
@@ -854,10 +861,11 @@ def test_clear_pending_for_session_drops_all_pending_lists(
         "data": "AA==", "mime": "image/png",
         "name": "residuals.png", "path": "/tmp/residuals.png",
     })
-    runner.pending_plot_images.append({
+    plot_image = {
         "data": "AA==", "mime": "image/png",
         "name": "coefficients.png", "kind": "image",
-    })
+    }
+    runner.pending_plot_images.append(plot_image)
 
     res = bridge.clear_pending_for_session(str(tmp_path))
     assert res["ok"] is True
@@ -865,7 +873,9 @@ def test_clear_pending_for_session_drops_all_pending_lists(
     assert runner.pending_script_attachments == []
     assert runner.pending_mentioned_files == []
     assert runner.pending_mentioned_images == []
-    assert runner.pending_plot_images == []
+    # Model-captured plot images survive — see docstring above and the
+    # `Plot images stay` comment in ``clear_pending_for_session``.
+    assert runner.pending_plot_images == [plot_image]
 
 
 def test_clear_pending_for_session_idempotent_on_unknown_runner(

@@ -1517,21 +1517,143 @@ def _stage_runtime(run_dir: Path, language: Language) -> Path:
     return lib_dir
 
 
-def _write_script(run_dir: Path, language: Language, code: str) -> Path:
-    """Persist Claude's code to disk.
+# Helper-program names the Stata wrapper `capture program drop`s.
+# Kept as a module-level tuple so `_strip_redundant_wrapper_lines` and
+# the wrapper-builder below stay in lock-step: if a new helper joins
+# the staging list, only this tuple needs updating and both surfaces
+# pick it up.
+_STATA_NORA_HELPER_NAMES: tuple[str, ...] = (
+    "nora_result_regress",
+    "nora_result_ttest",
+    "nora_ttest",
+    "nora_result_sum",
+    "nora_result_tab",
+    "nora_result_magnitude",
+    "nora_result_correlation",
+    "nora_result_km",
+    "nora_result_cluster",
+    "nora_result_factor",
+    "nora_plot_residuals",
+    "nora_plot_coefficients",
+    "nora_plot_interaction",
+    "nora_plot_estimate_comparison",
+    "nora_safe_export",
+    "_nora_export_plot",
+)
 
-    For Stata, prepends a small preamble that adds the Nora runtime
-    library to the adopath and `cd`s into the researcher's working
-    directory (so `use "data.dta"` in the user's code resolves against
-    their project, not the scratch dir). The researcher's code and the
-    preamble live in a single `.do` file with a visible separator — we
-    used to split preamble and user code across two files with an
-    internal `do "<user_path>"`, but that path was absolute and broke
-    when the researcher's cwd contained spaces: Stata's own parser for
-    the `-b do <path>` command line tokenizes on spaces and the nested
-    `do` inherited the same risk. Concatenating avoids both issues and
-    keeps the scratch dir easy to audit.
+
+# Exact lines the wrapper already runs. If they appear in the model's
+# submitted code they are semantically a no-op (the wrapper has
+# already set adopath, cd'd into the user's project, and dropped any
+# stale helper definitions before user code starts), but they make
+# the on-disk script.do / script.py noisier to read. The patterns
+# below match VERBATIM — same Nora-internal env-var names and
+# local-macro names a researcher would never write themselves — so
+# this is safe to strip without inspecting context. If the model's
+# code contains one of these as part of a larger expression, the
+# line-equality check below leaves it alone (we only drop the line
+# when the whole line equals one of these, modulo trailing whitespace
+# and an optional immediately-following blank line so we don't leave
+# orphan paragraph breaks).
+_STATA_REDUNDANT_LINES: frozenset[str] = frozenset({
+    "local lib : env NORA_LIB_DIR",
+    'adopath + "`lib\'"',
+    "local nora_cwd : env NORA_CWD",
+    'cd "`nora_cwd\'"',
+} | {
+    f"capture program drop {name}" for name in _STATA_NORA_HELPER_NAMES
+})
+
+
+def _strip_redundant_wrapper_lines(language: Language, code: str) -> str:
+    """Drop lines from user code that the wrapper already runs.
+
+    The wrapper (see ``_write_script``) sets up adopath, cd's into
+    ``$NORA_CWD``, and ``capture program drop``s every Nora helper
+    before the user's script starts. When the model echoes those
+    exact lines at the top of its submitted code (a learned habit
+    from pre-split scripts that embedded the preamble inline) they
+    are redundant — semantically a no-op, visually clutter that
+    shows up every time the researcher opens ``script.do``.
+
+    The strip targets EXACT-line matches against a small allowlist
+    of Nora-internal patterns (env vars ``NORA_LIB_DIR`` /
+    ``NORA_CWD``; local macros ``\\`lib'`` / ``\\`nora_cwd'``;
+    helper names from ``_STATA_NORA_HELPER_NAMES``). A researcher
+    writing their own ``cd`` or ``adopath`` would not reference
+    these Nora-internal names, so false-positive risk is bounded
+    by what we put in the allowlist.
+
+    Only Stata is wired up here. Python's wrapper does an fd-level
+    stderr split that's not something a user-authored script would
+    plausibly reproduce, so there's no equivalent superstition to
+    strip on that side (the redundant-imports case can wait until
+    we see it in the wild).
+
+    The function preserves all other content verbatim, including
+    blank lines, indentation, and comments. A single blank line
+    immediately following a stripped line is also dropped so the
+    leading paragraph doesn't end up with an orphan break.
     """
+    if language != "Stata" or not code:
+        return code
+    lines = code.split("\n")
+    out: list[str] = []
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        if line.rstrip() in _STATA_REDUNDANT_LINES:
+            # Skip this line. If the very next line is blank,
+            # skip it too — it was the spacer between the
+            # plumbing block and the real code.
+            if (i + 1 < len(lines)
+                    and out
+                    and (not out or out[-1].rstrip() == "")
+                    and lines[i + 1].rstrip() == ""):
+                i += 2
+                continue
+            i += 1
+            continue
+        out.append(line)
+        i += 1
+    # Trim a leading run of blank lines the strip may have exposed.
+    while out and out[0].rstrip() == "":
+        out.pop(0)
+    return "\n".join(out)
+
+
+def _write_script(run_dir: Path, language: Language, code: str) -> Path:
+    """Persist Claude's code to disk and return the path the runner invokes.
+
+    The researcher's code lands at ``<run_dir>/script.{do,py,R}`` —
+    clean, no Nora plumbing — so opening that file in Stata / RStudio /
+    a text editor shows the same bytes the model wrote, nothing more.
+
+    For Stata and Python, a separate ``_nora_wrapper.{do,py}`` file
+    holds the executor preamble (adopath / cd / capture drops for
+    Stata; sys.path manipulation and fd-level stderr split for
+    Python) and then sources or runpy-loads ``script.{do,py}``. The
+    runner is invoked against the wrapper; users (and the model on
+    recall) only ever see ``script.*``.
+
+    Earlier versions concatenated preamble + user code into a single
+    ``script.*`` file because an earlier attempt at a wrapper-based
+    split hit a nested-do path bug. The bug was a missing-quote
+    artifact, not a Stata limitation: a quoted ``do "<abs path>"``
+    handles paths with spaces fine. The current split keeps the
+    runner's actual entry-point (wrapper) and the user-visible
+    artifact (script.*) cleanly separated.
+
+    For R, no preamble is needed — the runtime is sourced via the
+    ``Rscript`` command line (see ``_r_command``) — so ``script.R``
+    is already clean and no wrapper file exists.
+    """
+    # Drop any wrapper-equivalent boilerplate the model echoed at
+    # the top of its submission (Stata-only at the moment — see
+    # the helper's docstring for the rationale). Semantically a
+    # no-op since the wrapper still runs the same commands; the
+    # value is a clean on-disk ``script.do``.
+    code = _strip_redundant_wrapper_lines(language, code)
     if language == "R":
         path = run_dir / "script.R"
         path.write_text(code, encoding="utf-8")
@@ -1600,7 +1722,14 @@ def _write_script(run_dir: Path, language: Language, code: str) -> Path:
         # traceback machinery being intact when the failure fires.
         phase_a_path = run_dir / "stderr.phase_a"
         phase_b_path = run_dir / "stderr.phase_b"
-        preamble_lines = [
+        # Researcher's clean code lives at script.py. The wrapper
+        # below loads it via `runpy.run_path(..., run_name="__main__")`
+        # so tracebacks reference `script.py` and `if __name__ ==
+        # "__main__":` blocks fire — exactly as if the user ran
+        # `python script.py` directly.
+        script_path = run_dir / "script.py"
+        script_path.write_text(code + "\n", encoding="utf-8")
+        wrapper_lines = [
             "import sys as _nora_sys",
             "import os as _nora_os",
             # Open phase-A buffer and replace fd 2. dup2 closes the
@@ -1615,39 +1744,47 @@ def _write_script(run_dir: Path, language: Language, code: str) -> Path:
         ]
         if py_tool is not None:
             pkg_dir = nora_python_pkg_dir(py_tool.binary)
-            preamble_lines.append(
+            wrapper_lines.append(
                 f"_nora_sys.path.append({str(pkg_dir)!r})"
             )
-        preamble_lines.append(
+        wrapper_lines.append(
             f"_nora_sys.path.insert(0, {str(lib_dir)!r})"
         )
-        preamble_lines.extend([
+        wrapper_lines.extend([
             # Swap to phase-B buffer just before user code starts.
             # ``sys.stderr.flush()`` first so any Python-buffered
-            # bytes from the preamble are forced to phase A rather
+            # bytes from the wrapper are forced to phase A rather
             # than leaking into phase B at the next implicit flush.
             f"_nora_phb_fd = _nora_os.open({str(phase_b_path)!r}, "
             "_nora_os.O_WRONLY | _nora_os.O_CREAT | _nora_os.O_TRUNC, 0o644)",
             "_nora_sys.stderr.flush()",
             "_nora_os.dup2(_nora_phb_fd, 2)",
             "_nora_os.close(_nora_phb_fd)",
-            # Names cleaned up so the user's script sees a fresh
-            # namespace. The fd's are owned by the kernel now; no
-            # Python references remain.
-            "del _nora_sys, _nora_os, _nora_pha_fd, _nora_phb_fd",
-            "# ----- Nora preamble above; researcher code below -----",
+            # Hand off to the researcher's script. ``runpy.run_path``
+            # opens its own fresh globals dict with ``__name__``
+            # set to "__main__" and ``__file__`` set to the script
+            # path, so the user's code sees the same namespace it
+            # would under a plain ``python script.py`` invocation
+            # — tracebacks reference ``script.py`` and the wrapper's
+            # ``_nora_*`` names never leak into user scope.
+            "import runpy as _nora_runpy",
+            f"_nora_runpy.run_path({str(script_path)!r}, "
+            "run_name='__main__')",
         ])
-        preamble = "\n".join(preamble_lines) + "\n\n"
-        path = run_dir / "script.py"
-        path.write_text(preamble + code + "\n", encoding="utf-8")
-        return path
-    # Stata: single .do file. Preamble + separator + researcher code.
-    # Quoted paths in Stata's `adopath +` and `cd` handle spaces fine
-    # at the language level — only the command-line `-b do <path>`
-    # has the tokenization bug (see _stata_command).
+        wrapper = "\n".join(wrapper_lines) + "\n"
+        wrapper_path = run_dir / "_nora_wrapper.py"
+        wrapper_path.write_text(wrapper, encoding="utf-8")
+        return wrapper_path
+    # Stata: clean script.do + wrapper _nora_wrapper.do. The wrapper
+    # carries the preamble (capture drops, adopath, cd) and ends
+    # with a quoted nested ``do "<abs path>/script.do"`` that hands
+    # off to the researcher's code. Quoted absolute paths inside a
+    # nested ``do`` handle spaces fine — only the command-line
+    # ``-b do <path>`` invocation has the tokenization concern
+    # (handled in ``_stata_command``).
     #
     # Shadowing defense: Stata batch mode runs ``~/ado/profile.do`` at
-    # startup BEFORE the user's do file, so any program defined there
+    # startup BEFORE the wrapper, so any program defined there
     # (``program define nora_result_regress ...malicious...``) ends
     # up in memory ahead of the preamble. Stata's resolver checks
     # in-memory programs before the adopath, so a tampered profile.do
@@ -1666,25 +1803,16 @@ def _write_script(run_dir: Path, language: Language, code: str) -> Path:
     # suppresses the error when a name isn't currently defined (the
     # common case — most profile.do files don't pre-define any of
     # these).
-    nora_program_drops = "\n".join([
-        "capture program drop nora_result_regress",
-        "capture program drop nora_result_ttest",
-        "capture program drop nora_ttest",
-        "capture program drop nora_result_sum",
-        "capture program drop nora_result_tab",
-        "capture program drop nora_result_magnitude",
-        "capture program drop nora_result_correlation",
-        "capture program drop nora_result_km",
-        "capture program drop nora_result_cluster",
-        "capture program drop nora_result_factor",
-        "capture program drop nora_plot_residuals",
-        "capture program drop nora_plot_coefficients",
-        "capture program drop nora_plot_interaction",
-        "capture program drop nora_plot_estimate_comparison",
-        "capture program drop nora_safe_export",
-        "capture program drop _nora_export_plot",
-    ])
-    preamble = (
+    # Pulled from ``_STATA_NORA_HELPER_NAMES`` so adding a helper
+    # in one place updates both the wrapper's drop block and the
+    # ingress strip's allowlist together.
+    nora_program_drops = "\n".join(
+        f"capture program drop {name}"
+        for name in _STATA_NORA_HELPER_NAMES
+    )
+    script_path = run_dir / "script.do"
+    script_path.write_text(code + "\n", encoding="utf-8")
+    wrapper = (
         f"{nora_program_drops}\n"
         "local lib : env NORA_LIB_DIR\n"
         "adopath + \"`lib'\"\n"
@@ -1703,12 +1831,15 @@ def _write_script(run_dir: Path, language: Language, code: str) -> Path:
         # makes that ineffective: the real marker is always emitted
         # before any user code runs.
         "display \"_NORA_STATA_PREAMBLE_END_MARKER_\"\n"
-        "*! ----- Nora preamble above; researcher code below -----\n"
-        "\n"
+        # Hand off to the researcher's clean script. Absolute path
+        # so this resolves regardless of the user's NORA_CWD setting
+        # (``cd "\`nora_cwd'"`` above already moved into the project
+        # dir for the user's ``use "data.dta"`` to work).
+        f"do \"{script_path.as_posix()}\"\n"
     )
-    script_path = run_dir / "script.do"
-    script_path.write_text(preamble + code + "\n", encoding="utf-8")
-    return script_path
+    wrapper_path = run_dir / "_nora_wrapper.do"
+    wrapper_path.write_text(wrapper, encoding="utf-8")
+    return wrapper_path
 
 
 # ---------------------------------------------------------------------------

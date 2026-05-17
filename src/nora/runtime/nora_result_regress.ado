@@ -88,7 +88,12 @@ program define nora_result_regress
     * The leading "<depvar>:" equation prefix is also stripped from
     * vnames here so predictor names match the dataset schema
     * (sanitizer expects "x", not "y:x").
-    local _is_mixed_re = ("`e(cmd)'" == "mixed") | ("`e(cmd)'" == "meglm")
+    * meglm in current Stata is wired through gsem internally: the
+    * outer ``e(cmd)`` reports "gsem" and the "real" command name lives
+    * in ``e(cmd2)``. Check both so the random-effects branch fires
+    * on meglm regardless of which surface stored the name.
+    local _is_mixed_re = ("`e(cmd)'" == "mixed") | ///
+        ("`e(cmd)'" == "meglm") | ("`e(cmd2)'" == "meglm")
     if `_is_mixed_re' & "`e(k_f)'" != "" & !missing(`=e(k_f)') & `=e(k_f)' > 0 {
         local _k_f = `=e(k_f)'
         matrix `bmat' = e(b)[1, 1..`_k_f']
@@ -664,60 +669,115 @@ program define nora_result_regress
     *   fit_method:              "REML" / "ML"
     *   icc:                     single-grouping intercept-only case
     *
-    * Stata stores random-effects parameters in e(b) on a transformed
-    * scale (log-SD, atanh-correlation) that the optimizer uses.
-    * ``estat recovariance`` posts the NATURAL-scale RE covariance
-    * matrices in r(Cov_1), r(Cov_2), ... — one per RE level. Row /
-    * column names are the random-effect terms (_cons for the
-    * intercept, varname for random slopes). Diagonals of those
-    * matrices are the variance components we emit.
+    * Why we read e(b) column metadata instead of `estat recovariance`:
+    *   - `estat recovariance` posts r(Cov<N>) matrices in newer Stata
+    *     (the underscored r(Cov_<N>) form earlier versions of this
+    *     helper used does not exist on Stata 18/19 — the capture
+    *     swallowed the rc and the random_effects_variance field
+    *     silently disappeared).
+    *   - `estat recovariance` is "not valid" after meglm (gsem-backed
+    *     in current Stata), so a single uniform path can't be built
+    *     on it anyway.
+    *   - e(sigma_e) is empty on at least StataNow 19.5 even for
+    *     plain Gaussian `mixed` — the residual SD lives in
+    *     e(b)["lnsig_e":_cons] as log(sigma_e). Reading e(b) directly
+    *     avoids the version drift entirely.
     *
-    * Level ordering: e(ivars) lists grouping variables outermost
-    * first; e(N_g) is a 1 × n_levels matrix with columns in the
-    * same order. r(Cov_1) corresponds to e(ivars)'s first word.
+    * Parameterization in e(b):
+    *   mixed (and gsem when called as a non-mixed sem path):
+    *     equation = "lns<L>_<E>_<T>"  → log-SD of the T-th term in
+    *     equation E at level L; variance = exp(2 * coef). Level 1
+    *     is innermost grouping; L = n_grouping_levels is outermost.
+    *     equation = "lnsig_e"         → log(sigma_e); residual
+    *     variance = exp(2 * coef).
+    *     equation = "atr<...>"        → atanh of a correlation; we
+    *     skip these (sanitizer contract is variances only).
+    *   meglm (gsem internal):
+    *     equation = "/"  with column-name pattern "var(<term>[<group>])"
+    *     → variance DIRECTLY (no transform). Random slopes show up
+    *     as "var(<slopevar>[<group>])"; correlations as
+    *     "cov(<term1>[<group>],<term2>[<group>])" — skipped.
+    *
+    * Term-to-key mapping:
+    *   intercept (T=1 for mixed; "_cons" inside var(...) for meglm) →
+    *       group name, e.g. "school".
+    *   slope (T>1 for mixed; slope var name for meglm) →
+    *       "group.term", e.g. "school.x".
+    * For mixed we can't recover the slope variable name from
+    * "lns<L>_<E>_<T>" alone (T is just an index into the level's
+    * random-effect equation). For the intercept-only case the audit
+    * actually covers, T=1 maps to the group name cleanly; if random
+    * slopes are present we fall back to "group.term<T>" so the key
+    * is at least disambiguating rather than colliding.
     if `_is_mixed_re' {
         local _ivars = "`e(ivars)'"
         local _n_levels : word count `_ivars'
 
-        capture quietly estat recovariance
-        local _have_rec = (_rc == 0)
-
-        * random_effects_variance — buffer pairs into a local macro
-        * so we can omit the field entirely when no entries survive
-        * (matches R/Python which never emit empty dicts here).
+        * Walk e(b) once, classifying each column by its equation
+        * prefix. Buffer pairs into a local macro so we can omit the
+        * random_effects_variance field entirely when nothing
+        * survives (matches R/Python which never emit empty dicts).
         local _re_pairs ""
-        if `_have_rec' & `_n_levels' > 0 {
-            forvalues lev = 1/`_n_levels' {
-                local _gname : word `lev' of `_ivars'
-                tempname _cov
-                capture matrix `_cov' = r(Cov_`lev')
-                if _rc continue
-                local _nr = rowsof(`_cov')
-                if `_nr' == 0 continue
-                local _rnames : rownames `_cov'
-                forvalues r = 1/`_nr' {
-                    local _rterm : word `r' of `_rnames'
-                    if missing(`_cov'[`r', `r']) continue
-                    if `_cov'[`r', `r'] < 0 continue
-                    local _v = `_cov'[`r', `r']
-                    * Key convention: group name for the intercept
-                    * (_cons), "group.term" for random slopes — mirrors
-                    * the R helper's lme4::VarCorr walk.
+        local _residual_var = .
+        if `_n_levels' > 0 {
+            local _coleq : coleq e(b)
+            local _colnm : colnames e(b)
+            local _ncols : word count `_coleq'
+            forvalues i = 1/`_ncols' {
+                local _eq : word `i' of `_coleq'
+                local _cn : word `i' of `_colnm'
+
+                * mixed: lns<L>_<E>_<T> — log-SD parameter.
+                if regexm("`_eq'", "^lns([0-9]+)_([0-9]+)_([0-9]+)$") {
+                    local _L = real(regexs(1))
+                    local _T = real(regexs(3))
+                    if missing(e(b)[1, `i']) continue
+                    local _coef = e(b)[1, `i']
+                    local _v = exp(2 * `_coef')
+                    if missing(`_v') | `_v' <= 0 continue
+                    * Map level L (innermost=1) to outermost-first
+                    * e(ivars) word. word_idx = n_levels - L + 1.
+                    local _word_idx = `_n_levels' - `_L' + 1
+                    if `_word_idx' < 1 | `_word_idx' > `_n_levels' continue
+                    local _gname : word `_word_idx' of `_ivars'
                     local _key = "`_gname'"
-                    if "`_rterm'" != "_cons" {
-                        local _key = "`_gname'.`_rterm'"
+                    if `_T' > 1 {
+                        local _key = "`_gname'.term`_T'"
                     }
                     local _x = strofreal(`_v', "%21.17e")
                     local _re_pairs `"`_re_pairs',"`_key'":`_x'"'
+                    continue
+                }
+
+                * mixed: lnsig_e — log-SD of residual.
+                if "`_eq'" == "lnsig_e" {
+                    if missing(e(b)[1, `i']) continue
+                    local _v = exp(2 * e(b)[1, `i'])
+                    if missing(`_v') | `_v' <= 0 continue
+                    local _residual_var = `_v'
+                    continue
+                }
+
+                * meglm (gsem-backed): "/" equation with var(...) name
+                * is the natural-scale variance, no transform.
+                if "`_eq'" == "/" & regexm("`_cn'", "^var\(([^\[]+)\[([^\]]+)\]\)$") {
+                    local _term = regexs(1)
+                    local _grp = regexs(2)
+                    if missing(e(b)[1, `i']) continue
+                    local _v = e(b)[1, `i']
+                    if `_v' <= 0 continue
+                    local _key = "`_grp'"
+                    if "`_term'" != "_cons" {
+                        local _key = "`_grp'.`_term'"
+                    }
+                    local _x = strofreal(`_v', "%21.17e")
+                    local _re_pairs `"`_re_pairs',"`_key'":`_x'"'
+                    continue
                 }
             }
         }
-        * Residual variance — Gaussian families only. mixed posts
-        * e(sigma_e); meglm with a non-identity link (binomial,
-        * poisson, ...) has no residual-variance parameter.
-        if "`e(sigma_e)'" != "" & !missing(`=e(sigma_e)') & `=e(sigma_e)' > 0 {
-            local _se2 = `=e(sigma_e)' * `=e(sigma_e)'
-            local _x = strofreal(`_se2', "%21.17e")
+        if !missing(`_residual_var') {
+            local _x = strofreal(`_residual_var', "%21.17e")
             local _re_pairs `"`_re_pairs',"residual":`_x'"'
         }
         if `"`_re_pairs'"' != "" {
@@ -746,8 +806,10 @@ program define nora_result_regress
         }
 
         * Fit method. mixed: e(method) is "REML" or "ML" (set by the
-        * default vs , mle option). meglm: nonlinear-link mixed
-        * models are always ML (REML isn't defined there), so
+        * default vs , mle option — but the default flipped to ML
+        * somewhere around Stata 18, so the audit do-file pins ,reml
+        * to keep the contract deterministic). meglm: nonlinear-link
+        * mixed models are always ML (REML isn't defined there), so
         * hardcode regardless of what e(method) returns (meglm's
         * e(method) reports the integration scheme, not REML/ML).
         local _fm = ""
@@ -756,7 +818,7 @@ program define nora_result_regress
                 local _fm = "`e(method)'"
             }
         }
-        else if "`e(cmd)'" == "meglm" {
+        else if "`e(cmd)'" == "meglm" | "`e(cmd2)'" == "meglm" {
             local _fm = "ML"
         }
         if "`_fm'" != "" {
@@ -765,17 +827,32 @@ program define nora_result_regress
 
         * ICC — only well-defined for single-grouping, intercept-only
         * random-effect specifications, AND a residual variance to
-        * divide into. estat icc validates the structure internally
-        * (refuses if the model has random slopes or multiple levels)
-        * and posts the correct quantity in r(icc1). Two safety nets
-        * around it: gate on n_levels == 1 (estat icc on multilevel
+        * divide into. Gate on n_levels == 1 (estat icc on multilevel
         * fits posts r(icc1), r(icc2), ... which mean something
-        * different) and on sigma_e populated (Gaussian only).
-        if `_n_levels' == 1 & "`e(sigma_e)'" != "" {
+        * different) and on having found a residual variance above
+        * (Gaussian only — meglm has no residual term, and the gate
+        * via _residual_var is the right signal regardless of which
+        * Stata version populated e(sigma_e)).
+        if `_n_levels' == 1 & !missing(`_residual_var') {
             capture quietly estat icc
-            if !_rc & "`r(icc1)'" != "" & !missing(`=r(icc1)') {
-                local _x = strofreal(`=r(icc1)', "%21.17e")
-                file write `fh' `","icc":`_x'"'
+            if !_rc {
+                * Stata 19's estat icc returns r(icc<N>) where N is
+                * the model level: r(icc2) for a single-grouping
+                * fit (level 1 is the residual). Older Stata used
+                * r(icc1) for the same quantity. Try the modern
+                * shape first; fall back so the helper stays
+                * version-stable.
+                local _icc = .
+                if "`r(icc2)'" != "" & !missing(`=r(icc2)') {
+                    local _icc = `=r(icc2)'
+                }
+                else if "`r(icc1)'" != "" & !missing(`=r(icc1)') {
+                    local _icc = `=r(icc1)'
+                }
+                if !missing(`_icc') {
+                    local _x = strofreal(`_icc', "%21.17e")
+                    file write `fh' `","icc":`_x'"'
+                }
             }
         }
     }
