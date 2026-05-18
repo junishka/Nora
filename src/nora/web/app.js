@@ -752,18 +752,39 @@ function formatCwd(raw) {
 
 // ----- landing: file picker / folder picker / drag-drop -----------------
 
+// Auto-dismiss handle shared by setLandingBusy and setLandingError.
+// Lives at module scope so a busy / new-error transition can cancel
+// the prior error's pending clear and avoid wiping a still-relevant
+// message mid-action.
+let landingErrorTimer = null;
+
 function setLandingBusy(busy, msg) {
+  if (landingErrorTimer) {
+    clearTimeout(landingErrorTimer);
+    landingErrorTimer = null;
+  }
   chooseFilesBtn.disabled = busy;
   chooseFolderBtn.disabled = busy;
   landingStatus.classList.remove('error');
   landingStatus.textContent = msg || '';
 }
 
-function setLandingError(msg) {
+function setLandingError(msg, { autoDismissMs } = {}) {
+  if (landingErrorTimer) {
+    clearTimeout(landingErrorTimer);
+    landingErrorTimer = null;
+  }
   chooseFilesBtn.disabled = false;
   chooseFolderBtn.disabled = false;
   landingStatus.classList.add('error');
   landingStatus.textContent = msg;
+  if (autoDismissMs) {
+    landingErrorTimer = setTimeout(() => {
+      landingStatus.classList.remove('error');
+      landingStatus.textContent = '';
+      landingErrorTimer = null;
+    }, autoDismissMs);
+  }
 }
 
 async function handleSessionResult(result) {
@@ -848,11 +869,8 @@ landingEl.addEventListener('drop', async (e) => {
   const oversize = accepted.find((f) => f.size > MAX_DRAG_DROP_BYTES);
   if (oversize) {
     setLandingError(
-      formatDragDropOversizeReason(
-        oversize,
-        'Use Choose Files… below. It copies directly from disk ' +
-          'with no memory overhead, so there is no size limit.',
-      ),
+      formatDragDropOversizeReason(oversize, 'Use Choose files instead.'),
+      { autoDismissMs: 4000 },
     );
     return;
   }
@@ -866,14 +884,9 @@ landingEl.addEventListener('drop', async (e) => {
   // a time, regardless of how many files."
   const aggregateBytes = accepted.reduce((s, f) => s + f.size, 0);
   if (aggregateBytes > MAX_DRAG_DROP_BYTES) {
-    const aggMb = Math.round(aggregateBytes / (1024 * 1024));
-    const capMb = Math.round(MAX_DRAG_DROP_BYTES / (1024 * 1024));
     setLandingError(
-      `Total drop size is ${aggMb} MB across ${accepted.length} files — ` +
-      `drag-drop is capped at ${capMb} MB total because each file is ` +
-      `read fully into memory and the base64-encoded copies coexist ` +
-      `during the bridge transfer. Use Choose Files… below — it ` +
-      `copies directly from disk with no aggregate limit.`,
+      'Total drop too large. Use Choose files instead.',
+      { autoDismissMs: 4000 },
     );
     return;
   }
@@ -965,13 +978,7 @@ const MAX_IMAGE_BYTES = 5 * 1024 * 1024;  // 5 MB per image (Anthropic limit bal
 const MAX_DRAG_DROP_BYTES = 1024 * 1024 * 1024;
 
 function formatDragDropOversizeReason(file, hint) {
-  const mb = Math.round(file.size / (1024 * 1024));
-  return (
-    `${file.name} is ${mb} MB — drag-drop is capped at ` +
-    `${Math.round(MAX_DRAG_DROP_BYTES / (1024 * 1024))} MB ` +
-    `because the file is read fully into memory (peak ~3–4× the ` +
-    `file size). ${hint}`
-  );
+  return `${file.name} is too large for drag and drop. ${hint}`;
 }
 
 function renderAttachments() {
@@ -1131,12 +1138,7 @@ async function stageDataFile(file) {
   // size limit.
   if (file.size > MAX_DRAG_DROP_BYTES) {
     appendError(
-      formatDragDropOversizeReason(
-        file,
-        'Use the + button next to the composer instead. It opens ' +
-          'the native picker and copies directly from disk with no ' +
-          'size limit.',
-      ),
+      formatDragDropOversizeReason(file, 'Use the + button instead.'),
     );
     return;
   }

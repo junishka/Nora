@@ -35,16 +35,30 @@ stdout/stderr to the model. The boundary is preserved by:
   2. **stdout is read only for Stata** (because Stata batch mode
      puts everything in the .log file, which the executor merges
      into stdout). For R and Python, only stderr is scanned.
-  3. **Exception bodies are redacted wholesale.** The exception
-     TYPE and the user-code FRAME (file + line + source-line
-     preview) are parser-owned; the body that follows the type is
-     script-controlled and could exfiltrate any short cell value
-     (``raise RuntimeError(df.iloc[0]['secret'])``). Each language's
-     extractor keeps only the parser-anchored framing — Python's
-     traceback frames including the verbatim source-line preview
-     (which is user-authored .py source, not runtime-evaluated
-     text), R's ``Error :`` template plus ``Calls:`` chain, Stata's
-     command verb plus ``r(<code>);`` line.
+  3. **Per-language body posture.** The boundary is asymmetric by
+     language because the leak surface and the model's alternatives
+     differ:
+
+       * **Python** — exception bodies are redacted wholesale on
+         the user-code path. The exception TYPE and the user-code
+         FRAME (file + line + source-line preview) are parser-owned
+         and already give the model what it needs in the common
+         case (a typo in ``df['col']`` shows up in the source-line
+         preview, which is user-authored .py source). The body
+         that follows the type is script-controlled and could
+         exfiltrate any short cell value (``raise RuntimeError
+         (df.iloc[0]['secret'])``); forwarding it would be redundant
+         with the source line and open a covert channel.
+       * **Stata + R** — bodies forward through ``_forward_short_body``
+         (length cap + data-shape detect). The model has no
+         equivalent of Python's source-line preview here: Stata's
+         user-code extractor only sees the command echo, R's only
+         sees the ``Error : ...`` block. Wholesale redaction left
+         the model unable to act on common failures like "X
+         invalid varname" or "object 'X' not found". The denylist
+         posture forwards the actual diagnostic and bounds the
+         residual scalar-leak channel to ~200 bytes per error.
+         Stata command echoes go through the same scrub.
   4. **No `print(df)` leakage.** Because Stata's extractor anchors
      on `r(<code>);` and walks back to the most recent `. <cmd>`,
      intervening `display` / `list` output stays out of the
@@ -96,27 +110,94 @@ MAX_QUOTED_ARG_BYTES = 400
 # truncated. The data-shape detector below handles the rest.
 MAX_EXCEPTION_MSG_BYTES = 80
 
+# Cap on Stata + R error bodies forwarded under the denylist posture
+# (see ``_forward_short_body`` and module docstring). Legitimate
+# error bodies are short — "highest_forprofit_title_pre_ceo_rank
+# invalid varname" is 50 chars, "object 'wage' not found" is 22
+# chars, "variable mpg not found" is 22. Bodies past 200 chars are
+# almost always verbose multi-line estimator diagnostics or data
+# dumps, both of which we'd rather truncate than forward whole.
+# Larger than ``MAX_EXCEPTION_MSG_BYTES`` because Stata / R bodies
+# can legitimately span two or three lines, where Python exception
+# message bodies (still redacted wholesale on the user-code path)
+# are always single-line.
+MAX_FORWARDED_BODY_BYTES = 200
 
-# Patterns that suggest an exception body is a data dump rather than
-# a parser-owned diagnostic. Conservative on purpose — must not fire
-# on common shapes like ``[Errno 2]`` or ``KeyError: ['col1','col2']``.
-# The two patterns target the canonical exfil shapes:
+
+# Shapes that suggest an exception body is a data dump rather than
+# a parser-owned diagnostic. Used by both ``_scrub_exception_body``
+# (Python user-code phase) and ``_forward_short_body`` (Stata + R
+# denylist mode).
 #
-#   * JSON dict from ``df.iloc[0].to_json()`` — at least one
-#     ``key:value`` pair inside braces.
-#   * Multi-cell row from ``df.to_csv()`` / ``str(row)`` —
-#     six-or-more comma-separated tokens (low enough to catch
-#     row dumps, high enough that ``KeyError: ['a','b','c','d']``
-#     still passes through).
+# Two concerns the detector has to balance:
 #
-# Anything narrower than these patterns rides the
-# ``MAX_EXCEPTION_MSG_BYTES`` cap. Documented residual risk in
-# ``_scrub_exception_body``.
-_DATA_SHAPED_RE = re.compile(
-    r'\{[^{}\n]*:[^{}\n]*\}'             # JSON-ish dict (key:value)
-    r'|(?:[^,\n]{1,40},\s*){5,}'         # 6+ comma-separated tokens
-)
+#   * Catch canonical exfil shapes: JSON dump from
+#     ``df.iloc[0].to_json()`` (``{"k": "v", ...}``); CSV row from
+#     ``df.to_csv()`` / ``str(row)`` (six-or-more comma-separated
+#     mixed-shape tokens like ``patient_42, John Smith, 1985,
+#     100000, doctor, NY``).
+#
+#   * Don't catch legitimate identifier lists embedded in real error
+#     messages: Stata varlists (``mpg, price, weight, length,
+#     displacement, gear_ratio``); R formula term lists; six-arg
+#     function call sites (``pmin(a, b, c, d, e, f, g)``). A naïve
+#     "6+ comma-separated tokens" rule trips on all of these,
+#     stripping the model of the variable names it needs to act on
+#     the error.
+#
+# The distinguishing signal is per-token shape: a pure-identifier
+# token sequence is a legitimate varlist; a sequence with at least
+# one non-identifier token (a quoted string, a number, a date, a
+# name-with-space) is the row-dump shape. The check on the
+# comma-separated branch verifies that AT LEAST ONE token in the
+# run is non-identifier; an all-identifier run forwards.
+#
+# Identifier alphabet here is wider than ``safe_key``'s — it accepts
+# a leading letter / underscore plus alphanumerics, underscores,
+# periods (R ``package.name`` / ``data.frame`` style), dollar signs
+# (R column accessors like ``df$col``), and parens (Stata function-
+# style options like ``by(price``, R / Python function calls like
+# ``pmin(a``, fixest formulas like ``i(x)``). Hyphen is excluded
+# because a token with a hyphen is usually a date or a number
+# (``2026-01-01``). The required-leading-letter-or-underscore is
+# load-bearing: it forces token to LOOK like a name, so pure
+# numeric tokens (``12345``, ``3.14``) and quoted strings (``"v"``)
+# still fail the shape check and the row stays flagged.
+_JSON_DICT_RE = re.compile(r'\{[^{}\n]*:[^{}\n]*\}')
+_COMMA_LIST_RE = re.compile(r'[^,\n]{1,40}(?:\s*,\s*[^,\n]{1,40}){5,}')
+_IDENTIFIER_TOKEN_RE = re.compile(r'^[A-Za-z_][A-Za-z0-9_.$()]*$')
 _REDACTED_DATA_BODY = "[message body suppressed: looked data-shaped]"
+
+
+def _body_looks_data_shaped(body: str) -> bool:
+    """Return True if ``body`` matches a known data-exfil shape.
+
+    Two shapes:
+      1. JSON-dict (``{"k": "v"}``) — always redacted.
+      2. Six-or-more comma-separated tokens where AT LEAST ONE
+         MIDDLE token is non-identifier-shape. A pure-identifier
+         run (Stata varlist, R formula args, ``pmin(a, b, c, d, e,
+         f, g)`` call sites) is legitimate error context; mixed-
+         shape runs are the canonical row dump.
+
+    Boundary tokens (first / last) are excluded from the shape
+    check because the greedy regex absorbs prefix / suffix prose
+    into them — e.g., ``object x1, x2, x3, x4, x5, x6 not found``
+    splits into ``['object x1', 'x2', 'x3', 'x4', 'x5', 'x6 not
+    found']``. The first and last carry sentence context, not the
+    token shape we care about; the inner tokens are bounded by
+    commas on both sides and are the reliable signal. Since the
+    regex requires 5+ continuations, every match has ≥ 6 raw
+    tokens and ≥ 4 middle tokens — enough to distinguish.
+    """
+    if _JSON_DICT_RE.search(body):
+        return True
+    for run in _COMMA_LIST_RE.finditer(body):
+        tokens = [t.strip() for t in run.group(0).split(',')]
+        middle = tokens[1:-1]
+        if any(t and not _IDENTIFIER_TOKEN_RE.match(t) for t in middle):
+            return True
+    return False
 
 
 # -----------------------------------------------------------------
@@ -481,7 +562,7 @@ _R_CALLS_RE = re.compile(r"^Calls: .*$", re.MULTILINE)
 
 
 def _extract_r(stderr: str) -> Optional[str]:
-    """Pull the LAST ``Error`` block's parser-owned framing plus its
+    """Pull the LAST ``Error`` block's call deparse + body, plus its
     ``Calls:`` trailer if present.
 
     R errors look like::
@@ -490,33 +571,29 @@ def _extract_r(stderr: str) -> Optional[str]:
           object 'wage' not found
         Calls: lm -> eval -> eval
 
-    The ``Error in <call> :`` portion and the message body are both
-    script-controlled in the limit: ``<call>`` is R's deparse of the
-    failing expression (and a script using ``do.call(fn, list(arg=
-    secret))`` could put cell data in there), and the message body
-    is whatever R's error formatter or ``stop()`` produced (with
-    ``stop(value)`` allowing direct exfiltration of any short cell).
-    We keep the ``Error`` anchor and the ``Calls:`` chain — function
-    names from the call stack that the model already knows because
-    it wrote the script — and discard both the call deparse and the
-    body. The researcher still has the un-scrubbed message in the
-    on-disk run log.
+    Under the denylist posture (see module docstring), both the
+    ``<call>`` deparse and the message body forward through
+    ``_forward_short_body`` (length cap + data-shape detect).
+    Credential scrubs and path normalisation run later in
+    ``_scrub_and_cap``. The previous posture redacted both
+    wholesale; that bounded ``stop(df$secret[1])``-style exfil but
+    left the model unable to read the specific diagnostic ("object
+    'wage' not found" → "Error : [message body redacted]"). The
+    denylist mitigations bound the residual short-scalar leak
+    channel; see ``_forward_short_body``.
     """
     matches = list(_R_ERROR_RE.finditer(stderr))
     if not matches:
         return None
     last = matches[-1]
-    # Drop both the `call` deparse AND the message body — both are
-    # script-controlled in the limit, so the cleanest privacy
-    # posture is to keep only the parser-owned anchor and the
-    # ``Calls:`` chain (function names the model already knows
-    # because it wrote the script). Earlier iterations scrubbed
-    # the body via credential regexes / data-shape detection, but
-    # the upstream "redact wholesale" approach is strictly safer:
-    # no SSN / ID / short data value sits under any per-pattern
-    # threshold the way it can in a body-included form. The
-    # researcher still has the un-scrubbed message on disk.
-    block = "Error : [message body redacted]"
+    call_text = (last.group("call") or "").strip()
+    msg_text = (last.group("msg") or "").strip()
+    call_excerpt = _forward_short_body(call_text)
+    msg_excerpt = _forward_short_body(msg_text)
+    if call_excerpt:
+        block = f"Error in {call_excerpt} : {msg_excerpt}"
+    else:
+        block = f"Error : {msg_excerpt}"
 
     # Look for a Calls: line in the slice immediately after the
     # error block (within the next 200 chars - the chain is always
@@ -642,36 +719,32 @@ def _extract_stata(stdout: str) -> Optional[str]:
         cmd_excerpt = cmd_text[:200]
         return f". {cmd_excerpt}\n{body}\nr({rc_code});"
 
-    # User-code branch: redact as before. The command echo's args
-    # can macro-expand to data values (``regress y `secret_macro'``
-    # → ``regress y patient_42`` in the log) and the error body
-    # embeds variable / file names that may themselves be
-    # data-derived. Keep only the verb plus the rc line.
+    # User-code branch under denylist posture: forward the command
+    # line and the error body so the model can diagnose the actual
+    # failure ("X invalid varname", "object 'X' not found",
+    # "joinby ein using `orgyears'"). Both pass through
+    # ``_forward_short_body`` for length cap + data-shape detect;
+    # credential scrubs, URL-userinfo collapse, and path
+    # normalisation run later in ``_scrub_and_cap`` over the whole
+    # excerpt.
     #
-    # Stata's modifier prefixes (``capture``, ``quietly``, ``noisily``)
-    # wrap another command. Keeping the first token verbatim makes a
-    # form like ``capture noisily regress y x_missing`` summarize as
-    # ``capture`` — useless. The model needs to know the kind of the
-    # failing command (``regress``), not that it was wrapped. Strip
-    # known prefixes iteratively before picking the verb. The list
-    # is exhaustive for the Stata wrapper modifiers; anything outside
-    # it stays put. The 32-char cap on the chosen verb is still
-    # defense-in-depth against an attacker-chosen first token that
-    # tries to push data through.
-    tokens = cmd_text.split() if cmd_text else []
-    _STATA_MODIFIER_PREFIXES = {"capture", "cap", "quietly", "qui", "noisily", "noi"}
-    while tokens and tokens[0].lower() in _STATA_MODIFIER_PREFIXES:
-        tokens.pop(0)
-    verb = tokens[0] if tokens else ""
-    verb = verb[:32]
-    # Validate against Stata's verb alphabet (lowercase letters and
-    # underscores). If it doesn't match, redact entirely rather than
-    # forwarding what an attacker constructed.
-    if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", verb or ""):
-        verb = ""
-    if verb:
-        return f". {verb} [args redacted]\n[message body redacted]\nr({rc_code});"
-    return f"[command body redacted]\nr({rc_code});"
+    # The previous posture redacted args + body wholesale on the
+    # theory that macro expansion (``regress y `secret_macro'`` →
+    # ``regress y patient_42`` in the log) and data-derived names
+    # in error messages would leak cell content. That trade-off
+    # was too aggressive: the common failure mode is a model-
+    # authored identifier that hit a Stata constraint (>32-char
+    # varname cap, unrecognised verb, missing column), and without
+    # the body the model couldn't tell what to fix. The denylist
+    # mitigations (data-shape detect + 200-char cap + downstream
+    # credential / path scrubs) bound the residual short-scalar
+    # leak channel; see module docstring and ``_forward_short_body``.
+    body = _stata_error_body_between(scan, cmd_match.end(), rc.start())
+    cmd_excerpt = _forward_short_body(cmd_text)
+    body_excerpt = _forward_short_body(body)
+    if cmd_excerpt:
+        return f". {cmd_excerpt}\n{body_excerpt}\nr({rc_code});"
+    return f"{body_excerpt}\nr({rc_code});"
 
 
 def _stata_error_body_between(scan: str, start: int, end: int) -> str:
@@ -738,6 +811,48 @@ def _scrub_exception_body(msg: str, *, phase: str = "user_code") -> str:
 
 
 _REDACTED_BODY = "[message body redacted]"
+
+
+def _forward_short_body(body: str) -> str:
+    """Apply length cap + data-shape detect to an error body that
+    the caller wants to forward to the model.
+
+    This is the denylist posture used by Stata and R: forward the
+    actual diagnostic ("X invalid varname", "object 'X' not found",
+    "joinby ein using `orgyears'") so the model can act on the
+    specific error without re-probing, with two targeted scrubs:
+
+      * **Data-shape detect** — if the body matches a JSON-dict
+        shape or a 6+ comma-separated-tokens shape (the canonical
+        ``df.to_csv()`` / ``to_json()`` exfil patterns), drop it
+        wholesale. Catches the obvious ``raise RuntimeError(df.iloc[0].to_json())``
+        / ``stop(paste(df$row, collapse=","))`` channels.
+      * **Length cap** — bodies past ``MAX_FORWARDED_BODY_BYTES``
+        are usually verbose estimator output or data dumps; truncate
+        to bound the per-error bandwidth.
+
+    Credential scrubs, URL-userinfo collapse, and path normalisation
+    run later in ``_scrub_and_cap`` over the full excerpt, so we
+    don't repeat them here — keeping this helper a thin per-body
+    pass keeps the layering legible.
+
+    Residual risk under this posture: short scalar values (a single
+    integer ID, a short string column value) embedded in a Stata or
+    R error message can still pass through. This is the explicit
+    SDC trade-off recorded in the module docstring — the model
+    needs to read the actual error to fix it, and short scalars
+    fall under the same bandwidth a script could exfiltrate through
+    a single ``display`` / ``print`` call anyway. The cell-suppression
+    threshold protects against tiny-count disclosure at the sanitizer
+    layer; this channel is bounded to ~200 bytes per failed script.
+    """
+    if not body:
+        return ""
+    if _body_looks_data_shaped(body):
+        return _REDACTED_DATA_BODY
+    if len(body) > MAX_FORWARDED_BODY_BYTES:
+        return body[:MAX_FORWARDED_BODY_BYTES] + "[...]"
+    return body
 
 
 # -----------------------------------------------------------------

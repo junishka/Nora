@@ -76,6 +76,7 @@ def render_table(payload: dict[str, Any]) -> str | None:
 def compose_layout(
     spec: dict[str, Any],
     payloads_by_id: dict[str, dict[str, Any]],
+    labels_by_id: dict[str, str] | None = None,
 ) -> str | None:
     """Compose a multi-result comparison table from a model-emitted
     layout spec.
@@ -89,6 +90,17 @@ def compose_layout(
     recoverable: grouping is fallible (the user can re-prompt or
     edit), the numbers aren't (they come from the sanitized store).
 
+    Row shapes (both are accepted in the same ``rows`` list):
+
+      * ``"M37"`` — bare result_id. Row label is auto-resolved from
+        ``labels_by_id`` (the store's helper-call label) when the
+        caller passed that dict, otherwise falls back to the rid.
+        This is the minimal form for the common case ("decide the
+        groups, hand me result_ids, let the store provide labels").
+      * ``{"result_id": "M37", "label": "ln_revenue"}`` — explicit
+        label override. Use when the stored label is too verbose or
+        the row needs renaming for the comparison context.
+
     Spec shape::
 
         {
@@ -101,10 +113,7 @@ def compose_layout(
             "groups": [
                 {
                     "label": "H1: direct effect",      # optional row header
-                    "rows": [
-                        {"result_id": "M1", "label": "ln_rev_total"},
-                        ...
-                    ]
+                    "rows": ["M1", "M2", ...]          # bare ids OR row dicts
                 },
                 ...
             ]
@@ -117,12 +126,18 @@ def compose_layout(
     ``—``). Group labels render as bold header rows above their
     members; missing labels just skip the header row.
 
+    ``labels_by_id`` is the store-resolved label map (rid → helper
+    call label). Wired up by ``compose_results`` in tools.py from
+    each ``store.get(rid).label``. Passing ``None`` keeps the
+    legacy "label defaults to rid" behaviour — used by tests that
+    drive the renderer directly without a store.
+
     Returns ``None`` when the spec is malformed (not a dict, missing
     or empty ``columns`` / ``groups``, wrong inner shapes); callers
     fall back to their default error handling. Never raises.
     """
     try:
-        return _compose_layout_inner(spec, payloads_by_id)
+        return _compose_layout_inner(spec, payloads_by_id, labels_by_id or {})
     except Exception:  # noqa: BLE001 — formatting must never crash callers
         return None
 
@@ -130,6 +145,7 @@ def compose_layout(
 def _compose_layout_inner(
     spec: dict[str, Any],
     payloads_by_id: dict[str, dict[str, Any]],
+    labels_by_id: dict[str, str],
 ) -> str | None:
     if not isinstance(spec, dict):
         return None
@@ -178,12 +194,35 @@ def _compose_layout_inner(
             # blank-cells header row is the conventional shape.
             rows.append([f"**{group_label.strip()}**", *([""] * len(col_ids))])
         for row in group_rows:
-            if not isinstance(row, dict):
+            # Two row shapes accepted: a bare result_id string (auto-
+            # label from ``labels_by_id``, fallback to rid) and the
+            # explicit ``{"result_id": ..., "label": ...}`` dict. The
+            # bare-string form is the minimal-friction path that
+            # matters for big multi-result batches — the model picks
+            # the groups, hands us result_ids, the store provides
+            # labels — so it doesn't have to type both the rid and a
+            # re-derived label for each row.
+            if isinstance(row, str):
+                rid = row
+                if not rid:
+                    return None
+                rlabel_override = None
+            elif isinstance(row, dict):
+                rid = row.get("result_id")
+                if not isinstance(rid, str) or not rid:
+                    return None
+                rlabel_override = row.get("label")
+            else:
                 return None
-            rid = row.get("result_id")
-            if not isinstance(rid, str) or not rid:
-                return None
-            rlabel = row.get("label", rid)
+            # Label precedence: explicit row override > stored helper
+            # label (``labels_by_id``) > raw result_id. The store
+            # fallback turns "M37" into "ln_revenue" (the
+            # ``nora.result(label=...)`` the script authored) without
+            # the model having to re-type it.
+            if rlabel_override is not None:
+                rlabel = rlabel_override
+            else:
+                rlabel = labels_by_id.get(rid, rid)
             # Pass the raw lookup result (None when the result_id
             # isn't in the store) so ``_compose_cell`` can distinguish
             # "result missing" from "result present but term missing"
@@ -894,35 +933,13 @@ def _render_factor_decomposition(p: dict[str, Any]) -> str | None:
     return f"{table}\n\n{caption}" if caption else table
 
 
-def _render_cluster_analysis(p: dict[str, Any]) -> str | None:
-    """Centroids matrix (cluster × variable) with cluster sizes
-    column.
+def _cluster_caption(p: dict[str, Any]) -> str:
+    """Shared caption builder for cluster_analysis payloads.
 
-    The "Size" column is the SDC-relevant info — small clusters
-    were already suppressed by the sanitizer, but the surviving
-    cluster sizes are still load-bearing context for the model.
-    Centroid values are precision-clamped per-cluster by the
-    sanitizer; the renderer just formats whatever survived.
+    Pulled out so the centroids and no-centroids (DBSCAN / HDBSCAN)
+    render paths share the same caption — keeps the model's view
+    consistent across cluster methods.
     """
-    centroids = p.get("centroids") or {}
-    if not isinstance(centroids, dict) or not centroids:
-        return None
-    cluster_labels = p.get("cluster_labels") or sorted(centroids.keys())
-    variables = p.get("variables") or []
-    if not isinstance(variables, list) or not isinstance(cluster_labels, list):
-        return None
-    sizes = p.get("cluster_sizes") or {}
-    header = ["Cluster", "Size"] + list(variables)
-    rows: list[list[str]] = []
-    for cl in cluster_labels:
-        row = [str(cl)]
-        row.append(_fmt_int(sizes.get(cl)))
-        cl_centroid = centroids.get(cl, {}) if isinstance(centroids.get(cl), dict) else {}
-        for v in variables:
-            row.append(_fmt_num(cl_centroid.get(v)))
-        rows.append(row)
-    table = _markdown_table(header, rows)
-
     cap_parts: list[str] = []
     method = p.get("method")
     if isinstance(method, str):
@@ -933,6 +950,12 @@ def _render_cluster_analysis(p: dict[str, Any]) -> str | None:
     n_cl = p.get("n_clusters")
     if isinstance(n_cl, int):
         cap_parts.append(f"k = {n_cl}")
+    n_noise = p.get("n_noise_points")
+    if isinstance(n_noise, int):
+        # DBSCAN / HDBSCAN-specific diagnostic: points that didn't fit
+        # any cluster. Shown alongside k so the reader can see the
+        # noise fraction at a glance.
+        cap_parts.append(f"noise = {n_noise:,}")
     ss_ratio = p.get("ss_ratio")
     if isinstance(ss_ratio, (int, float)) and math.isfinite(float(ss_ratio)):
         cap_parts.append(f"between/total = {ss_ratio*100:.1f}%")
@@ -942,7 +965,65 @@ def _render_cluster_analysis(p: dict[str, Any]) -> str | None:
     n_iter = p.get("n_iterations")
     if isinstance(n_iter, int):
         cap_parts.append(f"iter = {n_iter}")
-    caption = " · ".join(cap_parts)
+    return " · ".join(cap_parts)
+
+
+def _render_cluster_analysis(p: dict[str, Any]) -> str | None:
+    """Centroids matrix (cluster × variable) with cluster sizes
+    column.
+
+    The "Size" column is the SDC-relevant info — small clusters
+    were already suppressed by the sanitizer, but the surviving
+    cluster sizes are still load-bearing context for the model.
+    Centroid values are precision-clamped per-cluster by the
+    sanitizer; the renderer just formats whatever survived.
+
+    DBSCAN / HDBSCAN payloads carry no centroids by construction
+    (the sanitizer accepts these absent — see
+    ``_CLUSTER_METHODS_WITHOUT_CENTROIDS``); for those, fall through
+    to a sizes-only table so the model still sees a rendered result
+    instead of silently nothing.
+    """
+    centroids = p.get("centroids") or {}
+    cluster_labels = p.get("cluster_labels") or []
+    sizes = p.get("cluster_sizes") or {}
+    if not isinstance(cluster_labels, list) or not isinstance(sizes, dict):
+        return None
+
+    # No-centroids fallback (DBSCAN / HDBSCAN). Render a sizes-only
+    # table when there's at least a label list to drive it. Without
+    # this branch, a successful density-based cluster run produced
+    # no rendered output and the result was invisible in chat — the
+    # tool card still existed, but the conversational surface that
+    # the model embeds (this markdown) was empty.
+    if not isinstance(centroids, dict) or not centroids:
+        if not cluster_labels:
+            return None
+        header = ["Cluster", "Size"]
+        rows: list[list[str]] = [
+            [str(cl), _fmt_int(sizes.get(cl))] for cl in cluster_labels
+        ]
+        table = _markdown_table(header, rows)
+        caption = _cluster_caption(p)
+        return f"{table}\n\n{caption}" if caption else table
+
+    if not cluster_labels:
+        cluster_labels = sorted(centroids.keys())
+    variables = p.get("variables") or []
+    if not isinstance(variables, list):
+        return None
+    header = ["Cluster", "Size"] + list(variables)
+    rows = []
+    for cl in cluster_labels:
+        row = [str(cl)]
+        row.append(_fmt_int(sizes.get(cl)))
+        cl_centroid = centroids.get(cl, {}) if isinstance(centroids.get(cl), dict) else {}
+        for v in variables:
+            row.append(_fmt_num(cl_centroid.get(v)))
+        rows.append(row)
+    table = _markdown_table(header, rows)
+
+    caption = _cluster_caption(p)
     return f"{table}\n\n{caption}" if caption else table
 
 

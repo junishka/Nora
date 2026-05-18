@@ -3867,6 +3867,18 @@ def _sanitize_kaplan_meier(
                 f"or absent"
             )
 
+    # Coarsen rare event/subject counts on the same rule the Cox path
+    # uses (see ``_coarsen_small_cox_counts``). KM and Cox carry the
+    # same disclosure surface here: "324 subjects, 3 deaths" identifies
+    # those 3 individuals regardless of which estimator produced the
+    # payload. The ``n_subjects`` branch is effectively a no-op for
+    # well-formed KM (the upstream ``require_minimum_n`` gate rejects
+    # n_subjects below ``min_n_regression``, typically ≥
+    # ``cell_suppression_threshold``), but is kept in the call so the
+    # Cox / KM behaviour stays symmetric if the two thresholds ever
+    # diverge.
+    _coarsen_small_cox_counts(out, transformations, config)
+
     # Precision clamp by total n_subjects.
     for key in _KM_ALLOWED_NUMERIC_FIELDS:
         if key in out:

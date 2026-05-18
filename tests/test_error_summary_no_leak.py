@@ -55,12 +55,16 @@ _JWT = (
 # ---------------------------------------------------------------------------
 
 def test_stata_display_output_before_failure_is_not_forwarded() -> None:
-    """A researcher who runs ``display var`` followed by a
-    failing regression must not have the displayed values bleed
-    into the excerpt. The Stata extractor now keeps only the
-    failing command's verb plus the ``r(<code>);`` line, so neither
-    pre-failure display output nor the post-cmd error message can
-    cross."""
+    """A researcher who runs ``display var`` / ``list`` followed
+    by a failing regression must not have the displayed values
+    bleed into the excerpt. The Stata extractor anchors on the
+    failing command echo and walks back ONLY to that line, so
+    intervening ``display`` / ``list`` output from earlier commands
+    stays out — that's the boundary the denylist relaxation
+    preserves. The failing command line and its error body DO
+    forward (under length cap + data-shape detect), but the
+    unrelated PII rows do not.
+    """
     log = f"""\
 . set more off
 
@@ -84,14 +88,17 @@ r(111);
 """
     excerpt = extract_debug_excerpt(log, "", 111, "Stata")
     assert excerpt is not None
+    # Pre-failure display / list output stays out — anchored
+    # extraction means only the failing command's own block crosses.
     assert _PII_ROW not in excerpt
     assert _PII_VALUE not in excerpt
     assert "secret_token" not in excerpt
-    # The failing command's args and error body are redacted; only
-    # the verb and rc line survive.
-    assert "x_missing" not in excerpt
-    assert "variable x_missing not found" not in excerpt
-    assert ". regress" in excerpt
+    # The failing command line and its body forward (denylist
+    # posture). The command "regress y x_missing" and the body
+    # "variable x_missing not found" are what the model needs to
+    # diagnose. The earlier `display` / `list` PII never crosses.
+    assert ". regress y x_missing" in excerpt
+    assert "variable x_missing not found" in excerpt
     assert "r(111);" in excerpt
 
 
@@ -171,21 +178,28 @@ def test_python_to_json_exfil_via_runtimeerror_is_redacted() -> None:
     assert "RuntimeError" in excerpt
 
 
-def test_r_stop_exfil_message_is_redacted() -> None:
-    """``stop(paste(df$secret, collapse=','))`` would otherwise
-    pour a row of comma-separated cell values into the message
-    body. The body is now redacted wholesale — no shape detection
-    or cap-based partial leak."""
-    secret_row = ",".join(f"value_{i}" for i in range(20))
+def test_r_stop_data_shaped_exfil_is_redacted() -> None:
+    """``stop(paste(df$row, collapse=","))`` against a typical row
+    pours mixed-shape cell values (numbers, names with spaces,
+    dates, IDs) into the body. ``_body_looks_data_shaped`` fires
+    on the run because at least one token is non-identifier-shape
+    — the row-dump fingerprint. Pure-identifier lists pass through
+    (legitimate varlists / formula terms); mixed-shape runs do not.
+    See ``test_r_identifier_list_body_forwards`` for the
+    complementary case."""
+    # Realistic ``str(df.iloc[0])`` output: mixed numbers, quoted
+    # strings, names-with-spaces, dates, identifiers. Multiple
+    # tokens violate the identifier alphabet.
+    secret_row = "42, John Smith, 1985-01-01, 100000, doctor, NY, 12345"
     stderr = f"Error in stop(...) : {secret_row}\n"
     excerpt = extract_debug_excerpt("", stderr, 1, "R")
     assert excerpt is not None
-    # The full 20-cell row is not present.
-    assert secret_row not in excerpt
-    # The "Error :" anchor is the parser-owned framing — call
-    # deparse ``in stop(...)`` is also script-controlled and dropped.
-    assert "Error :" in excerpt
-    assert "stop(" not in excerpt
+    # The mixed-shape row is replaced by the data-shape marker.
+    assert "John Smith" not in excerpt
+    assert "100000" not in excerpt
+    assert "message body suppressed: looked data-shaped" in excerpt
+    # Parser-owned framing still present.
+    assert "Error in" in excerpt
 
 
 def test_python_long_unquoted_message_is_redacted() -> None:
@@ -229,19 +243,25 @@ def test_short_python_keyerror_body_redacted() -> None:
     assert "[message body redacted]" in last_line
 
 
-def test_short_r_object_not_found_body_redacted() -> None:
-    """Same posture for R: a short ``object 'wage' not found`` body
-    used to pass the cap. It now doesn't reach the excerpt — the
-    model has the script source and knows which symbol was
-    referenced without us forwarding it."""
+def test_short_r_object_not_found_body_forwards() -> None:
+    """R under the denylist posture forwards short identifier-shape
+    bodies like ``object 'wage' not found``. This is the explicit
+    relaxation: the model needs the missing symbol name to fix the
+    script (rename column, add to the dataframe, drop the predictor)
+    and forwarding it costs at most the bandwidth of one short
+    identifier per failed script. The data-shape detector still
+    blocks the multi-cell exfil shapes (see
+    ``test_r_stop_data_shaped_exfil_is_redacted``)."""
     stderr = (
         "Error in eval(predvars, data, env) : object 'wage' not found\n"
     )
     excerpt = extract_debug_excerpt("", stderr, 1, "R")
     assert excerpt is not None
-    assert "'wage'" not in excerpt
-    assert "Error :" in excerpt
-    assert "[message body redacted]" in excerpt
+    # Body forwards — the model can now read the missing-symbol
+    # diagnostic and act on it.
+    assert "'wage'" in excerpt
+    assert "object 'wage' not found" in excerpt
+    assert "Error in" in excerpt
 
 
 def test_python_filenotfound_body_redacted() -> None:
@@ -370,18 +390,24 @@ def test_python_traceback_strips_home_directory_prefix() -> None:
     assert "line 17" in excerpt
 
 
-def test_bare_absolute_path_in_message_is_redacted() -> None:
+def test_bare_absolute_path_in_message_is_basenamed() -> None:
     """R / Stata error messages sometimes embed a bare absolute
-    path (e.g., the .dta file that couldn't open). With body
-    redaction, the entire path — including the filename, which is
-    data-derived (a model can construct a script that ``read_dta(
-    df.loc[0, 'secret'])``) — never reaches the excerpt."""
+    path (e.g., the .dta file that couldn't open). Under the
+    denylist posture the body forwards, but the path is normalised
+    to its basename by ``_scrub_and_cap`` so the home-directory
+    layout never leaks. The basename itself ("secrets.dta") IS
+    forwarded — the model needs to see which file the script tried
+    to open. The leak the original test guarded was the absolute
+    path, which still doesn't reach the excerpt."""
     stderr = 'Error in read_dta : file /Users/jdoe/private/secrets.dta not found\n'
     excerpt = extract_debug_excerpt("", stderr, 1, "R")
     assert excerpt is not None
+    # Directory components stripped — home / project layout doesn't leak.
     assert "/Users/jdoe/private" not in excerpt
-    assert "secrets.dta" not in excerpt
-    assert "Error :" in excerpt
+    assert "/Users/jdoe" not in excerpt
+    # Basename forwarded (the model needs to know which file).
+    assert "secrets.dta" in excerpt
+    assert "Error in" in excerpt
 
 
 def test_path_with_space_in_username_is_fully_scrubbed() -> None:
@@ -486,20 +512,22 @@ def test_stripe_underscore_key_redacted() -> None:
 
 def test_r_call_argument_credential_is_redacted() -> None:
     """R errors of the form ``Error in some_func("user-supplied") : ...``
-    interpolate the call argument verbatim. Earlier extractor versions
-    forwarded the call group raw, leaking short data values that sit
-    under the long-quoted-arg threshold (SSNs, IDs, GH PATs from
-    header dumps). The current extractor drops the whole body
-    wholesale ("Error : [message body redacted]"), so the call group
-    — and any credential it carried — never reaches the excerpt."""
+    interpolate the call argument verbatim. Under the denylist
+    posture the call deparse + body forward, but the credential
+    scrub in ``_scrub_and_cap`` strips known token shapes (``ghp_``,
+    ``sk-...``, JWTs, etc.) from the final excerpt. So a leaked
+    GitHub PAT in the call argument is replaced with
+    ``[redacted-credential]`` even though the rest of the call
+    surface forwards.
+    """
     pat = "ghp_" + "B" * 36
     r_stderr = f'Error in httr::GET("api", token = "{pat}") : 401 Unauthorized\n'
     excerpt = extract_debug_excerpt("", r_stderr, 1, "R")
     assert excerpt is not None
+    # The credential is scrubbed by _scrub_and_cap even though the
+    # surrounding call and body forward.
     assert pat not in excerpt
-    # The whole body (including the call group's argument) is
-    # redacted; the parser-owned anchor still surfaces.
-    assert "[message body redacted]" in excerpt
+    assert "[redacted-credential]" in excerpt
     assert "Error" in excerpt
 
 
@@ -525,18 +553,61 @@ def test_python_extractor_ignores_stdout_entirely() -> None:
     assert "ZeroDivisionError" in excerpt
 
 
+def test_r_calls_chain_carries_function_names_not_arg_values() -> None:
+    """The ``Calls:`` chain R prints below an error is captured by
+    ``_R_CALLS_RE`` verbatim, so it's worth pinning that R itself
+    never puts call-argument VALUES in that chain — only function
+    NAMES. The argument values (which can be data-derived via
+    ``do.call(fn, list(x = secret))``) live in the ``Error in
+    <call> :`` deparse, NOT in Calls.
+
+    Threat scenario: a script does
+    ``lm(y ~ x, data = df_filtered_to_age_42)``. The Calls chain
+    is still ``Calls: lm -> eval -> eval`` — the data-bearing
+    expression ``df_filtered_to_age_42`` appears in the call
+    deparse (which DOES forward under denylist, with shape +
+    length checks) but not in the Calls chain. This test pins
+    that boundary: the chain content matches what R actually
+    formats (function names + ``->`` separators), not whatever
+    follows on the next line.
+    """
+    # The Calls regex is anchored on the literal "^Calls: " prefix
+    # and reads to end-of-line. The tail window is capped at 200
+    # chars after the Error block. Construct a stderr where the
+    # Calls chain itself contains only function names but the
+    # following lines have data-shaped content — confirm only the
+    # function-name chain survives.
+    stderr = (
+        "Error in lm(y ~ x, data = df_filtered_to_age_42) : "
+        "object 'x' not found\n"
+        "Calls: lm -> eval -> eval\n"
+        "Some other line: patient_42, 100000, doctor, John Smith\n"
+    )
+    excerpt = extract_debug_excerpt("", stderr, 1, "R")
+    assert excerpt is not None
+    # Calls chain is the function names only.
+    assert "Calls: lm -> eval -> eval" in excerpt
+    # The data-bearing line AFTER Calls never reaches the excerpt —
+    # the tail window stops at the Calls line itself.
+    assert "patient_42" not in excerpt
+    assert "John Smith" not in excerpt
+
+
 def test_r_extractor_ignores_stdout_entirely() -> None:
     """Same boundary for R: a ``cat()`` / ``print(df)`` to stdout
-    must never bleed into the excerpt. The error message body
-    (``NA in design matrix``) is also dropped under the new
-    posture — only ``Error :`` framing remains."""
+    must never bleed into the excerpt — the R extractor only
+    reads stderr. Under the denylist posture the stderr body
+    forwards ("NA in design matrix"), but stdout content (the
+    PII row) is still strictly out of bounds."""
     stdout = f"printed row: {_PII_ROW}\n"
     stderr = "Error in lm.fit : NA in design matrix\n"
     excerpt = extract_debug_excerpt(stdout, stderr, 1, "R")
     assert excerpt is not None
+    # stdout PII never crosses.
     assert _PII_ROW not in excerpt
-    assert "Error :" in excerpt
-    assert "NA in design matrix" not in excerpt
+    # Body forwards from stderr.
+    assert "NA in design matrix" in excerpt
+    assert "Error in" in excerpt
 
 
 def test_url_embedded_userinfo_credentials_are_redacted() -> None:

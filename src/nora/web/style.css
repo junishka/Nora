@@ -813,7 +813,8 @@ kbd {
 }
 
 .landing-status.error {
-  color: #c23;
+  color: var(--hot-pink);
+  opacity: 0.9;
 }
 
 .landing-fineprint {
@@ -2165,41 +2166,41 @@ kbd {
   position: relative;
 }
 
-/* Scrollbar styling on the script-display pre. Three concerns combined:
- *
- * Scope — ``.tool-code`` only. ``.tool-body`` also contains
- * ``pre.tool-output`` (raw R/Stata stdout, ``background: var(--bg)``);
- * painting code-panel-toned scrollbars onto that surface would put a
- * code-toned rail on a different-toned output panel. .tool-output
- * is left to inherit the theme-aware global ``.messages *::-webkit-
- * scrollbar-thumb`` rules below — those use translucent burgundy
- * (light) and translucent cream (dark), matching --bg naturally.
+/* Scrollbar styling on the two dark code panels inside ``.tool-body``:
+ * ``pre.tool-code`` (script display) and ``pre.tool-output`` (raw
+ * R/Stata/Python stdout). Both pick up ``background: var(--code-bg)``
+ * from ``.tool-card .tool-body pre`` above — the per-element
+ * ``.tool-output { background: var(--bg) }`` declaration is overridden
+ * by that more-specific selector — so they live on the same burgundy
+ * surface and need the same scrollbar chrome to look consistent
+ * across panels. Earlier scoping was ``.tool-code`` only on the
+ * theory that ``.tool-output`` was on ``--bg``; the global
+ * ``.messages *::-webkit-scrollbar-track`` then painted ``--bg``
+ * (soft pink) onto the actual burgundy panel, leaving a near-white
+ * strip in light mode.
  *
  * Track color — ``var(--code-bg)`` matches the pre's own background,
- * so the rail blends INTO the dark code panel where it actually lives
- * instead of painting a card-pink strip against the burgundy surface.
- * Earlier this used ``var(--bg-tool)`` on the theory the rail would
- * "merge with the card around the code panel," but the rail sits
- * inside the panel, not around it, so the pink track read as a
- * misplaced white strip in light mode. ``transparent`` is
+ * so the rail embeds INTO the dark panel. ``transparent`` is
  * intentionally avoided: in WKWebView with macOS "Always show
  * scrollbars", a transparent track can fall through to a default
  * light native fill, so an explicit theme color is belt-and-suspenders.
  *
  * Thumb — accent-soft fill with an accent ring. ``--accent-soft``
  * (blue-gray light / dusty-mauve dark) is light enough to read on
- * the new ``--code-bg`` track, and the inset ``var(--accent)`` ring
+ * the ``--code-bg`` track, and the inset ``var(--accent)`` ring
  * (teal light / pink dark) provides a brighter highlight rim. We use
  * ``box-shadow: inset`` rather than ``border`` because a real border
  * would shrink the thumb's hit area and fight ``background-clip``;
  * the inset shadow gives the same ring without those side effects.
  * Hover swaps the fill to ``--accent`` for a theme-aware affordance.
  *
- * Specificity: ``.tool-card .tool-body pre.tool-code`` is (0,3,1),
- * which beats the broader ``.tool-card .tool-body pre`` (0,2,1)
- * defining pre chrome above and the global ``.messages *``
- * scrollbar rules (0,1,1 + universal). */
-.tool-card .tool-body pre.tool-code {
+ * Specificity: ``.tool-card .tool-body pre.tool-code`` and
+ * ``.tool-card .tool-body pre.tool-output`` are both (0,3,1), which
+ * beats the broader ``.tool-card .tool-body pre`` (0,2,1) defining
+ * pre chrome above and the global ``.messages *`` scrollbar rules
+ * (0,1,1 + universal). */
+.tool-card .tool-body pre.tool-code,
+.tool-card .tool-body pre.tool-output {
   scrollbar-width: thin;
   /* Firefox: thumb / track. ``--accent`` flips with the theme tokens
    * (teal in light, pink in dark) so the thumb stays in-palette in
@@ -2210,7 +2211,8 @@ kbd {
   scrollbar-color: var(--accent) var(--code-bg);
 }
 
-.tool-card .tool-body pre.tool-code::-webkit-scrollbar {
+.tool-card .tool-body pre.tool-code::-webkit-scrollbar,
+.tool-card .tool-body pre.tool-output::-webkit-scrollbar {
   height: 8px;
   width: 8px;
   background: var(--code-bg);
@@ -2223,22 +2225,26 @@ kbd {
  * with the rest of the palette, so the thumb tracks the theme in
  * either mode. ``--pink`` / ``--code-bg`` were swatch references
  * that didn't flip (loud in dark, off-key in light). */
-.tool-card .tool-body pre.tool-code::-webkit-scrollbar-thumb {
+.tool-card .tool-body pre.tool-code::-webkit-scrollbar-thumb,
+.tool-card .tool-body pre.tool-output::-webkit-scrollbar-thumb {
   background: var(--accent-soft);
   box-shadow: inset 0 0 0 1px var(--accent);
   border-radius: 4px;
 }
 
-.tool-card .tool-body pre.tool-code::-webkit-scrollbar-thumb:hover {
+.tool-card .tool-body pre.tool-code::-webkit-scrollbar-thumb:hover,
+.tool-card .tool-body pre.tool-output::-webkit-scrollbar-thumb:hover {
   background: var(--accent);
   box-shadow: inset 0 0 0 1px var(--accent);
 }
 
-.tool-card .tool-body pre.tool-code::-webkit-scrollbar-track {
+.tool-card .tool-body pre.tool-code::-webkit-scrollbar-track,
+.tool-card .tool-body pre.tool-output::-webkit-scrollbar-track {
   background: var(--code-bg);
 }
 
-.tool-card .tool-body pre.tool-code::-webkit-scrollbar-corner {
+.tool-card .tool-body pre.tool-code::-webkit-scrollbar-corner,
+.tool-card .tool-body pre.tool-output::-webkit-scrollbar-corner {
   background: var(--code-bg);
 }
 
