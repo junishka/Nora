@@ -4,6 +4,89 @@ Notable changes per release. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 versions follow semver, pre-1.0.
 
+## [0.10.1] — 2026-05-18
+
+Focused patch on top of `0.10.0`. Closes a class of "model can't
+tell what's wrong" incidents in the audit and error-readability
+paths, plus several presentation papercuts surfaced during a 0.10.0
+review pass.
+
+- **Audit coverage caught up to the 0.10 shapes.** `_effective_n`
+  recognises `coefficient_table_with_fit_stats` alongside the legacy
+  `linear_regression` alias, so the row-count audit fires for current
+  R / Python / Stata regression payloads (it was silently skipping
+  every modern emission). Extends to `correlation_matrix`,
+  `marginal_effects`, `kaplan_meier`, `factor_decomposition`,
+  `cluster_analysis`. RDD and DiD deliberately skipped with
+  documented reasoning (bandwidth-restricted N, units-vs-rows
+  mismatch).
+- **Kaplan-Meier rare-event coarsening.** KM `n_failures` now
+  coarsens via `_coarsen_small_cox_counts` so a 1500-subject study
+  with 3 events shows `n_failures: "<10"` instead of leaking the
+  exact event count. Closes a Cox-vs-KM asymmetry where identically
+  shaped data got different SDC treatment by estimator.
+- **DBSCAN / HDBSCAN cluster payloads render.** The sanitizer accepts
+  density-based methods without centroids, but the renderer returned
+  `None`, so the model embedded nothing in the chat reply. Now falls
+  back to a `Cluster | Size` table plus a caption carrying
+  `n_noise_points`, `silhouette_score`, and the standard fit-quality
+  scalars.
+- **SDC policy lookup honours the basename contract.**
+  `_resolve_sdc_and_source_n` normalises `source_dataset` to its
+  basename before policy lookup, matching `get_schema` and the
+  contract documented in `policy.py:134-137`. Closes a silent gap
+  where `./data.csv` or `sub/data.csv` missed a policy entry keyed
+  `data.csv` and the researcher's `non_disclosive_variables` opt-in
+  was ignored.
+- **Error excerpt readable for the common Stata / R failures.**
+  Stata and R user-code error bodies forward through
+  `_forward_short_body` (length cap + data-shape detect) instead of
+  `[message body redacted]`. The model can now read `"highest_
+  forprofit_title_pre_ceo_rank invalid varname"` and shorten the
+  identifier without re-probing. Data-shape detector refined so
+  pure-identifier varlists / formula args forward (a Stata varlist
+  or an R `pmin(a, b, c, d, e, f, g)` is legitimate context); mixed
+  shape row dumps still get caught. Credential scrubs, URL-userinfo
+  collapse, and path-to-basename normalisation still run on the
+  final excerpt. Python unchanged: the source-line preview already
+  exposes the identifier in the common `KeyError` case.
+- **`compose_results` ergonomics.** Rows accept bare result_id
+  strings; row labels auto-resolve from the store's helper-call
+  label, with explicit per-row labels still overriding. Cuts spec
+  verbosity for big multi-result batches so the model takes the
+  comparison-table path more readily.
+- **System prompt: multi-result presentation as guidance.** Reframed
+  as descriptive ("a comparison table reads more cleanly than prose
+  for patterns across stored results") with the grouping decision
+  named as the model's call after seeing results. `compose_results`
+  positioned as the natural surface, `_inline_markdown_omitted` note
+  redirected toward it.
+- **UI papercuts.** Landing oversize-file message simplified to one
+  line, themed via `var(--hot-pink)` with `opacity: 0.9`, auto
+  dismisses after 4s. `.tool-output` scrollbar now shares the dark
+  panel chrome with `.tool-code` (was painting a near-white track
+  against burgundy in light mode).
+- **Inline budget bump.** `_INLINE_MARKDOWN_BUDGET` 30k → 45k so a
+  typical 12-15 regression batch stays inline before stage-2 stub
+  replacement. `_REPLAY_TEXT_ENVELOPE_CAP` bumped 64k → 96k to keep
+  the linked-constraint margin comfortable.
+
+Researcher-visible: regression-batch row-count audits stop silently
+passing; KM rare-event counts match Cox suppression; DBSCAN results
+actually render in chat; Stata / R errors name the offending
+identifier so the model can fix without re-probing; comparison
+tables stay inline for typical batches instead of getting stubbed.
+
+No data shape changes; no API breaks. Sessions saved under `0.10.0`
+resolve unchanged.
+
+**Updated in 0.10.1**: audit-coverage gaps closed across the 0.10
+analysis shapes (row-count alias, KM `n_failures`, DBSCAN render,
+SDC policy basename); Stata / R error bodies forward under a
+denylist posture so the diagnostic reaches the model; plus
+`compose_results` bare-string rows, inline markdown budget bump
+(30k → 45k), and themed landing oversize message.
+
 ## [0.10.0] — 2026-05-16
 
 Late-beta release. Expands the sanitized analysis surface from
