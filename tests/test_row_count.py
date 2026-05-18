@@ -103,6 +103,66 @@ def test_effective_n_unknown_type():
     assert _effective_n({"type": "covariance_matrix"}) is None
 
 
+def test_effective_n_correlation_matrix():
+    # Same shape as ``descriptive``: n is complete-cases count,
+    # missing_count is rows dropped by listwise NA-removal; the sum
+    # is what the DataFrame had at correlation time.
+    assert _effective_n({
+        "type": "correlation_matrix", "n": 90, "missing_count": 10,
+    }) == 100
+    # Missing ``missing_count`` blocks the audit (no false positives
+    # from a partial payload).
+    assert _effective_n({"type": "correlation_matrix", "n": 90}) is None
+
+
+def test_effective_n_marginal_effects():
+    assert _effective_n({"type": "marginal_effects", "n": 500}) == 500
+    assert _effective_n({"type": "marginal_effects"}) is None
+
+
+def test_effective_n_kaplan_meier():
+    assert _effective_n({"type": "kaplan_meier", "n_subjects": 300}) == 300
+    assert _effective_n({"type": "kaplan_meier"}) is None
+
+
+def test_effective_n_factor_decomposition():
+    assert _effective_n({
+        "type": "factor_decomposition", "n_observations": 200,
+    }) == 200
+    assert _effective_n({"type": "factor_decomposition"}) is None
+
+
+def test_effective_n_cluster_analysis():
+    assert _effective_n({
+        "type": "cluster_analysis", "n_observations": 150,
+    }) == 150
+    assert _effective_n({"type": "cluster_analysis"}) is None
+
+
+def test_effective_n_rdd_deliberately_skipped():
+    """RDD's ``effective_n_*`` fields are bandwidth-restricted by
+    construction — narrowing IS the analysis, not silent filtering.
+    The audit deliberately does not extract an N from these payloads;
+    if a future revision changes that, this test should be updated
+    alongside the new branch in ``_effective_n``."""
+    assert _effective_n({
+        "type": "rdd", "effective_n_left": 50, "effective_n_right": 50,
+        "effective_n_total": 100,
+    }) is None
+
+
+def test_effective_n_did_event_study_deliberately_skipped():
+    """DiD event study's only N-like field is ``n_treated_per_group``
+    (per-cohort treated-unit counts) — units, not rows, and not even
+    all units (untreated controls aren't counted). Comparing to
+    source dataset rows is a units-vs-rows mismatch, so the audit
+    deliberately skips it."""
+    assert _effective_n({
+        "type": "did_event_study",
+        "n_treated_per_group": {"2010": 40, "2012": 30},
+    }) is None
+
+
 # ---------------------------------------------------------------------------
 # _check_row_count — integration with real CSV
 # ---------------------------------------------------------------------------
@@ -213,6 +273,170 @@ def test_check_applies_to_magnitude_table(dataset_100):
     msg = _check_row_count(payload, "data.csv", 100)
     assert msg is not None
     assert "n=50" in msg
+
+
+# ---------------------------------------------------------------------------
+# Sanitizer → row-count audit integration. The hand-built payloads
+# above don't exercise the real handoff: the helpers emit
+# ``coefficient_table_with_fit_stats`` (the canonical name) but
+# earlier ``_effective_n`` only matched the legacy ``linear_regression``
+# alias, so the audit silently skipped every regression result that
+# went through the sanitizer. This block runs payloads through
+# ``sanitize()`` and confirms the audit fires on the sanitized
+# output regardless of which alias the raw payload carries.
+# ---------------------------------------------------------------------------
+
+def _raw_regression_payload(type_name: str, n: int) -> dict:
+    """Minimal raw regression payload that passes ``_sanitize_linear_regression``.
+
+    Covers the structural required set (``_OLS_REQUIRED``) and nothing
+    more; intercept-only fit so no coefficient-name cross-field
+    validation comes into play.
+    """
+    return {
+        "type": type_name,
+        "n": n,
+        "response_variable": "y",
+        "predictor_variables": [],
+        "coefficients": {"(Intercept)": 1.0},
+        "standard_errors": {"(Intercept)": 0.1},
+    }
+
+
+def test_sanitizer_to_audit_canonical_type_fires(dataset_100):
+    """Real-pipeline regression: helper emits the canonical name,
+    sanitizer keeps it, audit must see n=80 < source N=100 and flag.
+    Previously this silently passed because ``_effective_n`` only
+    matched the legacy alias."""
+    from nora.sanitizer import sanitize
+
+    raw = _raw_regression_payload("coefficient_table_with_fit_stats", 80)
+    sanitized = sanitize(raw)
+    assert sanitized.ok, sanitized.rejection_reason
+    msg = _check_row_count(sanitized.sanitized or {}, "data.csv", 100)
+    assert msg is not None
+    assert "ROW COUNT CHANGE" in msg
+    assert "n=80" in msg
+
+
+def test_sanitizer_to_audit_legacy_alias_fires(dataset_100):
+    """Same path with the legacy alias — older stored payloads and
+    scripts that hand-craft ``result(type='linear_regression', ...)``
+    must keep working."""
+    from nora.sanitizer import sanitize
+
+    raw = _raw_regression_payload("linear_regression", 80)
+    sanitized = sanitize(raw)
+    assert sanitized.ok, sanitized.rejection_reason
+    msg = _check_row_count(sanitized.sanitized or {}, "data.csv", 100)
+    assert msg is not None
+    assert "ROW COUNT CHANGE" in msg
+    assert "n=80" in msg
+
+
+# ---------------------------------------------------------------------------
+# Sanitizer → audit handoff for the other 0.10 shapes. Same
+# motivation as the regression-bucket test above: hand-built payloads
+# don't exercise the real ``sanitize() → _check_row_count`` flow, so
+# silent gaps in ``_effective_n``'s type dispatch slip past unit
+# tests.
+# ---------------------------------------------------------------------------
+
+def test_sanitizer_to_audit_correlation_matrix_fires(dataset_100):
+    from nora.sanitizer import sanitize
+
+    raw = {
+        "type": "correlation_matrix",
+        "n": 70,
+        "missing_count": 10,
+        "variables": ["x", "y"],
+        "correlations": {"x": {"x": 1.0, "y": 0.5}, "y": {"x": 0.5, "y": 1.0}},
+    }
+    sanitized = sanitize(raw)
+    assert sanitized.ok, sanitized.rejection_reason
+    msg = _check_row_count(sanitized.sanitized or {}, "data.csv", 100)
+    assert msg is not None
+    assert "ROW COUNT CHANGE" in msg
+    # n + missing_count = 80, audit reports n=80 vs source 100
+    assert "n=80" in msg
+
+
+def test_sanitizer_to_audit_marginal_effects_fires(dataset_100):
+    from nora.sanitizer import sanitize
+
+    raw = {
+        "type": "marginal_effects",
+        "n": 80,
+        "method": "ame",
+        "variables": ["age"],
+        "effects": {"age": 0.012},
+    }
+    sanitized = sanitize(raw)
+    assert sanitized.ok, sanitized.rejection_reason
+    msg = _check_row_count(sanitized.sanitized or {}, "data.csv", 100)
+    assert msg is not None
+    assert "n=80" in msg
+
+
+def test_sanitizer_to_audit_kaplan_meier_fires(dataset_100):
+    from nora.sanitizer import sanitize
+
+    raw = {
+        "type": "kaplan_meier",
+        "time_variable": "t",
+        "event_variable": "ev",
+        "n_subjects": 80,
+        "n_failures": 30,
+    }
+    sanitized = sanitize(raw)
+    assert sanitized.ok, sanitized.rejection_reason
+    msg = _check_row_count(sanitized.sanitized or {}, "data.csv", 100)
+    assert msg is not None
+    assert "n=80" in msg
+
+
+def test_sanitizer_to_audit_factor_decomposition_fires(dataset_100):
+    from nora.sanitizer import sanitize
+
+    raw = {
+        "type": "factor_decomposition",
+        "method": "pca",
+        "n_observations": 80,
+        "n_variables": 2,
+        "n_components": 1,
+        "variables": ["x", "y"],
+        "components": ["PC1"],
+        "loadings": {"x": {"PC1": 0.7}, "y": {"PC1": 0.7}},
+    }
+    sanitized = sanitize(raw)
+    assert sanitized.ok, sanitized.rejection_reason
+    msg = _check_row_count(sanitized.sanitized or {}, "data.csv", 100)
+    assert msg is not None
+    assert "n=80" in msg
+
+
+def test_sanitizer_to_audit_cluster_analysis_fires(dataset_100):
+    from nora.sanitizer import sanitize
+
+    raw = {
+        "type": "cluster_analysis",
+        "method": "kmeans",
+        "n_observations": 80,
+        "n_clusters": 2,
+        "n_features": 2,
+        "variables": ["x", "y"],
+        "cluster_labels": ["c1", "c2"],
+        "cluster_sizes": {"c1": 40, "c2": 40},
+        "centroids": {
+            "c1": {"x": 0.0, "y": 0.0},
+            "c2": {"x": 1.0, "y": 1.0},
+        },
+    }
+    sanitized = sanitize(raw)
+    assert sanitized.ok, sanitized.rejection_reason
+    msg = _check_row_count(sanitized.sanitized or {}, "data.csv", 100)
+    assert msg is not None
+    assert "n=80" in msg
 
 
 # ---------------------------------------------------------------------------

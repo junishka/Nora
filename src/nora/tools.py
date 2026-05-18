@@ -205,7 +205,13 @@ def _effective_n(payload: dict[str, Any]) -> int | None:
     suppressed so summation would underestimate).
     """
     t = payload.get("type")
-    if t == "linear_regression":
+    # ``coefficient_table_with_fit_stats`` is the canonical name for
+    # the regression bucket as emitted by the R / Python / Stata
+    # helpers; ``linear_regression`` is the legacy alias kept on read
+    # for older stored payloads. See ``sanitizer.py`` for the alias
+    # definition. ``result_render.py`` handles the same pair inline
+    # in its dispatch table.
+    if t in ("linear_regression", "coefficient_table_with_fit_stats"):
         n = payload.get("n")
         return n if isinstance(n, int) else None
     if t == "t_test":
@@ -259,6 +265,43 @@ def _effective_n(payload: dict[str, Any]) -> int | None:
             else:
                 any_suppressed = True
         return None if any_suppressed else total
+    if t == "correlation_matrix":
+        # n = complete-cases count; missing_count = rows dropped by
+        # listwise NA-removal on the chosen variables. Sum gives the
+        # rows the DataFrame had when the correlation was computed,
+        # which is what we want to compare to source_n. Same pattern
+        # as ``descriptive`` above.
+        n = payload.get("n")
+        m = payload.get("missing_count")
+        if isinstance(n, int) and isinstance(m, int):
+            return n + m
+        return None
+    if t == "marginal_effects":
+        n = payload.get("n")
+        return n if isinstance(n, int) else None
+    if t == "kaplan_meier":
+        # Subject-level count, not row-level. The KM helper consumes
+        # wide-form survival data (one row per subject), so for that
+        # use case n_subjects == source row count. Long-form / split-
+        # episode data isn't the helper's intended input and would
+        # legitimately false-flag here; KM users should ship wide-form.
+        n = payload.get("n_subjects")
+        return n if isinstance(n, int) else None
+    if t in ("factor_decomposition", "cluster_analysis"):
+        n = payload.get("n_observations")
+        return n if isinstance(n, int) else None
+    # Deliberately NOT handled — the absence is intentional, not a
+    # forgotten branch:
+    # - ``rdd``: only emits ``effective_n_left`` / ``effective_n_right``
+    #   / ``effective_n_total``, all bandwidth-restricted by
+    #   construction. Comparing to source_n would false-flag every
+    #   run since narrowing to the bandwidth IS the analysis.
+    # - ``did_event_study``: only emits ``n_treated_per_group`` (per-
+    #   cohort treated-unit counts). Not rows, and not even total
+    #   units (untreated controls aren't counted) — units-vs-rows
+    #   mismatch against source_n.
+    # Revisit if either schema gains a "rows the analysis ingested"
+    # field.
     return None
 
 
@@ -348,7 +391,10 @@ def _summarize(payload: dict[str, Any]) -> str:
     lives, not the individual tool results.
     """
     t = payload.get("type")
-    if t == "linear_regression":
+    # Same alias pair as ``_effective_n`` above — match both so the
+    # regression-bucket one-liner fires regardless of which name the
+    # emitting helper used.
+    if t in ("linear_regression", "coefficient_table_with_fit_stats"):
         n = payload.get("n")
         r2 = payload.get("r_squared")
         k = len(payload.get("predictor_variables", []))
@@ -423,7 +469,12 @@ def _summarize(payload: dict[str, Any]) -> str:
 # (condition_number, partial_residuals, …) silently leaked into the
 # compact view because only one of the two copies got updated.
 _VIEW_COEFFICIENTS_DROP_FIELDS: dict[str, tuple[str, ...]] = {
+    # Both the legacy ``linear_regression`` and the canonical
+    # ``coefficient_table_with_fit_stats`` map to the same drop set —
+    # the trim follows the payload shape, not the type name. Same
+    # alias treatment as ``_HANDLERS`` in ``result_render.py``.
     "linear_regression": ("vcov", "vif"),
+    "coefficient_table_with_fit_stats": ("vcov", "vif"),
 }
 
 
@@ -515,7 +566,7 @@ def _compact_payload(sanitized: dict[str, Any]) -> dict[str, Any]:
 #
 # Stage 2 — markdown summarization, fires at ``_INLINE_MARKDOWN_BUDGET``:
 # even after stripping payloads, very heavy turns (e.g., 20+
-# regression batch with verbose markdown) can still ship 30k+ chars
+# regression batch with verbose markdown) can still ship 45k+ chars
 # of tables inline. At this point we replace each entry's
 # ``markdown`` with a one-line summary noting the result_id and
 # instruction to call ``expand_result`` for the table. This is the
@@ -526,8 +577,16 @@ def _compact_payload(sanitized: dict[str, Any]) -> dict[str, Any]:
 # ``label``, ``type``, ``n``, ``summary``, and any error fields —
 # enough for the model to compare batches and decide which to
 # inspect deeper.
+#
+# Budget tuning: ``_INLINE_MARKDOWN_BUDGET`` was 30k originally,
+# bumped to 45k so a typical 10–15-regression batch (common when
+# the model runs the same spec across an asset-category panel) fits
+# inline without the model having to expand each result manually.
+# At ~3 chars/token for table markdown that's ~15k tokens per
+# submit_script call — small fraction of even the 200k context
+# window and well under 2% on 1M-context configurations.
 _INLINE_PAYLOAD_BUDGET = 12_000
-_INLINE_MARKDOWN_BUDGET = 30_000
+_INLINE_MARKDOWN_BUDGET = 45_000
 
 
 def _trim_oversize_inline_payloads(results: list[dict[str, Any]]) -> dict[str, bool]:
@@ -1293,8 +1352,23 @@ def _resolve_sdc_and_source_n(
     if source_dataset:
         try:
             policy_obj = policy_module.load_policy(cwd)
+            # Policy keys are dataset basenames (see policy.py:134-137:
+            # "datasets keys are dataset filenames (not full paths)").
+            # ``get_schema`` honours this contract by passing
+            # ``path.name``; here we must do the same — otherwise the
+            # model passing ``./data.csv`` or ``sub/data.csv`` as
+            # ``source_dataset`` silently misses a policy entry keyed
+            # ``data.csv`` and a researcher's explicit
+            # ``non_disclosive_variables`` opt-in is ignored. Path
+            # resolution failures fall back to the raw string; the
+            # lookup will just miss, which is no worse than the prior
+            # behaviour.
+            try:
+                dataset_key = resolve_in_cwd(source_dataset).name
+            except PathEscapeError:
+                dataset_key = source_dataset
             non_disclosive = policy_module.non_disclosive_for(
-                policy_obj, source_dataset,
+                policy_obj, dataset_key,
             )
         except Exception:  # noqa: BLE001 — policy load must never block sanitization
             non_disclosive = frozenset()
@@ -2490,7 +2564,10 @@ async def compose_results(args: dict[str, Any]) -> dict[str, Any]:
 
     # Walk the spec collecting (rid, session_path) pairs for lookup.
     # Each row's session_path is optional — when absent we resolve to
-    # the current session.
+    # the current session. Two row shapes accepted (mirroring
+    # ``compose_layout``): a bare result_id string (minimal-friction
+    # form, store provides the label) OR an explicit dict with
+    # ``result_id`` and optional ``label`` / ``session_path`` overrides.
     referenced: list[tuple[str, str | None]] = []
     groups = spec.get("groups")
     if isinstance(groups, list):
@@ -2501,6 +2578,10 @@ async def compose_results(args: dict[str, Any]) -> dict[str, Any]:
             if not isinstance(rows, list):
                 continue
             for row in rows:
+                if isinstance(row, str):
+                    if row:
+                        referenced.append((row, None))
+                    continue
                 if not isinstance(row, dict):
                     continue
                 rid = row.get("result_id")
@@ -2521,6 +2602,11 @@ async def compose_results(args: dict[str, Any]) -> dict[str, Any]:
     # last-write-wins behavior. Surfaced via the
     # ``rid_collisions_across_sessions`` hint when it actually fires.
     payloads_by_id: dict[str, dict[str, Any]] = {}
+    # Store-resolved helper-call label per rid, used by
+    # ``compose_layout`` to auto-label rows when the spec uses the
+    # bare-string row shape. Keeps the model from having to re-type
+    # labels it already named at script time.
+    labels_by_id: dict[str, str] = {}
     missing: list[str] = []
     denied: list[str] = []
     collisions: list[str] = []
@@ -2557,6 +2643,10 @@ async def compose_results(args: dict[str, Any]) -> dict[str, Any]:
                 collisions.append(rid)
             else:
                 payloads_by_id[rid] = row_obj.sanitized_payload
+                # Stored label only on first resolution — colliding
+                # rids hit the error path above anyway.
+                if isinstance(row_obj.label, str) and row_obj.label:
+                    labels_by_id[rid] = row_obj.label
 
     # Hard-reject the spec when ANY rid resolves to two different
     # cross-session payloads. Earlier behavior assigned the second
@@ -2587,7 +2677,7 @@ async def compose_results(args: dict[str, Any]) -> dict[str, Any]:
         })
 
     from nora.result_render import compose_layout
-    markdown = compose_layout(spec, payloads_by_id)
+    markdown = compose_layout(spec, payloads_by_id, labels_by_id)
     if markdown is None:
         return _as_mcp_text({
             "status": "error",

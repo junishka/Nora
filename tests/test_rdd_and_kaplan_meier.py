@@ -261,3 +261,35 @@ def test_km_logrank_chi_preserved_when_grouped() -> None:
     assert "logrank_chi_squared" in s
     assert "logrank_p_value" in s
     assert "n_groups" in s
+
+
+def test_km_n_failures_below_threshold_is_suppressed() -> None:
+    """KM-on-rare-events: a survival curve with 3 deaths discloses
+    those 3 individuals the same way Cox with the same n_failures
+    does. The Cox path already coarsens this via
+    ``_coarsen_small_cox_counts``; KM previously kept the exact
+    count, leaving the same disclosure surface unguarded. The fix
+    routes KM through the same helper so the two estimators apply
+    the same rule to identically-shaped data."""
+    p = _good_km()
+    p["n_failures"] = 3
+    res = sanitize(p)
+    assert res.ok, res.rejection_reason
+    assert res.sanitized["n_failures"] == "<10", (
+        f"n_failures=3 must be coarsened (matching the Cox path), "
+        f"got {res.sanitized['n_failures']!r}"
+    )
+    assert any("n_failures" in t for t in res.transformations)
+
+
+def test_km_zero_failures_left_as_zero() -> None:
+    """Mirrors ``test_ols_cox_zero_failures_left_as_zero``: the
+    suppression rule fires for ``0 < n < threshold``. Zero events
+    means there is no individual to identify, so the value passes
+    through unchanged. Without this gate, a study where nothing
+    happened would be over-suppressed."""
+    p = _good_km()
+    p["n_failures"] = 0
+    res = sanitize(p)
+    assert res.ok, res.rejection_reason
+    assert res.sanitized["n_failures"] == 0

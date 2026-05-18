@@ -438,6 +438,96 @@ def test_render_correlation_matrix_has_diagonal_ones() -> None:
     assert "method: pearson" in md
 
 
+def test_render_cluster_analysis_kmeans_has_centroids_matrix() -> None:
+    """Standard kmeans path: centroids present, full cluster × variable
+    matrix with the Size column. Pins the existing render shape so the
+    DBSCAN no-centroids branch added alongside doesn't accidentally
+    regress this surface."""
+    payload = {
+        "type": "cluster_analysis",
+        "method": "kmeans",
+        "n_observations": 200,
+        "n_clusters": 2,
+        "n_features": 2,
+        "variables": ["age", "income"],
+        "cluster_labels": ["c1", "c2"],
+        "cluster_sizes": {"c1": 80, "c2": 120},
+        "centroids": {
+            "c1": {"age": 30.0, "income": 50000.0},
+            "c2": {"age": 45.0, "income": 75000.0},
+        },
+        "silhouette_score": 0.42,
+    }
+    md = render_table(payload)
+    assert md is not None
+    assert "Cluster" in md and "Size" in md
+    assert "age" in md and "income" in md
+    assert "c1" in md and "c2" in md
+    # Caption carries method + n + k + silhouette.
+    assert "kmeans" in md
+    assert "n = 200" in md
+    assert "k = 2" in md
+    assert "silhouette" in md
+
+
+def test_render_cluster_analysis_dbscan_renders_sizes_only_table() -> None:
+    """DBSCAN / HDBSCAN have no centroids by construction — the
+    sanitizer explicitly accepts payloads without them
+    (``_CLUSTER_METHODS_WITHOUT_CENTROIDS`` at sanitizer.py:4611).
+    Before the fix, the renderer returned None for any centroid-less
+    payload, so a successful density-based cluster run produced no
+    embedded markdown in the chat. The fallback now renders a
+    sizes-only ``Cluster | Size`` table plus the standard caption,
+    so the model has something to read instead of silently nothing.
+    """
+    payload = {
+        "type": "cluster_analysis",
+        "method": "dbscan",
+        "n_observations": 200,
+        "n_clusters": 3,
+        "n_features": 2,
+        "variables": ["age", "income"],
+        "cluster_labels": ["c1", "c2", "c3"],
+        "cluster_sizes": {"c1": 60, "c2": 47, "c3": 88},
+        "n_noise_points": 5,
+        "silhouette_score": 0.42,
+    }
+    md = render_table(payload)
+    assert md is not None, (
+        "DBSCAN payload sanitizes OK but produced no markdown — "
+        "renderer should fall through to a sizes-only table when "
+        "centroids are absent by method."
+    )
+    assert "Cluster" in md and "Size" in md
+    for cl in ("c1", "c2", "c3"):
+        assert cl in md
+    # n_noise_points surfaced in the caption — DBSCAN-specific
+    # diagnostic that the model needs to interpret cluster quality.
+    assert "noise = 5" in md
+    # Standard caption parts still present.
+    assert "dbscan" in md
+    assert "n = 200" in md
+    assert "k = 3" in md
+
+
+def test_render_cluster_analysis_dbscan_without_cluster_labels_returns_none() -> None:
+    """Defensive: if a DBSCAN payload reaches the renderer with no
+    cluster_labels list at all, there's nothing to drive the sizes
+    table, so returning None is correct. Pins the boundary — the
+    fix shouldn't render an empty table."""
+    payload = {
+        "type": "cluster_analysis",
+        "method": "dbscan",
+        "n_observations": 200,
+        "n_clusters": 0,
+        "n_features": 2,
+        "variables": ["age", "income"],
+        "cluster_labels": [],
+        "cluster_sizes": {},
+    }
+    assert render_table(payload) is None
+
+
 # ---------------------------------------------------------------------------
 # expand_result(view="markdown") end-to-end
 # ---------------------------------------------------------------------------
@@ -689,6 +779,91 @@ def test_compose_layout_multi_group_has_bold_header_rows() -> None:
     pos_h2 = md.find("**H2: indirect**")
     pos_b = md.find("outcome B")
     assert 0 < pos_h1 < pos_a < pos_h2 < pos_b
+
+
+def test_compose_layout_accepts_bare_string_rows() -> None:
+    """Bare result_id strings in the ``rows`` list are the minimal-
+    friction row shape — the model picks groups, hands over a flat
+    list of ids per group, the store labels them. Pin that strings
+    and dicts interoperate in the same ``rows`` list and that the
+    rendered cell values are identical to the equivalent dict form."""
+    payloads = {
+        "M1": _payload({"x": 0.020}, {"x": 0.005}, {"x": 0.001}),
+        "M2": _payload({"x": 0.015}, {"x": 0.003}, {"x": 0.0001}),
+    }
+    labels = {"M1": "ln_rev", "M2": "ln_exp"}
+    spec = {
+        "columns": [{"id": "x", "label": "treat"}],
+        "groups": [{"label": None, "rows": ["M1", "M2"]}],
+    }
+    md = compose_layout(spec, payloads, labels)
+    assert md is not None
+    # Store-provided labels surface as row labels — model didn't
+    # have to retype them.
+    assert "ln_rev" in md
+    assert "ln_exp" in md
+    # Cell values render identically to the explicit-dict form.
+    assert "0.02 (0.005) [0.001]" in md or "0.02 (0.005) [<0.001]" in md
+
+
+def test_compose_layout_bare_string_falls_back_to_rid_without_label_map() -> None:
+    """When ``labels_by_id`` isn't passed (legacy callers, tests
+    that drive the renderer directly), bare-string rows fall back
+    to using the rid as the row label. Pin so the no-store path
+    stays predictable."""
+    payloads = {"M1": _payload({"x": 0.5}, {"x": 0.05}, {"x": 0.001})}
+    spec = {
+        "columns": [{"id": "x", "label": "x"}],
+        "groups": [{"label": None, "rows": ["M1"]}],
+    }
+    md = compose_layout(spec, payloads)
+    assert md is not None
+    assert "M1" in md
+
+
+def test_compose_layout_dict_row_label_overrides_store_label() -> None:
+    """When a row dict supplies an explicit ``label``, it overrides
+    the store-provided label. Use case: the stored label is too
+    verbose for the comparison context, or two rows from different
+    sources need consistent renaming."""
+    payloads = {"M1": _payload({"x": 0.5}, {"x": 0.05}, {"x": 0.001})}
+    labels = {"M1": "very_verbose_helper_call_label_from_script"}
+    spec = {
+        "columns": [{"id": "x", "label": "x"}],
+        "groups": [{"label": None, "rows": [
+            {"result_id": "M1", "label": "ln_rev"},
+        ]}],
+    }
+    md = compose_layout(spec, payloads, labels)
+    assert md is not None
+    assert "ln_rev" in md
+    # Override wins; the verbose store label does NOT appear.
+    assert "very_verbose_helper_call_label_from_script" not in md
+
+
+def test_compose_layout_mixed_string_and_dict_rows_in_one_group() -> None:
+    """Strings and dicts coexist in the same ``rows`` list. A
+    research batch can have most rows auto-labeled from the store
+    plus one row that needs an explicit rename — both work in the
+    same group without forcing the model to convert everything to
+    the verbose dict form."""
+    payloads = {
+        "M1": _payload({"x": 0.020}, {"x": 0.005}, {"x": 0.001}),
+        "M2": _payload({"x": 0.015}, {"x": 0.003}, {"x": 0.0001}),
+    }
+    labels = {"M1": "ln_rev", "M2": "ln_exp"}
+    spec = {
+        "columns": [{"id": "x", "label": "treat"}],
+        "groups": [{"label": None, "rows": [
+            "M1",                                          # auto-label
+            {"result_id": "M2", "label": "renamed"},      # explicit
+        ]}],
+    }
+    md = compose_layout(spec, payloads, labels)
+    assert md is not None
+    assert "ln_rev" in md
+    assert "renamed" in md
+    assert "ln_exp" not in md  # store label suppressed by override
 
 
 def test_compose_layout_returns_none_for_malformed_specs() -> None:

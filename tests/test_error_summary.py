@@ -121,9 +121,11 @@ def test_python_chained_exceptions_keeps_last_one() -> None:
 # ---------------------------------------------------------------------------
 
 def test_r_error_block_with_calls_chain() -> None:
-    """R's ``Error`` anchor + the ``Calls:`` trailer survive. The
-    call deparse (``in eval(predvars, data, env)``) and message
-    body are both script-controlled and now redacted."""
+    """R's ``Error`` anchor + the ``Calls:`` trailer survive, and
+    under the denylist posture the call deparse and message body
+    forward through ``_forward_short_body`` so the model can read
+    the actual diagnostic ("object 'wage' not found") instead of a
+    redacted placeholder."""
     stderr = (
         "Loading required package: stats\n"
         "Error in eval(predvars, data, env) : object 'wage' not found\n"
@@ -132,20 +134,24 @@ def test_r_error_block_with_calls_chain() -> None:
     )
     excerpt = extract_debug_excerpt("", stderr, 1, "R")
     assert excerpt is not None
-    # The "Error :" anchor and "Calls:" trailer are parser-owned.
-    assert "Error :" in excerpt
+    # The "Error in <call> : <body>" framing and "Calls:" trailer
+    # are now both forwarded. Call deparse helps the model locate
+    # the failure ("in eval(predvars, ...)"); body names the missing
+    # symbol ("object 'wage' not found").
+    assert "Error in" in excerpt
+    assert "eval(predvars" in excerpt
+    assert "object 'wage' not found" in excerpt
     assert "Calls: lm -> eval -> eval" in excerpt
-    # Call deparse and body redacted.
-    assert "eval(predvars" not in excerpt
-    assert "object 'wage' not found" not in excerpt
-    assert "[message body redacted]" in excerpt
     # "Execution halted" trailer is noise — still dropped.
     assert "Execution halted" not in excerpt
 
 
-def test_r_multiline_error_message_redacted() -> None:
-    """Multi-line error message bodies are redacted regardless of
-    their wrap. The Calls: trailer remains as parser-owned framing."""
+def test_r_multiline_error_message_forwarded() -> None:
+    """Multi-line error message bodies forward up to the cap. The
+    Calls: trailer remains as parser-owned framing. Pre-denylist
+    this was ``test_r_multiline_error_message_redacted`` and asserted
+    that ``NA/NaN/Inf in 'x'`` did NOT appear; under the new posture
+    the model needs to read that diagnostic to fix the design matrix."""
     stderr = (
         "Error in lm.fit(x, y, offset = offset, singular.ok = singular.ok, ...) : \n"
         "  NA/NaN/Inf in 'x'\n"
@@ -153,16 +159,18 @@ def test_r_multiline_error_message_redacted() -> None:
     )
     excerpt = extract_debug_excerpt("", stderr, 1, "R")
     assert excerpt is not None
-    assert "NA/NaN/Inf in 'x'" not in excerpt
-    assert "lm.fit(x, y" not in excerpt
+    assert "NA/NaN/Inf in 'x'" in excerpt
+    assert "lm.fit(x, y" in excerpt
     assert "Calls: lm -> lm.fit" in excerpt
-    assert "Error :" in excerpt
+    assert "Error in" in excerpt
 
 
 def test_r_only_last_error_is_returned() -> None:
     """If a script logs multiple errors (e.g., recovered errors
-    inside ``tryCatch``), only the LAST top-level one's Calls
-    trailer remains. Both error bodies are redacted."""
+    inside ``tryCatch``), only the LAST top-level one's call +
+    body + Calls trailer is returned. The earlier ``foo()`` error
+    is dropped so the model focuses on the actual propagating
+    failure."""
     stderr = (
         "Error in foo() : early problem\n"
         "Error in bar() : the actual cause\n"
@@ -170,10 +178,12 @@ def test_r_only_last_error_is_returned() -> None:
     )
     excerpt = extract_debug_excerpt("", stderr, 1, "R")
     assert excerpt is not None
-    # Both bodies redacted.
-    assert "the actual cause" not in excerpt
+    # The LAST error's body and call survive; the earlier one is
+    # dropped entirely (we extract only the last match).
+    assert "the actual cause" in excerpt
     assert "early problem" not in excerpt
-    # The Calls trailer of the LAST error survives.
+    assert "foo()" not in excerpt
+    assert "bar()" in excerpt
     assert "Calls: bar -> baz" in excerpt
 
 
@@ -199,22 +209,20 @@ r(111);
 """
 
 
-def test_stata_extract_anchors_on_rc_and_command_verb() -> None:
-    """The failing command's verb (``regress``) and the rc line are
-    parser-owned framing and pass through. The command's arguments
-    (``y x_missing``) and the error message body (``variable
-    x_missing not found``) are script-controlled and redacted —
-    a macro-expanded raw value in the args used to ride that
-    channel directly to the model."""
+def test_stata_extract_anchors_on_rc_and_command_forwards_body() -> None:
+    """The failing command echo + error body forward under the
+    denylist posture so the model can read the actual diagnostic
+    ("variable x_missing not found") and the command that triggered
+    it ("regress y x_missing"). The extractor still anchors on
+    ``r(<code>);`` and walks back to the most recent ``. <cmd>`` —
+    unrelated earlier command echoes never reach the excerpt
+    (that's what bounds the per-error bandwidth)."""
     excerpt = extract_debug_excerpt(_STATA_LOG_TYPICAL, "", 111, "Stata")
     assert excerpt is not None
-    # Verb survives.
-    assert ". regress" in excerpt
-    # Args dropped.
-    assert "x_missing" not in excerpt
-    # Error body dropped.
-    assert "variable x_missing not found" not in excerpt
-    assert "[message body redacted]" in excerpt
+    # Failing command line forwards in full.
+    assert ". regress y x_missing" in excerpt
+    # Error body forwards.
+    assert "variable x_missing not found" in excerpt
     # rc line preserved.
     assert "r(111);" in excerpt
     # The unrelated `set more off` / `use ...` echos must NOT be
@@ -234,13 +242,13 @@ def test_stata_excludes_end_of_dofile_trailer_rc() -> None:
     assert "end of do-file" not in excerpt
 
 
-def test_stata_unwraps_modifier_prefixes_to_underlying_verb() -> None:
+def test_stata_modifier_wrapped_command_forwards_full_line() -> None:
     """Stata wrappers like ``capture``, ``quietly``, ``noisily`` take
-    another command as their body. Reporting the wrapper as the
-    failing verb (``capture``) is useless to the model — the
-    actionable information is the inner command (``regress``).
-    The extractor unwraps known modifier prefixes iteratively
-    before picking the verb."""
+    another command as their body. The old verb-only extractor
+    unwrapped these so the verb-only output named the inner command
+    (``regress`` rather than ``capture``). Under the denylist
+    posture the FULL command line forwards, so the model sees both
+    the wrapper and the inner command verbatim — no unwrap needed."""
     log_capture_noisily = (
         ". capture noisily regress y x_missing\n"
         "variable x_missing not found\n"
@@ -252,21 +260,16 @@ def test_stata_unwraps_modifier_prefixes_to_underlying_verb() -> None:
     )
     excerpt = extract_debug_excerpt(log_capture_noisily, "", 111, "Stata")
     assert excerpt is not None
-    assert ". regress" in excerpt, (
-        f"verb should unwrap to the inner command, got: {excerpt!r}"
-    )
-    assert "capture" not in excerpt
-    assert "noisily" not in excerpt
-    # Still no args / message body.
-    assert "x_missing" not in excerpt
-    assert "[message body redacted]" in excerpt
+    # Whole command line surfaces, including wrappers.
+    assert ". capture noisily regress y x_missing" in excerpt
+    assert "variable x_missing not found" in excerpt
     assert "r(111);" in excerpt
 
 
-def test_stata_unwraps_short_form_modifier_prefixes() -> None:
-    """Stata accepts short forms ``cap`` / ``qui`` / ``noi``. The
-    unwrapper covers those too — a script that hits an error via
-    ``qui summarize x`` should report ``summarize``, not ``qui``."""
+def test_stata_short_form_modifier_command_forwards_full_line() -> None:
+    """Same forwarding for the short-form wrappers (``cap``, ``qui``,
+    ``noi``). The full command line including the wrapper passes
+    through; the body names the missing variable."""
     log = (
         ". qui summarize bad_var\n"
         "variable bad_var not found\n"
@@ -278,47 +281,160 @@ def test_stata_unwraps_short_form_modifier_prefixes() -> None:
     )
     excerpt = extract_debug_excerpt(log, "", 111, "Stata")
     assert excerpt is not None
-    assert ". summarize" in excerpt
-    assert "qui" not in excerpt
-    assert "bad_var" not in excerpt
+    assert ". qui summarize bad_var" in excerpt
+    assert "variable bad_var not found" in excerpt
 
 
-def test_stata_modifier_only_command_redacts_completely() -> None:
-    """A pathological echo with ONLY a wrapper and nothing after
-    (the script body got cut by extraction) should fail closed:
-    no verb gets through. Without this guard, the wrapper itself
-    would survive as the verb after the strip loop empties the
-    token list."""
-    log = (
-        ". capture\n"
-        "r(198);\n"
-        "\n"
-        "end of do-file\n"
-        "\n"
-        "r(198);\n"
-    )
-    excerpt = extract_debug_excerpt(log, "", 198, "Stata")
-    assert excerpt is not None
-    # No verb survives.
-    assert ". " not in excerpt or "[command body redacted]" in excerpt
-    assert "capture" not in excerpt
-    assert "r(198);" in excerpt
-
-
-def test_stata_no_command_echo_returns_rc_only() -> None:
+def test_stata_no_command_echo_returns_body_and_rc() -> None:
     """If the executor truncated the log such that the failing
-    command isn't present, return the rc line only. The error
-    message body (``syntax error``) is data-controlled too and
-    is no longer forwarded — the rc code carries enough framing
-    for the model to know the failure class."""
+    command isn't present, the body still forwards alongside the
+    rc line — the model gets at least the diagnostic text
+    ("syntax error") even without a command line to anchor on."""
     log = (
         "syntax error\n"
         "r(198);\n"
     )
     excerpt = extract_debug_excerpt(log, "", 198, "Stata")
     assert excerpt is not None
-    assert "syntax error" not in excerpt
     assert "r(198);" in excerpt
+
+
+def test_stata_invalid_varname_surfaces_long_identifier() -> None:
+    """The denylist posture's main motivating case. A model-
+    constructed varname that overflows Stata's 32-char cap
+    triggers ``r(198) invalid varname`` and the failing identifier
+    must be visible so the model can shorten it without re-probing.
+    Before the relaxation the model saw ``. joinby [args redacted]``
+    + ``[message body redacted]`` and could not tell which name to
+    fix; now both the command line and the body forward."""
+    log = (
+        "_NORA_STATA_PREAMBLE_END_MARKER_\n\n"
+        ". use orgyears.dta, clear\n\n"
+        ". joinby ein using `orgyears'\n"
+        "highest_forprofit_title_pre_ceo_rank invalid varname\n"
+        "r(198);\n\n"
+        "end of do-file\n\n"
+        "r(198);\n"
+    )
+    excerpt = extract_debug_excerpt(log, "", 198, "Stata")
+    assert excerpt is not None
+    # Failing command line forwards in full.
+    assert ". joinby ein using `orgyears'" in excerpt
+    # The 36-char identifier the model needs to shorten is now
+    # visible in the body.
+    assert "highest_forprofit_title_pre_ceo_rank" in excerpt
+    assert "invalid varname" in excerpt
+    assert "r(198);" in excerpt
+
+
+def test_r_long_identifier_in_body_surfaces() -> None:
+    """The R analogue of the Stata invalid-varname case. A
+    ``object 'X' not found`` body with a long identifier X must
+    forward so the model can rename / add the column. Pre-denylist
+    the body was redacted wholesale and the model only saw
+    ``Error : [message body redacted]``."""
+    stderr = (
+        "Error in eval(predvars, data, env) : "
+        "object 'highest_forprofit_title_pre_ceo_rank' not found\n"
+        "Calls: lm -> eval -> eval\n"
+    )
+    excerpt = extract_debug_excerpt("", stderr, 1, "R")
+    assert excerpt is not None
+    assert "highest_forprofit_title_pre_ceo_rank" in excerpt
+    assert "object" in excerpt and "not found" in excerpt
+    assert "Calls: lm -> eval -> eval" in excerpt
+
+
+def test_stata_body_length_cap_truncates_verbose_diagnostic() -> None:
+    """Stata estimators occasionally emit multi-line diagnostics
+    that run to several hundred chars. The 200-char per-body cap
+    in ``_forward_short_body`` truncates without losing the head
+    of the message — the model still sees the failure type."""
+    long_diag = "convergence not achieved; " + ("residual deviance increased; " * 30)
+    log = (
+        ". glm y x, family(poisson)\n"
+        f"{long_diag}\n"
+        "r(430);\n"
+        "\n"
+        "end of do-file\n"
+        "\n"
+        "r(430);\n"
+    )
+    excerpt = extract_debug_excerpt(log, "", 430, "Stata")
+    assert excerpt is not None
+    # The first chunk of the diagnostic is present.
+    assert "convergence not achieved" in excerpt
+    # The truncation marker is present.
+    assert "[...]" in excerpt
+    # The whole long diagnostic is NOT echoed — the cap fired.
+    assert long_diag not in excerpt
+
+
+def test_r_data_shaped_body_redacted() -> None:
+    """``stop(paste(df$row, collapse=","))``-style exfil where the
+    body matches the multi-cell row shape gets caught by
+    ``_body_looks_data_shaped`` and replaced with the data-shape
+    marker. The detector flags the run because at least one token
+    is non-identifier-shape (numbers, quoted strings, a
+    name-with-space, a date) — the canonical row-dump fingerprint.
+    Pure-identifier lists pass through, see
+    ``test_r_identifier_list_body_forwards`` below."""
+    # Realistic ``str(df.iloc[0])`` shape: mixed numbers, names,
+    # dates, identifiers. At least one token violates the identifier
+    # alphabet (the space in "John Smith", the dash in "1985-01-01",
+    # the leading digits "42" and "100000").
+    row_dump = "42, John Smith, 1985-01-01, 100000, doctor, NY, 12345"
+    stderr = f"Error in stop(...) : {row_dump}\n"
+    excerpt = extract_debug_excerpt("", stderr, 1, "R")
+    assert excerpt is not None
+    assert "John Smith" not in excerpt
+    assert "100000" not in excerpt
+    assert "message body suppressed: looked data-shaped" in excerpt
+
+
+def test_r_identifier_list_body_forwards() -> None:
+    """The refinement to ``_body_looks_data_shaped``: a comma-
+    separated list of pure-identifier tokens is legitimate error
+    context — a Stata varlist, an R formula term list, a six-arg
+    function call — not a row dump. Forwarding it gives the model
+    the variable names it needs to fix the script. The data-shape
+    rule fires only when at least one token in the list is
+    non-identifier-shape (the canonical row-dump fingerprint)."""
+    # Realistic R error with a many-arg function call. Before the
+    # refinement, the 6+ comma-separated-tokens rule fired on this
+    # and the model saw "[message body suppressed: looked data-shaped]"
+    # instead of the missing-arg diagnostic.
+    stderr = (
+        "Error in pmin(a, b, c, d, e, f, g) : "
+        "object 'a' not found\n"
+    )
+    excerpt = extract_debug_excerpt("", stderr, 1, "R")
+    assert excerpt is not None
+    # The call args forward — model can see which function was called
+    # and what args were supplied.
+    assert "pmin(a, b, c, d, e, f, g)" in excerpt
+    assert "object 'a' not found" in excerpt
+    assert "message body suppressed" not in excerpt
+
+
+def test_stata_identifier_list_body_forwards() -> None:
+    """Same refinement at the Stata layer. A comma-separated varlist
+    in an error message must reach the model — these are exactly
+    the variable names the script tried to use and the model has
+    to read to fix the issue."""
+    log = (
+        ". collapse (mean) mpg, by(price, weight, length, displacement, gear_ratio, foreign)\n"
+        "invalid: mpg, price, weight, length, displacement, gear_ratio, foreign\n"
+        "r(198);\n\n"
+        "end of do-file\n\n"
+        "r(198);\n"
+    )
+    excerpt = extract_debug_excerpt(log, "", 198, "Stata")
+    assert excerpt is not None
+    # The body forwards even though it carries a 7-element
+    # comma-separated identifier list.
+    assert "invalid: mpg, price, weight" in excerpt
+    assert "message body suppressed" not in excerpt
 
 
 # ---------------------------------------------------------------------------

@@ -4762,9 +4762,12 @@ def _is_within(child: Path, parent: Path) -> bool:
 # warm-start replay → ``renderCanonicalResultTables`` can't parse it
 # → the result table renders blank. The tool side caps the inline
 # payload at ``_INLINE_PAYLOAD_BUDGET + _INLINE_MARKDOWN_BUDGET``
-# ≈ 42 KB (see ``tools.py``); 64 KB gives ~50% headroom for JSON
-# overhead and small fields, so cards never disappear on reload.
-_REPLAY_TEXT_ENVELOPE_CAP = 64 * 1024    # tool_result ``text`` JSON envelope
+# ≈ 57 KB (see ``tools.py``); 96 KB gives ~70% headroom for JSON
+# overhead and small fields (label, summary, transformations,
+# plot info across many results), so cards never disappear on reload.
+# Bumped from 64 KB alongside the markdown-budget bump from 30 KB
+# to 45 KB so the linked-constraint margin stays comfortable.
+_REPLAY_TEXT_ENVELOPE_CAP = 96 * 1024    # tool_result ``text`` JSON envelope
 _REPLAY_RAW_OUTPUT_CAP = 1 * 1024 * 1024  # raw_stdout / raw_stderr per tool_result
 _REPLAY_THINKING_CAP = 8 * 1024          # assistant_thinking text
 _REPLAY_TOOL_INPUT_CAP = 8 * 1024        # tool_call input fields (script code)
