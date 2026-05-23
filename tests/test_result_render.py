@@ -806,6 +806,158 @@ def test_compose_layout_accepts_bare_string_rows() -> None:
     assert "0.02 (0.005) [0.001]" in md or "0.02 (0.005) [<0.001]" in md
 
 
+def test_compose_layout_hoists_common_prefix_when_group_label_absent() -> None:
+    """When the script bakes a hypothesis tag into each helper call's
+    ``label("H2-comp :: ln_ceo_salary")`` arg and the compose spec
+    passes bare result_ids without setting ``group.label``, the
+    renderer auto-detects the shared ``<TAG> :: `` prefix, hoists
+    ``TAG`` to a bold group header row, and strips the prefix from
+    each row label. Addresses the rendered shape the model commonly
+    produces (flat ungrouped table with the hypothesis tag pasted
+    into every row's first cell) without depending on the model
+    later changing its labelling convention."""
+    payloads = {
+        "M1": _payload({"x": 0.020}, {"x": 0.005}, {"x": 0.001}),
+        "M2": _payload({"x": 0.015}, {"x": 0.003}, {"x": 0.0001}),
+        "M3": _payload({"x": 0.010}, {"x": 0.004}, {"x": 0.0050}),
+    }
+    labels = {
+        "M1": "H2-comp :: ln_ceo_salary",
+        "M2": "H2-comp :: ln_other_salaries_wages",
+        "M3": "H2-comp :: ln_comp_officers_total_990",
+    }
+    spec = {
+        "columns": [{"id": "x", "label": "fp x t0"}],
+        # No group.label set — the buggy shape we're consolidating.
+        "groups": [{"rows": ["M1", "M2", "M3"]}],
+    }
+    md = compose_layout(spec, payloads, labels)
+    assert md is not None
+    # The common tag becomes the bold group header.
+    assert "**H2-comp**" in md
+    # Row labels are stripped to just the variable name.
+    assert "ln_ceo_salary" in md
+    assert "ln_other_salaries_wages" in md
+    assert "ln_comp_officers_total_990" in md
+    # The duplicated "H2-comp ::" prefix is gone from every row.
+    assert "H2-comp ::" not in md
+    # Header precedes the first member row.
+    assert md.find("**H2-comp**") < md.find("ln_ceo_salary")
+
+
+def test_compose_layout_strips_common_prefix_when_group_label_matches() -> None:
+    """Model sets group.label to the hypothesis tag AND also bakes
+    the same tag into each row label (belt-and-suspenders shape).
+    Strip the prefix from rows so the tag isn't duplicated in every
+    cell, but keep the explicit group.label as the bold header."""
+    payloads = {
+        "M1": _payload({"x": 0.020}, {"x": 0.005}, {"x": 0.001}),
+        "M2": _payload({"x": 0.015}, {"x": 0.003}, {"x": 0.0001}),
+    }
+    spec = {
+        "columns": [{"id": "x", "label": "x"}],
+        "groups": [{
+            "label": "H2-comp",
+            "rows": [
+                {"result_id": "M1", "label": "H2-comp :: ln_ceo_salary"},
+                {"result_id": "M2", "label": "H2-comp :: ln_other_salaries_wages"},
+            ],
+        }],
+    }
+    md = compose_layout(spec, payloads)
+    assert md is not None
+    assert "**H2-comp**" in md
+    assert "ln_ceo_salary" in md
+    assert "ln_other_salaries_wages" in md
+    assert "H2-comp ::" not in md
+
+
+def test_compose_layout_leaves_alone_when_group_label_differs_from_common_prefix() -> None:
+    """Model set group.label to something specific that disagrees
+    with the common row prefix. The explicit choice wins — the
+    heuristic doesn't override a deliberate ``"H1: direct effect"``
+    header even when every row happens to carry an ``"H2 ::"``
+    prefix. Conservative: never silently rewrite the model's own
+    grouping decision."""
+    payloads = {
+        "M1": _payload({"x": 0.020}, {"x": 0.005}, {"x": 0.001}),
+        "M2": _payload({"x": 0.015}, {"x": 0.003}, {"x": 0.0001}),
+    }
+    spec = {
+        "columns": [{"id": "x", "label": "x"}],
+        "groups": [{
+            "label": "H1: direct effect",
+            "rows": [
+                {"result_id": "M1", "label": "H2 :: ln_ceo_salary"},
+                {"result_id": "M2", "label": "H2 :: ln_other_salaries_wages"},
+            ],
+        }],
+    }
+    md = compose_layout(spec, payloads)
+    assert md is not None
+    # Group header stays as the model wrote it.
+    assert "**H1: direct effect**" in md
+    # Row labels stay verbatim — the heuristic deferred.
+    assert "H2 :: ln_ceo_salary" in md
+    assert "H2 :: ln_other_salaries_wages" in md
+
+
+def test_compose_layout_partial_prefix_no_op() -> None:
+    """A group where SOME rows carry the prefix and some don't is
+    not uniformly tagged. Rewriting only the prefixed rows would
+    lose information (the un-prefixed row's full label IS its
+    full label). Leave the whole group alone."""
+    payloads = {
+        "M1": _payload({"x": 0.020}, {"x": 0.005}, {"x": 0.001}),
+        "M2": _payload({"x": 0.015}, {"x": 0.003}, {"x": 0.0001}),
+    }
+    spec = {
+        "columns": [{"id": "x", "label": "x"}],
+        "groups": [{
+            "rows": [
+                {"result_id": "M1", "label": "H2 :: ln_ceo_salary"},
+                {"result_id": "M2", "label": "raw_unprefixed_var"},
+            ],
+        }],
+    }
+    md = compose_layout(spec, payloads)
+    assert md is not None
+    # No bold header inserted.
+    assert "**H2**" not in md
+    # Both labels render verbatim.
+    assert "H2 :: ln_ceo_salary" in md
+    assert "raw_unprefixed_var" in md
+
+
+def test_compose_layout_single_colon_label_does_not_split() -> None:
+    """``"H1: direct effect"`` is a legitimate single-colon label
+    (the conventional group-header shape). The consolidation
+    heuristic only fires on the ``" :: "`` double-colon separator,
+    so a single-colon row label is left alone — pinning this so a
+    future tweak that broadens the separator regex doesn't quietly
+    mangle group headers that happen to live in row labels."""
+    payloads = {
+        "M1": _payload({"x": 0.020}, {"x": 0.005}, {"x": 0.001}),
+        "M2": _payload({"x": 0.015}, {"x": 0.003}, {"x": 0.0001}),
+    }
+    spec = {
+        "columns": [{"id": "x", "label": "x"}],
+        "groups": [{
+            "rows": [
+                {"result_id": "M1", "label": "H1: direct effect on rev"},
+                {"result_id": "M2", "label": "H1: direct effect on exp"},
+            ],
+        }],
+    }
+    md = compose_layout(spec, payloads)
+    assert md is not None
+    # No bold "**H1**" header hoisted (single colon doesn't qualify).
+    assert "**H1**" not in md
+    # Labels survive verbatim.
+    assert "H1: direct effect on rev" in md
+    assert "H1: direct effect on exp" in md
+
+
 def test_compose_layout_bare_string_falls_back_to_rid_without_label_map() -> None:
     """When ``labels_by_id`` isn't passed (legacy callers, tests
     that drive the renderer directly), bare-string rows fall back
