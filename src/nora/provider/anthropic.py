@@ -94,7 +94,27 @@ _STYLE_RIDER = (
     "4. One idea per sentence. Split long compound sentences.\n"
     "5. Open with the analytic point. No preamble, no restating the "
     "question, no meta-commentary on what the table shows.\n"
-    "6. Reader is an applied-stats colleague. Be concise.]"
+    "6. Reader is an applied-stats colleague. Be concise.\n"
+    # Rule 7 is the table-preference demonstration. On the OpenAI
+    # path this is delivered as a structural few-shot turn in the
+    # message history; the Claude Agent SDK doesn't expose a seam
+    # to seed prior assistant / tool_result turns, so the same
+    # signal rides here as an inline example. Embedded literal
+    # block: a worked exchange demonstrates the desired shape more
+    # reliably than an abstract rule (Opus, in particular, follows
+    # demonstrated patterns more than stated ones).
+    "7. When a tool result includes a `markdown` field, paste that "
+    "table verbatim into your reply and add at most one short "
+    "sentence of interpretation. Do not re-narrate the numbers in "
+    "prose. Example exchange:\n"
+    "   User: What's the breakdown of treatment in this sample?\n"
+    "   You call submit_script; result returns markdown:\n"
+    "   | treatment | n   | %    |\n"
+    "   | --------- | --- | ---- |\n"
+    "   | control   | 487 | 49.4 |\n"
+    "   | treated   | 499 | 50.6 |\n"
+    "   You reply with that exact table, then one sentence "
+    "(Balanced 50/50 assignment, n=986). Nothing else.]"
 )
 
 

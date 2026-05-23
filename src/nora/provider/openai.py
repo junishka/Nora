@@ -165,6 +165,117 @@ def _verify_lockdown(tools: list[dict[str, Any]]) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Few-shot turn (structural, not prompt text)
+# ---------------------------------------------------------------------------
+
+
+# One demonstration exchange prepended to the very first round of every
+# new session, BEFORE the real user message. The Responses API treats
+# these items the same as real prior conversation: the model sees
+# ``submit_script`` returning a payload whose ``markdown`` field is a
+# pipe table, and an assistant reply that pastes that table verbatim
+# followed by a single short sentence of interpretation. The point is
+# behavioral demonstration of the desired output shape, parallel to the
+# tool descriptions that say "Drop the markdown directly into your
+# reply" for ``compose_results`` / ``expand_result``.
+#
+# Why few-shot rather than another system-prompt rule. Rules describe
+# the desired behavior; demonstrations are the behavior. Demonstrations
+# carry stronger pull because the model has now SEEN the pattern in its
+# own conversation history. The same pull is unavailable here on the
+# Anthropic provider because the Claude Agent SDK doesn't expose a
+# point to seed prior assistant / tool_result turns; that path uses an
+# embedded example in ``_STYLE_RIDER`` instead.
+#
+# Token cost. ~350 input tokens on round 1 of session 1. Re-rides
+# implicitly via ``previous_response_id`` on every subsequent round in
+# the same session, so it pays this cost once per session, not per
+# turn.
+#
+# Stability of call_id. The ``fewshot_call_1`` id is a literal string
+# the model never produces (handler dispatch is name-keyed, not id-
+# keyed). It cannot collide with a real call because real ids come
+# from the OpenAI server side and use a different format.
+#
+# Opt out for A/B testing: ``NORA_DISABLE_FEWSHOT=1``.
+_FEWSHOT_USER_TEXT = (
+    "What's the breakdown of `treatment` in this sample?"
+)
+
+_FEWSHOT_TOOL_ARGS = json.dumps({
+    "language": "stata",
+    "code": 'nora_result_tab treatment, label("Treatment assignment")',
+    "label": "Treatment frequency",
+})
+
+_FEWSHOT_TOOL_OUTPUT = json.dumps({
+    "results": [
+        {
+            "status": "ok",
+            "result_id": "r_demo_treatment_freq",
+            "label": "Treatment assignment",
+            "type": "frequency_table",
+            "markdown": (
+                "| treatment | n   | %    |\n"
+                "| --------- | --- | ---- |\n"
+                "| control   | 487 | 49.4 |\n"
+                "| treated   | 499 | 50.6 |"
+            ),
+        }
+    ]
+})
+
+_FEWSHOT_ASSISTANT_TEXT = (
+    "| treatment | n   | %    |\n"
+    "| --------- | --- | ---- |\n"
+    "| control   | 487 | 49.4 |\n"
+    "| treated   | 499 | 50.6 |\n"
+    "\n"
+    "Balanced 50/50 assignment, n=986."
+)
+
+
+def _build_fewshot_items() -> list[dict[str, Any]]:
+    """Return the few-shot exchange as Responses-API input items.
+
+    Order matches a real prior turn: user message, function_call,
+    function_call_output, assistant message. Round-trips byte-for-byte
+    with what the server would emit for the same exchange, which is
+    why the demonstration registers as "real history" rather than a
+    style instruction.
+    """
+    return [
+        {
+            "role": "user",
+            "content": [{"type": "input_text", "text": _FEWSHOT_USER_TEXT}],
+        },
+        {
+            "type": "function_call",
+            "call_id": "fewshot_call_1",
+            "name": "submit_script",
+            "arguments": _FEWSHOT_TOOL_ARGS,
+        },
+        {
+            "type": "function_call_output",
+            "call_id": "fewshot_call_1",
+            "output": _FEWSHOT_TOOL_OUTPUT,
+        },
+        {
+            "type": "message",
+            "role": "assistant",
+            "content": [
+                {"type": "output_text", "text": _FEWSHOT_ASSISTANT_TEXT}
+            ],
+        },
+    ]
+
+
+def _fewshot_enabled() -> bool:
+    """``NORA_DISABLE_FEWSHOT=1`` opts out for A/B testing."""
+    return os.environ.get("NORA_DISABLE_FEWSHOT") != "1"
+
+
+# ---------------------------------------------------------------------------
 # Session
 # ---------------------------------------------------------------------------
 
@@ -333,6 +444,18 @@ class OpenAISession:
         pending_input: list[dict[str, Any]] = [
             {"role": "user", "content": user_content},
         ]
+
+        # First-turn-only: prepend the few-shot demonstration exchange
+        # (see _build_fewshot_items for rationale). The chain pointer is
+        # None here because no real turn has committed yet on this
+        # session. On every subsequent turn the few-shot rides for free
+        # via previous_response_id, so we never re-prepend it. A mid-
+        # session context-chain reset (chain expiry) drops
+        # _last_response_id back to None, which correctly re-injects
+        # the few-shot when the next turn rebuilds the chain from a
+        # fresh root.
+        if self._last_response_id is None and _fewshot_enabled():
+            pending_input = _build_fewshot_items() + pending_input
 
         # Walk a local pointer through each round of the tool loop.
         # Initialised from the last committed turn so the new turn
