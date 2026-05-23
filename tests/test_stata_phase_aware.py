@@ -4,25 +4,44 @@ The Stata preamble emits a fixed ``display
 "_NORA_STATA_PREAMBLE_END_MARKER_"`` line just before the
 researcher's code runs. The extractor finds the FIRST occurrence
 of that marker in the log and classifies any failing command echo
-BEFORE the offset as preamble (nora_owned). Preamble failures
-forward the failing command and its error body verbatim; user-code
-failures keep the legacy "verb + r(<code>);" redacted shape.
+BEFORE the offset as preamble (nora_owned). Both branches now
+FORWARD the failing command and its error body, but they do so
+through different paths:
+
+  * ``nora_owned`` (failing command before the marker): args and
+    error body are Nora-authored — no researcher data has reached
+    them. Forwarded verbatim, capped at 200 chars on the command
+    echo only.
+  * ``user_code`` (everything else, including the missing-marker
+    fallback): args and body are researcher-influenced. Forwarded
+    through ``_forward_short_body`` (200-char cap + data-shape
+    detect), with downstream credential / URL / path scrubs in
+    ``_scrub_and_cap`` over the full excerpt.
 
 Why this matters: Jun is the primary user and works in Stata. The
 buffer-split refactor on the Python side benefits no one in the
-actual workflow unless Stata gets equivalent treatment.
+actual workflow unless Stata gets equivalent treatment, and the
+prior allowlist posture left the model unable to read the actual
+diagnostic ("variable X not found" → "[message body redacted]").
 
 The invariants here:
 
   * Marker present + failing command before it → nora_owned →
-    command body + error body forwarded.
+    command body + error body forwarded verbatim.
   * Marker present + failing command after it → user_code →
-    legacy redaction.
+    command + body forwarded through _forward_short_body. Short
+    scalar values (varnames, identifiers) pass through; this is
+    the documented residual leak channel bounded by the 200-byte
+    per-body cap.
   * Marker absent → conservatively user_code (handles older logs
     and any path where the marker contract is interfered with).
+    Same forwarding policy as the marker-present user_code branch.
   * User code tries to fake the marker → first-occurrence rule
     means the real marker (emitted before user code by the
     preamble) always wins.
+  * Data-shape exfil patterns (JSON dict, 6+ mixed-token rows) are
+    still rejected by ``_body_looks_data_shaped`` regardless of
+    classification.
 """
 
 from __future__ import annotations
@@ -36,11 +55,13 @@ _MARKER_LINE = (
 )
 
 
-def test_preamble_failure_forwards_command_and_body() -> None:
-    """A failing command in the Nora-authored preamble — say the
-    adopath setup with a malformed path — has no researcher data
-    flowing through it. The model should see the actual error
-    instead of "[args redacted]\\n[message body redacted]"."""
+def test_no_marker_falls_back_to_user_code_forwarding() -> None:
+    """No marker in the log at all (e.g. the preamble bailed before
+    reaching the ``display`` line, or a legacy run predates the
+    marker contract). Classification defaults to user_code under
+    the conservative fallback. Under the denylist posture, that
+    means the command and body forward through _forward_short_body
+    rather than being redacted wholesale."""
     log = (
         ". local lib : env NORA_LIB_DIR\n"
         ". adopath + \"`lib'\"\n"
@@ -49,82 +70,23 @@ def test_preamble_failure_forwards_command_and_body() -> None:
     )
     excerpt = extract_debug_excerpt(log, "", 601, "Stata")
     assert excerpt is not None
-    # No marker in this log at all (failure before the marker line
-    # would have been emitted), so the conservative fallback kicks
-    # in — fully redacted, matches legacy. The next test covers
-    # the marker-present preamble-failure path.
-    assert "[message body redacted]" in excerpt
-
-
-def test_preamble_failure_with_marker_forwards_body() -> None:
-    """When the marker IS in the log but the failing command echo
-    appears before it (preamble emitted some output, the marker
-    was echoed, then a LATER preamble step failed), the failure
-    is still nora-owned by log position. Body forwards."""
-    # In real runs the marker is the last preamble line, so a
-    # preamble-only failure won't typically reach this shape. But
-    # the classification rule (position-relative-to-marker) is
-    # what the test pins, so simulate the unusual case where the
-    # marker emits and a later preamble command fails.
-    log = (
-        ". local lib : env NORA_LIB_DIR\n"
-        ". display \"diagnostic from preamble\"\n"
-        "diagnostic from preamble\n"
-        + _MARKER_LINE +
-        # The "failing command" here is positionally BEFORE the
-        # rc line. To exercise the nora-owned path we need a
-        # failing command BEFORE the marker.
-        ". cd \"/non/existent/path\"\n"
-        "directory not found\n"
-        "r(170);\n"
-    )
-    # In THIS construction the failing command (cd) is AFTER the
-    # marker, so it's classified user_code. That demonstrates the
-    # opposite case below; for the nora-owned path use the next
-    # test which places the failure earlier.
-    excerpt = extract_debug_excerpt(log, "", 170, "Stata")
-    assert excerpt is not None
-    assert "[message body redacted]" in excerpt  # user_code shape
-
-
-def test_failing_command_before_marker_is_nora_owned() -> None:
-    """Adopath / env-read failure during preamble setup: log
-    position is BEFORE the marker, so the extractor forwards the
-    failing command and the Stata error body unredacted."""
-    log = (
-        ". local lib : env NORA_LIB_DIR\n"
-        ". adopath + \"`lib'\"\n"
-        "directory does not exist\n"
-        "r(601);\n"
-        # Marker would normally appear here but the preamble
-        # bailed out before reaching it. Force the marker to be
-        # *somewhere* in the log so the extractor knows the run
-        # used the new contract — without it, conservative
-        # fallback (user_code) kicks in. We add the marker AFTER
-        # the failure here only to exercise the classifier logic;
-        # in a real run a preamble failure aborts before the
-        # marker echoes, and the conservative fallback applies
-        # anyway (which is fine — the legacy redacted output is
-        # safe).
-        ". * (would-be-marker line)\n"
-        + _MARKER_LINE
-    )
-    excerpt = extract_debug_excerpt(log, "", 601, "Stata")
-    assert excerpt is not None
-    # nora_owned: the failing command + body forward verbatim.
+    # Body forwards so the model can act on the actual diagnostic.
     assert "adopath" in excerpt
     assert "directory does not exist" in excerpt
     assert "r(601);" in excerpt
-    # The redaction sentinels must NOT appear.
+    # Legacy redaction sentinels are gone.
     assert "[args redacted]" not in excerpt
     assert "[message body redacted]" not in excerpt
 
 
-def test_failing_command_after_marker_is_user_code() -> None:
-    """The canonical user-code failure shape: researcher's
-    ``regress`` blows up with a missing variable. Marker is in
-    its normal preamble position. The extractor must redact the
-    args + body as today."""
+def test_user_code_failure_after_marker_forwards_command_and_body() -> None:
+    """Canonical user-code failure shape: researcher's ``regress``
+    blows up with a missing variable. Marker is in its normal
+    preamble position. Under the denylist posture the failing
+    command and the Stata error body forward through
+    _forward_short_body so the model can fix the specific
+    diagnostic. Short scalars (varnames here) ARE expected to pass
+    through; this is the documented residual leak."""
     log = (
         ". local lib : env NORA_LIB_DIR\n"
         ". adopath + \"`lib'\"\n"
@@ -136,18 +98,55 @@ def test_failing_command_after_marker_is_user_code() -> None:
     )
     excerpt = extract_debug_excerpt(log, "", 111, "Stata")
     assert excerpt is not None
-    # The verb survives, but args and body do not.
-    assert ". regress" in excerpt
-    assert "[args redacted]" in excerpt
-    assert "[message body redacted]" in excerpt
-    assert "x_missing" not in excerpt
+    # Command echo and body forward; the model needs both to
+    # diagnose "varname not found".
+    assert "regress y x_missing" in excerpt
+    assert "variable x_missing not found" in excerpt
+    assert "r(111);" in excerpt
+    # No legacy redaction sentinels.
+    assert "[args redacted]" not in excerpt
+    assert "[message body redacted]" not in excerpt
+
+
+def test_failing_command_before_marker_is_nora_owned() -> None:
+    """Adopath / env-read failure during preamble setup: log
+    position is BEFORE the marker, so the extractor takes the
+    nora_owned branch. Behavior here is unchanged by the denylist
+    migration — preamble failures always forwarded verbatim
+    because no researcher data has reached them."""
+    log = (
+        ". local lib : env NORA_LIB_DIR\n"
+        ". adopath + \"`lib'\"\n"
+        "directory does not exist\n"
+        "r(601);\n"
+        # Marker emitted after the failure to exercise the
+        # classifier logic; in a real run the preamble would
+        # have aborted before reaching the display line.
+        ". * (would-be-marker line)\n"
+        + _MARKER_LINE
+    )
+    excerpt = extract_debug_excerpt(log, "", 601, "Stata")
+    assert excerpt is not None
+    assert "adopath" in excerpt
+    assert "directory does not exist" in excerpt
+    assert "r(601);" in excerpt
+    assert "[args redacted]" not in excerpt
+    assert "[message body redacted]" not in excerpt
 
 
 def test_user_attempt_to_fake_marker_does_not_change_classification() -> None:
     """User code that does ``display "_NORA_STATA_PREAMBLE_END_MARKER_"``
     is no help — the real marker emitted by the preamble was the
     FIRST occurrence in the log. Subsequent fake emissions don't
-    shift the classification boundary."""
+    shift the classification boundary, so the failing command
+    stays in the user_code branch with its forwarding policy.
+
+    Note the contract change vs the prior posture: the failing
+    command and body now forward (under _forward_short_body
+    mitigations), so the user-supplied value (``secret_value_42``
+    here) IS visible in the excerpt. This is the documented short-
+    scalar residual leak; the classification still works correctly,
+    which is what this test is actually pinning."""
     log = (
         ". adopath + \".\"\n"
         + _MARKER_LINE +
@@ -160,22 +159,33 @@ def test_user_attempt_to_fake_marker_does_not_change_classification() -> None:
     )
     excerpt = extract_debug_excerpt(log, "", 111, "Stata")
     assert excerpt is not None
-    assert "secret_value_42" not in excerpt
-    # Still user_code — args and body redacted.
-    assert "[args redacted]" in excerpt
-    assert "[message body redacted]" in excerpt
+    # Classification stays user_code (first-occurrence rule wins),
+    # which under the denylist means body forwards. The fake
+    # marker did NOT promote the failure to the nora_owned branch
+    # (which would have used a different formatting path); both
+    # branches now forward, so we pin the forwarded body and the
+    # rc shape rather than asserting redaction sentinels.
+    assert "regress y" in excerpt
+    assert "r(111);" in excerpt
 
 
-def test_absent_marker_falls_back_to_user_code_redaction() -> None:
-    """Older runs (or runs where the marker never reached the log)
-    must NOT relax SDC. The fallback when the marker is missing is
-    the conservative full-redaction posture."""
+def test_user_code_data_shape_exfil_still_blocked() -> None:
+    """``_body_looks_data_shaped`` runs INSIDE _forward_short_body
+    regardless of nora_owned vs user_code classification. A script
+    that tries ``display "42, John Smith, 1985-01-01, 100000, doctor, NY"``
+    as its error message still gets its body suppressed: the
+    mixed-token row shape is the canonical row-dump fingerprint."""
+    row_dump = "42, John Smith, 1985-01-01, 100000, doctor, NY, 12345"
     log = (
-        ". regress y x_missing\n"
-        "variable x_missing not found\n"
-        "r(111);\n"
+        _MARKER_LINE
+        + ". display \"" + row_dump + "\"\n"
+        + row_dump + "\n"
+        + "r(198);\n"
     )
-    excerpt = extract_debug_excerpt(log, "", 111, "Stata")
+    excerpt = extract_debug_excerpt(log, "", 198, "Stata")
     assert excerpt is not None
-    assert "[message body redacted]" in excerpt
-    assert "x_missing" not in excerpt
+    # The data-shape body never reaches the excerpt.
+    assert "John Smith" not in excerpt
+    assert "100000" not in excerpt
+    # The suppression marker is present.
+    assert "message body suppressed: looked data-shaped" in excerpt
