@@ -42,6 +42,7 @@ render; callers fall back to whatever they had.
 from __future__ import annotations
 
 import math
+import re
 from typing import Any
 
 
@@ -142,6 +143,82 @@ def compose_layout(
         return None
 
 
+# Recognised group-tag separator for the auto-consolidation pass. The
+# canonical shape the model emits when it bakes a hypothesis tag into
+# each helper call's ``label(...)`` arg is ``"<TAG> :: <variable>"``
+# (double colon with surrounding whitespace). Matching only that
+# separator avoids false positives on legitimate prose labels that
+# happen to contain a single colon (e.g. ``"H1: direct effect"`` is
+# itself a valid group.label and must not be split).
+_GROUP_PREFIX_RE = re.compile(
+    r"^(?P<tag>\S[^:]*?)\s*::\s*(?P<rest>.+?)\s*$"
+)
+
+
+def _split_group_prefix(label: str) -> tuple[str, str] | None:
+    """Split ``"H2-comp :: ln_ceo_salary"`` into
+    ``("H2-comp", "ln_ceo_salary")``. Returns ``None`` when the
+    ``::`` separator isn't present or the tag/rest would be empty.
+    """
+    m = _GROUP_PREFIX_RE.match(label)
+    if not m:
+        return None
+    tag = m.group("tag").strip()
+    rest = m.group("rest").strip()
+    if not tag or not rest:
+        return None
+    return tag, rest
+
+
+def _consolidate_group_prefix(
+    group_label: str | None,
+    row_labels: list[str],
+) -> tuple[str | None, list[str]]:
+    """Hoist or strip a ``<TAG> :: `` prefix shared by every row label.
+
+    Three outcomes, all conservative:
+
+      * Every row label carries the same ``<TAG> :: `` prefix and
+        ``group_label`` is unset (or whitespace) → hoist ``TAG`` to
+        ``group_label`` and strip the prefix from each row label.
+        This is the common case where the script baked the
+        hypothesis tag into each helper call's ``label("H2-comp ::
+        ln_ceo_salary")`` arg and the compose spec passed bare
+        result_ids without a group.label.
+      * Every row label carries the same ``<TAG> :: `` prefix AND
+        the existing ``group_label`` (stripped) equals ``TAG`` →
+        just strip the prefix. The model set group.label correctly
+        but ALSO baked the prefix into row labels; drop the
+        duplication.
+      * Anything else (partial prefix, mixed prefixes, group.label
+        already set to something different, no prefix at all) →
+        leave both inputs unchanged. The model's explicit
+        choice wins over our heuristic.
+
+    Returns ``(group_label, row_labels)`` (possibly rewritten).
+    """
+    if not row_labels:
+        return group_label, row_labels
+    splits = [_split_group_prefix(lbl) for lbl in row_labels]
+    # All-or-nothing: a single row without the prefix means the group
+    # isn't uniformly tagged and we leave it alone. Partial-prefix
+    # rewriting would lose information.
+    if any(s is None for s in splits):
+        return group_label, row_labels
+    tags = {s[0] for s in splits if s is not None}
+    if len(tags) != 1:
+        return group_label, row_labels
+    common_tag = next(iter(tags))
+    stripped_group = group_label.strip() if isinstance(group_label, str) else ""
+    if stripped_group and stripped_group != common_tag:
+        # Model set group.label to something specific that doesn't
+        # match the common prefix. Honor the explicit choice.
+        return group_label, row_labels
+    new_group_label = common_tag if not stripped_group else group_label
+    new_row_labels = [s[1] for s in splits if s is not None]
+    return new_group_label, new_row_labels
+
+
 def _compose_layout_inner(
     spec: dict[str, Any],
     payloads_by_id: dict[str, dict[str, Any]],
@@ -187,26 +264,27 @@ def _compose_layout_inner(
         group_rows = group.get("rows")
         if not isinstance(group_rows, list) or not group_rows:
             return None
-        group_label = group.get("label")
-        if isinstance(group_label, str) and group_label.strip():
-            # Header row: bold label in first cell, blanks elsewhere.
-            # Markdown pipe tables don't support row spans, so a
-            # blank-cells header row is the conventional shape.
-            rows.append([f"**{group_label.strip()}**", *([""] * len(col_ids))])
+        group_label_raw = group.get("label")
+        group_label: str | None = (
+            group_label_raw if isinstance(group_label_raw, str) else None
+        )
+
+        # First pass: validate row shapes and resolve each to
+        # (rid, rlabel, payload). Two row shapes accepted: a bare
+        # result_id string (auto-label from ``labels_by_id``, fallback
+        # to rid) and the explicit ``{"result_id": ..., "label": ...}``
+        # dict. The bare-string form is the minimal-friction path that
+        # matters for big multi-result batches — the model picks the
+        # groups, hands us result_ids, the store provides labels — so
+        # it doesn't have to type both the rid and a re-derived label
+        # for each row.
+        resolved: list[tuple[str, str, dict[str, Any] | None]] = []
         for row in group_rows:
-            # Two row shapes accepted: a bare result_id string (auto-
-            # label from ``labels_by_id``, fallback to rid) and the
-            # explicit ``{"result_id": ..., "label": ...}`` dict. The
-            # bare-string form is the minimal-friction path that
-            # matters for big multi-result batches — the model picks
-            # the groups, hands us result_ids, the store provides
-            # labels — so it doesn't have to type both the rid and a
-            # re-derived label for each row.
             if isinstance(row, str):
                 rid = row
                 if not rid:
                     return None
-                rlabel_override = None
+                rlabel_override: Any = None
             elif isinstance(row, dict):
                 rid = row.get("result_id")
                 if not isinstance(rid, str) or not rid:
@@ -223,13 +301,40 @@ def _compose_layout_inner(
                 rlabel = rlabel_override
             else:
                 rlabel = labels_by_id.get(rid, rid)
+            rlabel_str = str(rlabel) if rlabel is not None else rid
+            resolved.append((rid, rlabel_str, payloads_by_id.get(rid)))
+
+        # Consolidate a common "<TAG> :: " prefix shared by every row
+        # label in this group. Addresses the common shape where the
+        # script bakes the hypothesis tag into each helper call's
+        # ``label("H2-comp :: ln_ceo_salary")`` arg and the compose
+        # call passes bare result_ids without a group.label. Without
+        # this pass the rendered table reads as a flat ungrouped list
+        # with the hypothesis tag pasted into every row's first cell,
+        # defeating the bold-header row that group.label is meant to
+        # produce. See module docstring for the broader contract.
+        consolidated_group_label, consolidated_row_labels = (
+            _consolidate_group_prefix(group_label, [r[1] for r in resolved])
+        )
+
+        if consolidated_group_label and consolidated_group_label.strip():
+            # Header row: bold label in first cell, blanks elsewhere.
+            # Markdown pipe tables don't support row spans, so a
+            # blank-cells header row is the conventional shape.
+            rows.append([
+                f"**{consolidated_group_label.strip()}**",
+                *([""] * len(col_ids)),
+            ])
+
+        for (rid, _orig_label, payload), new_label in zip(
+            resolved, consolidated_row_labels
+        ):
             # Pass the raw lookup result (None when the result_id
             # isn't in the store) so ``_compose_cell`` can distinguish
             # "result missing" from "result present but term missing"
             # — three failure modes get three distinct glyphs.
-            payload = payloads_by_id.get(rid)
             cells = [_compose_cell(payload, col_id) for col_id in col_ids]
-            rows.append([str(rlabel) if rlabel is not None else rid, *cells])
+            rows.append([new_label, *cells])
             if payload is None or _has_unresolved_term(payload, col_ids):
                 any_unresolved = True
 

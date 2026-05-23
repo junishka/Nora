@@ -87,6 +87,46 @@ def test_python_includes_source_line() -> None:
     assert "'compute_things' is not defined" not in excerpt
 
 
+def test_python_traceback_drops_nora_wrapper_and_runpy_frames() -> None:
+    """``executor.py`` runs the researcher's script through
+    ``_nora_wrapper.py`` → ``runpy.run_path``, which produces
+    stderr that begins with the wrapper frame plus three or four
+    ``<frozen runpy>`` frames before reaching ``script.py``. The
+    wrapper's documented intent (executor.py:1768) is that
+    tracebacks reference ``script.py`` and the wrapper's
+    ``_nora_*`` names never leak into user scope. Neither path
+    matches the ``LIB_PAT`` site-packages-style fragment, so the
+    explicit ``NORA_WRAPPER_PAT`` filter in ``_extract_python`` is
+    what enforces the contract — this test pins it.
+
+    Regression coverage for the wrapper-frame leak: without the
+    filter the excerpt led with ``_nora_wrapper.py`` and four
+    ``<frozen runpy>`` frames, misdirecting the model toward Nora
+    internals while diagnosing the failure."""
+    stderr = (
+        "Traceback (most recent call last):\n"
+        "  File \"/tmp/run_abc123/_nora_wrapper.py\", line 12, in <module>\n"
+        "    _nora_runpy.run_path(\"/tmp/run_abc123/script.py\", run_name=\"__main__\")\n"
+        "  File \"<frozen runpy>\", line 287, in run_path\n"
+        "    return _run_module_code(code, init_globals, run_name,\n"
+        "  File \"<frozen runpy>\", line 98, in _run_module_code\n"
+        "    _run_code(code, mod_globals, init_globals,\n"
+        "  File \"<frozen runpy>\", line 88, in _run_code\n"
+        "    exec(code, run_globals)\n"
+        "  File \"/tmp/run_abc123/script.py\", line 3, in <module>\n"
+        "    raise RuntimeError(\"boom\")\n"
+        "RuntimeError: boom\n"
+    )
+    excerpt = extract_debug_excerpt("", stderr, 1, "Python")
+    assert excerpt is not None
+    # The bridge frames are dropped; the script frame survives.
+    assert "_nora_wrapper" not in excerpt
+    assert "runpy" not in excerpt.lower()
+    assert "script.py" in excerpt
+    # The exception type and the redacted-body trailer survive.
+    assert "RuntimeError" in excerpt
+
+
 def test_python_chained_exceptions_keeps_last_one() -> None:
     """When Python raises during except-handling, both exceptions
     appear. The LAST one is the propagating one — that's the type

@@ -380,6 +380,13 @@ def test_previous_response_id_chains_across_rounds_and_turns(
 
     from nora.provider import openai as openai_provider
     monkeypatch.setattr(openai_provider, "_resolve_api_key", lambda: "sk-test")
+    # Disable the first-turn few-shot prepend so this test pins the
+    # chain-pointer contract (no previous_response_id, body is just the
+    # new user message) without coupling to the few-shot constants.
+    # The few-shot itself is covered separately; the lockdown test
+    # exists to enforce the round-trip shape, which is what we keep
+    # isolated here.
+    monkeypatch.setenv("NORA_DISABLE_FEWSHOT", "1")
 
     # Three scripted responses driving two turns:
     scripted = [
@@ -435,6 +442,124 @@ def test_previous_response_id_chains_across_rounds_and_turns(
     assert c3.get("previous_response_id") == "resp_2"
     assert len(c3["input"]) == 1
     assert c3["input"][0]["role"] == "user"
+
+
+def test_first_turn_prepends_fewshot_demonstration_then_user_message(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """Round 1 of a fresh session prepends a 4-item few-shot exchange
+    (user, function_call, function_call_output, assistant) BEFORE the
+    real user message. This is the structural table-preference nudge
+    that biases the model toward pasting markdown payloads verbatim
+    rather than re-narrating numbers. Subsequent turns ride the
+    demonstration via previous_response_id; only round 1 carries the
+    inline items.
+
+    The companion lockdown test
+    (``test_previous_response_id_chains_across_rounds_and_turns``)
+    sets NORA_DISABLE_FEWSHOT=1 to isolate the chain-pointer
+    contract from this prepend; here we leave the env unset so the
+    prepend fires and pin its shape."""
+    import asyncio
+
+    from nora.provider import openai as openai_provider
+    monkeypatch.setattr(openai_provider, "_resolve_api_key", lambda: "sk-test")
+
+    scripted = [
+        _ScriptedResponse("resp_1", with_tool_call=False),   # turn 1 r1
+        _ScriptedResponse("resp_2", with_tool_call=False),   # turn 2 r1
+    ]
+
+    import openai as openai_pkg
+    monkeypatch.setattr(
+        openai_pkg, "AsyncOpenAI",
+        lambda api_key=None: _ScriptedAsyncOpenAI(api_key, responses=scripted),
+        raising=True,
+    )
+
+    sess = OpenAISession(
+        cwd=tmp_path,
+        model="gpt-5.5",
+        system_prompt="you are nora",
+    )
+
+    async def _drive() -> None:
+        async for _ in sess.send("turn one"):
+            pass
+        async for _ in sess.send("turn two"):
+            pass
+
+    asyncio.run(_drive())
+
+    api = sess._client.responses  # type: ignore[union-attr]
+    assert len(api.calls) == 2
+    c1, c2 = api.calls
+
+    # Round 1: few-shot prefix + real user. Item types in order:
+    # user (few-shot Q), function_call, function_call_output,
+    # message (few-shot assistant), user (real).
+    inp = c1["input"]
+    assert len(inp) == 5, (
+        f"round 1 should carry 4 few-shot items + 1 real user; got {len(inp)}"
+    )
+    assert inp[0].get("role") == "user"
+    assert inp[1].get("type") == "function_call"
+    assert inp[1].get("name") == "submit_script"
+    assert inp[2].get("type") == "function_call_output"
+    assert inp[3].get("type") == "message"
+    assert inp[3].get("role") == "assistant"
+    # The real user message is last and carries the prompt verbatim.
+    assert inp[4].get("role") == "user"
+    real_user_text = inp[4]["content"][0]["text"]
+    assert real_user_text == "turn one"
+
+    # Round 1 of turn 2: chains via previous_response_id, body is
+    # ONLY the new user message. Few-shot does NOT re-prepend.
+    assert c2.get("previous_response_id") == "resp_1"
+    assert len(c2["input"]) == 1
+    assert c2["input"][0]["role"] == "user"
+
+
+def test_disable_fewshot_env_var_skips_prepend(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """``NORA_DISABLE_FEWSHOT=1`` is the documented A/B opt-out. With
+    it set, round 1 carries only the real user message. Used by the
+    chain-pointer lockdown test above and available to researchers
+    who want to measure the few-shot's behavioral effect."""
+    import asyncio
+
+    from nora.provider import openai as openai_provider
+    monkeypatch.setattr(openai_provider, "_resolve_api_key", lambda: "sk-test")
+    monkeypatch.setenv("NORA_DISABLE_FEWSHOT", "1")
+
+    scripted = [_ScriptedResponse("resp_1", with_tool_call=False)]
+
+    import openai as openai_pkg
+    monkeypatch.setattr(
+        openai_pkg, "AsyncOpenAI",
+        lambda api_key=None: _ScriptedAsyncOpenAI(api_key, responses=scripted),
+        raising=True,
+    )
+
+    sess = OpenAISession(
+        cwd=tmp_path,
+        model="gpt-5.5",
+        system_prompt="you are nora",
+    )
+
+    async def _drive() -> None:
+        async for _ in sess.send("turn one"):
+            pass
+
+    asyncio.run(_drive())
+
+    api = sess._client.responses  # type: ignore[union-attr]
+    assert len(api.calls) == 1
+    inp = api.calls[0]["input"]
+    assert len(inp) == 1
+    assert inp[0]["role"] == "user"
+    assert inp[0]["content"][0]["text"] == "turn one"
 
 
 def test_request_failure_does_not_advance_committed_response_id(

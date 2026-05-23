@@ -320,11 +320,25 @@ def test_debug_excerpt_does_not_forward_short_cell_value() -> None:
     assert last_line.startswith("RuntimeError")
 
 
-def test_debug_excerpt_stata_redacts_macro_expanded_command() -> None:
+def test_debug_excerpt_stata_macro_expanded_command_under_denylist() -> None:
     """Stata macro expansion echoes raw values into the failing
     command line (``local s = df[1]; regress y `s'`` →
-    ``. regress y patient_42``). The new extractor keeps only
-    the verb and the rc code."""
+    ``. regress y patient_42``). Under the denylist posture
+    introduced in 41903e2, the extractor forwards the command and
+    the body through _forward_short_body so the model can act on
+    the actual diagnostic ("variable X not found"). Short scalar
+    values (a varname here) DO pass through; this is the
+    documented residual leak channel — bounded by the 200-byte
+    per-body cap and the data-shape detect.
+
+    Predecessor of this test asserted full redaction; it was the
+    prior allowlist contract. The trade-off was that the model
+    saw "[message body redacted]" and could not tell what to fix,
+    so it re-probed (re-running the same broken script with minor
+    variations). The denylist posture forwards short diagnostics
+    at the cost of a varname-shaped leak channel; data-shape
+    exfil (``test_debug_excerpt_stata_redacts_data_shape_exfil``
+    below) is still blocked."""
     from nora.error_summary import extract_debug_excerpt
 
     secret_var = "patient_42_data"
@@ -335,9 +349,35 @@ def test_debug_excerpt_stata_redacts_macro_expanded_command() -> None:
     )
     excerpt = extract_debug_excerpt(log, "", 111, "Stata")
     assert excerpt is not None
-    assert secret_var not in excerpt
+    # Command echo and body forward verbatim under the denylist.
     assert ". regress" in excerpt
+    assert "variable" in excerpt and "not found" in excerpt
     assert "r(111);" in excerpt
+    # Short-scalar varname passes through (documented residual).
+    # Predecessor asserted absence; we now pin presence so a
+    # silent regression back to the allowlist posture is caught.
+    assert secret_var in excerpt
+
+
+def test_debug_excerpt_stata_redacts_data_shape_exfil() -> None:
+    """Companion to the macro-expanded test above: confirm the
+    data-shape detect inside _forward_short_body still blocks the
+    canonical row-dump fingerprint even when the script tries to
+    smuggle it through an error message. This is the mitigation
+    that makes the documented short-scalar leak bounded."""
+    from nora.error_summary import extract_debug_excerpt
+
+    row_dump = "42, Jane Doe, 1975-03-14, 85000, nurse, MA, 02139"
+    log = (
+        f". display \"{row_dump}\"\n"
+        f"{row_dump}\n"
+        "r(198);\n"
+    )
+    excerpt = extract_debug_excerpt(log, "", 198, "Stata")
+    assert excerpt is not None
+    assert "Jane Doe" not in excerpt
+    assert "85000" not in excerpt
+    assert "message body suppressed: looked data-shaped" in excerpt
 
 
 def test_attach_session_file_helper_plot_filters_hidden_run(
