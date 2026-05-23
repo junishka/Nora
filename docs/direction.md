@@ -13,7 +13,7 @@ present but unreachable under 0.9.x is fixed in the executor and
 pinned by a new disk↔staging invariant test; the DiD Stata path is
 reframed in the system prompt as no-realistic-workflow (recommend
 R / Python in the same session), and RDD Stata is targeted for
-0.10.1 with a documented cross-language numerics protocol. The
+0.10.3 with a documented cross-language numerics protocol. The
 previous substantive update **2026-05-15** was the audit-fixes
 pass: install-packages consent is modal-only, the
 script-failure `debug_excerpt` is documented at its stricter
@@ -137,7 +137,7 @@ As of 2026-05-16, the implementation covers:
   staging tuple gap kept it unreachable until 0.10.0). DiD and
   RDD stay Stata-deferred for substantive reasons documented in
   the `handoff.md` Stata coverage matrix and the 0.10.0 CHANGELOG;
-  RDD is targeted for 0.10.1 pending a cross-language numerics
+  RDD is targeted for 0.10.3 pending a cross-language numerics
   check, DiD waits on a contributor pinning the `csdid` API.
 - Runtime libraries for R, Python, and Stata with JSON-escaped
   labels and CR/LF/TAB handling. The runtime-directory ↔ executor

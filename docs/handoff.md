@@ -25,7 +25,7 @@ so a future helper added to `src/nora/runtime/` without staging
 fails the test. The DiD Stata path is reframed in the system
 prompt as no-realistic-workflow (recommend R / Python in the same
 session loading the `.dta` via `haven` / `pyreadstat`); RDD Stata
-is targeted for 0.10.1 with a documented cross-language numerics
+is targeted for 0.10.3 with a documented cross-language numerics
 verification protocol (see [CHANGELOG.md](../CHANGELOG.md)
 deferred section). The previous substantive batch (2026-05-15)
 was the audit-fixes pass:
@@ -180,7 +180,7 @@ release.
 | Panel-data diagnostics (sub-feature: `f_test_fe_chi2/p`, `hausman_chi2/p`, `breusch_pagan_chi2/p`, `wooldridge_ar1_chi2/p`) | ✓ R `from_lm` auto-runs `plm::pFtest` / `phtest` / `pbgtest` / `pwartest` on `plm` fits | ✓ Python `from_lm` accepts these as caller kwargs (linearmodels PanelOLS) | ✓ Stata `xtreg, fe` auto-emits `f_test_fe_chi2` + `f_test_fe_p` from `e(F_f)`; other tests pass via caller (run `xttest0` / `xtserial` in the script) | **shipped 0.10.0** |
 | Cluster-robust SE + typed `robust_se_type` enum (`classical`, `hc0..hc3`, `hac_newey_west`, `cluster`, `bootstrap`) (sub-feature) | ✓ fixest `vcov=` arg auto-detected | ✓ `cov_type=` auto-mapped (`HC0..HC3`, `HAC`, `cluster`) | ✓ `vce(cluster id)` + `e(cmd)=="newey"` auto-emit cluster / hac_newey_west; `cluster_variables` + `n_clusters` populated when applicable | shipped |
 | `did_event_study` | ✓ `from_callaway_santanna` + `from_sun_abraham` + `from_twfe_event_study`; de Chaisemartin via `nora$result(...)` | ✓ `from_callaway_santanna`; sun_abraham / twfe_event_study / de_chaisemartin via `nora.result(...)` | ✗ no helper; `csdid` is SSC-distributed and Nora's `install_packages` can't reach SSC | **deferred — no realistic Stata workflow.** The only way to emit `did_event_study` from Stata today is hand-authoring JSON to `NORA_RESULT_PATH` against the field schema — that's a contributor-level escape hatch, not an end-user workflow. System prompt now directs the model to recommend running CS DiD in R or Python via the same session (the `.dta` opens via `haven` / `pyreadstat`; the data stays on the machine). Adding a real Stata helper waits on a contributor pinning the `csdid` API surface |
-| `rdd` | ✓ `from_rdd` (wraps `rdrobust::rdrobust`) | ✓ `from_rdd` (wraps `rdrobust` Python) | ✗ no helper; SSC Stata `rdrobust` port has maintenance lag and numerics haven't been verified against CCT 2014 reference | **deferred — targeted 0.10.1.** Go / no-go is empirical and roughly one Stata session: fit `rdrobust` in Stata and R / Python on the same simulated DGP, compare τ / SE / bandwidths at the 0.5% relative-tolerance level. If they agree, write the helper following the `nora_result_factor.ado` pattern. If they disagree, document the divergence and keep deferred. See [CHANGELOG.md](../CHANGELOG.md) deferred section for the protocol |
+| `rdd` | ✓ `from_rdd` (wraps `rdrobust::rdrobust`) | ✓ `from_rdd` (wraps `rdrobust` Python) | ✗ no helper; SSC Stata `rdrobust` port has maintenance lag and numerics haven't been verified against CCT 2014 reference | **deferred — targeted 0.10.3.** Go / no-go is empirical and roughly one Stata session: fit `rdrobust` in Stata and R / Python on the same simulated DGP, compare τ / SE / bandwidths at the 0.5% relative-tolerance level. If they agree, write the helper following the `nora_result_factor.ado` pattern. If they disagree, document the divergence and keep deferred. See [CHANGELOG.md](../CHANGELOG.md) deferred section for the protocol |
 
 **Operational meaning of the two Stata-deferred entries.** Both
 deferrals point a Stata-using researcher at the same fallback:
@@ -190,7 +190,7 @@ sanitizer; the `.dta` opens via `haven` (R) or `pyreadstat`
 in a different runtime. The two deferrals differ in *why* the
 Stata helper is missing:
 
-- **RDD: numerics-unverified, targeted 0.10.1.** The Stata SSC
+- **RDD: numerics-unverified, targeted 0.10.3.** The Stata SSC
   `rdrobust` port has known maintenance lag and we have not yet
   verified its output against the CCT 2014 reference that R and
   Python `rdrobust` reproduce. Go / no-go is empirical and roughly
