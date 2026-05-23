@@ -31,7 +31,7 @@ contract so the suite reflects the actual SDC posture.
   (Anthropic, covers the whole rider).
 - **`compose_layout` consolidates baked-in hypothesis prefixes.**
   When the script labels each helper call as `nora_result_*,
-  label("H2-comp :: ln_ceo_salary")` and the compose spec passes
+  label("H1 :: outcome_a")` and the compose spec passes
   bare result_ids without `group.label`, the renderer used to
   produce a flat ungrouped table with the hypothesis tag pasted into
   every row's first cell. It now detects a `<TAG> :: ` prefix shared

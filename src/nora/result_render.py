@@ -156,8 +156,8 @@ _GROUP_PREFIX_RE = re.compile(
 
 
 def _split_group_prefix(label: str) -> tuple[str, str] | None:
-    """Split ``"H2-comp :: ln_ceo_salary"`` into
-    ``("H2-comp", "ln_ceo_salary")``. Returns ``None`` when the
+    """Split ``"H1 :: outcome_a"`` into
+    ``("H1", "outcome_a")``. Returns ``None`` when the
     ``::`` separator isn't present or the tag/rest would be empty.
     """
     m = _GROUP_PREFIX_RE.match(label)
@@ -182,8 +182,8 @@ def _consolidate_group_prefix(
         ``group_label`` is unset (or whitespace) → hoist ``TAG`` to
         ``group_label`` and strip the prefix from each row label.
         This is the common case where the script baked the
-        hypothesis tag into each helper call's ``label("H2-comp ::
-        ln_ceo_salary")`` arg and the compose spec passed bare
+        hypothesis tag into each helper call's ``label("H1 ::
+        outcome_a")`` arg and the compose spec passed bare
         result_ids without a group.label.
       * Every row label carries the same ``<TAG> :: `` prefix AND
         the existing ``group_label`` (stripped) equals ``TAG`` →
@@ -307,7 +307,7 @@ def _compose_layout_inner(
         # Consolidate a common "<TAG> :: " prefix shared by every row
         # label in this group. Addresses the common shape where the
         # script bakes the hypothesis tag into each helper call's
-        # ``label("H2-comp :: ln_ceo_salary")`` arg and the compose
+        # ``label("H1 :: outcome_a")`` arg and the compose
         # call passes bare result_ids without a group.label. Without
         # this pass the rendered table reads as a flat ungrouped list
         # with the hypothesis tag pasted into every row's first cell,

@@ -808,41 +808,41 @@ def test_compose_layout_accepts_bare_string_rows() -> None:
 
 def test_compose_layout_hoists_common_prefix_when_group_label_absent() -> None:
     """When the script bakes a hypothesis tag into each helper call's
-    ``label("H2-comp :: ln_ceo_salary")`` arg and the compose spec
-    passes bare result_ids without setting ``group.label``, the
-    renderer auto-detects the shared ``<TAG> :: `` prefix, hoists
-    ``TAG`` to a bold group header row, and strips the prefix from
-    each row label. Addresses the rendered shape the model commonly
-    produces (flat ungrouped table with the hypothesis tag pasted
-    into every row's first cell) without depending on the model
-    later changing its labelling convention."""
+    ``label("H1 :: outcome_a")`` arg and the compose spec passes
+    bare result_ids without setting ``group.label``, the renderer
+    auto-detects the shared ``<TAG> :: `` prefix, hoists ``TAG`` to
+    a bold group header row, and strips the prefix from each row
+    label. Addresses the rendered shape the model commonly produces
+    (flat ungrouped table with the hypothesis tag pasted into every
+    row's first cell) without depending on the model later changing
+    its labelling convention."""
     payloads = {
         "M1": _payload({"x": 0.020}, {"x": 0.005}, {"x": 0.001}),
         "M2": _payload({"x": 0.015}, {"x": 0.003}, {"x": 0.0001}),
         "M3": _payload({"x": 0.010}, {"x": 0.004}, {"x": 0.0050}),
     }
     labels = {
-        "M1": "H2-comp :: ln_ceo_salary",
-        "M2": "H2-comp :: ln_other_salaries_wages",
-        "M3": "H2-comp :: ln_comp_officers_total_990",
+        "M1": "H1 :: outcome_a",
+        "M2": "H1 :: outcome_b",
+        "M3": "H1 :: outcome_c",
     }
     spec = {
-        "columns": [{"id": "x", "label": "fp x t0"}],
+        "columns": [{"id": "x", "label": "x"}],
         # No group.label set — the buggy shape we're consolidating.
         "groups": [{"rows": ["M1", "M2", "M3"]}],
     }
     md = compose_layout(spec, payloads, labels)
     assert md is not None
     # The common tag becomes the bold group header.
-    assert "**H2-comp**" in md
+    assert "**H1**" in md
     # Row labels are stripped to just the variable name.
-    assert "ln_ceo_salary" in md
-    assert "ln_other_salaries_wages" in md
-    assert "ln_comp_officers_total_990" in md
-    # The duplicated "H2-comp ::" prefix is gone from every row.
-    assert "H2-comp ::" not in md
+    assert "outcome_a" in md
+    assert "outcome_b" in md
+    assert "outcome_c" in md
+    # The duplicated "H1 ::" prefix is gone from every row.
+    assert "H1 ::" not in md
     # Header precedes the first member row.
-    assert md.find("**H2-comp**") < md.find("ln_ceo_salary")
+    assert md.find("**H1**") < md.find("outcome_a")
 
 
 def test_compose_layout_strips_common_prefix_when_group_label_matches() -> None:
@@ -857,19 +857,19 @@ def test_compose_layout_strips_common_prefix_when_group_label_matches() -> None:
     spec = {
         "columns": [{"id": "x", "label": "x"}],
         "groups": [{
-            "label": "H2-comp",
+            "label": "H1",
             "rows": [
-                {"result_id": "M1", "label": "H2-comp :: ln_ceo_salary"},
-                {"result_id": "M2", "label": "H2-comp :: ln_other_salaries_wages"},
+                {"result_id": "M1", "label": "H1 :: outcome_a"},
+                {"result_id": "M2", "label": "H1 :: outcome_b"},
             ],
         }],
     }
     md = compose_layout(spec, payloads)
     assert md is not None
-    assert "**H2-comp**" in md
-    assert "ln_ceo_salary" in md
-    assert "ln_other_salaries_wages" in md
-    assert "H2-comp ::" not in md
+    assert "**H1**" in md
+    assert "outcome_a" in md
+    assert "outcome_b" in md
+    assert "H1 ::" not in md
 
 
 def test_compose_layout_leaves_alone_when_group_label_differs_from_common_prefix() -> None:
@@ -888,8 +888,8 @@ def test_compose_layout_leaves_alone_when_group_label_differs_from_common_prefix
         "groups": [{
             "label": "H1: direct effect",
             "rows": [
-                {"result_id": "M1", "label": "H2 :: ln_ceo_salary"},
-                {"result_id": "M2", "label": "H2 :: ln_other_salaries_wages"},
+                {"result_id": "M1", "label": "H2 :: outcome_a"},
+                {"result_id": "M2", "label": "H2 :: outcome_b"},
             ],
         }],
     }
@@ -898,8 +898,8 @@ def test_compose_layout_leaves_alone_when_group_label_differs_from_common_prefix
     # Group header stays as the model wrote it.
     assert "**H1: direct effect**" in md
     # Row labels stay verbatim — the heuristic deferred.
-    assert "H2 :: ln_ceo_salary" in md
-    assert "H2 :: ln_other_salaries_wages" in md
+    assert "H2 :: outcome_a" in md
+    assert "H2 :: outcome_b" in md
 
 
 def test_compose_layout_partial_prefix_no_op() -> None:
@@ -915,7 +915,7 @@ def test_compose_layout_partial_prefix_no_op() -> None:
         "columns": [{"id": "x", "label": "x"}],
         "groups": [{
             "rows": [
-                {"result_id": "M1", "label": "H2 :: ln_ceo_salary"},
+                {"result_id": "M1", "label": "H2 :: outcome_a"},
                 {"result_id": "M2", "label": "raw_unprefixed_var"},
             ],
         }],
@@ -925,7 +925,7 @@ def test_compose_layout_partial_prefix_no_op() -> None:
     # No bold header inserted.
     assert "**H2**" not in md
     # Both labels render verbatim.
-    assert "H2 :: ln_ceo_salary" in md
+    assert "H2 :: outcome_a" in md
     assert "raw_unprefixed_var" in md
 
 
