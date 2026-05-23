@@ -480,7 +480,38 @@ def _extract_python(
         r"(?:/site-packages/|/dist-packages/|/lib/python[\d\.]+/"
         r"|/typeshed/|/\.venv/|/python\d+\.\d+/lib/)"
     )
-    user_frames = [m for m in frames if not LIB_PAT.search(m.group("path"))]
+    # Nora's own wrapper frames. ``executor.py`` runs the researcher's
+    # script through ``_nora_wrapper.py`` → ``runpy.run_path``, which
+    # produces stderr that begins with three or four bridge frames
+    # before reaching ``script.py``:
+    #
+    #   File "<run_dir>/_nora_wrapper.py", line 12, in <module>
+    #     _nora_runpy.run_path("script.py", run_name="__main__")
+    #   File "<frozen runpy>", line 287, in run_path
+    #   File "<frozen runpy>", line  98, in _run_module_code
+    #   File "<frozen runpy>", line  88, in _run_code
+    #   File "script.py", line 3, in <module>
+    #     raise RuntimeError("boom")
+    #
+    # Neither lives under a site-packages-style path, so ``LIB_PAT``
+    # doesn't drop them. Without an explicit filter the excerpt
+    # leads with the Nora wrapper + four runpy frames, contradicting
+    # the wrapper's documented intent at executor.py:1768
+    # ("tracebacks reference script.py and the wrapper's ``_nora_*``
+    # names never leak into user scope") and misdirecting the model
+    # toward Nora internals when it diagnoses the failure.
+    #
+    # Match strategy mirrors LIB_PAT: a path-fragment regex run via
+    # ``re.search`` over the captured path. ``_nora_wrapper.py`` is
+    # the actual on-disk filename written by ``_write_python_wrapper``
+    # in executor.py; ``<frozen runpy>`` is the literal path string
+    # Python emits for the stdlib runpy module since 3.11.
+    NORA_WRAPPER_PAT = re.compile(r"(?:/_nora_wrapper\.py$|^<frozen runpy>$)")
+    user_frames = [
+        m for m in frames
+        if not LIB_PAT.search(m.group("path"))
+        and not NORA_WRAPPER_PAT.search(m.group("path"))
+    ]
     if not user_frames:
         # All frames look like library code (rare — usually means the
         # script is a one-liner with no user-frame in the trace).
