@@ -49,3 +49,11 @@ scratch/
 # in the filename so WKWebView reloads JS/CSS — runtime artifact,
 # never source.
 src/nora/web/.index.bust-*.html
+
+# Researcher-produced audit / run logs. These can carry data-derived
+# values (varnames, partial diagnostics) from a real session and must
+# never be staged. Pattern covers the canonical names produced by
+# ``packaging/release.sh`` smoke runs and ad-hoc Stata audit dumps.
+audit.log
+audit_*.log
+*.audit.log
