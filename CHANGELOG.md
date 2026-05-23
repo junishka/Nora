@@ -4,6 +4,95 @@ Notable changes per release. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 versions follow semver, pre-1.0.
 
+## [0.10.2] — 2026-05-23
+
+Focused patch on top of `0.10.1`. Two threads. The first is
+presentation. The model now defaults to the table form for tool
+results that carry a `markdown` field, and multi-result composites
+render with proper bold group headers even when the script baked
+hypothesis tags into helper labels. The second is error-readability
+and test-debt. Python tracebacks no longer lead with Nora's wrapper
+and runpy frames before reaching `script.py`, and the prior
+allowlist-style Stata tests catch up to the post-0.10.1 denylist
+contract so the suite reflects the actual SDC posture.
+
+- **Few-shot demonstration biases replies toward tables.** OpenAI
+  sessions get a structural 4-item exchange (user, function_call,
+  function_call_output, assistant) prepended to round 1 of every
+  session. The model sees `submit_script` return a payload whose
+  `markdown` field is a pipe table, then an assistant reply that
+  pastes that table verbatim plus one short sentence. Costs ~350
+  input tokens once per session, rides for free on subsequent turns
+  via `previous_response_id`, and re-injects after chain-expiry
+  resets. The Claude Agent SDK does not expose a seam to seed prior
+  assistant or tool_result turns, so the same demonstration ships as
+  rule 7 of `_STYLE_RIDER` on the Anthropic path. Opt-out:
+  `NORA_DISABLE_FEWSHOT=1` (OpenAI), `NORA_DISABLE_STYLE_RIDER=1`
+  (Anthropic, covers the whole rider).
+- **`compose_layout` consolidates baked-in hypothesis prefixes.**
+  When the script labels each helper call as `nora_result_*,
+  label("H2-comp :: ln_ceo_salary")` and the compose spec passes
+  bare result_ids without `group.label`, the renderer used to
+  produce a flat ungrouped table with the hypothesis tag pasted into
+  every row's first cell. It now detects a `<TAG> :: ` prefix shared
+  by every row label in a group and hoists `TAG` to a bold header
+  row, or strips it from rows when `group.label` already matches.
+  Conservative on edge cases: partial-prefix groups, mixed tags, and
+  explicit `group.label` that disagrees with the common prefix all
+  leave the input unchanged (the model's explicit decision wins
+  over the heuristic). Companion change in the `compose_results`
+  description names the anti-pattern explicitly.
+- **Python tracebacks reference `script.py` again.** `_extract_python`
+  drops `_nora_wrapper.py` and `<frozen runpy>` frames before
+  composing the user-visible excerpt. The wrapper's documented
+  intent at `executor.py:1768` was that tracebacks reference
+  `script.py` and the wrapper's `_nora_*` names never leak into user
+  scope, but neither path matched `LIB_PAT`'s site-packages
+  fragment, so the excerpt was leading with one wrapper frame plus
+  three or four runpy frames before reaching the researcher's code.
+  The model now sees the script frame at the top, which is what
+  it's actually supposed to act on.
+- **System prompt brevity rules tightened.** "Shorter is better.
+  When in doubt, cut." prepended to the Voice section so the
+  brevity prior is set early, where Opus weights it most. The
+  post-run reading rule narrows to "extremely concise and direct
+  interpretation on the aspect relevant to the current discussion",
+  replacing wording that had been licensing multi-frame
+  theorization.
+- **Stata redaction tests aligned to the post-0.10.1 denylist
+  contract.** Commit `41903e2` (shipped in 0.10.1) moved Stata
+  user-code excerpts from allowlist (full redaction) to denylist
+  (forward through `_forward_short_body` with cap, data-shape
+  detect, downstream scrubs). The tests in
+  `tests/test_stata_phase_aware.py` and one case in
+  `tests/test_audit_fixes_9.py` were missed in that commit and still
+  encoded the prior allowlist contract. Rewritten to pin the new
+  contract (forwarded command and body, documented short-scalar
+  leak, data-shape detect bound). New paired tests cover the
+  data-shape mitigation. Source unchanged.
+- **`openai_lockdown` covers the few-shot prepend.** Existing
+  chain-pointer test sets `NORA_DISABLE_FEWSHOT=1` to isolate its
+  scope. New `test_first_turn_prepends_fewshot_demonstration_then_
+  user_message` pins the 5-item round-1 shape;
+  `test_disable_fewshot_env_var_skips_prepend` verifies the opt-out.
+
+Researcher-visible: tool results that ship markdown reliably appear
+as tables in the reply instead of being re-narrated; multi-result
+composites render with proper bold group headers even when the
+script baked hypothesis tags into helper labels; Python failure
+excerpts start at `script.py` instead of Nora internals; replies are
+shorter, more direct, and stay on the relevant frame.
+
+No data shape changes; no API breaks. Sessions saved under `0.10.0`
+or `0.10.1` resolve unchanged.
+
+**Updated in 0.10.2**: structural table-preference few-shot (OpenAI
++ Anthropic), `compose_layout` auto-consolidates `<TAG> :: `
+prefixes shared by every row in a group, Python excerpts drop
+`_nora_wrapper.py` and `<frozen runpy>` frames, system prompt
+brevity rules tightened, post-0.10.1 Stata denylist test coverage
+caught up, plus few-shot lockdown coverage.
+
 ## [0.10.1] — 2026-05-18
 
 Focused patch on top of `0.10.0`. Closes a class of "model can't
