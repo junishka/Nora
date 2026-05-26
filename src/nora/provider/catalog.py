@@ -36,6 +36,14 @@ PROVIDER_PRICING_URLS: dict[str, str] = {
     "openai": "https://openai.com/api/pricing/",
 }
 
+# API-key creation pages surfaced as a "create / get a key" link on
+# the auth screen's per-provider help text. A researcher arriving
+# without a key clicks straight through to the provider's console.
+PROVIDER_API_KEY_URLS: dict[str, str] = {
+    "anthropic": "https://console.anthropic.com/settings/keys",
+    "openai": "https://platform.openai.com/api-keys",
+}
+
 
 # ---------------------------------------------------------------------------
 # Per-provider models

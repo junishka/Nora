@@ -66,9 +66,15 @@
             <div class="auth-provider-status" data-role="status"></div>
           </div>
           <div class="auth-provider-help">
-            Either paste an API key or sign in via the Claude CLI
-            (<code>claude</code> in a terminal); the subscription
-            path is detected automatically.
+            Either paste an API key
+            (<a
+              class="auth-help-link"
+              href="https://console.anthropic.com/settings/keys"
+              data-external-url="https://console.anthropic.com/settings/keys"
+            >create/fetch</a>),
+            or if you have a Claude Max subscription, sign in via the
+            Claude CLI (<code>claude</code> in a terminal) and Nora
+            will detect it automatically.
           </div>
           <div class="auth-provider-input">
             <input
@@ -90,7 +96,13 @@
             <div class="auth-provider-status" data-role="status"></div>
           </div>
           <div class="auth-provider-help">
-            API key only. OpenAI subscriptions don't cover API usage.
+            API key only
+            (<a
+              class="auth-help-link"
+              href="https://platform.openai.com/api-keys"
+              data-external-url="https://platform.openai.com/api-keys"
+            >create/fetch</a>).
+            OpenAI subscriptions don't cover API usage.
           </div>
           <div class="auth-provider-input">
             <input
@@ -112,6 +124,13 @@
         <button id="auth-continue-btn" type="button" class="landing-btn primary" disabled>
           Continue
         </button>
+        <!-- Inline hint that explains the disabled Continue state on
+             first launch, then flips to a confirmation once at least
+             one provider is configured. Toggled by renderAuthScreen
+             based on the ``any_authed`` flag in the auth payload. -->
+        <div id="auth-continue-hint" class="auth-continue-hint">
+          Save at least one provider to continue.
+        </div>
       </div>
     </div>
   </div>
