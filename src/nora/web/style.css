@@ -605,6 +605,19 @@ kbd {
   border: 1px solid var(--border);
 }
 
+.auth-help-link {
+  color: var(--accent);
+  text-decoration: underline;
+  text-underline-offset: 2px;
+  cursor: pointer;
+}
+
+.auth-help-link:hover,
+.auth-help-link:focus-visible {
+  text-decoration-thickness: 2px;
+  outline: none;
+}
+
 .auth-provider-input {
   display: flex;
   gap: 8px;
@@ -672,7 +685,18 @@ kbd {
 
 .auth-footer {
   display: flex;
-  justify-content: center;
+  flex-direction: column;
+  align-items: center;
+  gap: 8px;
+}
+
+.auth-continue-hint {
+  font-size: 12px;
+  color: var(--text-dim);
+}
+
+.auth-continue-hint.ready {
+  color: var(--accent);
 }
 
 .landing {

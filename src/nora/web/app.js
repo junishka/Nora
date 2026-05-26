@@ -15,6 +15,7 @@ const chatEl = document.getElementById('chat');
 const authEl = document.getElementById('auth');
 const authStatusEl = document.getElementById('auth-status');
 const authContinueBtn = document.getElementById('auth-continue-btn');
+const authContinueHint = document.getElementById('auth-continue-hint');
 const dropZone = document.getElementById('drop-zone');
 const chooseFilesBtn = document.getElementById('choose-files-btn');
 const chooseFolderBtn = document.getElementById('choose-folder-btn');
@@ -240,6 +241,20 @@ const DEPTH_TIERS = [
 
 // ----- view routing ------------------------------------------------------
 
+// Display labels for provider ids. The auth bridge speaks lowercase
+// ids ("anthropic", "openai"); UI copy should never leak those raw.
+// Falls back to capitalising the id if a new provider is added before
+// this map catches up.
+const PROVIDER_LABELS = {
+  anthropic: 'Anthropic',
+  openai: 'OpenAI',
+};
+function providerLabel(id) {
+  if (!id) return '';
+  if (PROVIDER_LABELS[id]) return PROVIDER_LABELS[id];
+  return id.charAt(0).toUpperCase() + id.slice(1);
+}
+
 function showAuth(authPayload) {
   /* Reveal the auth screen and render per-provider rows from the
    * payload returned by ``ui_ready`` / ``auth_status``. Called on
@@ -254,6 +269,19 @@ function showAuth(authPayload) {
     authStatusEl.className = 'auth-status';
   }
   renderAuthScreen(authPayload);
+  // Drop focus into the first unconfigured input so a first-launch
+  // researcher can paste straight away without tabbing to find the
+  // field. If every provider is already authed (e.g., they hit
+  // "Manage providers" from landing just to peek), skip — stealing
+  // focus to a field they don't need to touch is noisy.
+  const firstEmpty = authEl.querySelector(
+    '.auth-provider:not(.configured) [data-role="key-input"]'
+  );
+  if (firstEmpty) {
+    // requestAnimationFrame so focus lands after the panel has
+    // un-hidden; focusing a still-hidden element is a no-op.
+    requestAnimationFrame(() => firstEmpty.focus());
+  }
 }
 
 function renderAuthScreen(authPayload) {
@@ -295,8 +323,19 @@ function renderAuthScreen(authPayload) {
       forgetBtn.disabled = !info.has_keyring_entry;
     }
   });
+  const anyAuthed = !!(authPayload && authPayload.any_authed);
   if (authContinueBtn) {
-    authContinueBtn.disabled = !(authPayload && authPayload.any_authed);
+    authContinueBtn.disabled = !anyAuthed;
+  }
+  if (authContinueHint) {
+    // Swap between the "why is Continue gray?" prompt and a quiet
+    // ready-state confirmation. Keeping the element rendered (rather
+    // than show/hide) prevents the footer from jumping vertically
+    // when the researcher's first Save flips the state.
+    authContinueHint.textContent = anyAuthed
+      ? 'Ready when you are.'
+      : 'Save at least one provider to continue.';
+    authContinueHint.classList.toggle('ready', anyAuthed);
   }
 }
 
@@ -338,7 +377,7 @@ if (authEl) {
           const res = await window.pywebview.api.save_credential(provider, key);
           if (res && res.ok) {
             input.value = '';
-            setAuthStatus(`${provider} key saved.`, 'ok');
+            setAuthStatus(`${providerLabel(provider)} key saved.`, 'ok');
             renderAuthScreen(res.auth);
           } else {
             const reason = (res && res.reason) || 'unknown error';
@@ -363,7 +402,7 @@ if (authEl) {
         try {
           const res = await window.pywebview.api.delete_credential(provider);
           if (res && res.ok) {
-            setAuthStatus(`${provider} credential removed.`, 'ok');
+            setAuthStatus(`${providerLabel(provider)} credential removed.`, 'ok');
             renderAuthScreen(res.auth);
           } else {
             setAuthStatus('Forget failed: ' + ((res && res.reason) || ''), 'error');
@@ -407,6 +446,20 @@ async function openAuthScreen() {
 const manageProvidersBtn = document.getElementById('manage-providers-btn');
 if (manageProvidersBtn) {
   manageProvidersBtn.addEventListener('click', openAuthScreen);
+}
+
+// Inline "create an API key" links inside each provider's help text.
+// WKWebView would otherwise navigate the whole webview to the provider
+// console, blowing away the auth state. Intercept the click and hand
+// the URL to the OS browser via the allowlisted bridge.
+if (authEl) {
+  authEl.addEventListener('click', (e) => {
+    const link = e.target.closest('.auth-help-link');
+    if (!link) return;
+    e.preventDefault();
+    const url = link.getAttribute('data-external-url');
+    if (url) openExternal(url);
+  });
 }
 
 function showLanding() {

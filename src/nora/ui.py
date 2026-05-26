@@ -58,6 +58,7 @@ from nora.provider import (
 )
 from nora.provider.catalog import (
     ALL_MODELS,
+    PROVIDER_API_KEY_URLS,
     PROVIDER_DEFAULTS,
     PROVIDER_PRICING_URLS,
 )
@@ -2578,17 +2579,21 @@ class NoraBridge:
 
     def open_external(self, url: str) -> dict[str, Any]:
         """Open ``url`` in the OS default browser, NOT inside the
-        WKWebView. Used by the model picker's "view pricing" links so
-        researchers don't lose their chat session navigating to
-        anthropic.com or openai.com.
+        WKWebView. Used by the model picker's "view pricing" links and
+        the auth screen's "get an API key" links so researchers don't
+        lose their chat session navigating to anthropic.com or
+        openai.com.
 
-        Allowlist-gated — only URLs in ``PROVIDER_PRICING_URLS`` are
-        accepted. The bridge is reachable from page-rendered JS, so a
-        compromised page (e.g., a malicious tool result that escaped
-        sanitisation and somehow injected JS) MUST NOT be able to
-        coerce Nora into opening attacker-controlled URLs.
+        Allowlist-gated — only URLs in ``PROVIDER_PRICING_URLS`` and
+        ``PROVIDER_API_KEY_URLS`` are accepted. The bridge is reachable
+        from page-rendered JS, so a compromised page (e.g., a malicious
+        tool result that escaped sanitisation and somehow injected JS)
+        MUST NOT be able to coerce Nora into opening attacker-
+        controlled URLs.
         """
-        allowed = set(PROVIDER_PRICING_URLS.values())
+        allowed = set(PROVIDER_PRICING_URLS.values()) | set(
+            PROVIDER_API_KEY_URLS.values()
+        )
         if url not in allowed:
             return {"ok": False, "reason": f"url not on allowlist: {url!r}"}
         try:
