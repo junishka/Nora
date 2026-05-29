@@ -612,26 +612,31 @@ def _render_t_test(p: dict[str, Any]) -> str | None:
 
 
 def _render_descriptive(p: dict[str, Any]) -> str | None:
-    """One row. Columns: Variable, n, Mean, SD, Missing (and Min/Max
-    when the researcher's policy opted them in)."""
+    """One row. Columns: Variable, n, [Distinct], Mean, SD, [Min], [Max],
+    Missing. The Distinct (unique-value count) and Min/Max columns render
+    only when those fields are present in the (sanitized) payload."""
+    has_distinct = "distinct_count" in p and p["distinct_count"] is not None
     has_min = "min_value" in p and p["min_value"] is not None
     has_max = "max_value" in p and p["max_value"] is not None
-    header = ["Variable", "n", "Mean", "SD"]
+
+    header = ["Variable", "n"]
+    row = [str(p.get("variable") or ""), _fmt_int(p.get("n"))]
+    # Distinct sits next to n: it's a count companion ("n=523, distinct=7"),
+    # not a moment like Mean/SD. ``_fmt_int`` passes the ``"<10"``
+    # suppression marker through verbatim when the SDC layer coarsened a
+    # small unique-value count.
+    if has_distinct:
+        header.append("Distinct")
+        row.append(_fmt_int(p.get("distinct_count")))
+    header += ["Mean", "SD"]
+    row += [_fmt_num(p.get("mean")), _fmt_num(p.get("sd"))]
     if has_min:
         header.append("Min")
-    if has_max:
-        header.append("Max")
-    header.append("Missing")
-    row = [
-        str(p.get("variable") or ""),
-        _fmt_int(p.get("n")),
-        _fmt_num(p.get("mean")),
-        _fmt_num(p.get("sd")),
-    ]
-    if has_min:
         row.append(_fmt_num(p["min_value"]))
     if has_max:
+        header.append("Max")
         row.append(_fmt_num(p["max_value"]))
+    header.append("Missing")
     # ``p.get("missing_count")`` (no default) — when the sanitizer
     # has DROPPED the field entirely (cross-query back-calc case in
     # ``_render_crosstab`` analogues, single-suppressed-cell paths,

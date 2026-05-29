@@ -28,10 +28,20 @@
 *! The Nora sanitizer's `descriptive` schema does NOT accept min /
 *! max / median / quartiles — those are individual observations
 *! and get dropped even if emitted. This helper doesn't emit them.
+*!
+*! Optional `distinct` flag: emit the exact count of unique non-missing
+*! values of the variable (over the same [if] sample). Unlike mean / sd
+*! (which the sanitizer rounds to an N-appropriate number of significant
+*! figures), `distinct_count` is an allowed INTEGER field and passes
+*! through unrounded — so this is the supported way to release an exact
+*! unique/cardinality count. The helper computes it itself (egen group),
+*! so it's correct by construction; the whole-payload n>=10 minimum still
+*! applies. Example:
+*!     nora_result_sum ein, distinct label("Unique EINs")
 
 program define nora_result_sum
     version 13
-    syntax varname [if] [, label(string) missing(integer -1) ]
+    syntax varname [if] [, label(string) missing(integer -1) DISTINCT ]
 
     * JSON-escape `label` (Claude-controllable free text). See
     * nora_result_regress for the full explanation of this pattern.
@@ -91,6 +101,21 @@ program define nora_result_sum
         local missing = r(N)
     }
 
+    * Exact distinct count, opt-in via the `distinct` flag. `egen group`
+    * assigns each distinct non-missing value of `vname` a sequential id
+    * (missing -> missing, NOT a group), so r(max) is the number of unique
+    * non-missing values — consistent with `n` (non-missing) and tracked
+    * separately from `missing_count`. Respects the same [if] as summarize.
+    * Guarded by the all-missing exit above, so r(max) is >= 1 here.
+    if "`distinct'" != "" {
+        tempvar _nd
+        quietly egen `_nd' = group(`vname') `if'
+        quietly summarize `_nd', meanonly
+        * %18.0f + trim: plain integer literal, no scientific notation and
+        * no leading pad, for any cardinality up to the dataset size.
+        local distinct_count = trim(strofreal(r(max), "%18.0f"))
+    }
+
     tempname fh
     file open `fh' using `"`path'"', write text append
 
@@ -112,6 +137,13 @@ program define nora_result_sum
     }
 
     file write `fh' `","missing_count":`missing'"'
+
+    * Only emit when the flag was set and a valid (non-missing) count was
+    * produced — a "." would be invalid JSON and the sanitizer would reject
+    * the whole payload.
+    if "`distinct'" != "" & "`distinct_count'" != "" & "`distinct_count'" != "." {
+        file write `fh' `","distinct_count":`distinct_count'"'
+    }
 
     file write `fh' "}" _newline
     file close `fh'

@@ -360,6 +360,57 @@ def test_render_descriptive_without_min_max() -> None:
     assert md is not None
     assert "Min" not in md
     assert "Max" not in md
+    # No Distinct column unless the payload carries distinct_count.
+    assert "Distinct" not in md
+
+
+def test_render_descriptive_with_distinct_count() -> None:
+    payload = {
+        "type": "descriptive",
+        "variable": "ein",
+        "n": 851515, "mean": 4.726e8, "sd": 2.6e8,
+        "missing_count": 0,
+        "distinct_count": 165813,
+    }
+    md = render_table(payload)
+    assert md is not None
+    assert "Distinct" in md
+    # Exact count surfaced to the model/researcher, not dropped by render.
+    assert "165,813" in md
+
+
+def test_render_descriptive_distinct_count_suppression_marker() -> None:
+    """When the SDC layer coarsened a small unique-value count, the
+    ``"<10"`` marker must render verbatim in the Distinct column."""
+    payload = {
+        "type": "descriptive",
+        "variable": "region",
+        "n": 523, "mean": 2.5, "sd": 1.1,
+        "missing_count": 0,
+        "distinct_count": "<10",
+    }
+    md = render_table(payload)
+    assert md is not None
+    assert "Distinct" in md
+    assert "<10" in md
+
+
+def test_summarize_descriptive_includes_distinct_count() -> None:
+    """The terse one-liner the model carries in context (and the last
+    representation to survive inline-budget trimming) must surface
+    ``distinct_count`` when present, and omit it cleanly otherwise."""
+    from nora.tools import _summarize
+    with_distinct = _summarize({
+        "type": "descriptive", "variable": "ein",
+        "n": 851515, "mean": 4.726e8, "sd": 2.6e8,
+        "missing_count": 0, "distinct_count": 165813,
+    })
+    assert "distinct=165813" in with_distinct
+    without_distinct = _summarize({
+        "type": "descriptive", "variable": "salary",
+        "n": 100, "mean": 50000, "sd": 12000, "missing_count": 0,
+    })
+    assert "distinct" not in without_distinct
 
 
 def test_render_frequency_table_preserves_suppression_markers() -> None:
