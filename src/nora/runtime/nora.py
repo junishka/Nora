@@ -2519,6 +2519,7 @@ def from_t_test(res: Any, *, n1: int, n2: int | None = None,
 
 def from_summarize(variable: str, *, n: int, mean: float, sd: float,
                    missing_count: int = 0,
+                   distinct_count: int | None = None,
                    **extra: Any) -> None:
     """Emit a ``descriptive`` payload for a single numeric variable.
     Mirrors ``nora$from_summarize`` in the R library.
@@ -2529,6 +2530,21 @@ def from_summarize(variable: str, *, n: int, mean: float, sd: float,
     column. Researchers who need a variable's range should use a
     Nora-owned path (request_data with a future bounds extension)
     rather than a script-emitted descriptive.
+
+    ``distinct_count`` is the exact number of unique values. Unlike
+    ``mean`` / ``sd`` (floats, which the sanitizer rounds to an
+    N-appropriate number of significant figures), it is an allowed
+    *integer* field and passes through unrounded — so this is the
+    supported way to release an exact unique/cardinality count. The
+    whole-payload ``n >= 10`` minimum still applies. Compute it from
+    the data and pass it in, e.g.::
+
+        nora.from_summarize(
+            "ein", n=len(df),
+            mean=df["ein"].mean(), sd=df["ein"].std(),
+            missing_count=int(df["ein"].isna().sum()),
+            distinct_count=int(df["ein"].nunique()),
+        )
     """
     # ``_safe_int`` instead of bare ``int(...)``: avoid crashing the
     # whole helper on a NaN count that a careless caller forwarded
@@ -2542,6 +2558,13 @@ def from_summarize(variable: str, *, n: int, mean: float, sd: float,
         "sd": _safe_float(sd),
         "missing_count": _safe_int(missing_count),
     }
+    # Only attach ``distinct_count`` when supplied AND coercible. Emitting
+    # ``None`` would make the sanitizer drop it with a noisy "expected int"
+    # transformation; omitting the key entirely is cleaner and equivalent.
+    if distinct_count is not None:
+        _dc = _safe_int(distinct_count)
+        if _dc is not None:
+            fields["distinct_count"] = _dc
     fields.update(extra)
     result(type="descriptive", **fields)
 

@@ -103,6 +103,57 @@ def test_from_summarize_through_sanitizer(runtime) -> None:
     assert res.sanitized["n"] == 523
 
 
+def test_from_summarize_distinct_count_passes_through_exact(runtime) -> None:
+    """``distinct_count`` is an allowed *integer* field, so it must reach
+    the model UNROUNDED — unlike ``mean`` / ``sd`` which get clamped to an
+    N-appropriate number of significant figures.
+
+    The value 165_813 at n=851_515 is the discriminator: ``sigfigs_for_n``
+    yields 5 sig figs at this N, so a float passing through ``clamp_precision``
+    would round to 165_810. Asserting the exact integer survives proves the
+    sanitizer treats it as an integer field, not a float.
+    """
+    mod, path = runtime
+    mod.from_summarize("ein", n=851_515, mean=4.726e8, sd=2.6e8,
+                       missing_count=0, distinct_count=165_813)
+    payload = _read_payload_strip_token(path)
+    assert payload["distinct_count"] == 165_813
+    res = sanitize(payload)
+    assert res.ok, f"sanitizer rejected: {res.rejection_reason}"
+    assert res.analysis_type == "descriptive"
+    # Exact, NOT rounded to 165_810 the way a float field would be.
+    assert res.sanitized["distinct_count"] == 165_813
+
+
+def test_from_summarize_omits_distinct_count_when_not_supplied(runtime) -> None:
+    """When the caller doesn't pass ``distinct_count``, the key must be
+    absent from the payload entirely — never emitted as ``null`` (which the
+    sanitizer would drop with a noisy "expected int" transformation)."""
+    mod, path = runtime
+    mod.from_summarize("salary", n=523, mean=85000.0, sd=12000.0,
+                       missing_count=4)
+    payload = _read_payload_strip_token(path)
+    assert "distinct_count" not in payload
+
+
+def test_from_summarize_small_distinct_count_coarsened(runtime) -> None:
+    """A small exact ``distinct_count`` is itself disclosive (few unique
+    values = few groups, same surface as a small frequency cell), so the
+    sanitizer coarsens ``0 < distinct_count < threshold`` to ``<10`` — the
+    same floor as ``missing_count`` and cell suppression. ``n`` is well
+    above the minimum here, so it's specifically the unique-value count
+    being suppressed, not the whole payload."""
+    mod, path = runtime
+    mod.from_summarize("region", n=523, mean=2.5, sd=1.1,
+                       missing_count=0, distinct_count=4)
+    payload = _read_payload_strip_token(path)
+    assert payload["distinct_count"] == 4  # emitted exact by the runtime
+    res = sanitize(payload)
+    assert res.ok, f"sanitizer rejected: {res.rejection_reason}"
+    # ...but coarsened by the SDC layer before it reaches the model.
+    assert res.sanitized["distinct_count"] == "<10"
+
+
 # ---------------------------------------------------------------------------
 # from_table (frequency_table)
 # ---------------------------------------------------------------------------

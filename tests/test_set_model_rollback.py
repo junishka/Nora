@@ -74,7 +74,7 @@ def test_failed_swap_via_exception_restores_model(tmp_path: Path) -> None:
         bridge._session = _FakeSession(swap_raises=RuntimeError("nope"))
 
         # Pick a different Anthropic model to trigger the swap path.
-        target = "claude-opus-4-7[1m]"
+        target = "claude-opus-4-8[1m]"
         assert target != original_model
 
         res = bridge.set_model(target)
@@ -101,7 +101,7 @@ def test_failed_swap_via_ok_false_restores_model(tmp_path: Path) -> None:
             swap_returns={"ok": False, "reason": "unknown id at SDK level"}
         )
 
-        target = "claude-opus-4-7[1m]"
+        target = "claude-opus-4-8[1m]"
         res = bridge.set_model(target)
 
         assert res["ok"] is False
@@ -120,7 +120,7 @@ def test_successful_swap_keeps_new_model(tmp_path: Path) -> None:
         original_model = bridge._model
         bridge._session = _FakeSession(swap_returns={"ok": True})
 
-        target = "claude-opus-4-7[1m]"
+        target = "claude-opus-4-8[1m]"
         assert target != original_model
         res = bridge.set_model(target)
 
@@ -141,7 +141,7 @@ def test_failed_swap_with_no_open_session_still_assigns(
     bridge = NoraBridge(cwd=tmp_path)
     # No loop, no session — just a fresh bridge.
     original_model = bridge._model
-    target = "claude-opus-4-7[1m]"
+    target = "claude-opus-4-8[1m]"
     assert target != original_model
     res = bridge.set_model(target)
     assert res["ok"] is True

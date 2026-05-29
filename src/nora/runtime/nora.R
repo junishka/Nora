@@ -5,7 +5,7 @@
 #   nora$result(type = "linear_regression", ...)
 #   nora$from_lm(model, ...)
 #   nora$from_t_test(res, ...)
-#   nora$from_summarize(var_name, n, mean, sd, missing_count)
+#   nora$from_summarize(var_name, n, mean, sd, missing_count, distinct_count)
 #   nora$from_table(var_name, counts, n, missing_count)
 #
 # The script writes structured payloads to the path in $NORA_RESULT_PATH.
@@ -2141,6 +2141,18 @@ nora$from_t_test <- function(res, ...) {
 #' Prints a compact one-variable summary to stdout so the researcher
 #' sees "variable: n=X, mean=Y, sd=Z, missing=M" in the raw log
 #' panel. The caller provides the numbers; we don't recompute.
+#'
+#' `distinct_count` (optional) is the exact number of unique values.
+#' Unlike `mean` / `sd` (floats, which the sanitizer rounds to an
+#' N-appropriate number of significant figures), it is an allowed
+#' *integer* field and passes through unrounded — so this is the
+#' supported way to release an exact unique/cardinality count. The
+#' whole-payload `n >= 10` minimum still applies. Compute it from the
+#' data and pass it in, e.g.
+#'   nora$from_summarize("ein", n = nrow(df), mean = mean(df$ein),
+#'                        sd = sd(df$ein),
+#'                        missing_count = sum(is.na(df$ein)),
+#'                        distinct_count = length(unique(na.omit(df$ein))))
 nora$from_summarize <- function(variable, n, mean, sd, missing_count,
                                    distinct_count = NULL,
                                    ...) {
@@ -2163,9 +2175,16 @@ nora$from_summarize <- function(variable, n, mean, sd, missing_count,
     n = as.integer(n),
     mean = mean,
     sd = sd,
-    missing_count = as.integer(missing_count),
-    distinct_count = if (is.null(distinct_count)) NULL else as.integer(distinct_count)
+    missing_count = as.integer(missing_count)
   )
+  # Attach distinct_count only when supplied. `list(x = NULL)` would
+  # RETAIN a null element (R keeps named NULLs), so the payload would
+  # carry `"distinct_count": null` and the sanitizer would drop it with
+  # a noisy "expected int" transformation on every call that omits it.
+  # Conditional assignment never creates the key.
+  if (!is.null(distinct_count)) {
+    args$distinct_count <- as.integer(distinct_count)
+  }
   do.call(nora$result, c(args, list(...)))
 }
 

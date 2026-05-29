@@ -1749,6 +1749,60 @@ def test_missing_count_zero_left_intact() -> None:
     assert result.sanitized.get("missing_count") == 0
 
 
+def test_descriptive_coarsens_small_distinct_count() -> None:
+    """A small exact ``distinct_count`` is the same disclosure surface
+    as a small frequency cell: it reveals the variable splits the
+    (well-above-minimum) sample into only a handful of groups. Coarsen
+    ``0 < distinct_count < threshold`` to the suppression marker, the
+    same floor as ``missing_count`` and cell suppression. ``n`` is large
+    here, so it's specifically the unique-value count being suppressed."""
+    result = sanitize({
+        "type": "descriptive",
+        "variable": "region",
+        "n": 523,
+        "mean": 2.5,
+        "sd": 1.1,
+        "missing_count": 0,
+        # 4 < 10 (threshold), > 0 → coarsen.
+        "distinct_count": 4,
+    })
+    assert result.ok
+    assert result.sanitized.get("distinct_count") == "<10"
+
+
+def test_descriptive_distinct_count_at_threshold_intact() -> None:
+    """The gate is strict (``< threshold``): a ``distinct_count`` exactly
+    at the threshold is not coarsened."""
+    result = sanitize({
+        "type": "descriptive",
+        "variable": "region",
+        "n": 523,
+        "mean": 5.0,
+        "sd": 2.0,
+        "missing_count": 0,
+        "distinct_count": 10,  # == threshold → kept exact
+    })
+    assert result.ok
+    assert result.sanitized.get("distinct_count") == 10
+
+
+def test_descriptive_large_distinct_count_exact_unrounded() -> None:
+    """Above the threshold, ``distinct_count`` passes through as an exact
+    integer — never significance-rounded the way ``mean`` / ``sd`` are.
+    165_813 at this N would round to 165_810 if it were a float field."""
+    result = sanitize({
+        "type": "descriptive",
+        "variable": "ein",
+        "n": 851_515,
+        "mean": 4.726e8,
+        "sd": 2.6e8,
+        "missing_count": 0,
+        "distinct_count": 165_813,
+    })
+    assert result.ok
+    assert result.sanitized.get("distinct_count") == 165_813
+
+
 def test_magnitude_table_suppressed_group_labels_bucketed() -> None:
     """Magnitude table: groups with n < threshold or dominance
     failure are bucketed under ``[suppressed]`` so the group label

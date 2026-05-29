@@ -10,7 +10,7 @@ Each test pins a behaviour that broke in production at least once:
 2. ``NoraBridge(cwd=...)`` (the launcher path that opens straight
    into chat) restores the per-session model preference. Without
    this, a session whose state file says ``active_model =
-   "claude-opus-4-7[1m]"`` came up on the default Sonnet.
+   "claude-opus-4-8[1m]"`` came up on the default Sonnet.
 
 3. ``unstage_attachment`` removes a staged script from
    ``_pending_script_attachments`` so the chip × in the JS UI is
@@ -71,17 +71,17 @@ def test_constructor_with_cwd_restores_recorded_model(
     tmp_path: Path,
 ) -> None:
     """A session whose ``.nora/session_state.json`` records
-    ``active_model = "claude-opus-4-7[1m]"`` must come up on Opus
+    ``active_model = "claude-opus-4-8[1m]"`` must come up on Opus
     when the launcher passes the cwd directly. Skipping the
     restore step (the previous behaviour) silently dropped
     researchers onto the catalog default."""
     session_dir = tmp_path / "saved-on-opus"
     session_dir.mkdir()
-    write_session_state(session_dir, model="claude-opus-4-7[1m]")
+    write_session_state(session_dir, model="claude-opus-4-8[1m]")
 
     bridge = NoraBridge(cwd=session_dir)
 
-    assert bridge._model == "claude-opus-4-7[1m]"
+    assert bridge._model == "claude-opus-4-8[1m]"
     assert bridge._provider == "anthropic"
 
 

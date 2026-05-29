@@ -51,7 +51,7 @@ PROVIDER_API_KEY_URLS: dict[str, str] = {
 
 # Anthropic. The ``[1m]`` suffix on Sonnet/Opus requests the 1M-context
 # beta via the Claude CLI / Agent SDK. As of March 2026 there's no
-# pricing tier on context length — Opus 4.7 / Opus 4.6 / Sonnet 4.6
+# pricing tier on context length — Opus 4.8 / Opus 4.7 / Sonnet 4.6
 # bill the full 1M window at standard rates (a 900k-token request
 # costs the same per-token as a 9k-token request, per Anthropic's
 # pricing doc). The suffix is a beta-header opt-in, not a paid
@@ -67,8 +67,8 @@ ANTHROPIC_MODELS: tuple[ModelInfo, ...] = (
         provider="anthropic",
     ),
     ModelInfo(
-        id="claude-opus-4-7[1m]",
-        label="Opus 4.7",
+        id="claude-opus-4-8[1m]",
+        label="Opus 4.8",
         context_window=1_000_000,
         provider="anthropic",
     ),

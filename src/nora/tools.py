@@ -412,7 +412,14 @@ def _summarize(payload: dict[str, Any]) -> str:
         n = payload.get("n")
         m = payload.get("mean")
         sd = payload.get("sd")
-        return f"descriptive for {v!r}, n={n}, mean={m}, sd={sd}"
+        # ``distinct_count`` is the headline for a unique-count query and
+        # is the field most at risk of being lost to context trimming
+        # (the summary is the last representation to survive the staged
+        # inline-budget trim). Carry it when present — handles both the
+        # exact integer and the ``"<10"`` suppression marker.
+        dc = payload.get("distinct_count")
+        distinct_part = f", distinct={dc}" if dc is not None else ""
+        return f"descriptive for {v!r}, n={n}, mean={m}, sd={sd}{distinct_part}"
     if t == "frequency_table":
         v = payload.get("variable")
         counts = payload.get("counts", {})

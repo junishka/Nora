@@ -4,6 +4,58 @@ Notable changes per release. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 versions follow semver, pre-1.0.
 
+## [0.10.3] - 2026-05-29
+
+Focused patch on top of `0.10.2`. Two threads. The first closes a
+real gap: researchers can now release an exact unique-value count
+through the descriptive payload, where before every obvious path
+returned a significance-rounded approximation. The second moves the
+Anthropic model picker from Opus 4.7 to Opus 4.8.
+
+- **Exact unique-value counts via `distinct_count`.** A unique count
+  computed and pushed through `from_magnitude_table` (sum) or a
+  scalar `mean` was rounded to 3-to-5 significant figures by the SDC
+  layer, so 165,813 distinct EINs came back as 166,000 or 165,800.
+  `distinct_count` is now a first-class optional field on the
+  descriptive payload, surfaced by `nora.from_summarize(...,
+  distinct_count=...)` (Python), `nora$from_summarize(...,
+  distinct_count=...)` (R), and `nora_result_sum varname, distinct`
+  (Stata, which computes the exact count itself over the same `if`
+  sample via `egen group`). It is an allowed integer field, so the
+  sanitizer passes it through unrounded, the descriptive table
+  renders it in a new `Distinct` column, and the carried one-line
+  summary includes it so the figure survives context trimming.
+- **Small unique counts coarsen to `<10`.** A `distinct_count`
+  between 1 and 9 partitions a sample (already gated to at least 10
+  rows) into a handful of groups, the same disclosure surface as a
+  small frequency cell, so the sanitizer holds it to the
+  cell-suppression floor and emits `<10` (mirroring the existing
+  `missing_count` rule). Counts at or above the threshold pass
+  through exact.
+- **Anthropic model picker: Opus 4.7 to Opus 4.8.** The picker now
+  offers Opus 4.8 in place of Opus 4.7. Opus 4.8 is a drop-in for
+  4.7 (same 1M context window, 128k max output, adaptive thinking,
+  no breaking API changes), so the `[1m]` context suffix and every
+  call site are unchanged. Per-session model-memory and set-model
+  rollback tests now pin the 4.8 id.
+
+Researcher-visible: a unique or cardinality count now comes back as
+the exact integer (for example 165,813) in a `Distinct` column
+instead of a rounded magnitude, except when fewer than 10 distinct
+values would themselves be disclosive (shown as `<10`); the
+Anthropic picker lists Opus 4.8.
+
+No data shape changes beyond the additive `distinct_count` field; no
+API breaks. Sessions saved under `0.10.0` through `0.10.2` resolve
+unchanged.
+
+**Updated in 0.10.3**: exact `distinct_count` on the descriptive
+payload across the Python, R, and Stata helpers (passed through the
+sanitizer unrounded, rendered in a `Distinct` column, carried in the
+result summary), small unique counts coarsened to `<10` like
+`missing_count`, and the Anthropic model picker moved from Opus 4.7
+to Opus 4.8.
+
 ## [0.10.2] — 2026-05-23
 
 Focused patch on top of `0.10.1`. Two threads. The first is

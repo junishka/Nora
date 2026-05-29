@@ -1122,6 +1122,41 @@ def _coarsen_small_missing_count(
         )
 
 
+def _coarsen_small_distinct_count(
+    out: dict[str, Any],
+    transformations: list[str],
+    config: SDCConfig,
+) -> None:
+    """Replace ``distinct_count`` with the suppression marker when its
+    exact value is itself disclosive (``0 < distinct_count < threshold``).
+
+    ``distinct_count`` is the number of unique values of the variable.
+    A small exact value means the variable partitions the (>= min_n)
+    analyzed records into very few groups — structurally the same
+    disclosure surface as a frequency_table with a handful of cells,
+    which we already cell-suppress. "523 records, 2 distinct employers"
+    tells you the average group is ~260, but "12 records, 2 distinct"
+    or a low count paired with other margins narrows membership the way
+    a small cell does. The actual values aren't emitted, so the leak is
+    cardinality, not identity — but we hold ``distinct_count`` to the
+    same floor as cell suppression / ``missing_count`` so the descriptive
+    path can't become a side channel for low-cardinality structure that
+    ``from_table`` would have suppressed. Zero is left as-is (it only
+    arises when there are no non-missing records, which the ``n`` gate
+    already precludes).
+
+    Mutates ``out`` in place. Appends one log line if coarsening fired.
+    """
+    threshold = config.cell_suppression_threshold
+    distinct_raw = out.get("distinct_count")
+    if isinstance(distinct_raw, int) and 0 < distinct_raw < threshold:
+        out["distinct_count"] = suppression_marker(threshold)
+        transformations.append(
+            f"coarsened distinct_count to {suppression_marker(threshold)} "
+            f"(exact small unique-value counts are themselves disclosive)"
+        )
+
+
 def _coarsen_small_cox_counts(
     out: dict[str, Any],
     transformations: list[str],
@@ -1888,6 +1923,7 @@ def _sanitize_descriptive(
         if key in out:
             out[key] = clamp_precision(out[key], n)
     _coarsen_small_missing_count(out, transformations, config)
+    _coarsen_small_distinct_count(out, transformations, config)
     transformations.append(
         f"clamped numeric fields to {sigfigs_for_n(n)} significant "
         f"figures (n={n})"
