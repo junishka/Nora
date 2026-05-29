@@ -307,7 +307,7 @@ Picker (top-right of composer, grouped by provider):
 
 | Provider | Models | Pricing link |
 |---|---|---|
-| Anthropic | Sonnet 4.6, Opus 4.7 | platform.claude.com/docs/…/pricing |
+| Anthropic | Sonnet 4.6, Opus 4.8 | platform.claude.com/docs/…/pricing |
 | OpenAI | GPT-5.5, GPT-5.5 Pro (extended reasoning) | openai.com/api/pricing |
 
 Each row carries a small `$` link that opens the provider's pricing

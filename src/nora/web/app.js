@@ -75,7 +75,7 @@ if (cwdEl) {
 
 // Context-window ceiling for the chip's ratio display. Updated
 // whenever the researcher picks a model (see updateModelChip) —
-// Sonnet 4.6 defaults to 1M, Opus 4.7 and Haiku 4.5 to 200k. The
+// Sonnet 4.6 defaults to 1M, Opus 4.8 and Haiku 4.5 to 200k. The
 // starting 1M matches the default model (Sonnet).
 const DEFAULT_CONTEXT_WINDOW = 1_000_000;
 let contextWindow = DEFAULT_CONTEXT_WINDOW;
@@ -4323,7 +4323,7 @@ function renderModelPopup() {
   // Group models by provider so the picker reads as
   //   Anthropic
   //     Sonnet 4.6 (1M)
-  //     Opus 4.7 (1M)
+  //     Opus 4.8 (1M)
   //     Haiku 4.5
   //   OpenAI
   //     GPT-5
