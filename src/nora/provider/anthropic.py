@@ -361,6 +361,22 @@ class AnthropicSession:
         return ClaudeAgentOptions(
             system_prompt=self._system_prompt,
             model=self.model,
+            # Reasoning controls. Left unset, the SDK inherits each
+            # model's defaults: adaptive thinking on 4.6+ models, but a
+            # "high" effort ceiling and — on Opus 4.7+ — an "omitted"
+            # thinking display that strips the reasoning text down to
+            # signatures (so Nora's AssistantThinking trace goes blank).
+            # We pin both explicitly:
+            #   - effort="xhigh": extended reasoning depth on models that
+            #     support it (Opus 4.7+); falls back to "high" elsewhere
+            #     (e.g. the default Sonnet 4.6), so it's safe across the
+            #     whole catalog.
+            #   - thinking adaptive + display="summarized": keep the model
+            #     deciding how much to think, but ask for human-readable
+            #     summarized traces so the thinking panel stays populated
+            #     on Opus 4.8 / Fable 5, not just pre-4.7 Sonnet.
+            effort="xhigh",
+            thinking={"type": "adaptive", "display": "summarized"},
             continue_conversation=self._continue,
             mcp_servers={SERVER_NAME: build_server()},
             allowed_tools=list(ALLOWED_TOOL_NAMES),
