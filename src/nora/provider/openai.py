@@ -51,6 +51,7 @@ from typing import Any, AsyncIterator
 
 from nora.provider.base import (
     AssistantText,
+    AssistantThinking,
     AuthFailure,
     Event,
     ToolCall,
@@ -515,6 +516,21 @@ class OpenAISession:
                     # Pinning surfaces the dependency at the request
                     # boundary and the lockdown test asserts it.
                     "parallel_tool_calls": True,
+                    # Reasoning controls — the OpenAI analogue of the
+                    # Anthropic provider's effort="xhigh" +
+                    # thinking.display="summarized" pinning:
+                    #   - effort="xhigh": deepest reasoning tier. Valid
+                    #     on both catalog models — gpt-5.5 supports the
+                    #     full none/low/medium/high/xhigh range, and the
+                    #     gpt-5.x-pro line lifted the gpt-5-pro
+                    #     "high-only" restriction (gpt-5.4-pro and later
+                    #     accept xhigh). If OpenAI ever ships a Pro
+                    #     variant that re-pins high, it would 400 here.
+                    #   - summary="auto": request reasoning summaries so
+                    #     the thinking trace below has something to
+                    #     surface. ("concise" is NOT supported by the
+                    #     gpt-5 series; "auto" lets the server pick.)
+                    "reasoning": {"effort": "xhigh", "summary": "auto"},
                     # store=True is required for reasoning models AND
                     # for ``previous_response_id`` chaining: the
                     # server has to retain the prior response object
@@ -696,8 +712,29 @@ class OpenAISession:
                             input=_safe_json(args_json),
                             call_id=call_id,
                         )
-                    # ``reasoning`` / ``reasoning_summary`` and any
-                    # other item types are held server-side and
+                    elif itype == "reasoning":
+                        # Surface the model's reasoning SUMMARY (requested
+                        # via reasoning.summary="auto" above) as a thinking
+                        # trace, mirroring the Anthropic provider's
+                        # ThinkingBlock -> AssistantThinking translation so
+                        # the UI's thinking panel populates on both
+                        # providers. We read ``summary`` (a list of
+                        # ``{type:"summary_text", text:...}`` parts), NOT the
+                        # raw ``content``/``encrypted_content`` — OpenAI's
+                        # policy only sanctions the summary surface, and
+                        # summaries aren't emitted every round, so the
+                        # strip()-guard keeps empties out. The item itself is
+                        # still carried forward server-side via the
+                        # response-id chain; this is display-only.
+                        summary = getattr(item, "summary", None) or []
+                        trace = "".join(
+                            getattr(part, "text", "") or ""
+                            for part in summary
+                            if getattr(part, "type", None) == "summary_text"
+                        )
+                        if trace.strip():
+                            yield AssistantThinking(text=trace)
+                    # Any other item types are held server-side and
                     # carried forward implicitly by the chain — no
                     # local tracking needed.
 
