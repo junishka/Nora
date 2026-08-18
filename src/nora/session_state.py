@@ -131,6 +131,12 @@ class SessionState:
     recent_results: list[RecentResult] = field(default_factory=list)
     datasets: list[str] = field(default_factory=list)
     active_model: str | None = None
+    # Reasoning-effort level the researcher picked for this session
+    # (``low`` … ``max``; see ``catalog.EFFORT_LEVELS``). ``None``
+    # means "never chosen" — the bridge applies its default. Restored
+    # alongside ``active_model`` so a session that ran on Opus at
+    # ``max`` comes back on Opus at ``max``.
+    active_effort: str | None = None
     # Optional researcher-set label for the session. When set, the UI
     # prefers this over the auto-derived title (dataset name /
     # timestamp). ``None`` means "use the auto-derived title".
@@ -152,6 +158,7 @@ class SessionState:
 def write_session_state(
     cwd: Path,
     model: str | None = None,
+    effort: str | None = None,
     *,
     # ``store_list`` is injected so tests don't have to construct a
     # real ResultStore. Production callers pass
@@ -254,6 +261,12 @@ def write_session_state(
         custom_name = prior.custom_name if prior is not None else None
         pinned = prior.pinned if prior is not None else False
         pinned_at = prior.pinned_at if prior is not None else ""
+        # ``effort=None`` means "caller didn't say" — carry the prior
+        # value rather than clobbering it, so a writer that only
+        # knows the model (older call sites, tests) never silently
+        # resets a researcher's per-session effort choice.
+        if effort is None and prior is not None:
+            effort = prior.active_effort
 
         state = SessionState(
             version=SESSION_STATE_VERSION,
@@ -264,6 +277,7 @@ def write_session_state(
             recent_results=recent,
             datasets=datasets,
             active_model=model,
+            active_effort=effort,
             custom_name=custom_name,
             pinned=pinned,
             pinned_at=pinned_at,
@@ -325,6 +339,7 @@ def set_custom_name(cwd: Path, name: str | None) -> SessionState | None:
                 recent_results=prior.recent_results,
                 datasets=prior.datasets,
                 active_model=prior.active_model,
+                active_effort=prior.active_effort,
                 custom_name=cleaned,
                 pinned=prior.pinned,
                 pinned_at=prior.pinned_at,
@@ -381,6 +396,7 @@ def set_pinned(cwd: Path, pinned: bool) -> SessionState | None:
                 recent_results=prior.recent_results,
                 datasets=prior.datasets,
                 active_model=prior.active_model,
+                active_effort=prior.active_effort,
                 custom_name=prior.custom_name,
                 pinned=flag,
                 pinned_at=new_pinned_at,
@@ -433,6 +449,7 @@ def read_session_state(cwd: Path | None) -> SessionState | None:
             ],
             datasets=[str(d) for d in (raw.get("datasets") or []) if d],
             active_model=raw.get("active_model"),
+            active_effort=(raw.get("active_effort") or None),
             custom_name=(raw.get("custom_name") or None),
             pinned=bool(raw.get("pinned", False)),
             pinned_at=str(raw.get("pinned_at", "") or ""),

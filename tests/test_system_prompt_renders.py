@@ -450,7 +450,7 @@ def test_anthropic_prompt_carries_mcp_prefix_intro(tmp_path: Path) -> None:
 
 def test_openai_prompt_drops_mcp_prefix_intro(tmp_path: Path) -> None:
     """OpenAI's function tools have flat names — no ``mcp__`` prefix.
-    Telling GPT-5.5 about a name convention it never sees is both
+    Telling GPT-5.6 about a name convention it never sees is both
     inaccurate and wastes tokens on the per-call prefix."""
     rendered = build_system_prompt(tmp_path, "nora", provider="openai")
     assert "mcp__nora__" not in rendered

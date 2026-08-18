@@ -29,21 +29,23 @@ def _seed_session_state(cwd: Path, model: str) -> None:
     write_session_state(cwd, model=model)
 
 
-def test_set_cwd_restores_recorded_model(tmp_path: Path) -> None:
+def test_set_cwd_restores_recorded_model(
+    tmp_path: Path, anthropic_authed: None,
+) -> None:
     """A session whose state file says ``active_model = "claude-opus-..."``
     should open with Opus selected, not the global default."""
     session_dir = tmp_path / "session-a"
     session_dir.mkdir()
-    _seed_session_state(session_dir, "claude-opus-4-8[1m]")
+    _seed_session_state(session_dir, "claude-opus-5[1m]")
 
     bridge = NoraBridge(cwd=None)
     # Default model at construction is the catalog default. Confirm we
     # actually swap away from it.
-    assert bridge._model != "claude-opus-4-8[1m]"
+    assert bridge._model != "claude-opus-5[1m]"
 
     bridge._set_cwd(session_dir)
 
-    assert bridge._model == "claude-opus-4-8[1m]"
+    assert bridge._model == "claude-opus-5[1m]"
     assert bridge._provider == "anthropic"
 
 
@@ -87,7 +89,7 @@ def test_set_cwd_ignores_unauthed_provider(
     provider we can't auth would just fail at first turn."""
     session_dir = tmp_path / "session-needs-openai"
     session_dir.mkdir()
-    _seed_session_state(session_dir, "gpt-5.5")
+    _seed_session_state(session_dir, "gpt-5.6-sol")
 
     # Force ``_authed_providers`` to report only Anthropic.
     monkeypatch.setattr(
@@ -104,7 +106,7 @@ def test_set_cwd_ignores_unauthed_provider(
 
 
 def test_switching_back_and_forth_remembers_per_session(
-    tmp_path: Path,
+    tmp_path: Path, anthropic_authed: None,
 ) -> None:
     """End-to-end: two sessions, each remembers its own model. The
     point of the per-session feature."""
@@ -112,42 +114,44 @@ def test_switching_back_and_forth_remembers_per_session(
     session_b = tmp_path / "b"
     session_a.mkdir()
     session_b.mkdir()
-    _seed_session_state(session_a, "claude-sonnet-4-6[1m]")
-    _seed_session_state(session_b, "claude-opus-4-8[1m]")
+    _seed_session_state(session_a, "claude-sonnet-5[1m]")
+    _seed_session_state(session_b, "claude-opus-5[1m]")
 
     bridge = NoraBridge(cwd=None)
 
     bridge._set_cwd(session_a)
-    assert bridge._model == "claude-sonnet-4-6[1m]"
+    assert bridge._model == "claude-sonnet-5[1m]"
 
     bridge._set_cwd(session_b)
-    assert bridge._model == "claude-opus-4-8[1m]"
+    assert bridge._model == "claude-opus-5[1m]"
 
     bridge._set_cwd(session_a)
-    assert bridge._model == "claude-sonnet-4-6[1m]"
+    assert bridge._model == "claude-sonnet-5[1m]"
 
 
-def test_set_model_persists_choice_immediately(tmp_path: Path) -> None:
+def test_set_model_persists_choice_immediately(
+    tmp_path: Path, anthropic_authed: None,
+) -> None:
     """A successful set_model should write active_model to the state
     file BEFORE the first turn lands, so swap-then-quit-then-reopen
     comes back to the chosen model rather than the prior recorded
     one."""
     session_dir = tmp_path / "session-swap"
     session_dir.mkdir()
-    _seed_session_state(session_dir, "claude-sonnet-4-6[1m]")
+    _seed_session_state(session_dir, "claude-sonnet-5[1m]")
 
     bridge = NoraBridge(cwd=None)
     bridge._set_cwd(session_dir)
-    assert bridge._model == "claude-sonnet-4-6[1m]"
+    assert bridge._model == "claude-sonnet-5[1m]"
 
     # Swap to Opus. Bridge has no session open yet so set_model is the
     # no-session branch — just stashes the choice. Without our
     # _persist_active_model() call, the next read_session_state would
     # still return Sonnet.
-    res = bridge.set_model("claude-opus-4-8[1m]")
+    res = bridge.set_model("claude-opus-5[1m]")
     assert res["ok"] is True
 
     # Confirm the on-disk file reflects the swap.
     state_path = session_dir / ".nora" / "session_state.json"
     payload = json.loads(state_path.read_text(encoding="utf-8"))
-    assert payload["active_model"] == "claude-opus-4-8[1m]"
+    assert payload["active_model"] == "claude-opus-5[1m]"

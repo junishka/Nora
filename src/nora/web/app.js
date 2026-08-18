@@ -74,9 +74,10 @@ if (cwdEl) {
 }
 
 // Context-window ceiling for the chip's ratio display. Updated
-// whenever the researcher picks a model (see updateModelChip) —
-// Sonnet 4.6 defaults to 1M, Opus 4.8 and Haiku 4.5 to 200k. The
-// starting 1M matches the default model (Sonnet).
+// whenever the researcher picks a model (see updateModelChip) from
+// the catalog's per-model ``context_window`` — every current entry
+// is 1M (Claude 5 family) or 1.05M (GPT-5.6 family). The starting
+// 1M matches the default model (Sonnet 5).
 const DEFAULT_CONTEXT_WINDOW = 1_000_000;
 let contextWindow = DEFAULT_CONTEXT_WINDOW;
 // Last solid count returned by ``count_next_context``. The chip
@@ -4262,6 +4263,9 @@ const modelChipLabel = document.getElementById('model-chip-label');
 const modelPopup = document.getElementById('model-popup');
 let availableModels = [];      // cached from list_models
 let currentModelId = null;     // the backend's authoritative selection
+let availableEfforts = [];     // [{id,label,hint}] — provider-neutral ladder
+let currentEffortId = null;    // the backend's authoritative effort level
+let defaultEffortId = null;    // catalog default (marked in the picker)
 
 async function loadModels() {
   /* Fetch the model catalog from the backend and render the popup.
@@ -4280,6 +4284,9 @@ async function loadModels() {
     if (!res || !res.ok) return;
     availableModels = res.models || [];
     currentModelId = res.current;
+    availableEfforts = res.efforts || [];
+    currentEffortId = res.current_effort || null;
+    defaultEffortId = res.default_effort || null;
     renderModelChip();
   } catch (err) {
     console.warn('list_models failed', err);
@@ -4289,7 +4296,21 @@ async function loadModels() {
 function renderModelChip() {
   if (!modelChip || !modelChipLabel) return;
   const info = availableModels.find((m) => m.id === currentModelId);
-  modelChipLabel.textContent = info ? info.label : 'Model';
+  // "Sonnet 5 · xhigh" — the effort rides the chip as a dim mono
+  // suffix so the current level is visible without opening the
+  // popup (the same at-a-glance treatment Claude Code gives its
+  // effort setting). Rendered as two spans so the suffix can be
+  // styled independently; the label span is rebuilt each time.
+  modelChipLabel.textContent = '';
+  const nameSpan = document.createElement('span');
+  nameSpan.textContent = info ? info.label : 'Model';
+  modelChipLabel.appendChild(nameSpan);
+  if (currentEffortId) {
+    const effSpan = document.createElement('span');
+    effSpan.className = 'model-chip-effort';
+    effSpan.textContent = ' · ' + currentEffortId;
+    modelChipLabel.appendChild(effSpan);
+  }
   // Keep the context-chip ceiling in sync with the selected model
   // so the X / Y ratio reflects that model's actual window. If a
   // turn_done already painted the chip against the default window
@@ -4322,12 +4343,12 @@ function renderModelPopup() {
 
   // Group models by provider so the picker reads as
   //   Anthropic
-  //     Sonnet 4.6 (1M)
-  //     Opus 4.8 (1M)
-  //     Haiku 4.5
+  //     Sonnet 5 (1M)
+  //     Opus 5 (1M)
+  //     Fable 5 (1M)
   //   OpenAI
-  //     GPT-5
-  //     GPT-5 mini
+  //     GPT-5.6 Terra (1.05M)
+  //     GPT-5.6 Sol (1.05M)
   // Models for un-authed providers stay in the list but render
   // disabled with a "Configure auth" hint so the researcher can see
   // the option exists without being able to silently pick it.
@@ -4412,6 +4433,55 @@ function renderModelPopup() {
       wrap.appendChild(row);
     });
   });
+
+  // Effort section — the same dial as Claude Code's effort picker,
+  // embedded under the model list so "which model" and "how hard
+  // it thinks" live in one place. Provider-neutral: every catalog
+  // model accepts every level, so the ladder never re-renders on a
+  // model switch. Segmented control; the active level is filled,
+  // the catalog default carries a small dot so a researcher who
+  // wandered off it can find the way back.
+  if (availableEfforts.length > 0) {
+    const effHeader = document.createElement('div');
+    effHeader.className = 'model-group-header';
+    effHeader.textContent = 'Effort';
+    wrap.appendChild(effHeader);
+
+    const seg = document.createElement('div');
+    seg.className = 'effort-seg';
+    seg.setAttribute('role', 'radiogroup');
+    seg.setAttribute('aria-label', 'Reasoning effort');
+    availableEfforts.forEach((e) => {
+      const btn = document.createElement('button');
+      btn.type = 'button';
+      btn.className = 'effort-seg-btn';
+      btn.dataset.effort = e.id;
+      btn.setAttribute('role', 'radio');
+      const isActive = e.id === currentEffortId;
+      btn.setAttribute('aria-checked', isActive ? 'true' : 'false');
+      if (isActive) btn.classList.add('active');
+      if (e.id === defaultEffortId) btn.classList.add('is-default');
+      btn.textContent = e.id;
+      btn.title = e.label + (e.id === defaultEffortId ? ' (default)' : '') + ' — ' + e.hint;
+      btn.addEventListener('click', (ev) => {
+        ev.stopPropagation();
+        if (e.id === currentEffortId) return;
+        setEffort(e.id);
+      });
+      seg.appendChild(btn);
+    });
+    wrap.appendChild(seg);
+
+    // One-line hint for the active level, so the popup explains
+    // itself without a hover. Updated on every render.
+    const active = availableEfforts.find((e) => e.id === currentEffortId);
+    const hint = document.createElement('div');
+    hint.className = 'effort-hint';
+    hint.textContent = active
+      ? active.label + ' — ' + active.hint
+      : 'Reasoning depth for this session.';
+    wrap.appendChild(hint);
+  }
 
   modelPopup.appendChild(wrap);
 }
@@ -4621,6 +4691,40 @@ async function setModel(modelId, silent) {
   } catch (err) {
     console.warn('set_model failed', err);
     if (!silent) toast('Model switch failed: ' + err, 'error', 'model');
+  }
+}
+
+async function setEffort(effortId) {
+  /* Switch the focused session's reasoning effort. Mirrors setModel:
+   * the backend is authoritative, so we only repaint after it says ok.
+   * The popup stays open — effort is a dial researchers nudge and
+   * compare, not a one-shot pick like the model — and the segmented
+   * control re-renders in place. Anthropic sessions re-warm on the
+   * next message (the Agent SDK takes effort at launch only), so the
+   * toast says so when the backend flags it. */
+  if (!window.pywebview || !window.pywebview.api) return;
+  if (typeof window.pywebview.api.set_effort !== 'function') {
+    toast('Restart Nora to enable effort switching.', 'error', 'model');
+    return;
+  }
+  try {
+    const res = await window.pywebview.api.set_effort(effortId);
+    if (!res || !res.ok) {
+      const reason = res && res.reason ? res.reason : 'unknown';
+      toast('Effort switch failed: ' + reason, 'error', 'model');
+      return;
+    }
+    currentEffortId = effortId;
+    renderModelChip();
+    if (!res.unchanged) {
+      const tail = res.conversation_rewarmed
+        ? ' Session re-warms on the next message.'
+        : ' Takes effect on the next message.';
+      toast('Effort set to ' + (res.label || effortId) + '.' + tail, 'success', 'model');
+    }
+  } catch (err) {
+    console.warn('set_effort failed', err);
+    toast('Effort switch failed: ' + err, 'error', 'model');
   }
 }
 

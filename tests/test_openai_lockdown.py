@@ -244,7 +244,7 @@ def test_send_only_passes_function_tools(
 
     sess = OpenAISession(
         cwd=tmp_path,
-        model="gpt-5.5",
+        model="gpt-5.6-sol",
         system_prompt="you are nora",
     )
 
@@ -271,7 +271,7 @@ def test_send_only_passes_function_tools(
     assert sent_names == expected
     assert not any(t.get("type") in FORBIDDEN_BUILTIN_TYPES for t in tools)
 
-    # store=True is required for reasoning models (gpt-5.5-pro and
+    # store=True is required for reasoning models (gpt-5.6-sol and
     # the like): the model emits ``reasoning`` items with ``rs_…``
     # ids that the next round-trip references by id. server-side
     # persistence of response *objects* is retrievability only — it
@@ -404,7 +404,7 @@ def test_previous_response_id_chains_across_rounds_and_turns(
 
     sess = OpenAISession(
         cwd=tmp_path,
-        model="gpt-5.5",
+        model="gpt-5.6-sol",
         system_prompt="you are nora",
     )
 
@@ -479,7 +479,7 @@ def test_first_turn_prepends_fewshot_demonstration_then_user_message(
 
     sess = OpenAISession(
         cwd=tmp_path,
-        model="gpt-5.5",
+        model="gpt-5.6-sol",
         system_prompt="you are nora",
     )
 
@@ -544,7 +544,7 @@ def test_disable_fewshot_env_var_skips_prepend(
 
     sess = OpenAISession(
         cwd=tmp_path,
-        model="gpt-5.5",
+        model="gpt-5.6-sol",
         system_prompt="you are nora",
     )
 
@@ -601,7 +601,7 @@ def test_request_failure_does_not_advance_committed_response_id(
 
     sess = OpenAISession(
         cwd=tmp_path,
-        model="gpt-5.5",
+        model="gpt-5.6-sol",
         system_prompt="you are nora",
     )
 
@@ -677,7 +677,7 @@ def test_previous_response_id_expiry_yields_context_reset_turn_error(
 
     sess = OpenAISession(
         cwd=tmp_path,
-        model="gpt-5.5",
+        model="gpt-5.6-sol",
         system_prompt="you are nora",
     )
     # Simulate an established session — there's a committed
@@ -765,7 +765,7 @@ def test_handler_exception_does_not_leak_message_to_model(
 
     sess = OpenAISession(
         cwd=tmp_path,
-        model="gpt-5.5",
+        model="gpt-5.6-sol",
         system_prompt="you are nora",
     )
 
@@ -834,7 +834,7 @@ def test_send_yields_turnerror_when_tool_loop_does_not_converge(
 
     sess = OpenAISession(
         cwd=tmp_path,
-        model="gpt-5.5",
+        model="gpt-5.6-sol",
         system_prompt="you are nora",
     )
     # Pre-set the committed pointer so we can verify it is NOT
@@ -900,7 +900,7 @@ def test_send_with_no_api_key_yields_auth_failure(
 
     sess = OpenAISession(
         cwd=tmp_path,
-        model="gpt-5.5",
+        model="gpt-5.6-sol",
         system_prompt="you are nora",
     )
 
@@ -946,7 +946,7 @@ def test_runner_ensure_session_does_not_raise_on_missing_openai_key(
     runner = SessionRunner(
         cwd=tmp_path,
         provider="openai",
-        model="gpt-5.5",
+        model="gpt-5.6-sol",
     )
 
     # ensure_session must succeed and return a ProviderSession whose
@@ -981,7 +981,7 @@ def test_request_kwargs_pin_parallel_tool_calls(
 
     sess = OpenAISession(
         cwd=tmp_path,
-        model="gpt-5.5",
+        model="gpt-5.6-sol",
         system_prompt="you are nora",
     )
 

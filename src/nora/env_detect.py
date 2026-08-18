@@ -631,14 +631,25 @@ def _python_missing_packages(
 
 
 def _python_prefixes(binary: str) -> tuple[str, ...]:
-    """Return ``(sys.prefix,)`` (and ``sys.exec_prefix`` if it differs)
-    for the given Python interpreter.
+    """Return the deduped ``sys.prefix`` / ``sys.exec_prefix`` /
+    ``sys.base_prefix`` / ``sys.base_exec_prefix`` paths for the
+    given Python interpreter.
 
     These paths feed the executor's sandbox profile so the
     interpreter can read its own stdlib + site-packages — without
     them, a venv-based Python (which lives outside the system trees
     the default sandbox already covers) would fail to load even the
     standard library inside the sandbox.
+
+    The base prefixes matter for venvs specifically: a venv's
+    ``sys.prefix`` holds only ``site-packages`` and bin stubs, while
+    the stdlib stays under ``sys.base_prefix`` (the parent install).
+    When that parent is itself outside the system trees — canonically
+    a uv-managed CPython under ``~/.local/share/uv/python/`` — a
+    profile granting only ``sys.prefix`` lets the interpreter launch
+    and then die with ``Failed to import encodings module`` before
+    main(). Homebrew / python.org installs are unaffected (base ==
+    prefix, deduped below).
 
     ``-I`` (isolated mode) + filtered env: the probe runs OUTSIDE
     the analysis sandbox at startup. Without ``-I``, an inherited
@@ -655,7 +666,13 @@ def _python_prefixes(binary: str) -> tuple[str, ...]:
     from nora.executor import _filter_env
     try:
         out = subprocess.run(
-            [binary, "-I", "-c", "import sys; print(sys.prefix); print(sys.exec_prefix)"],
+            [
+                binary, "-I", "-c",
+                "import sys\n"
+                "for p in (sys.prefix, sys.exec_prefix, "
+                "sys.base_prefix, sys.base_exec_prefix):\n"
+                "    print(p)\n",
+            ],
             capture_output=True,
             text=True,
             timeout=5,

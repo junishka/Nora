@@ -93,7 +93,7 @@ def test_capture_drops_residuals_kind(tmp_path: Path) -> None:
     )
 
     runner = SessionRunner(
-        cwd=tmp_path, provider="anthropic", model="claude-sonnet-4-6[1m]",
+        cwd=tmp_path, provider="anthropic", model="claude-sonnet-5[1m]",
     )
     runner._capture_plots(run)
 
