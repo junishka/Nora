@@ -18,10 +18,17 @@ Two asymmetries drive most of these tests:
    conversation. OpenAI sends effort per request, so it just applies
    to the next message.
 
-2. **Effort is provider-neutral.** Every catalog model accepts the
-   same ladder, so effort survives a cross-provider model swap and
-   restores independently of whether the recorded model is still
-   selectable.
+2. **The ladders differ at the top.** Both providers share
+   ``low``…``xhigh``, then part: Anthropic's ceiling is ``max``,
+   OpenAI's is ``pro`` — which isn't an effort value at all but
+   ``reasoning.mode``, presented as the rung above ``xhigh`` and
+   unpacked back into two API parameters on the way out. So the
+   picker renders the ladder belonging to the selected model's
+   provider, validation is per-provider, and a level crossing a
+   boundary it doesn't exist on maps by RANK — ceiling to ceiling,
+   never silently down a rung. Effort still restores independently
+   of the model, so a session whose recorded model left the catalog
+   keeps its level.
 """
 
 from __future__ import annotations
@@ -37,6 +44,11 @@ from nora.provider.catalog import (
     DEFAULT_EFFORT,
     EFFORT_LEVELS,
     EFFORT_OPTIONS,
+    PROVIDER_EFFORTS,
+    _EFFORT_RANK,
+    clamp_effort,
+    effort_levels_for_provider,
+    efforts_for_provider,
     get_effort,
     normalize_effort,
 )
@@ -50,11 +62,102 @@ from nora.ui import NoraBridge
 # ---------------------------------------------------------------------------
 
 def test_effort_ladder_is_cheapest_first() -> None:
-    """Order is load-bearing: the picker renders the segmented
-    control in list order, so a shuffle would put ``max`` next to
-    ``low`` and invite a mis-click that triples someone's bill."""
-    assert EFFORT_LEVELS == ("low", "medium", "high", "xhigh", "max")
+    """Order is load-bearing: the picker renders each bar in list
+    order, so a shuffle would put a ceiling rung next to ``low`` and
+    invite a mis-click that multiplies someone's bill."""
+    assert EFFORT_LEVELS == (
+        "low", "medium", "high", "xhigh", "max", "pro",
+    )
     assert [e.id for e in EFFORT_OPTIONS] == list(EFFORT_LEVELS)
+
+
+def test_provider_ladders_share_a_prefix_and_differ_at_the_top() -> None:
+    """The whole reason the picker is provider-aware. The four lower
+    rungs are the same dial on both sides; the ceiling is not.
+    Anthropic's is ``max`` (the Agent SDK types EffortLevel as
+    low..max). OpenAI has no ``max`` its client can express — the
+    pinned SDK (2.41.0) types ReasoningEffort without it — so its
+    ceiling is ``pro``, which is a different API knob entirely
+    (``reasoning.mode``) presented as the rung above ``xhigh``."""
+    assert effort_levels_for_provider("anthropic") == (
+        "low", "medium", "high", "xhigh", "max",
+    )
+    assert effort_levels_for_provider("openai") == (
+        "low", "medium", "high", "xhigh", "pro",
+    )
+    assert "max" not in effort_levels_for_provider("openai")
+    assert "pro" not in effort_levels_for_provider("anthropic")
+
+
+def test_ceilings_share_a_rank() -> None:
+    """``max`` and ``pro`` aren't the same parameter, but they hold
+    the same position on their provider's bar. Tying their rank is
+    what makes a provider switch land ceiling-to-ceiling instead of
+    silently dropping a rung."""
+    assert _EFFORT_RANK["max"] == _EFFORT_RANK["pro"]
+    assert _EFFORT_RANK["max"] > _EFFORT_RANK["xhigh"]
+
+
+def test_openai_ladder_omits_none_and_minimal() -> None:
+    """OpenAI additionally accepts ``none`` / ``minimal``, both
+    deliberately excluded: they suppress the reasoning trace Nora
+    renders in the thinking panel, and Anthropic has no equivalent
+    rung, so offering them would split the panels for no gain."""
+    ids = effort_levels_for_provider("openai")
+    assert "none" not in ids
+    assert "minimal" not in ids
+
+
+def test_every_provider_ladder_is_ranked_and_ascending() -> None:
+    """``clamp_effort`` steps down by rank, which only works if every
+    rung is ranked and each ladder ascends."""
+    for provider, ladder in PROVIDER_EFFORTS.items():
+        ids = [e.id for e in ladder]
+        assert set(ids) <= set(EFFORT_LEVELS), provider
+        ranks = [_EFFORT_RANK[i] for i in ids]
+        assert ranks == sorted(ranks), f"{provider} ladder is out of order"
+        assert len(set(ranks)) == len(ranks), f"{provider} has a tied rung"
+
+
+def test_default_effort_is_offered_by_every_provider() -> None:
+    """A default that some provider doesn't offer would mean a fresh
+    session on that provider starts on a clamped level nobody chose."""
+    for provider in PROVIDER_EFFORTS:
+        assert DEFAULT_EFFORT in effort_levels_for_provider(provider)
+
+
+@pytest.mark.parametrize(
+    "requested, provider, expected",
+    [
+        # Supported levels pass through untouched.
+        ("max", "anthropic", "max"),
+        ("low", "openai", "low"),
+        ("xhigh", "openai", "xhigh"),
+        # The real case: each provider's ceiling maps to the other's
+        # ceiling, not down a rung. Someone who asked for "work as
+        # hard as you can" keeps asking for it across a switch.
+        ("max", "openai", "pro"),
+        ("pro", "anthropic", "max"),
+        ("pro", "openai", "pro"),
+        # Unknown levels (future build, hand-edited state file) fall
+        # back to the default rather than wedging the session.
+        ("ultra", "openai", DEFAULT_EFFORT),
+        ("ultra", "anthropic", DEFAULT_EFFORT),
+        (None, "openai", DEFAULT_EFFORT),
+    ],
+)
+def test_clamp_effort(requested, provider: str, expected: str) -> None:
+    assert clamp_effort(requested, provider) == expected
+
+
+def test_clamp_never_steps_up() -> None:
+    """Clamping raises spend if it rounds upward. Every clamped
+    result must sit at or below the requested RANK (ceilings tie, so
+    ceiling-to-ceiling is level, never a step up)."""
+    for provider in PROVIDER_EFFORTS:
+        for level in EFFORT_LEVELS:
+            got = clamp_effort(level, provider)
+            assert _EFFORT_RANK[got] <= _EFFORT_RANK[level]
 
 
 def test_default_effort_is_xhigh() -> None:
@@ -65,11 +168,10 @@ def test_default_effort_is_xhigh() -> None:
     assert DEFAULT_EFFORT in EFFORT_LEVELS
 
 
-def test_every_level_has_a_label_and_hint() -> None:
-    """Both are rendered — the label in the toast and tooltip, the
-    hint as the one-liner under the segmented control."""
+def test_every_level_has_a_label() -> None:
+    """The label is what the toast and the button tooltip show."""
     for e in EFFORT_OPTIONS:
-        assert e.label and e.hint
+        assert e.label
         assert get_effort(e.id) is e
 
 
@@ -261,10 +363,117 @@ def test_openai_set_effort_needs_no_reopen(tmp_path: Path) -> None:
     sess = OpenAISession(
         cwd=tmp_path, model="gpt-5.6-sol", system_prompt="x",
     )
-    res = asyncio.run(sess.set_effort("max"))
+    res = asyncio.run(sess.set_effort("low"))
     assert res["ok"] is True
     assert not res.get("requires_reopen")
+    assert sess.effort == "low"
+
+
+def test_openai_session_rejects_max(tmp_path: Path) -> None:
+    """``max`` isn't in the pinned OpenAI SDK's ReasoningEffort, so
+    the session refuses it rather than putting it on the wire — even
+    though ``max`` is a perfectly real level on the other provider."""
+    from nora.provider.openai import OpenAISession
+
+    sess = OpenAISession(
+        cwd=tmp_path, model="gpt-5.6-sol", system_prompt="x",
+    )
+    res = asyncio.run(sess.set_effort("max"))
+    assert res["ok"] is False
+    assert "max" in res["reason"]
+    assert sess.effort == DEFAULT_EFFORT
+
+
+def test_anthropic_session_rejects_pro(tmp_path: Path) -> None:
+    """The mirror image: ``pro`` is an OpenAI-only knob, so it must
+    never reach the Agent SDK's ``--effort`` flag."""
+    from nora.provider.anthropic import AnthropicSession
+
+    sess = AnthropicSession(
+        cwd=tmp_path, model="claude-opus-5[1m]", system_prompt="x",
+    )
+    res = asyncio.run(sess.set_effort("pro"))
+    assert res["ok"] is False
+    assert sess.effort == DEFAULT_EFFORT
+    assert sess._build_options().effort != "pro"
+
+
+def test_openai_session_maps_max_to_its_own_ceiling(tmp_path: Path) -> None:
+    """A runner carrying Anthropic's ``max`` into a newly-opened
+    OpenAI session lands on OpenAI's ceiling, not a rung below it."""
+    from nora.provider.openai import OpenAISession
+
+    sess = OpenAISession(
+        cwd=tmp_path, model="gpt-5.6-sol", system_prompt="x", effort="max",
+    )
+    assert sess.effort == "pro"
+
+
+@pytest.mark.parametrize(
+    "effort, expected",
+    [
+        ("low", {"summary": "auto", "effort": "low"}),
+        ("high", {"summary": "auto", "effort": "high"}),
+        ("xhigh", {"summary": "auto", "effort": "xhigh"}),
+        # The translation that makes the bar honest: ``pro`` is not an
+        # effort value at all. It becomes reasoning.mode="pro", and it
+        # carries the highest expressible effort so the top rung
+        # doesn't reason LESS than the rung below it (effort would
+        # otherwise default to medium in pro mode).
+        ("pro", {"summary": "auto", "effort": "xhigh", "mode": "pro"}),
+    ],
+)
+def test_openai_reasoning_params(
+    tmp_path: Path, effort: str, expected: dict[str, Any],
+) -> None:
+    from nora.provider.openai import OpenAISession
+
+    sess = OpenAISession(
+        cwd=tmp_path, model="gpt-5.6-sol", system_prompt="x", effort=effort,
+    )
+    assert sess._reasoning_params() == expected
+
+
+def test_pro_reaches_the_wire(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """End-to-end through a fake client: picking ``pro`` must put
+    ``mode`` in the request body. ``mode`` is absent from the pinned
+    SDK's Reasoning TypedDict, so this is the test that catches an
+    SDK upgrade that starts stripping unknown keys."""
+    from nora.provider import openai as openai_provider
+    from nora.provider.openai import OpenAISession
+    from tests.test_openai_lockdown import _FakeAsyncOpenAI
+
+    monkeypatch.setattr(openai_provider, "_resolve_api_key", lambda: "sk-test")
+    import openai as openai_pkg
+    monkeypatch.setattr(openai_pkg, "AsyncOpenAI", _FakeAsyncOpenAI, raising=True)
+
+    sess = OpenAISession(
+        cwd=tmp_path, model="gpt-5.6-sol",
+        system_prompt="you are nora", effort="pro",
+    )
+
+    async def _drive() -> None:
+        async for _ in sess.send("hello"):
+            pass
+
+    asyncio.run(_drive())
+    call = sess._client.responses.calls[0]  # type: ignore[union-attr]
+    assert call["reasoning"]["mode"] == "pro"
+    assert call["reasoning"]["effort"] == "xhigh"
+
+
+def test_anthropic_session_keeps_max(tmp_path: Path) -> None:
+    """The other side of the same coin — Anthropic does offer it."""
+    from nora.provider.anthropic import AnthropicSession
+
+    sess = AnthropicSession(
+        cwd=tmp_path, model="claude-opus-5[1m]",
+        system_prompt="x", effort="max",
+    )
     assert sess.effort == "max"
+    assert sess._build_options().effort == "max"
 
 
 # ---------------------------------------------------------------------------
@@ -379,18 +588,40 @@ def test_runner_unknown_level_is_rejected(tmp_path: Path) -> None:
 # Bridge
 # ---------------------------------------------------------------------------
 
-def test_list_models_carries_the_effort_ladder(
+def test_list_models_carries_every_provider_ladder(
     tmp_path: Path, anthropic_authed: None,
 ) -> None:
-    """The picker renders its Effort section straight from this
-    payload, so every field the JS reads has to be present."""
+    """The picker rebuilds the bar from the selected model's provider
+    on every render, so it needs ALL the ladders up front — a model
+    switch must repaint without another round-trip."""
     bridge = NoraBridge(cwd=None)
     payload = bridge.list_models()
     assert payload["current_effort"] == DEFAULT_EFFORT
     assert payload["default_effort"] == DEFAULT_EFFORT
-    assert [e["id"] for e in payload["efforts"]] == list(EFFORT_LEVELS)
-    for row in payload["efforts"]:
-        assert row["label"] and row["hint"]
+    by_provider = payload["efforts_by_provider"]
+    assert set(by_provider) == set(PROVIDER_EFFORTS)
+    for provider, rows in by_provider.items():
+        assert [r["id"] for r in rows] == list(
+            effort_levels_for_provider(provider)
+        )
+        for row in rows:
+            assert row["label"]
+    # ``efforts`` is the current provider's ladder, so a caller that
+    # only wants today's bar doesn't have to index the map.
+    assert payload["efforts"] == by_provider[payload["current_provider"]]
+
+
+def test_set_effort_rejects_a_level_the_provider_lacks(
+    tmp_path: Path, anthropic_authed: None,
+) -> None:
+    """Validation is per-provider, not against the canonical union —
+    ``max`` is a real level, just not an OpenAI one."""
+    bridge = NoraBridge(cwd=None)
+    bridge._default_provider = "openai"
+    res = bridge.set_effort("max")
+    assert res["ok"] is False
+    assert "openai" in res["reason"]
+    assert bridge._default_effort == DEFAULT_EFFORT
 
 
 def test_set_effort_without_session_updates_the_default(tmp_path: Path) -> None:
@@ -507,12 +738,13 @@ def test_two_sessions_keep_independent_effort(
     assert bridge._effort == "low"
 
 
-def test_effort_survives_a_cross_provider_model_swap(
+def test_cross_provider_swap_clamps_effort(
     tmp_path: Path, anthropic_authed: None,
 ) -> None:
-    """``swap_model`` across providers tears down the session, but
-    effort is a runner-level, provider-neutral setting — a
-    researcher on ``max`` stays on ``max`` when they hop to OpenAI."""
+    """Anthropic ``max`` has no OpenAI rung, so hopping providers
+    lands on that provider's own ceiling (``pro``) — and reports
+    where it landed so the UI can repaint the bar, whose top button
+    is now a different level."""
     runner = SessionRunner(
         cwd=tmp_path, provider="anthropic",
         model="claude-sonnet-5[1m]", effort="max",
@@ -520,4 +752,39 @@ def test_effort_survives_a_cross_provider_model_swap(
     res = asyncio.run(runner.swap_model("gpt-5.6-sol", "openai"))
     assert res["ok"] is True
     assert runner.provider == "openai"
-    assert runner.effort == "max"
+    assert runner.effort == "pro"
+    assert res["effort"] == "pro"
+
+
+def test_cross_provider_swap_keeps_a_shared_level(
+    tmp_path: Path, anthropic_authed: None,
+) -> None:
+    """Only levels the target provider lacks get clamped — a shared
+    rung carries across untouched."""
+    runner = SessionRunner(
+        cwd=tmp_path, provider="anthropic",
+        model="claude-sonnet-5[1m]", effort="medium",
+    )
+    res = asyncio.run(runner.swap_model("gpt-5.6-sol", "openai"))
+    assert res["ok"] is True
+    assert runner.effort == "medium"
+
+
+def test_restore_clamps_recorded_effort_to_the_session_provider(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A state file can record a level the restored model's provider
+    doesn't offer — Anthropic ``max`` against a session that now
+    opens on OpenAI. The runner must come up on a level the OpenAI
+    client can actually express."""
+    import nora.provider as provider_mod
+    monkeypatch.setattr(provider_mod, "detect_auth", lambda p: "api_key")
+
+    session_dir = tmp_path / "openai-at-max"
+    session_dir.mkdir()
+    write_session_state(session_dir, model="gpt-5.6-sol", effort="max")
+
+    bridge = NoraBridge(cwd=None)
+    bridge._set_cwd(session_dir)
+    assert bridge._provider == "openai"
+    assert bridge._effort == "pro"

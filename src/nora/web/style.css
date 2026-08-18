@@ -3475,7 +3475,7 @@ kbd {
 .effort-seg {
   display: flex;
   gap: 2px;
-  margin: 2px 10px 6px;
+  margin: 2px 10px 2px;
   padding: 2px;
   border: 1px solid var(--border);
   border-radius: 8px;
@@ -3529,12 +3529,6 @@ kbd {
   opacity: 0.9;
 }
 
-.effort-hint {
-  font-size: 11px;
-  line-height: 1.4;
-  color: var(--text-dim);
-  padding: 0 10px 4px;
-}
 
 .context-chip:hover,
 .context-chip.open {

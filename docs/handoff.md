@@ -315,12 +315,43 @@ page in the system browser. Models for un-authed providers stay
 listed but are dimmed; clicking them opens the auth screen
 positioned on that provider.
 
-**Effort.** The same popup carries an Effort section under the model
-list — `low / medium / high / xhigh / max`, default `xhigh` (what
-both providers were hard-pinned to before the dial existed). The
-ladder is provider-neutral: every catalog model accepts every level,
-so it doesn't re-render on a model switch and survives a
-cross-provider swap. The composer chip reads `Sonnet 5 · xhigh`.
+**Effort.** The same popup carries an Effort bar under the model
+list, default `xhigh` (what both providers were hard-pinned to
+before the dial existed). The composer chip reads `Sonnet 5 · xhigh`.
+
+The ladders are **per provider** — the bar is rebuilt from the
+selected model's provider on every render:
+
+| Provider | Ladder |
+|---|---|
+| Anthropic | `low` `medium` `high` `xhigh` `max` |
+| OpenAI | `low` `medium` `high` `xhigh` `pro` |
+
+The four lower rungs are the same dial on both sides
+(`output_config.effort` / `reasoning.effort`). The ceilings differ:
+
+- Anthropic's is `max` — the Agent SDK types `EffortLevel` as
+  `low…max`.
+- OpenAI has no `max` its client can express (the pinned SDK, 2.41.0,
+  types `ReasoningEffort` without it; OpenAI's docs *do* claim it, so
+  this is the SDK lagging the API). Its ceiling is `pro`, which is a
+  different knob entirely — `reasoning.mode` — that buys more model
+  work per turn. It's genuinely orthogonal to effort in the API, but
+  for "how hard should this try" it is the rung above `xhigh`, so
+  that's where the bar puts it. `provider/openai.py::_reasoning_params`
+  unpacks it back into `mode="pro"` **plus** `effort="xhigh"` — effort
+  would otherwise default to `medium` in pro mode, making the top rung
+  reason *less* than the one below it.
+
+`mode` isn't in the pinned SDK's `Reasoning` TypedDict; TypedDicts
+aren't runtime-enforced and the SDK's transform layer passes unknown
+keys through to the JSON body (verified against
+`openai._utils.maybe_transform`, and pinned by a test). Drop the
+special case when the SDK types it.
+
+Crossing providers maps by **rank**, so the two ceilings tie: a
+researcher on Anthropic `max` who switches to OpenAI lands on `pro`,
+not a rung below. Clamping never steps *up*.
 
 Both settings are per-session and both persist to
 `.nora/session_state.json`, but they apply differently:

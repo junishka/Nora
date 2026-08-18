@@ -142,17 +142,17 @@ class SessionRunner:
         model: str,
         effort: str | None = None,
     ) -> None:
-        from nora.provider.catalog import normalize_effort
+        from nora.provider.catalog import clamp_effort
 
         self.cwd: Path = cwd.resolve()
         # Mutable: ``set_model`` may swap provider+model in place.
         self.provider: str = provider
         self.model: str = model
         # Mutable: ``set_effort`` swaps the reasoning-effort level.
-        # Provider-neutral (``catalog.EFFORT_LEVELS``); survives a
-        # cross-provider model swap so a researcher on ``max`` stays
-        # on ``max`` when they hop from Sonnet to Sol.
-        self.effort: str = normalize_effort(effort)
+        # Held to THIS provider's ladder — they differ (Anthropic has
+        # ``max``, OpenAI stops at ``xhigh``), so a level is clamped
+        # rather than carried verbatim across a provider change.
+        self.effort: str = clamp_effort(effort, provider)
         # Lazy: opened on first send. ``ensure_session`` is idempotent.
         self._session: ProviderSession | None = None
         # Created without a running loop on the bridge thread; binds
@@ -495,11 +495,22 @@ class SessionRunner:
         so the next turn opens fresh against the new provider. The
         runner's cwd does NOT change.
         """
+        from nora.provider.catalog import clamp_effort
+
         if provider != self.provider:
             await self.close()
             self.provider = provider
             self.model = model_id
-            return {"ok": True, "model": model_id, "provider": provider}
+            # The new provider may not offer the level we're on —
+            # Anthropic ``max`` has no OpenAI equivalent. Step down to
+            # its nearest rung rather than sending an effort the
+            # client can't express (and report it so the UI can
+            # repaint the bar, which is now a different ladder).
+            self.effort = clamp_effort(self.effort, provider)
+            return {
+                "ok": True, "model": model_id, "provider": provider,
+                "effort": self.effort,
+            }
         # Same provider: try in-place swap.
         old_model = self.model
         self.model = model_id
@@ -534,10 +545,19 @@ class SessionRunner:
         ``swap_model`` path. Providers that send effort per request
         (OpenAI) apply it on the next message with no reset.
         """
-        from nora.provider.catalog import EFFORT_LEVELS, get_effort
+        from nora.provider.catalog import (
+            effort_levels_for_provider,
+            get_effort,
+        )
 
-        if effort not in EFFORT_LEVELS:
-            return {"ok": False, "reason": f"unknown effort level: {effort}"}
+        if effort not in effort_levels_for_provider(self.provider):
+            return {
+                "ok": False,
+                "reason": (
+                    f"{self.provider} does not support effort "
+                    f"level {effort!r}"
+                ),
+            }
         info = get_effort(effort)
         if effort == self.effort:
             return {

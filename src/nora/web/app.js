@@ -4263,9 +4263,13 @@ const modelChipLabel = document.getElementById('model-chip-label');
 const modelPopup = document.getElementById('model-popup');
 let availableModels = [];      // cached from list_models
 let currentModelId = null;     // the backend's authoritative selection
-let availableEfforts = [];     // [{id,label,hint}] — provider-neutral ladder
+// Effort ladders are PER PROVIDER — Anthropic offers max, OpenAI
+// stops at xhigh — so the bar is rebuilt from the selected model's
+// provider on every render. effortsByProvider holds all of them so a
+// model switch repaints without another round-trip.
+let effortsByProvider = {};    // {provider: [{id,label}]}
 let currentEffortId = null;    // the backend's authoritative effort level
-let defaultEffortId = null;    // catalog default (marked in the picker)
+let defaultEffortId = null;    // catalog default (dotted in the bar)
 
 async function loadModels() {
   /* Fetch the model catalog from the backend and render the popup.
@@ -4284,7 +4288,7 @@ async function loadModels() {
     if (!res || !res.ok) return;
     availableModels = res.models || [];
     currentModelId = res.current;
-    availableEfforts = res.efforts || [];
+    effortsByProvider = res.efforts_by_provider || {};
     currentEffortId = res.current_effort || null;
     defaultEffortId = res.default_effort || null;
     renderModelChip();
@@ -4434,13 +4438,17 @@ function renderModelPopup() {
     });
   });
 
-  // Effort section — the same dial as Claude Code's effort picker,
-  // embedded under the model list so "which model" and "how hard
-  // it thinks" live in one place. Provider-neutral: every catalog
-  // model accepts every level, so the ladder never re-renders on a
-  // model switch. Segmented control; the active level is filled,
-  // the catalog default carries a small dot so a researcher who
-  // wandered off it can find the way back.
+  // Effort bar — the same dial as Claude Code's effort picker,
+  // embedded under the model list so "which model" and "how hard it
+  // thinks" live in one place. The ladder belongs to the SELECTED
+  // model's provider (Anthropic goes to max, OpenAI stops at xhigh),
+  // so it's looked up per render and changes when the model does.
+  // Segmented control; the active level is filled, and the default
+  // carries a small dot so a researcher who wandered off it can find
+  // the way back.
+  const currentInfo = availableModels.find((m) => m.id === currentModelId);
+  const currentProvider = (currentInfo && currentInfo.provider) || 'anthropic';
+  const availableEfforts = effortsByProvider[currentProvider] || [];
   if (availableEfforts.length > 0) {
     const effHeader = document.createElement('div');
     effHeader.className = 'model-group-header';
@@ -4462,7 +4470,7 @@ function renderModelPopup() {
       if (isActive) btn.classList.add('active');
       if (e.id === defaultEffortId) btn.classList.add('is-default');
       btn.textContent = e.id;
-      btn.title = e.label + (e.id === defaultEffortId ? ' (default)' : '') + ' — ' + e.hint;
+      btn.title = e.label + (e.id === defaultEffortId ? ' (default)' : '');
       btn.addEventListener('click', (ev) => {
         ev.stopPropagation();
         if (e.id === currentEffortId) return;
@@ -4471,16 +4479,6 @@ function renderModelPopup() {
       seg.appendChild(btn);
     });
     wrap.appendChild(seg);
-
-    // One-line hint for the active level, so the popup explains
-    // itself without a hover. Updated on every render.
-    const active = availableEfforts.find((e) => e.id === currentEffortId);
-    const hint = document.createElement('div');
-    hint.className = 'effort-hint';
-    hint.textContent = active
-      ? active.label + ' — ' + active.hint
-      : 'Reasoning depth for this session.';
-    wrap.appendChild(hint);
   }
 
   modelPopup.appendChild(wrap);
@@ -4684,9 +4682,18 @@ async function setModel(modelId, silent) {
       return;
     }
     currentModelId = modelId;
+    // A cross-provider switch can clamp the effort onto the new
+    // provider's ladder (Anthropic max -> OpenAI xhigh). The backend
+    // is authoritative about where it landed, so adopt what it
+    // reports rather than assuming the level carried over.
+    const clamped = res.effort && res.effort !== currentEffortId;
+    if (res.effort) currentEffortId = res.effort;
     renderModelChip();
     if (!silent && !res.unchanged) {
-      toast('Model switched to ' + (res.label || modelId) + '. Takes effect on the next message.', 'success', 'model');
+      const tail = clamped
+        ? ' Effort moved to ' + res.effort + ' (highest this provider offers).'
+        : '';
+      toast('Model switched to ' + (res.label || modelId) + '. Takes effect on the next message.' + tail, 'success', 'model');
     }
   } catch (err) {
     console.warn('set_model failed', err);
