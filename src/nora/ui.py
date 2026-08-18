@@ -60,10 +60,13 @@ from nora.provider.catalog import (
     ALL_MODELS,
     DEFAULT_EFFORT,
     EFFORT_LEVELS,
-    EFFORT_OPTIONS,
     PROVIDER_API_KEY_URLS,
     PROVIDER_DEFAULTS,
+    PROVIDER_EFFORTS,
     PROVIDER_PRICING_URLS,
+    clamp_effort,
+    effort_levels_for_provider,
+    efforts_for_provider,
     get_effort,
 )
 from nora.runner import SessionRunner
@@ -1590,15 +1593,24 @@ class NoraBridge:
             "current": current_model,
             "current_provider": current_provider,
             # Effort rides the same payload: the picker renders an
-            # Effort section under the model list, and the chip
-            # shows "<model> · <effort>". Provider-neutral ladder —
-            # every catalog model accepts every level.
+            # Effort bar under the model list, and the chip shows
+            # "<model> · <effort>". The ladders DIFFER per provider
+            # (Anthropic has ``max``, OpenAI stops at ``xhigh``), so
+            # ship all of them keyed by provider — the JS re-renders
+            # the bar from the selected model's provider without a
+            # round-trip on every model switch. ``efforts`` is the
+            # ladder for the CURRENT provider, so a caller that only
+            # wants today's bar doesn't have to index the map.
             "current_effort": current_effort,
             "default_effort": DEFAULT_EFFORT,
             "efforts": [
-                {"id": e.id, "label": e.label, "hint": e.hint}
-                for e in EFFORT_OPTIONS
+                {"id": e.id, "label": e.label}
+                for e in efforts_for_provider(current_provider)
             ],
+            "efforts_by_provider": {
+                provider: [{"id": e.id, "label": e.label} for e in ladder]
+                for provider, ladder in PROVIDER_EFFORTS.items()
+            },
             "models": [
                 {
                     "id": m.id,
@@ -2868,15 +2880,26 @@ class NoraBridge:
             "label": info.label,
             "context_window": info.context_window,
             "provider": new_provider,
+            # A cross-provider swap can clamp the effort (Anthropic
+            # ``max`` has no OpenAI rung), and the bar itself is a
+            # different ladder either way — hand both back so the JS
+            # repaints without a second call.
+            "effort": active.effort,
+            "efforts": [
+                {"id": e.id, "label": e.label}
+                for e in efforts_for_provider(new_provider)
+            ],
         }
 
     def set_effort(self, effort: str) -> dict[str, Any]:
         """Switch the focused session's reasoning-effort level.
 
-        Provider-neutral (``catalog.EFFORT_LEVELS``); operates on THIS
-        session's runner only, like ``set_model``. With no focused
-        session it updates the bridge default so the next runner
-        picks it up. Refused while THIS runner has a turn in flight.
+        Validated against the ladder the session's provider actually
+        offers — they differ (Anthropic has ``max``, OpenAI stops at
+        ``xhigh``). Operates on THIS session's runner only, like
+        ``set_model``. With no focused session it updates the bridge
+        default so the next runner picks it up. Refused while THIS
+        runner has a turn in flight.
         Persists ``active_effort`` to the runner's
         ``.nora/session_state.json`` so a reload restores the choice.
 
@@ -2885,10 +2908,19 @@ class NoraBridge:
         the payload carries ``conversation_rewarmed`` so the UI can
         say so. On OpenAI it just applies to the next request.
         """
-        if effort not in EFFORT_LEVELS:
-            return {"ok": False, "reason": f"unknown effort level: {effort}"}
+        target_provider = (
+            active.provider if (active := self._active_runner()) is not None
+            else self._default_provider
+        )
+        if effort not in effort_levels_for_provider(target_provider):
+            return {
+                "ok": False,
+                "reason": (
+                    f"{target_provider} does not support effort "
+                    f"level {effort!r}"
+                ),
+            }
         info = get_effort(effort)
-        active = self._active_runner()
         if active is None:
             self._default_effort = effort
             return {"ok": True, "effort": effort, "label": info.label}
@@ -3405,7 +3437,7 @@ class NoraBridge:
         if runner is not None:
             return runner
         provider, model = self._initial_model_for_session(cwd)
-        effort = self._initial_effort_for_session(cwd)
+        effort = self._initial_effort_for_session(cwd, provider)
         runner = SessionRunner(
             cwd=cwd, provider=provider, model=model, effort=effort,
         )
@@ -3438,27 +3470,31 @@ class NoraBridge:
             return self._default_provider, self._default_model
         return info.provider, info.id
 
-    def _initial_effort_for_session(self, cwd: Path) -> str:
+    def _initial_effort_for_session(self, cwd: Path, provider: str) -> str:
         """Pick the reasoning-effort level for a freshly-created
-        runner: the session's recorded ``active_effort`` when it's a
-        level this build knows, else the bridge default. Independent
-        of the model restore — effort is provider-neutral, so it
-        survives even when the recorded model fell out of the catalog
-        or its provider isn't authed."""
+        runner: the session's recorded ``active_effort``, clamped to
+        what ``provider`` actually offers, else the bridge default.
+
+        Runs independently of the model restore — a session whose
+        recorded model fell out of the catalog still gets its effort
+        back. The clamp matters when the two disagree: a file
+        recording Anthropic ``max`` against a session that now opens
+        on OpenAI steps down to ``xhigh`` rather than sending a level
+        the OpenAI client can't express.
+        """
         try:
             from nora.session_state import read_session_state
             state = read_session_state(cwd)
         except Exception:  # noqa: BLE001
             state = None
         if state is None or not state.active_effort:
-            return self._default_effort
-        # Note the fallback is the BRIDGE default, not the catalog
-        # default — a researcher who set "low" on the landing screen
-        # shouldn't get "xhigh" just because this session's file
-        # names a level from a future build.
+            # Fall back to the BRIDGE default, not the catalog one — a
+            # researcher who set "low" on the landing screen shouldn't
+            # get "xhigh" here — but still hold it to the ladder.
+            return clamp_effort(self._default_effort, provider)
         if state.active_effort not in EFFORT_LEVELS:
-            return self._default_effort
-        return state.active_effort
+            return clamp_effort(self._default_effort, provider)
+        return clamp_effort(state.active_effort, provider)
 
     def _active_runner(self) -> SessionRunner | None:
         """Convenience accessor: the runner for the focused session."""

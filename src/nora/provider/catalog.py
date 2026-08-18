@@ -148,52 +148,76 @@ DEFAULT_MODEL = PROVIDER_DEFAULTS[DEFAULT_PROVIDER]
 @dataclass(frozen=True)
 class EffortInfo:
     """One selectable reasoning-effort level. ``id`` is the wire value
-    both providers accept (Anthropic ``output_config.effort`` via the
-    Agent SDK's ``--effort`` flag; OpenAI ``reasoning.effort``)."""
+    the provider accepts (Anthropic ``output_config.effort``, passed
+    by the Agent SDK as the CLI's ``--effort`` flag; OpenAI
+    ``reasoning.effort`` on the Responses request)."""
 
     id: str
     label: str
-    hint: str
 
 
-# Reasoning effort, cheapest first. Every catalog model — the Claude
-# 5 family and the GPT-5.6 family — accepts this exact ladder, so a
-# single provider-neutral list is enough (OpenAI additionally has
-# ``none``, deliberately excluded: Nora surfaces the reasoning trace,
-# and Anthropic has no equivalent). Mirrors Claude Code's effort
-# picker so a researcher who knows that dial finds the same one here.
-# ``xhigh`` is the default: it's what the providers were pinned to
-# before effort became selectable, and the recommended setting for
-# multi-step tool-using analysis on both families.
+# Reasoning effort, cheapest first. **The ladders differ per provider**
+# — the picker renders whichever one belongs to the selected model's
+# provider, so a level that provider can't take is never offered:
+#
+#   Anthropic  low, medium, high, xhigh, max
+#   OpenAI     low, medium, high, xhigh, pro
+#
+# The four lower rungs are the same dial on both sides
+# (``output_config.effort`` on Anthropic, ``reasoning.effort`` on
+# OpenAI). The top rung is where they part:
+#
+# - Anthropic's ceiling is ``max``. The Claude Agent SDK types
+#   ``EffortLevel`` as low|medium|high|xhigh|max and the CLI lists
+#   all five.
+# - OpenAI has no ``max`` the client can express — the pinned SDK
+#   (2.41.0) types ``ReasoningEffort`` as none|minimal|low|medium|
+#   high|xhigh. (OpenAI's model pages do claim ``max``; that's the
+#   SDK lagging the API, and we follow the SDK because it's what
+#   ships in the bundle.) What OpenAI has instead is ``pro`` — a
+#   *separate* knob, ``reasoning.mode``, which buys more model work
+#   per turn at the same effort. It is genuinely orthogonal to
+#   effort in the API, but for a researcher choosing "how hard
+#   should this try" it is the rung above ``xhigh``, so that's where
+#   the bar puts it. ``provider/openai.py`` translates it back into
+#   the two real parameters on the way out.
+#
+# ``none`` / ``minimal`` (OpenAI-only) are deliberately excluded:
+# Nora surfaces the reasoning trace in the thinking panel, and those
+# levels suppress it. Anthropic has no equivalent rung either, so
+# offering them would make the two panels diverge for no gain.
+_LOW = EffortInfo(id="low", label="Low")
+_MEDIUM = EffortInfo(id="medium", label="Medium")
+_HIGH = EffortInfo(id="high", label="High")
+_XHIGH = EffortInfo(id="xhigh", label="Extra high")
+_MAX = EffortInfo(id="max", label="Max")
+_PRO = EffortInfo(id="pro", label="Pro")
+
+PROVIDER_EFFORTS: dict[str, tuple[EffortInfo, ...]] = {
+    "anthropic": (_LOW, _MEDIUM, _HIGH, _XHIGH, _MAX),
+    "openai": (_LOW, _MEDIUM, _HIGH, _XHIGH, _PRO),
+}
+
+# Every level this build knows, in canonical cheapest-first order.
 EFFORT_OPTIONS: tuple[EffortInfo, ...] = (
-    EffortInfo(
-        id="low",
-        label="Low",
-        hint="Fastest, cheapest — quick lookups and small edits.",
-    ),
-    EffortInfo(
-        id="medium",
-        label="Medium",
-        hint="Balanced — routine analysis where speed matters.",
-    ),
-    EffortInfo(
-        id="high",
-        label="High",
-        hint="Deep reasoning — the provider default.",
-    ),
-    EffortInfo(
-        id="xhigh",
-        label="Extra high",
-        hint="Extended reasoning — best for multi-step, tool-heavy work.",
-    ),
-    EffortInfo(
-        id="max",
-        label="Max",
-        hint="Ceiling — most thorough, slowest, most tokens.",
-    ),
+    _LOW, _MEDIUM, _HIGH, _XHIGH, _MAX, _PRO,
 )
-
 EFFORT_LEVELS: tuple[str, ...] = tuple(e.id for e in EFFORT_OPTIONS)
+
+# Rank drives ``clamp_effort``. ``max`` and ``pro`` deliberately
+# SHARE the top rank: they aren't the same parameter, but they
+# occupy the same position on their provider's bar — each is that
+# provider's "work as hard as you can". Tying them means a
+# researcher at one ceiling who switches providers lands on the
+# other ceiling instead of silently dropping a rung.
+_EFFORT_RANK: dict[str, int] = {
+    "low": 0, "medium": 1, "high": 2, "xhigh": 3, "max": 4, "pro": 4,
+}
+
+# What a session runs at when nobody has chosen: exactly what both
+# providers were hard-pinned to before effort became selectable, so
+# turning the dial on changed no existing behaviour. Supported on
+# both ladders.
 DEFAULT_EFFORT = "xhigh"
 
 
@@ -205,12 +229,58 @@ def get_effort(effort_id: str) -> EffortInfo:
     raise KeyError(f"unknown effort level: {effort_id!r}")
 
 
-def normalize_effort(effort_id: str | None) -> str:
-    """Return ``effort_id`` when it's a known level, else the default.
+def efforts_for_provider(provider: str) -> tuple[EffortInfo, ...]:
+    """The ladder a given provider actually accepts. Unknown provider
+    falls back to the canonical list — callers validate the provider
+    elsewhere, and an empty picker would be worse than a wrong one."""
+    return PROVIDER_EFFORTS.get(provider, EFFORT_OPTIONS)
 
-    Used on the restore path (per-session memory) so a state file
-    written by a future build with a level this build doesn't know
-    falls back to the default rather than wedging the session."""
+
+def effort_levels_for_provider(provider: str) -> tuple[str, ...]:
+    """Just the ids — the validation surface for ``set_effort``."""
+    return tuple(e.id for e in efforts_for_provider(provider))
+
+
+def clamp_effort(effort_id: str | None, provider: str) -> str:
+    """Return the closest level ``provider`` supports at or below
+    ``effort_id``, else the provider's default.
+
+    Two callers need this, both crossing a boundary where the ladder
+    can change out from under a recorded choice:
+
+    - a cross-provider model swap (a researcher on Anthropic ``max``
+      switching to OpenAI, which has no ``max``), and
+    - the per-session restore path (a state file recording ``max``
+      against a session whose model is now an OpenAI one).
+
+    Stepping *down* rather than resetting keeps the researcher's
+    intent: someone who asked for the ceiling gets the new provider's
+    ceiling, not a silent drop to the middle of the ladder. Never
+    steps up — that would raise spend nobody asked for.
+    """
+    supported = effort_levels_for_provider(provider)
+    if effort_id in supported:
+        return effort_id  # type: ignore[return-value]
+    default = DEFAULT_EFFORT if DEFAULT_EFFORT in supported else supported[-1]
+    if effort_id not in _EFFORT_RANK:
+        return default
+    want = _EFFORT_RANK[effort_id]
+    at_or_below = [e for e in supported if _EFFORT_RANK[e] <= want]
+    # Ladders are cheapest-first, so the last match is the highest
+    # supported rung that doesn't exceed what was asked for.
+    return at_or_below[-1] if at_or_below else supported[0]
+
+
+def normalize_effort(effort_id: str | None, provider: str | None = None) -> str:
+    """Return ``effort_id`` when this build knows it, else the default.
+
+    With ``provider``, this is :func:`clamp_effort` — the level is
+    additionally held to that provider's ladder. Without one it only
+    checks the canonical list, which is what the runner does before
+    it knows which session it will open.
+    """
+    if provider is not None:
+        return clamp_effort(effort_id, provider)
     if effort_id in EFFORT_LEVELS:
         return effort_id  # type: ignore[return-value]
     return DEFAULT_EFFORT

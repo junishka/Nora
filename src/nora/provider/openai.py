@@ -302,7 +302,7 @@ class OpenAISession:
         continue_conversation: bool = False,
         effort: str | None = None,
     ) -> None:
-        from nora.provider.catalog import normalize_effort
+        from nora.provider.catalog import clamp_effort
 
         self.cwd = cwd
         self.model = model
@@ -310,7 +310,7 @@ class OpenAISession:
         # Reasoning effort — sent per request in ``reasoning.effort``
         # (see the send loop), so a change applies on the next
         # message with no client rebuild and no conversation reset.
-        self.effort: str = normalize_effort(effort)
+        self.effort: str = clamp_effort(effort, PROVIDER_ID)
         # ``continue_conversation`` is Anthropic-specific (CLI session
         # store); accepted for interface symmetry but ignored here.
         del continue_conversation
@@ -410,14 +410,54 @@ class OpenAISession:
             "context_window": info.context_window,
         }
 
+    def _reasoning_params(self) -> dict[str, Any]:
+        """Translate the picker's effort level into the Responses
+        API's reasoning parameters.
+
+        The bar shows one ladder — low … xhigh … pro — but OpenAI
+        splits that across two independent knobs, so the top rung
+        needs unpacking:
+
+        - ``low``/``medium``/``high``/``xhigh`` → ``reasoning.effort``
+          verbatim, standard mode.
+        - ``pro`` → ``reasoning.mode="pro"`` (more model work per
+          turn) *plus* ``reasoning.effort="xhigh"``. Mode and effort
+          are independent in the API and effort would otherwise
+          default to ``medium`` in pro mode — which would make the
+          bar's top rung reason *less* than the rung below it. Pairing
+          pro with the highest effort the client can express is what
+          makes the ladder monotonic, which is the whole promise of
+          rendering it as a bar.
+
+        ``mode`` is not in the pinned SDK's ``Reasoning`` TypedDict
+        (2.41.0 knows only effort/summary/generate_summary), but
+        TypedDicts aren't enforced at runtime and the SDK's transform
+        layer passes unknown keys straight through to the JSON body —
+        verified against ``openai._utils.maybe_transform``. Drop the
+        special-case here once the SDK types it.
+        """
+        params: dict[str, Any] = {"summary": "auto"}
+        if self.effort == "pro":
+            params["effort"] = "xhigh"
+            params["mode"] = "pro"
+        else:
+            params["effort"] = self.effort
+        return params
+
     async def set_effort(self, effort: str) -> dict[str, Any]:
         """Switch reasoning effort. Sent per request, so this is a
         field change that takes effect on the next message — the
         ``previous_response_id`` chain is untouched, no reopen."""
-        from nora.provider.catalog import EFFORT_LEVELS, get_effort
+        from nora.provider.catalog import (
+            effort_levels_for_provider,
+            get_effort,
+        )
 
-        if effort not in EFFORT_LEVELS:
-            return {"ok": False, "reason": f"unknown effort level: {effort}"}
+        if effort not in effort_levels_for_provider(PROVIDER_ID):
+            return {
+                "ok": False,
+                "reason": f"OpenAI does not support effort level {effort!r}",
+            }
         info = get_effort(effort)
         if effort == self.effort:
             return {
@@ -542,21 +582,14 @@ class OpenAISession:
                     "parallel_tool_calls": True,
                     # Reasoning controls — the OpenAI analogue of the
                     # Anthropic provider's effort +
-                    # thinking.display="summarized" pinning:
-                    #   - effort: the researcher's per-session pick
-                    #     from the picker's Effort section
-                    #     (``catalog.EFFORT_LEVELS``; default
-                    #     ``xhigh``). Valid on both catalog models —
-                    #     gpt-5.6-sol and gpt-5.6-terra each accept the
-                    #     full none/low/medium/high/xhigh/max range per
-                    #     OpenAI's model pages. If a future catalog
-                    #     entry re-pins a narrower range, it would 400
-                    #     here — check the model page before adding.
-                    #   - summary="auto": request reasoning summaries so
-                    #     the thinking trace below has something to
-                    #     surface. ("concise" is NOT supported by the
-                    #     gpt-5 series; "auto" lets the server pick.)
-                    "reasoning": {"effort": self.effort, "summary": "auto"},
+                    # thinking.display="summarized" pinning. Built by
+                    # ``_reasoning_params`` because the picker's top
+                    # rung (``pro``) is not an effort value at all;
+                    # see that method. ``summary="auto"`` rides along
+                    # so the thinking trace below has something to
+                    # surface ("concise" is NOT supported by the
+                    # gpt-5 series; "auto" lets the server pick).
+                    "reasoning": self._reasoning_params(),
                     # store=True is required for reasoning models AND
                     # for ``previous_response_id`` chaining: the
                     # server has to retain the prior response object

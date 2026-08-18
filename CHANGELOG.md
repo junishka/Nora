@@ -4,6 +4,80 @@ Notable changes per release. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 versions follow semver, pre-1.0.
 
+## [0.11.0] - 2026-08-18
+
+Minor bump on top of `0.10.3`. Two threads, one small fix. The model
+picker moves to the current frontier families on both providers, and
+reasoning effort — previously pinned to `xhigh` behind the scenes —
+becomes a researcher-facing dial next to the model.
+
+- **Model picker: Claude 5 and GPT-5.6.** Anthropic now lists Sonnet
+  5, Opus 5, and Fable 5; OpenAI lists GPT-5.6 Terra (the cost tier,
+  \$2/\$12 per MTok) and GPT-5.6 Sol (the flagship, \$5/\$30). Both
+  defaults move to the direct successor of the previous default —
+  Sonnet 5 for Anthropic, Sol for OpenAI — so an upgrade doesn't move
+  anyone's per-token rate: Sol sits at the same \$5/\$30 as the
+  GPT-5.5 it replaces. The heavier tiers (Opus 5, Fable 5) and the
+  cheaper one (Terra) stay explicit per-session opt-ins. Anthropic
+  ids keep the `[1m]` suffix so the provider follows one convention;
+  on the Claude 5 family a 1M window is already both the default and
+  the maximum.
+- **Per-session reasoning effort.** The model popup gains an Effort
+  bar under the model list, and the composer chip reads
+  `Sonnet 5 · xhigh`. The default is `xhigh`, which is exactly what
+  both providers were hard-pinned to before, so nothing changes
+  until a researcher moves the dial. Effort is per-session like the
+  model, is refused while a turn is in flight, and persists to
+  `.nora/session_state.json`, so a session that ran at the ceiling
+  reopens at the ceiling.
+- **The effort bar is provider-specific.** Anthropic offers `low`,
+  `medium`, `high`, `xhigh`, `max`; OpenAI offers `low`, `medium`,
+  `high`, `xhigh`, `pro`. The bar is rebuilt from the selected
+  model's provider, so a level that provider can't take is never
+  offered. `pro` is not an effort value — it is OpenAI's separate
+  `reasoning.mode`, which buys more model work per turn — but for
+  "how hard should this try" it is the rung above `xhigh`, so that
+  is where it sits; the provider unpacks it into `mode="pro"` plus
+  the highest expressible effort, so the top rung never reasons less
+  than the one below it. Switching providers maps by rank, which
+  ties the two ceilings: a session on Anthropic `max` that moves to
+  OpenAI lands on `pro` rather than dropping a rung, and the
+  confirmation toast says so when a level moves.
+- **Effort applies differently per provider, and the UI says so.**
+  OpenAI carries effort in each request, so a change lands on the
+  next message with the conversation intact. The Claude Agent SDK
+  accepts effort only when the CLI process launches, so an Anthropic
+  session is closed and re-warmed on the next message — the same
+  warm-start path a cross-provider model switch already takes, with
+  the conversation carried across by the context prefix. The
+  confirmation toast states which of the two happened.
+- **Sandbox: venv base prefixes.** The Python executor's sandbox
+  profile granted a venv's `sys.prefix` but not its `sys.base_prefix`
+  — and for a venv the standard library lives under the base. With a
+  uv-managed CPython (`~/.local/share/uv/python/`) the interpreter
+  launched inside the sandbox and died with `Failed to import
+  encodings module` before running anything. Homebrew and python.org
+  installs were unaffected, since their base and prefix are the same
+  path. Both base prefixes are now granted.
+
+Researcher-visible: the picker lists Sonnet 5 / Opus 5 / Fable 5 and
+GPT-5.6 Terra / Sol, with an Effort control beneath it and the level
+shown on the composer chip; Python analysis now runs on machines
+whose `python3` is a uv-managed virtualenv.
+
+Sessions saved under `0.10.x` resolve unchanged, with one expected
+consequence of the catalog move: per-session model memory restores
+only models still in the picker, so a session last used on Sonnet
+4.6, Opus 4.8, or GPT-5.5 reopens on the current default rather than
+a model no longer listed. Recorded effort is restored either way.
+
+**Updated in 0.11.0**: model picker moved to the Claude 5 family
+(Sonnet 5, Opus 5, Fable 5) and the GPT-5.6 family (Terra, Sol) with
+same-price successors as the defaults, a per-session reasoning-effort
+dial in the model popup that persists across reopens and survives
+provider switches, and a sandbox-profile fix that lets uv-managed
+virtualenv interpreters load their own standard library.
+
 ## [0.10.3] - 2026-05-29
 
 Focused patch on top of `0.10.2`. Two threads. The first closes a

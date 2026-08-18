@@ -346,7 +346,7 @@ class AnthropicSession:
         continue_conversation: bool = False,
         effort: str | None = None,
     ) -> None:
-        from nora.provider.catalog import normalize_effort
+        from nora.provider.catalog import clamp_effort
 
         self.cwd = cwd
         self.model = model
@@ -355,7 +355,7 @@ class AnthropicSession:
         # launch (see ``_build_options``) — there is no in-place
         # control request for it, unlike ``set_model``, so a change
         # while a client is live means a reopen (``set_effort``).
-        self.effort: str = normalize_effort(effort)
+        self.effort: str = clamp_effort(effort, PROVIDER_ID)
         # Anthropic SDK can resume the CLI's own session store keyed by
         # cwd. Nora doesn't use that path — the bridge prepends its own
         # condensed history on the first turn after open — but keep
@@ -519,10 +519,16 @@ class AnthropicSession:
         reopen a fresh CLI process WITHOUT the runner re-arming the
         context prefix, silently dropping the conversation.
         """
-        from nora.provider.catalog import EFFORT_LEVELS, get_effort
+        from nora.provider.catalog import (
+            effort_levels_for_provider,
+            get_effort,
+        )
 
-        if effort not in EFFORT_LEVELS:
-            return {"ok": False, "reason": f"unknown effort level: {effort}"}
+        if effort not in effort_levels_for_provider(PROVIDER_ID):
+            return {
+                "ok": False,
+                "reason": f"Anthropic does not support effort level {effort!r}",
+            }
         info = get_effort(effort)
         if effort == self.effort:
             return {
