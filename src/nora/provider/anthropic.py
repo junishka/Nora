@@ -344,10 +344,18 @@ class AnthropicSession:
         model: str,
         system_prompt: str,
         continue_conversation: bool = False,
+        effort: str | None = None,
     ) -> None:
+        from nora.provider.catalog import normalize_effort
+
         self.cwd = cwd
         self.model = model
         self._system_prompt = system_prompt
+        # Reasoning effort. Passed to the CLI as ``--effort`` at
+        # launch (see ``_build_options``) — there is no in-place
+        # control request for it, unlike ``set_model``, so a change
+        # while a client is live means a reopen (``set_effort``).
+        self.effort: str = normalize_effort(effort)
         # Anthropic SDK can resume the CLI's own session store keyed by
         # cwd. Nora doesn't use that path — the bridge prepends its own
         # condensed history on the first turn after open — but keep
@@ -362,20 +370,25 @@ class AnthropicSession:
             system_prompt=self._system_prompt,
             model=self.model,
             # Reasoning controls. Left unset, the SDK inherits each
-            # model's defaults: adaptive thinking on 4.6+ models, but a
-            # "high" effort ceiling and — on Opus 4.7+ — an "omitted"
-            # thinking display that strips the reasoning text down to
-            # signatures (so Nora's AssistantThinking trace goes blank).
-            # We pin both explicitly:
-            #   - effort="xhigh": extended reasoning depth on models that
-            #     support it (Opus 4.7+); falls back to "high" elsewhere
-            #     (e.g. the default Sonnet 4.6), so it's safe across the
-            #     whole catalog.
+            # model's defaults: adaptive thinking on the Claude 5 family,
+            # but a "high" effort ceiling and an "omitted" thinking
+            # display that strips the reasoning text down to signatures
+            # (so Nora's AssistantThinking trace goes blank). We pin
+            # both explicitly:
+            #   - effort: the researcher's per-session pick from the
+            #     picker's Effort section (``catalog.EFFORT_LEVELS``;
+            #     default ``xhigh``). Every catalog model (Sonnet 5 /
+            #     Opus 5 / Fable 5) accepts the full low..max ladder,
+            #     so any level is safe across the catalog. The SDK
+            #     hands it to the CLI as ``--effort`` at launch.
             #   - thinking adaptive + display="summarized": keep the model
             #     deciding how much to think, but ask for human-readable
             #     summarized traces so the thinking panel stays populated
-            #     on Opus 4.8 / Fable 5, not just pre-4.7 Sonnet.
-            effort="xhigh",
+            #     — the Claude 5 default is "omitted" (empty text).
+            #     ``{"type": "adaptive"}`` is the one explicit thinking
+            #     config Fable 5 accepts (it rejects "disabled" and any
+            #     budget_tokens), so this shape is valid on all three.
+            effort=self.effort,
             thinking={"type": "adaptive", "display": "summarized"},
             continue_conversation=self._continue,
             mcp_servers={SERVER_NAME: build_server()},
@@ -489,6 +502,40 @@ class AnthropicSession:
         }
 
     # ---- send ------------------------------------------------------------
+
+    async def set_effort(self, effort: str) -> dict[str, Any]:
+        """Switch the reasoning-effort level.
+
+        The Agent SDK only takes effort at client construction (the
+        CLI's ``--effort`` flag) — there is no ``set_effort`` control
+        request the way there is ``set_model``. So: with no client
+        open, just record the level and the next ``open()`` uses it.
+        With a live client, record it and report ``requires_reopen``
+        so the runner closes this session; the next turn reopens with
+        the new level and the bridge's warm-start context prefix
+        carries the conversation across (same path a cross-provider
+        model swap takes). We deliberately do NOT close the client
+        here: closing at this layer would let ``send()`` lazily
+        reopen a fresh CLI process WITHOUT the runner re-arming the
+        context prefix, silently dropping the conversation.
+        """
+        from nora.provider.catalog import EFFORT_LEVELS, get_effort
+
+        if effort not in EFFORT_LEVELS:
+            return {"ok": False, "reason": f"unknown effort level: {effort}"}
+        info = get_effort(effort)
+        if effort == self.effort:
+            return {
+                "ok": True, "effort": effort, "label": info.label,
+                "unchanged": True,
+            }
+        self.effort = effort
+        return {
+            "ok": True,
+            "effort": effort,
+            "label": info.label,
+            "requires_reopen": self._client is not None,
+        }
 
     async def send(
         self,

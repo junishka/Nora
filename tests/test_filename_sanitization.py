@@ -180,7 +180,7 @@ class _PromptCapturingSession:
 
     @property
     def model(self) -> str:
-        return "claude-sonnet-4-6[1m]"
+        return "claude-sonnet-5[1m]"
 
     async def aclose(self) -> None:
         return None
@@ -219,7 +219,7 @@ def test_dataset_diff_notice_strips_newline_injection(tmp_path: Path) -> None:
     (tmp_path / "panel.csv").write_text("x,y\n1,2\n")
 
     runner = SessionRunner(
-        cwd=tmp_path, provider="anthropic", model="claude-sonnet-4-6[1m]",
+        cwd=tmp_path, provider="anthropic", model="claude-sonnet-5[1m]",
     )
     runner.known_datasets = frozenset({"panel.csv"})
     session = _PromptCapturingSession()
@@ -247,7 +247,7 @@ def test_dataset_diff_notice_strips_bidi_override(tmp_path: Path) -> None:
     (tmp_path / "panel.csv").write_text("x,y\n1,2\n")
 
     runner = SessionRunner(
-        cwd=tmp_path, provider="anthropic", model="claude-sonnet-4-6[1m]",
+        cwd=tmp_path, provider="anthropic", model="claude-sonnet-5[1m]",
     )
     runner.known_datasets = frozenset({"panel.csv"})
     session = _PromptCapturingSession()
@@ -266,7 +266,7 @@ def test_mention_notice_strips_newline_injection(tmp_path: Path) -> None:
     JS chip layer hands it; the runner is the chokepoint."""
     set_cwd(tmp_path)
     runner = SessionRunner(
-        cwd=tmp_path, provider="anthropic", model="claude-sonnet-4-6[1m]",
+        cwd=tmp_path, provider="anthropic", model="claude-sonnet-5[1m]",
     )
     # Skip the dataset-diff path; we want only mention_notice exercised.
     runner.known_datasets = frozenset()

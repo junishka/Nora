@@ -153,8 +153,8 @@ def test_two_runners_observe_their_own_cwd_under_concurrent_send(
     other.mkdir()
     set_cwd(other)
 
-    runner_a = SessionRunner(cwd=a, provider="anthropic", model="claude-sonnet-4-6[1m]")
-    runner_b = SessionRunner(cwd=b, provider="anthropic", model="claude-sonnet-4-6[1m]")
+    runner_a = SessionRunner(cwd=a, provider="anthropic", model="claude-sonnet-5[1m]")
+    runner_b = SessionRunner(cwd=b, provider="anthropic", model="claude-sonnet-5[1m]")
 
     session_a = _CwdProbingSession()
     session_b = _CwdProbingSession()

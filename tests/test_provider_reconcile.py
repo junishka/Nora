@@ -144,7 +144,7 @@ def test_ui_ready_reconciles_provider(
     bridge = NoraBridge(cwd=tmp_path)
     # Manually wedge the bridge into a bad state.
     bridge._provider = "anthropic"
-    bridge._model = "claude-sonnet-4-6[1m]"
+    bridge._model = "claude-sonnet-5[1m]"
 
     bridge.ui_ready()
     assert bridge._provider == "openai"
@@ -170,7 +170,7 @@ def test_reconcile_skips_swap_when_active_runner_busy(
     active = bridge._active_runner()
     assert active is not None
     active.provider = "anthropic"
-    active.model = "claude-sonnet-4-6[1m]"
+    active.model = "claude-sonnet-5[1m]"
 
     class _BusyTask:
         def done(self) -> bool: return False

@@ -209,6 +209,21 @@ class ProviderSession(Protocol):
         """
         ...
 
+    async def set_effort(self, effort: str) -> dict[str, Any]:
+        """Switch the reasoning-effort level (``catalog.EFFORT_LEVELS``).
+
+        Returns ``{"ok": True, "effort": <id>, ...}`` on success or
+        ``{"ok": False, "reason": <str>}`` on failure. Providers that
+        can only apply effort at client construction (the Anthropic
+        Agent SDK passes it as a CLI flag at launch) report
+        ``"requires_reopen": True`` when a live client exists — the
+        caller (the runner) then closes the session so the next turn
+        reopens with the new level and the warm-start context prefix
+        carries the conversation. Providers that apply it per request
+        (OpenAI) just take effect on the next message.
+        """
+        ...
+
 
 # ---------------------------------------------------------------------------
 # Auth detection

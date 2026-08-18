@@ -307,13 +307,37 @@ Picker (top-right of composer, grouped by provider):
 
 | Provider | Models | Pricing link |
 |---|---|---|
-| Anthropic | Sonnet 4.6, Opus 4.8 | platform.claude.com/docs/…/pricing |
-| OpenAI | GPT-5.5, GPT-5.5 Pro (extended reasoning) | openai.com/api/pricing |
+| Anthropic | Sonnet 5 (default), Opus 5, Fable 5 | platform.claude.com/docs/…/pricing |
+| OpenAI | GPT-5.6 Terra (cost tier), GPT-5.6 Sol (flagship, default) | openai.com/api/pricing |
 
 Each row carries a small `$` link that opens the provider's pricing
 page in the system browser. Models for un-authed providers stay
 listed but are dimmed; clicking them opens the auth screen
 positioned on that provider.
+
+**Effort.** The same popup carries an Effort section under the model
+list — `low / medium / high / xhigh / max`, default `xhigh` (what
+both providers were hard-pinned to before the dial existed). The
+ladder is provider-neutral: every catalog model accepts every level,
+so it doesn't re-render on a model switch and survives a
+cross-provider swap. The composer chip reads `Sonnet 5 · xhigh`.
+
+Both settings are per-session and both persist to
+`.nora/session_state.json`, but they apply differently:
+
+| | Anthropic | OpenAI |
+|---|---|---|
+| Model swap | in-place via the Agent SDK, conversation kept | per-request field, conversation kept |
+| Effort swap | **session closes and re-warms on the next message** | per-request field, conversation kept |
+
+The Anthropic asymmetry is the Agent SDK: effort is the CLI's
+`--effort` flag, set at launch, with no in-place control request (
+unlike `set_model`). So the provider reports `requires_reopen` and
+the *runner* closes the session — closing inside the provider would
+let the next `send()` lazily reopen without the runner re-arming
+`needs_context_prefix`, silently dropping the conversation. The
+re-warm path is the same one a cross-provider model swap takes, and
+the toast says so.
 
 ## Architecture at a glance
 
@@ -450,10 +474,14 @@ and can react instead of guessing "thumbnail should be visible".
 `nora` without an argv opens a landing screen; dropped /
 picked files land in `~/.nora-sessions/<ts>_<id>/` which becomes
 the cwd. That dir is spaces-free (Stata-safe), outside cloud-sync
-roots, persistent across restarts. Reopening a session restores
-the `active_model` recorded in `.nora/session_state.json` — a
-researcher who switched to Opus for one project comes back to Opus
-next time, even when the launcher passes the cwd directly.
+roots, persistent across restarts. Reopening a session restores the
+`active_model` and `active_effort` recorded in
+`.nora/session_state.json` — a researcher who switched to Opus at
+`max` for one project comes back to Opus at `max` next time, even
+when the launcher passes the cwd directly. The two restore
+independently: effort is provider-neutral, so a state file naming a
+model that has since left the catalog still gets its effort back
+while the model falls to the default.
 
 ## Longer-term: governance for wider distribution
 

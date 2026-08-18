@@ -140,11 +140,19 @@ class SessionRunner:
         cwd: Path,
         provider: str,
         model: str,
+        effort: str | None = None,
     ) -> None:
+        from nora.provider.catalog import normalize_effort
+
         self.cwd: Path = cwd.resolve()
         # Mutable: ``set_model`` may swap provider+model in place.
         self.provider: str = provider
         self.model: str = model
+        # Mutable: ``set_effort`` swaps the reasoning-effort level.
+        # Provider-neutral (``catalog.EFFORT_LEVELS``); survives a
+        # cross-provider model swap so a researcher on ``max`` stays
+        # on ``max`` when they hop from Sonnet to Sol.
+        self.effort: str = normalize_effort(effort)
         # Lazy: opened on first send. ``ensure_session`` is idempotent.
         self._session: ProviderSession | None = None
         # Created without a running loop on the bridge thread; binds
@@ -441,6 +449,7 @@ class SessionRunner:
                 model=self.model,
                 system_prompt=system_prompt,
                 continue_conversation=False,
+                effort=self.effort,
             )
             await self._session.open()
             self.needs_context_prefix = True
@@ -509,6 +518,47 @@ class SessionRunner:
             self.model = old_model
             if self._session is not None:
                 await self.close()
+        return res
+
+    async def swap_effort(self, effort: str) -> dict[str, Any]:
+        """Swap the reasoning-effort level.
+
+        Records the level on the runner (so a lazily-opened session
+        picks it up) and, when a session is live, asks the provider
+        to apply it. Providers that can only take effort at client
+        construction (Anthropic — the Agent SDK's ``--effort`` CLI
+        flag) answer ``requires_reopen``; we then close the session
+        here at the RUNNER level, which re-arms ``needs_context_prefix``
+        so the next turn reopens with the new level and the warm-start
+        prefix carries the conversation — exactly the cross-provider
+        ``swap_model`` path. Providers that send effort per request
+        (OpenAI) apply it on the next message with no reset.
+        """
+        from nora.provider.catalog import EFFORT_LEVELS, get_effort
+
+        if effort not in EFFORT_LEVELS:
+            return {"ok": False, "reason": f"unknown effort level: {effort}"}
+        info = get_effort(effort)
+        if effort == self.effort:
+            return {
+                "ok": True, "effort": effort, "label": info.label,
+                "unchanged": True,
+            }
+        old_effort = self.effort
+        self.effort = effort
+        if self._session is None:
+            return {"ok": True, "effort": effort, "label": info.label}
+        try:
+            res = await self._session.set_effort(effort)
+        except Exception as e:  # noqa: BLE001 — provider shape varies
+            self.effort = old_effort
+            return {"ok": False, "reason": f"effort switch failed: {e}"}
+        if not res.get("ok"):
+            self.effort = old_effort
+            return res
+        if res.get("requires_reopen"):
+            await self.close()
+            res = {**res, "conversation_rewarmed": True}
         return res
 
     def _capture_plots(self, run_dir: Path) -> None:
@@ -1227,7 +1277,9 @@ class SessionRunner:
                     # Persist the durable session snapshot.
                     try:
                         from nora.session_state import write_session_state
-                        write_session_state(cwd, model=self.model)
+                        write_session_state(
+                            cwd, model=self.model, effort=self.effort,
+                        )
                     except Exception:  # noqa: BLE001
                         pass
                 except asyncio.CancelledError:

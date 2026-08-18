@@ -10,7 +10,7 @@ Each test pins a behaviour that broke in production at least once:
 2. ``NoraBridge(cwd=...)`` (the launcher path that opens straight
    into chat) restores the per-session model preference. Without
    this, a session whose state file says ``active_model =
-   "claude-opus-4-8[1m]"`` came up on the default Sonnet.
+   "claude-opus-5[1m]"`` came up on the default Sonnet.
 
 3. ``unstage_attachment`` removes a staged script from
    ``_pending_script_attachments`` so the chip × in the JS UI is
@@ -39,11 +39,15 @@ from nora.ui import NoraBridge
 # Fix 1 — ui_ready 'ready' branch carries the state key
 # ---------------------------------------------------------------------------
 
-def test_ui_ready_with_cwd_returns_state_ready(tmp_path: Path) -> None:
+def test_ui_ready_with_cwd_returns_state_ready(
+    tmp_path: Path, anthropic_authed: None,
+) -> None:
     """``nora /path/to/session`` constructs the bridge with a cwd
     set. The first ``ui_ready`` call must return ``state ==
     'ready'`` so the JS startup branch routes to chat instead of
-    falling through to ``showLanding``."""
+    falling through to ``showLanding``. Auth is stubbed — without
+    the fixture this asserts the developer's keyring, not the
+    routing logic."""
     bridge = NoraBridge(cwd=tmp_path)
     payload = bridge.ui_ready()
     assert payload.get("state") == "ready", (
@@ -68,20 +72,20 @@ def test_ui_ready_without_cwd_signals_needs_session(tmp_path: Path) -> None:
 # ---------------------------------------------------------------------------
 
 def test_constructor_with_cwd_restores_recorded_model(
-    tmp_path: Path,
+    tmp_path: Path, anthropic_authed: None,
 ) -> None:
     """A session whose ``.nora/session_state.json`` records
-    ``active_model = "claude-opus-4-8[1m]"`` must come up on Opus
+    ``active_model = "claude-opus-5[1m]"`` must come up on Opus
     when the launcher passes the cwd directly. Skipping the
     restore step (the previous behaviour) silently dropped
     researchers onto the catalog default."""
     session_dir = tmp_path / "saved-on-opus"
     session_dir.mkdir()
-    write_session_state(session_dir, model="claude-opus-4-8[1m]")
+    write_session_state(session_dir, model="claude-opus-5[1m]")
 
     bridge = NoraBridge(cwd=session_dir)
 
-    assert bridge._model == "claude-opus-4-8[1m]"
+    assert bridge._model == "claude-opus-5[1m]"
     assert bridge._provider == "anthropic"
 
 

@@ -300,10 +300,17 @@ class OpenAISession:
         model: str,
         system_prompt: str,
         continue_conversation: bool = False,
+        effort: str | None = None,
     ) -> None:
+        from nora.provider.catalog import normalize_effort
+
         self.cwd = cwd
         self.model = model
         self._system_prompt = system_prompt
+        # Reasoning effort — sent per request in ``reasoning.effort``
+        # (see the send loop), so a change applies on the next
+        # message with no client rebuild and no conversation reset.
+        self.effort: str = normalize_effort(effort)
         # ``continue_conversation`` is Anthropic-specific (CLI session
         # store); accepted for interface symmetry but ignored here.
         del continue_conversation
@@ -402,6 +409,23 @@ class OpenAISession:
             "label": info.label,
             "context_window": info.context_window,
         }
+
+    async def set_effort(self, effort: str) -> dict[str, Any]:
+        """Switch reasoning effort. Sent per request, so this is a
+        field change that takes effect on the next message — the
+        ``previous_response_id`` chain is untouched, no reopen."""
+        from nora.provider.catalog import EFFORT_LEVELS, get_effort
+
+        if effort not in EFFORT_LEVELS:
+            return {"ok": False, "reason": f"unknown effort level: {effort}"}
+        info = get_effort(effort)
+        if effort == self.effort:
+            return {
+                "ok": True, "effort": effort, "label": info.label,
+                "unchanged": True,
+            }
+        self.effort = effort
+        return {"ok": True, "effort": effort, "label": info.label}
 
     # ---- send ------------------------------------------------------------
 
@@ -517,20 +541,22 @@ class OpenAISession:
                     # boundary and the lockdown test asserts it.
                     "parallel_tool_calls": True,
                     # Reasoning controls — the OpenAI analogue of the
-                    # Anthropic provider's effort="xhigh" +
+                    # Anthropic provider's effort +
                     # thinking.display="summarized" pinning:
-                    #   - effort="xhigh": deepest reasoning tier. Valid
-                    #     on both catalog models — gpt-5.5 supports the
-                    #     full none/low/medium/high/xhigh range, and the
-                    #     gpt-5.x-pro line lifted the gpt-5-pro
-                    #     "high-only" restriction (gpt-5.4-pro and later
-                    #     accept xhigh). If OpenAI ever ships a Pro
-                    #     variant that re-pins high, it would 400 here.
+                    #   - effort: the researcher's per-session pick
+                    #     from the picker's Effort section
+                    #     (``catalog.EFFORT_LEVELS``; default
+                    #     ``xhigh``). Valid on both catalog models —
+                    #     gpt-5.6-sol and gpt-5.6-terra each accept the
+                    #     full none/low/medium/high/xhigh/max range per
+                    #     OpenAI's model pages. If a future catalog
+                    #     entry re-pins a narrower range, it would 400
+                    #     here — check the model page before adding.
                     #   - summary="auto": request reasoning summaries so
                     #     the thinking trace below has something to
                     #     surface. ("concise" is NOT supported by the
                     #     gpt-5 series; "auto" lets the server pick.)
-                    "reasoning": {"effort": "xhigh", "summary": "auto"},
+                    "reasoning": {"effort": self.effort, "summary": "auto"},
                     # store=True is required for reasoning models AND
                     # for ``previous_response_id`` chaining: the
                     # server has to retain the prior response object

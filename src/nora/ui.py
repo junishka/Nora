@@ -58,9 +58,13 @@ from nora.provider import (
 )
 from nora.provider.catalog import (
     ALL_MODELS,
+    DEFAULT_EFFORT,
+    EFFORT_LEVELS,
+    EFFORT_OPTIONS,
     PROVIDER_API_KEY_URLS,
     PROVIDER_DEFAULTS,
     PROVIDER_PRICING_URLS,
+    get_effort,
 )
 from nora.runner import SessionRunner
 
@@ -189,6 +193,10 @@ class NoraBridge:
         # active runner).
         self._default_provider: str = "anthropic"
         self._default_model: str = PROVIDER_DEFAULTS[self._default_provider]
+        # Default reasoning effort for a NEW runner with no recorded
+        # ``active_effort``. Provider-neutral; ``set_effort`` with no
+        # focused session updates it, a per-session pick doesn't.
+        self._default_effort: str = DEFAULT_EFFORT
         if cwd is not None:
             # If the launcher handed us a cwd, eagerly create its
             # runner so per-session model preference is applied
@@ -1576,10 +1584,21 @@ class NoraBridge:
         active = self._active_runner()
         current_model = active.model if active is not None else self._default_model
         current_provider = active.provider if active is not None else self._default_provider
+        current_effort = active.effort if active is not None else self._default_effort
         return {
             "ok": True,
             "current": current_model,
             "current_provider": current_provider,
+            # Effort rides the same payload: the picker renders an
+            # Effort section under the model list, and the chip
+            # shows "<model> · <effort>". Provider-neutral ladder —
+            # every catalog model accepts every level.
+            "current_effort": current_effort,
+            "default_effort": DEFAULT_EFFORT,
+            "efforts": [
+                {"id": e.id, "label": e.label, "hint": e.hint}
+                for e in EFFORT_OPTIONS
+            ],
             "models": [
                 {
                     "id": m.id,
@@ -2851,6 +2870,49 @@ class NoraBridge:
             "provider": new_provider,
         }
 
+    def set_effort(self, effort: str) -> dict[str, Any]:
+        """Switch the focused session's reasoning-effort level.
+
+        Provider-neutral (``catalog.EFFORT_LEVELS``); operates on THIS
+        session's runner only, like ``set_model``. With no focused
+        session it updates the bridge default so the next runner
+        picks it up. Refused while THIS runner has a turn in flight.
+        Persists ``active_effort`` to the runner's
+        ``.nora/session_state.json`` so a reload restores the choice.
+
+        On Anthropic a live session is closed and re-warmed on the
+        next message (the Agent SDK takes effort only at launch);
+        the payload carries ``conversation_rewarmed`` so the UI can
+        say so. On OpenAI it just applies to the next request.
+        """
+        if effort not in EFFORT_LEVELS:
+            return {"ok": False, "reason": f"unknown effort level: {effort}"}
+        info = get_effort(effort)
+        active = self._active_runner()
+        if active is None:
+            self._default_effort = effort
+            return {"ok": True, "effort": effort, "label": info.label}
+        if active.is_busy():
+            return {
+                "ok": False,
+                "reason": "a turn is in flight; wait for it to finish",
+            }
+        if effort == active.effort:
+            return {
+                "ok": True, "effort": effort, "label": info.label,
+                "unchanged": True,
+            }
+        res = self._run_on_loop(active.swap_effort(effort))
+        if res is None or not res.get("ok"):
+            return res or {"ok": False, "reason": "effort switch failed"}
+        self._persist_active_model()
+        return {
+            "ok": True,
+            "effort": effort,
+            "label": info.label,
+            "conversation_rewarmed": bool(res.get("conversation_rewarmed")),
+        }
+
     def _persist_active_model(self) -> None:
         """Refresh ``.nora/session_state.json`` so a successful
         ``set_model`` survives an app restart even before the
@@ -2862,7 +2924,9 @@ class NoraBridge:
             return
         try:
             from nora.session_state import write_session_state
-            write_session_state(active.cwd, model=active.model)
+            write_session_state(
+                active.cwd, model=active.model, effort=active.effort,
+            )
         except Exception:  # noqa: BLE001 — never let state write break a swap
             pass
 
@@ -3341,7 +3405,10 @@ class NoraBridge:
         if runner is not None:
             return runner
         provider, model = self._initial_model_for_session(cwd)
-        runner = SessionRunner(cwd=cwd, provider=provider, model=model)
+        effort = self._initial_effort_for_session(cwd)
+        runner = SessionRunner(
+            cwd=cwd, provider=provider, model=model, effort=effort,
+        )
         self._runners[key] = runner
         return runner
 
@@ -3371,6 +3438,28 @@ class NoraBridge:
             return self._default_provider, self._default_model
         return info.provider, info.id
 
+    def _initial_effort_for_session(self, cwd: Path) -> str:
+        """Pick the reasoning-effort level for a freshly-created
+        runner: the session's recorded ``active_effort`` when it's a
+        level this build knows, else the bridge default. Independent
+        of the model restore — effort is provider-neutral, so it
+        survives even when the recorded model fell out of the catalog
+        or its provider isn't authed."""
+        try:
+            from nora.session_state import read_session_state
+            state = read_session_state(cwd)
+        except Exception:  # noqa: BLE001
+            state = None
+        if state is None or not state.active_effort:
+            return self._default_effort
+        # Note the fallback is the BRIDGE default, not the catalog
+        # default — a researcher who set "low" on the landing screen
+        # shouldn't get "xhigh" just because this session's file
+        # names a level from a future build.
+        if state.active_effort not in EFFORT_LEVELS:
+            return self._default_effort
+        return state.active_effort
+
     def _active_runner(self) -> SessionRunner | None:
         """Convenience accessor: the runner for the focused session."""
         if self.cwd is None:
@@ -3394,6 +3483,19 @@ class NoraBridge:
             active.model = value
         else:
             self._default_model = value
+
+    @property
+    def _effort(self) -> str:
+        active = self._active_runner()
+        return active.effort if active is not None else self._default_effort
+
+    @_effort.setter
+    def _effort(self, value: str) -> None:
+        active = self._active_runner()
+        if active is not None:
+            active.effort = value
+        else:
+            self._default_effort = value
 
     @property
     def _provider(self) -> str:
@@ -4045,7 +4147,9 @@ class NoraBridge:
         # committed.
         try:
             from nora.session_state import write_session_state
-            write_session_state(self.cwd, model=runner.model)
+            write_session_state(
+                self.cwd, model=runner.model, effort=runner.effort,
+            )
         except Exception:  # noqa: BLE001 — snapshot is advisory
             pass
 

@@ -89,7 +89,7 @@ def _seed_run(
 
 def _runner(cwd: Path) -> SessionRunner:
     return SessionRunner(
-        cwd=cwd, provider="anthropic", model="claude-sonnet-4-6[1m]"
+        cwd=cwd, provider="anthropic", model="claude-sonnet-5[1m]"
     )
 
 

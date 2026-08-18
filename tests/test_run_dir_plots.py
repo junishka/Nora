@@ -362,7 +362,7 @@ def test_capture_plots_sanitizes_label_via_safe_text(tmp_path: Path) -> None:
     register_run_token(run, token)
 
     runner = SessionRunner(
-        cwd=tmp_path, provider="anthropic", model="claude-sonnet-4-6[1m]",
+        cwd=tmp_path, provider="anthropic", model="claude-sonnet-5[1m]",
     )
     runner._capture_plots(run)
     assert len(runner.pending_plot_images) == 1
@@ -402,7 +402,7 @@ def test_capture_plots_sanitizes_filename(tmp_path: Path) -> None:
     )
     register_run_token(run, token)
     runner = SessionRunner(
-        cwd=tmp_path, provider="anthropic", model="claude-sonnet-4-6[1m]",
+        cwd=tmp_path, provider="anthropic", model="claude-sonnet-5[1m]",
     )
     runner._capture_plots(run)
     name = runner.pending_plot_images[0]["name"]
@@ -988,7 +988,7 @@ def test_runner_capture_plots_handles_pdf_via_sidecar(tmp_path: Path) -> None:
     with patch("nora.plot_convert.png_for", return_value=fake_png):
         runner = SessionRunner(
             cwd=tmp_path, provider="anthropic",
-            model="claude-sonnet-4-6[1m]",
+            model="claude-sonnet-5[1m]",
         )
         runner._capture_plots(run)
 
@@ -1031,7 +1031,7 @@ def test_runner_capture_plots_logs_failure_when_pdf_conversion_fails(
     with patch("nora.plot_convert.png_for", return_value=None):
         runner = SessionRunner(
             cwd=tmp_path, provider="anthropic",
-            model="claude-sonnet-4-6[1m]",
+            model="claude-sonnet-5[1m]",
         )
         runner._capture_plots(run)
     assert runner.pending_plot_images == []
@@ -1226,7 +1226,7 @@ def test_runner_capture_plots_handles_eps(tmp_path: Path) -> None:
     with patch("nora.plot_convert.png_for", return_value=fake_png):
         runner = SessionRunner(
             cwd=tmp_path, provider="anthropic",
-            model="claude-sonnet-4-6[1m]",
+            model="claude-sonnet-5[1m]",
         )
         runner._capture_plots(run)
     assert len(runner.pending_plot_images) == 1

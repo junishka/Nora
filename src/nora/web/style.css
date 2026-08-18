@@ -3457,6 +3457,85 @@ kbd {
   margin-top: 0;
 }
 
+/* --- effort section inside the model picker --- */
+
+/* Effort suffix on the composer chip: "Sonnet 5 · xhigh". Dim mono
+ * so it reads as a setting, not part of the model name. */
+.model-chip-effort {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--text-dim);
+  font-weight: 400;
+}
+
+/* Segmented control — one flat row, equal-width cells, single
+ * outer border. Same visual family as .model-option (rounded, bg
+ * on hover, accent-soft border on active) so it reads as part of
+ * the same picker rather than a bolted-on widget. */
+.effort-seg {
+  display: flex;
+  gap: 2px;
+  margin: 2px 10px 6px;
+  padding: 2px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: transparent;
+}
+
+.effort-seg-btn {
+  position: relative;
+  flex: 1 1 0;
+  padding: 5px 4px;
+  border: 1px solid transparent;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--text-dim);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  line-height: 1.2;
+  cursor: pointer;
+  transition: background 0.15s, color 0.15s, border-color 0.15s;
+}
+
+.effort-seg-btn:hover {
+  background: var(--bg);
+  color: var(--text);
+}
+
+.effort-seg-btn.active {
+  background: var(--bg);
+  color: var(--text);
+  border-color: var(--accent-soft);
+  font-weight: 600;
+}
+
+/* Small dot under the catalog default so a researcher who moved
+ * off it can see where "back to normal" is. */
+.effort-seg-btn.is-default::after {
+  content: '';
+  position: absolute;
+  left: 50%;
+  bottom: 1px;
+  width: 3px;
+  height: 3px;
+  margin-left: -1.5px;
+  border-radius: 50%;
+  background: var(--text-dim);
+  opacity: 0.6;
+}
+
+.effort-seg-btn.active.is-default::after {
+  background: var(--accent);
+  opacity: 0.9;
+}
+
+.effort-hint {
+  font-size: 11px;
+  line-height: 1.4;
+  color: var(--text-dim);
+  padding: 0 10px 4px;
+}
+
 .context-chip:hover,
 .context-chip.open {
   background: transparent;
