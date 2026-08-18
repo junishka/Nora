@@ -66,9 +66,21 @@ def test_python_is_detected_in_environment() -> None:
 # Refusal paths (don't need a real python install)
 # ---------------------------------------------------------------------------
 
-def test_run_script_refuses_python_without_interpreter(tmp_path: Path) -> None:
+def test_run_script_refuses_python_without_interpreter(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """A research box without python3 should get a clear error
-    pointing at how to install it — not a cryptic FileNotFoundError."""
+    pointing at how to install it — not a cryptic FileNotFoundError.
+
+    ``env.python is None`` has two error shapes (see the preflight in
+    ``executor.run_script``): "not found on PATH" vs "found but every
+    candidate failed the sandbox probe". The executor distinguishes
+    them via the process-global ``_SANDBOX_PROBE_CACHE`` — which this
+    file's import-time skip-gate already populated with the REAL
+    machine's probe results. Swap in an empty cache so this test pins
+    the truly-absent shape on every machine (the probe-failure shape
+    is pinned by ``test_find_python_sandbox_probe.py``)."""
+    monkeypatch.setattr(env_detect, "_SANDBOX_PROBE_CACHE", {})
     fake_env = env_detect.Environment(
         r=None,
         stata=None,
