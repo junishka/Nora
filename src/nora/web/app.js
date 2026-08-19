@@ -2211,8 +2211,7 @@ function showLoadingIndicator() {
     'background="transparent" speed="0.6" autoplay loop ' +
     'aria-hidden="true"></lottie-player>' +
     '<span class="loading-text">' + label + '</span>';
-  messagesEl.appendChild(el);
-  scrollToBottom();
+  appendFollowing(el);
 }
 
 function hideLoadingIndicator() {
@@ -2404,11 +2403,12 @@ window.nora_event = function (evt) {
       if (!flushPendingFor(evtCwd)) {
         setSending(false, evtCwd);
       }
-      // hideLoadingIndicator() (inside setSending(false)) removed
-      // the cat above the new assistant reply, so the reply just
-      // shifted up by ~80 px. Re-apply the top-anchor so the
-      // researcher still lands on the answer's first line.
-      reapplyAssistantTopAnchor();
+      // Deliberately no scroll here. The turn ending is not a
+      // reason to move the researcher's viewport: they may be
+      // mid-read somewhere above. hideLoadingIndicator() removes
+      // the cat and shifts content up by ~80px, so refresh the
+      // "scroll to latest" button against the new geometry.
+      updateScrollToBottomVisibility();
       // Refresh the sidebar so the just-active session bubbles to
       // the top — list_sessions sorts by chat_history.jsonl mtime,
       // which the persist path bumped during this turn.
@@ -2515,8 +2515,7 @@ function appendThinking(text) {
 
   card.appendChild(header);
   card.appendChild(body);
-  messagesEl.appendChild(card);
-  scrollToBottom();
+  appendFollowing(card);
   return card;
 }
 
@@ -2641,95 +2640,70 @@ function append(kind, text, markdown, attachments, images) {
     });
     wrapper.appendChild(row);
   }
+  const wasFollowing = beginFollowingAppend();
   messagesEl.appendChild(wrapper);
-  if (kind === 'assistant') {
-    // Anchor on the user's own preceding message so the researcher
-    // sees what they asked at the top of the viewport, then the
-    // reply right below. Scrolling to the assistant bubble's top
-    // landed them on the second line of the answer and dropped
-    // their own question off-screen — confusing for "what did I
-    // just ask?" review. Falls back to top-anchoring the reply
-    // itself if no preceding user message exists (the first turn
-    // of a session that opens with an assistant greeting). Other
-    // message kinds (user, system, error) still pin to the
-    // bottom: a user message pairs with the empty composer below
-    // it, and system / error notices are usually short status
-    // lines.
-    //
-    // Remember the anchor element so the turn_done handler can
-    // re-apply the scroll AFTER the loading indicator is removed.
-    // Without that re-anchor, hiding the cat shifts everything up
-    // by ~80px and the chosen anchor scrolls off the top.
-    const anchor = findPrecedingUserMessage(wrapper) || wrapper;
-    pendingAssistantTopAnchor = anchor;
-    scrollMessageToTop(anchor);
+  if (kind === 'user') {
+    // The researcher just hit Send — always take them to their own
+    // message. This is the one scroll that's unconditional, because
+    // it's a direct response to their action. Passing ``true``
+    // rather than calling scrollToBottom() directly also refreshes
+    // the button, which matters because the instant scroll fires no
+    // scroll event to trigger that refresh on its own.
+    endFollowingAppend(true);
   } else {
-    if (kind === 'user') pendingAssistantTopAnchor = null;
-    scrollToBottom();
+    // Everything that arrives on its own (assistant replies, system
+    // and error notices) follows only if the researcher is already
+    // parked at the bottom. If they've scrolled up to read something
+    // earlier, their position is left alone and the
+    // "scroll to latest" button surfaces instead.
+    //
+    // This replaces an earlier top-anchoring scheme that pinned each
+    // incoming reply under the user's preceding question. It read
+    // well for a single short exchange, but a turn that emits
+    // several assistant messages re-anchored on the SAME originating
+    // question every time, so the view kept getting yanked back up
+    // the transcript mid-read.
+    endFollowingAppend(wasFollowing);
   }
   return wrapper;
 }
 
-function findPrecedingUserMessage(wrapper) {
-  /* Walk backwards through ``messagesEl`` siblings looking for the
-   * nearest user bubble that DROVE this reply. Skip ``.queued`` and
-   * ``.not-sent`` user bubbles: those sit in the DOM ahead of the
-   * reply (queued ones haven't fired yet; cancelled ones never will),
-   * so DOM proximity would otherwise mis-anchor the reply under a
-   * later prompt that the model never saw. Example: A is in flight,
-   * the researcher queues B, A's reply arrives — without the filter
-   * the reply would anchor under B's prompt, not A's.
-   *
-   * Returns ``null`` when nothing matches (rare — only at session
-   * start before the researcher has typed anything, or when the
-   * provider emits an assistant message without a preceding user
-   * turn).
-   */
-  let prev = wrapper.previousElementSibling;
-  while (prev) {
-    if (
-      prev.classList
-      && prev.classList.contains('user')
-      && !prev.classList.contains('queued')
-      && !prev.classList.contains('not-sent')
-    ) {
-      return prev;
-    }
-    prev = prev.previousElementSibling;
-  }
-  return null;
+/* Auto-follow: keep chasing new content only while the researcher is
+ * parked at the end of the transcript. If they've scrolled up to read
+ * something, incoming replies must not yank the viewport away.
+ *
+ * Both halves of the measurement are load-bearing and easy to get
+ * wrong:
+ *
+ * 1. "Were they at the bottom" MUST be sampled BEFORE the new node
+ *    enters the DOM. Measured after, the just-appended message's own
+ *    height counts as distance-from-bottom, so any reply taller than
+ *    the threshold reads as "they scrolled away" and following dies
+ *    after the first message of every turn.
+ * 2. It must be a live geometry read, not a flag cached from scroll
+ *    events. Programmatic scrolls don't reliably emit scroll events
+ *    in WKWebView, so a flag maintained that way silently goes stale.
+ *
+ * ``endFollowingAppend`` also refreshes the button, because appending
+ * grows scrollHeight without moving scrollTop — no scroll event
+ * fires, so the button would otherwise stay hidden while new content
+ * piles up below the fold.
+ */
+function beginFollowingAppend() {
+  return isNearBottom();
 }
 
-// Set when we top-align a new assistant reply; the turn_done handler
-// re-applies the same top-align after hideLoadingIndicator() removes
-// the cat (which would otherwise shift the reply up off the viewport).
-let pendingAssistantTopAnchor = null;
-
-function reapplyAssistantTopAnchor() {
-  if (!pendingAssistantTopAnchor) return;
-  const wrapper = pendingAssistantTopAnchor;
-  pendingAssistantTopAnchor = null;
-  // Defer one frame so layout has settled after the indicator removal.
-  requestAnimationFrame(() => scrollMessageToTop(wrapper));
+function endFollowingAppend(wasFollowing) {
+  if (wasFollowing) scrollToBottom();
+  updateScrollToBottomVisibility();
 }
 
-function scrollMessageToTop(wrapper) {
-  /* Scroll ``messagesEl`` so ``wrapper``'s top edge sits near the
-   * top of the visible chat region. Uses offset arithmetic instead
-   * of ``scrollIntoView`` because the messages container is the
-   * scroll parent (not the document) and ``scrollIntoView`` on a
-   * descendant can scroll the WHOLE page in some WebKit builds.
-   *
-   * A small breathing-room offset (16 px) keeps the message from
-   * kissing the topbar; if the wrapper sits very close to the
-   * bottom (short tail) the clamp prevents an over-scroll that
-   * would leave the wrapper not actually at the top.
-   */
-  if (!messagesEl || !wrapper) return;
-  const breathingRoom = 16;
-  const target = Math.max(0, wrapper.offsetTop - breathingRoom);
-  const max = Math.max(0, messagesEl.scrollHeight - messagesEl.clientHeight);
-  messagesEl.scrollTop = Math.min(target, max);
+function appendFollowing(node) {
+  /* appendChild + auto-follow, sampled in the right order. */
+  if (!messagesEl || !node) return;
+  const wasFollowing = beginFollowingAppend();
+  messagesEl.appendChild(node);
+  endFollowingAppend(wasFollowing);
 }
 
 function appendToolCall(evt) {
@@ -2825,8 +2799,7 @@ function appendToolCall(evt) {
 
   card.appendChild(header);
   card.appendChild(body);
-  messagesEl.appendChild(card);
-  scrollToBottom();
+  appendFollowing(card);
   return card;
 }
 
@@ -2848,8 +2821,9 @@ function appendToolResult(evt) {
   // Errors are not surfaced on the card — Claude's chat reply
   // explains what went wrong. The sanitized payload is not shown;
   // researchers who want it can ask Claude.
+  const wasFollowing = beginFollowingAppend();
   renderScriptResultInline(body, evt);
-  scrollToBottom();
+  endFollowingAppend(wasFollowing);
   return existingCard;
 }
 
@@ -3165,7 +3139,26 @@ function prettyJson(text) {
 }
 
 function scrollToBottom() {
-  messagesEl.scrollTop = messagesEl.scrollHeight;
+  /* Jump (don't animate) to the end of the transcript.
+   *
+   * ``.messages`` sets ``scroll-behavior: smooth`` in CSS, which
+   * makes a bare ``scrollTop = scrollHeight`` start an animation
+   * rather than move immediately. That breaks auto-follow: the next
+   * message to land reads a mid-animation scrollTop, concludes the
+   * researcher has scrolled away, and stops following — so a burst
+   * of replies ends up stranded near the top. Forcing ``instant``
+   * keeps the position truthful the moment we set it, so
+   * ``isNearBottom()`` can be trusted on the very next append.
+   *
+   * The "scroll to latest" button deliberately keeps ``smooth``: a
+   * click IS a navigation gesture, and there is no follow-up read
+   * racing against it.
+   */
+  if (typeof messagesEl.scrollTo === 'function') {
+    messagesEl.scrollTo({ top: messagesEl.scrollHeight, behavior: 'instant' });
+  } else {
+    messagesEl.scrollTop = messagesEl.scrollHeight;
+  }
 }
 
 // "Scroll to latest" floating button. Anchored above the composer
@@ -3173,6 +3166,17 @@ function scrollToBottom() {
 // its bottom.
 const scrollToBottomBtn = document.getElementById('scroll-to-bottom');
 const SCROLL_TO_BOTTOM_THRESHOLD = 100;
+
+function isNearBottom() {
+  /* True when the transcript is scrolled to (or very near) its end.
+   * Single source of truth for both the "scroll to latest" button's
+   * visibility and whether incoming content auto-follows. */
+  if (!messagesEl) return true;
+  const distanceFromBottom = (
+    messagesEl.scrollHeight - messagesEl.scrollTop - messagesEl.clientHeight
+  );
+  return distanceFromBottom < SCROLL_TO_BOTTOM_THRESHOLD;
+}
 
 function updateScrollToBottomVisibility() {
   if (!scrollToBottomBtn || !messagesEl) return;
@@ -3182,11 +3186,7 @@ function updateScrollToBottomVisibility() {
     scrollToBottomBtn.classList.add('hidden');
     return;
   }
-  const distanceFromBottom = (
-    messagesEl.scrollHeight - messagesEl.scrollTop - messagesEl.clientHeight
-  );
-  const nearBottom = distanceFromBottom < SCROLL_TO_BOTTOM_THRESHOLD;
-  scrollToBottomBtn.classList.toggle('hidden', nearBottom);
+  scrollToBottomBtn.classList.toggle('hidden', isNearBottom());
 }
 
 if (messagesEl) {
@@ -3203,6 +3203,12 @@ if (scrollToBottomBtn) {
     // navigation gesture, not a snap. ``scrollToBottom()`` (the
     // existing helper) is left as the immediate snap that other
     // call sites use after appending content.
+    //
+    // Note: smooth programmatic scrolls are ignored outright in some
+    // non-WebKit engines, which makes this look dead when the UI is
+    // driven in a test browser. It works in WKWebView, which is what
+    // ships, so no fallback is wired here — a timeout-based hard
+    // land would interrupt the real animation on a long transcript.
     if (typeof messagesEl.scrollTo === 'function') {
       messagesEl.scrollTo({
         top: messagesEl.scrollHeight,
@@ -3211,6 +3217,7 @@ if (scrollToBottomBtn) {
     } else {
       scrollToBottom();
     }
+    updateScrollToBottomVisibility();
   });
 }
 

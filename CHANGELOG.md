@@ -4,6 +4,48 @@ Notable changes per release. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 versions follow semver, pre-1.0.
 
+## [0.11.1] - 2026-08-18
+
+Two interface fixes on top of `0.11.0`, both about the window moving
+when it shouldn't. The model picker opened past the right edge of the
+screen, and finishing a turn yanked the transcript away from wherever
+the researcher was reading.
+
+- **Model picker fits on screen.** The popup took its position from
+  the shared permission-popup rule, which anchors to the left edge —
+  correct for the permission chip at the left end of the composer row,
+  wrong for the model chip at the right end, where a left-anchored
+  320px popup grew away from the screen. At the default 960px window
+  it ran 172px past the viewport. It now opens leftward from the chip
+  and clamps its
+  width to the viewport, so it stays fully visible at any window size
+  (checked from 480px to 1440px). The permission popup is unchanged.
+- **The transcript stays where you put it.** Each incoming reply
+  scrolled the view to pin that reply under the question that
+  prompted it. Within a single turn every reply re-anchored on the
+  same originating question, so a multi-part answer repeatedly threw
+  the view back up the transcript, and the end of a turn did it once
+  more — losing your place mid-read. Now the transcript follows new
+  content only while you are already at the bottom. Scroll up to read
+  something and it stays put: replies land silently below, the
+  "scroll to latest" button appears, and you return on your own terms.
+  Sending a message still jumps to your own message, since that
+  follows directly from your own action.
+
+Researcher-visible: opening the model picker no longer pushes the
+window into a horizontal scroll, and reading back through a
+conversation is no longer interrupted every time an answer lands.
+
+Both predate `0.11.0` — the popup's positioning rule and the
+scroll-anchoring behaviour are older than the effort bar — but both
+got easier to hit once the picker carried an effort control worth
+opening and answers had more parts to them.
+
+**Updated in 0.11.1**: the model picker popup opens leftward from its
+chip and clamps to the viewport instead of running off the right edge
+of the window, and the transcript no longer scrolls itself when a
+reply arrives or a turn ends unless you are already at the bottom.
+
 ## [0.11.0] - 2026-08-18
 
 Minor bump on top of `0.10.3`. Two threads, one small fix. The model

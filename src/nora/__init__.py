@@ -5,4 +5,4 @@ never sees the raw data. It drives a complete analysis through
 sanitized summaries only. Anthropic and OpenAI models supported.
 """
 
-__version__ = "0.11.0"
+__version__ = "0.11.1"

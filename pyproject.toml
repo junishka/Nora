@@ -1,6 +1,6 @@
 [project]
 name = "nora"
-version = "0.11.0"
+version = "0.11.1"
 description = "Local privacy layer letting frontier LLMs (Anthropic, OpenAI) drive statistical analysis on a researcher's own machine (macOS-only at this stage)"
 authors = [
     {name = "Junishka Byun", email = "jbyun@iese.edu"},
