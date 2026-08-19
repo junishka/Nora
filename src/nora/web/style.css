@@ -1851,7 +1851,7 @@ kbd {
    * affect layout, so the transcript's scrollHeight is final the
    * instant the node lands. That's what lets the auto-follow scroll
    * measure correctly while the reveal is still playing. */
-  animation: message-fade-in 0.4s cubic-bezier(0.22, 0.61, 0.36, 1) both;
+  animation: message-fade-in 0.55s cubic-bezier(0.22, 0.61, 0.36, 1) both;
 }
 
 @keyframes message-fade-in {
@@ -1876,21 +1876,22 @@ kbd {
  *
  * The delay is capped at the 6th block: an answer with thirty
  * paragraphs would otherwise cascade for seconds, which is the
- * typewriter problem wearing a different hat.
+ * typewriter problem wearing a different hat. As tuned, a long
+ * answer finishes composing about 0.8s after it lands.
  *
  * fill-mode is ``backwards``, not ``both``: it holds the opening
  * keyframe during the delay, then leaves the element at its own
  * natural style once finished. If an animation is ever throttled
  * mid-flight the content still ends up visible. */
 .message.assistant .message-body > * {
-  animation: message-block-rise 0.34s cubic-bezier(0.22, 0.61, 0.36, 1) backwards;
+  animation: message-block-rise 0.45s cubic-bezier(0.22, 0.61, 0.36, 1) backwards;
 }
 
-.message.assistant .message-body > :nth-child(2) { animation-delay: 0.05s; }
-.message.assistant .message-body > :nth-child(3) { animation-delay: 0.10s; }
-.message.assistant .message-body > :nth-child(4) { animation-delay: 0.15s; }
-.message.assistant .message-body > :nth-child(5) { animation-delay: 0.20s; }
-.message.assistant .message-body > :nth-child(n + 6) { animation-delay: 0.24s; }
+.message.assistant .message-body > :nth-child(2) { animation-delay: 0.07s; }
+.message.assistant .message-body > :nth-child(3) { animation-delay: 0.14s; }
+.message.assistant .message-body > :nth-child(4) { animation-delay: 0.21s; }
+.message.assistant .message-body > :nth-child(5) { animation-delay: 0.28s; }
+.message.assistant .message-body > :nth-child(n + 6) { animation-delay: 0.34s; }
 
 @keyframes message-block-rise {
   from {
