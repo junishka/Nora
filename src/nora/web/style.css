@@ -3340,10 +3340,25 @@ kbd {
 }
 
 #model-popup {
+  /* Anchor to the wrapper's RIGHT edge, not the left. The shared
+   * .policy-popup rule uses `left: 0`, which is right for the
+   * permission chip (it sits at the left end of the composer row)
+   * but wrong here: the model chip sits at the right end, so a
+   * left-anchored 320px popup ran ~170px past the viewport at the
+   * default 960px window and forced a horizontal scroll to read.
+   * Opening leftward from the chip keeps it on screen at any
+   * window width.
+   *
+   * max-width is additionally clamped to the viewport so a narrow
+   * window can't reintroduce the overflow from the other side. */
+  left: auto;
+  right: 0;
+  max-width: min(560px, calc(100vw - 24px));
+
   /* Override the shared .policy-popup's overflow-y: auto so the
    * per-option hover tooltips aren't clipped when they extend
-   * outside the popup's left edge. The model list is always short
-   * (three entries), so max-height scrolling isn't needed here. */
+   * outside the popup's edge. The list is short (five models plus
+   * the effort bar), so max-height scrolling isn't needed. */
   overflow: visible;
   max-height: none;
 }
