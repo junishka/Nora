@@ -4,6 +4,39 @@ Notable changes per release. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 versions follow semver, pre-1.0.
 
+## [0.11.2] - 2026-08-19
+
+Single-change patch on top of `0.11.1`, all presentation. Answers
+appeared abruptly; they now arrive with a reveal you can actually
+feel.
+
+- **Answers compose as they arrive.** Each message already faded in
+  over 0.28s, but the effect was easy to miss — opacity and a slight
+  blur, with no movement. The reveal is now longer (0.55s), rises
+  10px into place, and starts from a deeper blur. Assistant answers
+  additionally stagger their top-level blocks: a long reply lands as
+  one insert, so previously the whole slab — paragraphs, headings,
+  tables — revealed in lockstep and read as a single card appearing.
+  Blocks now arrive in sequence, which is where most of the sense of
+  the answer composing itself comes from.
+
+This is deliberately not a typewriter effect. Every word is present,
+selectable, and copyable from the first frame; the stagger animates
+blocks that are already there rather than withholding text that has
+already arrived. The cascade is capped at the sixth block, so answer
+length never extends it — a long answer finishes composing about 0.8s
+after it lands, however many paragraphs it has.
+
+Only opacity, blur, and position are animated, none of which affect
+layout. That keeps the transcript's height final the moment a message
+lands, so the follow-the-bottom scrolling added in `0.11.1` still
+measures correctly while a reveal is playing. Researchers who set the
+system "reduce motion" preference get no animation at all.
+
+**Updated in 0.11.2**: a stronger message reveal with a per-block
+stagger on assistant answers, so a reply arrives as composing text
+rather than a card appearing at once.
+
 ## [0.11.1] - 2026-08-18
 
 Two interface fixes on top of `0.11.0`, both about the window moving
@@ -17,9 +50,9 @@ the researcher was reading.
   wrong for the model chip at the right end, where a left-anchored
   320px popup grew away from the screen. At the default 960px window
   it ran 172px past the viewport. It now opens leftward from the chip
-  and clamps its
-  width to the viewport, so it stays fully visible at any window size
-  (checked from 480px to 1440px). The permission popup is unchanged.
+  and clamps its width to the viewport, so it stays fully visible at
+  any window size (checked from 480px to 1440px). The permission
+  popup is unchanged.
 - **The transcript stays where you put it.** Each incoming reply
   scrolled the view to pin that reply under the question that
   prompted it. Within a single turn every reply re-anchored on the

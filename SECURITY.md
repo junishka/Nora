@@ -54,7 +54,7 @@ public detail.
 
 ## Supported versions
 
-The current beta line (`0.10.x`) receives security fixes. Earlier
-beta minors (`0.9.x` and below) and pre-beta versions (`0.0.x`) are
+The current beta line (`0.11.x`) receives security fixes. Earlier
+beta minors (`0.10.x` and below) and pre-beta versions (`0.0.x`) are
 no longer supported. After the first stable release (`1.0.0`), this
 section will document the support window for the previous minor.
