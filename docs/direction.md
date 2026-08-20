@@ -1,7 +1,19 @@
 # Nora — architectural direction
 
-Working document. Last substantive update **2026-05-16**, after
-the 0.10.0 Stata-parity pass: extended `nora_result_regress` to
+Working document. Last substantive update **2026-08-20**, after
+the 0.11.x releases: the model catalog moved to the Claude 5 and
+GPT-5.6 families, and reasoning effort became a researcher-facing
+per-session setting with provider-specific ladders — the picker,
+both provider adapters, the runner, and `session_state.json` all
+carry it, and cross-provider switches map ceiling-to-ceiling
+(`max` ↔ `pro`) rather than resetting to the default. A UI batch
+rode along: the model popup anchors right so it fits on screen,
+transcript scrolling is follow-if-at-bottom instead of per-reply
+top-anchoring, and messages reveal with a staggered fade. The
+executor sandbox also gained venv base-prefix grants so
+uv-managed CPython interpreters work. The previous substantive
+update (**2026-05-16**) was the 0.10.0 Stata-parity pass:
+extended `nora_result_regress` to
 emit mixed-effects variance components / group counts / fit method
 / ICC for `mixed` and `meglm` fits; new `nora_result_cluster.ado`
 covers `cluster kmeans` / `cluster wardslinkage` and family with
@@ -12,7 +24,7 @@ runtime-staging gap that left `nora_result_km.ado` physically
 present but unreachable under 0.9.x is fixed in the executor and
 pinned by a new disk↔staging invariant test; the DiD Stata path is
 reframed in the system prompt as no-realistic-workflow (recommend
-R / Python in the same session), and RDD Stata is targeted for
+R / Python in the same session), and RDD Stata was targeted for
 0.10.3 with a documented cross-language numerics protocol. The
 previous substantive update **2026-05-15** was the audit-fixes
 pass: install-packages consent is modal-only, the
@@ -137,7 +149,7 @@ As of 2026-05-16, the implementation covers:
   staging tuple gap kept it unreachable until 0.10.0). DiD and
   RDD stay Stata-deferred for substantive reasons documented in
   the `handoff.md` Stata coverage matrix and the 0.10.0 CHANGELOG;
-  RDD is targeted for 0.10.3 pending a cross-language numerics
+  RDD stays deferred (0.10.3 shipped without it) pending a cross-language numerics
   check, DiD waits on a contributor pinning the `csdid` API.
 - Runtime libraries for R, Python, and Stata with JSON-escaped
   labels and CR/LF/TAB handling. The runtime-directory ↔ executor
@@ -195,8 +207,8 @@ As of 2026-05-16, the implementation covers:
   support.
 - Packaging: `.app` launches the web UI directly (no Terminal popup);
   the release `.dmg` is signed and notarized.
-- 1312 pytest cases collected via `uv run pytest --collect-only -q`
-  on 2026-05-15, plus Hypothesis-generated adversarial cases.
+- 1726 pytest cases collected via `uv run pytest --collect-only -q`
+  on 2026-08-20, plus Hypothesis-generated adversarial cases.
   Canonical repo: [github.com/junishka/Nora](https://github.com/junishka/Nora).
 
 ## What's remaining (prioritized)

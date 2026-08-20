@@ -192,7 +192,7 @@ because Nora invokes them as subprocesses.
   - `provider/` for the Anthropic and OpenAI session adapters.
   - `chat_service.py` for the typed event stream the frontend
     consumes.
-- `tests/` for 1312+ pytest cases (the 0.10.0 Stata-parity pass
+- `tests/` for 1726+ pytest cases (the 0.10.0 Stata-parity pass
   added cluster / factor / mixed-effects real-fit pins plus the
   disk↔staging invariant test; run
   `uv run pytest --collect-only -q` for the current count).

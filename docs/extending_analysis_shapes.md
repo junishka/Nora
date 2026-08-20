@@ -42,7 +42,7 @@ Roughly grouped:
 | `cluster_analysis` | kmeans + hierarchical (Ward / complete / average / single linkage) | R `from_cluster`; Python `from_cluster`; Stata `nora_result_cluster` (after `cluster kmeans` / `cluster wardslinkage` / etc.) |
 | `factor_decomposition` | PCA + factor analysis (pcf / pf / ml / ipf) | R `from_pca` + `from_fa` (psych); Python `from_pca` + `from_factor_analyzer`; Stata `nora_result_factor` (after `pca` or `factor`) |
 | `did_event_study` | Callaway-Sant'Anna + Sun-Abraham (helpers); TWFE-ES R helper; de Chaisemartin + Python TWFE-ES via generic `result()` | R `from_callaway_santanna` + `from_sun_abraham` + `from_twfe_event_study`; Python `from_callaway_santanna` + `from_sun_abraham` (pyfixest). Stata deferred — no realistic workflow yet (see [handoff Stata coverage matrix](handoff.md#stata-coverage-matrix-release-status)) |
-| `rdd` | sharp + fuzzy local-polynomial (via rdrobust) | R + Python `from_rdd`. Stata helper targeted 0.10.3 pending cross-language numerics verification (see [CHANGELOG.md](../CHANGELOG.md) deferred section for the protocol) |
+| `rdd` | sharp + fuzzy local-polynomial (via rdrobust) | R + Python `from_rdd`. Stata helper deferred pending cross-language numerics verification (see [CHANGELOG.md](../CHANGELOG.md) deferred section for the protocol) |
 | `kaplan_meier` | safe-form survival (median + horizon scalars) | R + Python + Stata `from_kaplan_meier` / `nora_result_km` |
 | `marginal_effects` | AME / MEM / at-representative scalars from logit / probit / Poisson / GLM fits; `at_values` precision-clamped by sample N | R `from_marginal_effects` (wraps `marginaleffects::avg_slopes` / `slopes`); Python `from_marginal_effects` (wraps `fit.get_margeff`). Stata `nora_result_margins.ado` deferred |
 
@@ -398,7 +398,7 @@ Two patterns surface in the current shapes:
 - **Defer with a workaround** — Stata RDD and Stata CS DiD don't
   have helpers shipped today. The two deferrals have different
   reasons:
-  - **RDD: numerics-unverified, targeted 0.10.3.** SSC `rdrobust`
+  - **RDD: numerics-unverified, deferred.** SSC `rdrobust`
     has maintenance-lag risk; cross-language numerics check
     (Stata vs R vs Python `rdrobust` on the same DGP at 0.5%
     relative tolerance) is the go/no-go gate. Protocol in

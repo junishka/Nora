@@ -1,7 +1,7 @@
 # Nora overview
 
 Plain-language description of what Nora is and how it works.
-Current version: **0.11.1** (August 2026).
+Current version: **0.11.2** (August 2026).
 
 ## What Nora is
 

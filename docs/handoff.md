@@ -1,8 +1,33 @@
 # Nora — handoff
 
 Single-page entry point for picking this project up. Last
-substantive update **2026-05-16**, after the 0.10.0 Stata-parity
-pass: `nora_result_regress` now handles `mixed` / `meglm` fits
+substantive update **2026-08-20**, after the 0.11.x releases
+(0.11.0 / 0.11.1 / 0.11.2, each signed + notarized): the model
+picker moved to the Claude 5 family (Sonnet 5 default / Opus 5 /
+Fable 5) and the GPT-5.6 family (Terra / Sol default) with
+same-price successors as the defaults; reasoning effort —
+previously pinned to `xhigh` at both provider boundaries — is now
+a researcher-facing per-session dial in the model popup with
+provider-specific ladders (`low`…`max` on Anthropic, `low`…`pro`
+on OpenAI, where `pro` is OpenAI's separate `reasoning.mode`
+unpacked into `mode="pro"` + `effort="xhigh"` so the top rung
+never reasons less than the rung below it), persisted as
+`active_effort` in `session_state.json` and restored
+independently of the model, with cross-provider switches mapping
+ceiling-to-ceiling by rank rather than resetting; an Anthropic
+effort change re-warms the session on the next message (the
+Agent SDK takes `--effort` at CLI launch only — no in-place
+control request) while OpenAI applies it per request; the
+executor sandbox grants venv *base* prefixes so uv-managed
+CPython interpreters can load their own stdlib; the model popup
+anchors to its right edge so it fits on screen at the default
+window; transcript scrolling is follow-if-at-bottom (replacing
+per-reply top-anchoring, which re-anchored every reply of a turn
+on the same originating question and yanked the view mid-read);
+and messages reveal with a stronger fade plus a capped per-block
+stagger on assistant answers. The previous substantive update
+(**2026-05-16**) was the 0.10.0 Stata-parity pass:
+`nora_result_regress` now handles `mixed` / `meglm` fits
 (reads `estat recovariance` for variance components, `estat icc`
 for the single-grouping intercept-only case, restricts the
 coefficient submatrix to the fixed-effects equation via `e(k_f)`);
@@ -25,7 +50,7 @@ so a future helper added to `src/nora/runtime/` without staging
 fails the test. The DiD Stata path is reframed in the system
 prompt as no-realistic-workflow (recommend R / Python in the same
 session loading the `.dta` via `haven` / `pyreadstat`); RDD Stata
-is targeted for 0.10.3 with a documented cross-language numerics
+was targeted for 0.10.3 with a documented cross-language numerics
 verification protocol (see [CHANGELOG.md](../CHANGELOG.md)
 deferred section). The previous substantive batch (2026-05-15)
 was the audit-fixes pass:
@@ -98,6 +123,7 @@ keep streaming.
 | **Memory stack** — chat-history persisted, warm-start prefix on every fresh session, `recall_conversation` for older lookups | ✅ done |
 | **Durable session state** — `.nora/session_state.json` after each turn (last exchange, recent results, datasets, **active model**) | ✅ done |
 | **Per-session model memory** — restoring on session open from constructor or _set_cwd | ✅ done |
+| **Per-session reasoning effort** — provider-specific ladder in the model popup (`low`…`max` Anthropic, `low`…`pro` OpenAI); persisted as `active_effort` and restored independently of the model; Anthropic re-warms the session on change, OpenAI applies per request | ✅ done (0.11.0) |
 | **Multi-provider** — Anthropic (subscription or API key) + OpenAI (API key); per-provider sessions behind a `ProviderSession` interface | ✅ done |
 | **Auth screen** — first-launch flow with keyring-backed credential storage; auto-promote to whichever provider is authed | ✅ done |
 | **Mid-chat uploads visible to the model** — script files travel as inline context with the next message; new datasets surface as a per-turn "newly added" notice | ✅ done |
@@ -180,7 +206,7 @@ release.
 | Panel-data diagnostics (sub-feature: `f_test_fe_chi2/p`, `hausman_chi2/p`, `breusch_pagan_chi2/p`, `wooldridge_ar1_chi2/p`) | ✓ R `from_lm` auto-runs `plm::pFtest` / `phtest` / `pbgtest` / `pwartest` on `plm` fits | ✓ Python `from_lm` accepts these as caller kwargs (linearmodels PanelOLS) | ✓ Stata `xtreg, fe` auto-emits `f_test_fe_chi2` + `f_test_fe_p` from `e(F_f)`; other tests pass via caller (run `xttest0` / `xtserial` in the script) | **shipped 0.10.0** |
 | Cluster-robust SE + typed `robust_se_type` enum (`classical`, `hc0..hc3`, `hac_newey_west`, `cluster`, `bootstrap`) (sub-feature) | ✓ fixest `vcov=` arg auto-detected | ✓ `cov_type=` auto-mapped (`HC0..HC3`, `HAC`, `cluster`) | ✓ `vce(cluster id)` + `e(cmd)=="newey"` auto-emit cluster / hac_newey_west; `cluster_variables` + `n_clusters` populated when applicable | shipped |
 | `did_event_study` | ✓ `from_callaway_santanna` + `from_sun_abraham` + `from_twfe_event_study`; de Chaisemartin via `nora$result(...)` | ✓ `from_callaway_santanna`; sun_abraham / twfe_event_study / de_chaisemartin via `nora.result(...)` | ✗ no helper; `csdid` is SSC-distributed and Nora's `install_packages` can't reach SSC | **deferred — no realistic Stata workflow.** The only way to emit `did_event_study` from Stata today is hand-authoring JSON to `NORA_RESULT_PATH` against the field schema — that's a contributor-level escape hatch, not an end-user workflow. System prompt now directs the model to recommend running CS DiD in R or Python via the same session (the `.dta` opens via `haven` / `pyreadstat`; the data stays on the machine). Adding a real Stata helper waits on a contributor pinning the `csdid` API surface |
-| `rdd` | ✓ `from_rdd` (wraps `rdrobust::rdrobust`) | ✓ `from_rdd` (wraps `rdrobust` Python) | ✗ no helper; SSC Stata `rdrobust` port has maintenance lag and numerics haven't been verified against CCT 2014 reference | **deferred — targeted 0.10.3.** Go / no-go is empirical and roughly one Stata session: fit `rdrobust` in Stata and R / Python on the same simulated DGP, compare τ / SE / bandwidths at the 0.5% relative-tolerance level. If they agree, write the helper following the `nora_result_factor.ado` pattern. If they disagree, document the divergence and keep deferred. See [CHANGELOG.md](../CHANGELOG.md) deferred section for the protocol |
+| `rdd` | ✓ `from_rdd` (wraps `rdrobust::rdrobust`) | ✓ `from_rdd` (wraps `rdrobust` Python) | ✗ no helper; SSC Stata `rdrobust` port has maintenance lag and numerics haven't been verified against CCT 2014 reference | **deferred — 0.10.3 shipped without it; no target release.** Go / no-go is empirical and roughly one Stata session: fit `rdrobust` in Stata and R / Python on the same simulated DGP, compare τ / SE / bandwidths at the 0.5% relative-tolerance level. If they agree, write the helper following the `nora_result_factor.ado` pattern. If they disagree, document the divergence and keep deferred. See [CHANGELOG.md](../CHANGELOG.md) deferred section for the protocol |
 
 **Operational meaning of the two Stata-deferred entries.** Both
 deferrals point a Stata-using researcher at the same fallback:
@@ -190,13 +216,14 @@ sanitizer; the `.dta` opens via `haven` (R) or `pyreadstat`
 in a different runtime. The two deferrals differ in *why* the
 Stata helper is missing:
 
-- **RDD: numerics-unverified, targeted 0.10.3.** The Stata SSC
+- **RDD: numerics-unverified, still deferred.** The Stata SSC
   `rdrobust` port has known maintenance lag and we have not yet
   verified its output against the CCT 2014 reference that R and
   Python `rdrobust` reproduce. Go / no-go is empirical and roughly
   one Stata session (see [CHANGELOG.md](../CHANGELOG.md) deferred
-  section for the protocol). The deferral has a target version so
-  it isn't open-ended.
+  section for the protocol). It was targeted for 0.10.3, which
+  shipped without it; the deferral is open-ended until someone
+  runs the check.
 - **DiD: no realistic Stata workflow exists today.** `csdid` is
   SSC-distributed and `install_packages` does not reach SSC, so
   Nora cannot install it. Even with a researcher who runs
@@ -207,8 +234,8 @@ Stata helper is missing:
   real Stata helper waits on a contributor pinning the `csdid` API
   surface and following the `nora_result_*` ado-file convention.
 
-**1312 pytest cases collected** via `uv run pytest --collect-only -q`
-on 2026-05-15. Full pass/fail depends on local sandbox/runtime
+**1726 pytest cases collected** via `uv run pytest --collect-only -q`
+on 2026-08-20. Full pass/fail depends on local sandbox/runtime
 availability. Coverage spans SDK lockdown (Anthropic) +
 OpenAI lockdown, schema for all seven file formats, executor SBPL
 profile, Python executor end-to-end, helper-through-sanitizer
@@ -597,7 +624,7 @@ them by surprise.
 | `docs/overview.md` | Plain-language description for researchers |
 | `docs/install.md` | Researcher-facing install flow |
 | `docs/verification.md` | Manual smoke-test recipes (incl. Stata, which CI can't) |
-| `tests/` | 1312+ pytest cases (the 0.10.0 Stata-parity pass added cluster / factor / mixed-effects real-fit pins plus the disk↔staging invariant test; run `uv run pytest --collect-only -q` for the current count). `test_sanitizer.py` is the property-test backbone (now also covers vif / condition_number / vcov + correlation_matrix); `test_concurrent_sessions.py` pins the per-task ContextVar isolation; `test_plot_vision.py` pins the manifest-allowlist privacy gate; `test_run_dir_plots.py` covers thumbnail collection + PDF→PNG conversion + Stata export fallback chain; `test_openai_lockdown.py` pins the no-built-in-tools invariant; `test_cross_session_recall.py` pins the env-gated cross-session lookup + path-confinement defense; `test_bridge_lifecycle.py` covers active-session delete + landing-page navigation; `test_executor_profile.py` pins the staging-tuple ↔ runtime-directory invariant in both directions (every staged file exists; every file is staged) |
+| `tests/` | 1726+ pytest cases (the 0.10.0 Stata-parity pass added cluster / factor / mixed-effects real-fit pins plus the disk↔staging invariant test; run `uv run pytest --collect-only -q` for the current count). `test_sanitizer.py` is the property-test backbone (now also covers vif / condition_number / vcov + correlation_matrix); `test_concurrent_sessions.py` pins the per-task ContextVar isolation; `test_plot_vision.py` pins the manifest-allowlist privacy gate; `test_run_dir_plots.py` covers thumbnail collection + PDF→PNG conversion + Stata export fallback chain; `test_openai_lockdown.py` pins the no-built-in-tools invariant; `test_cross_session_recall.py` pins the env-gated cross-session lookup + path-confinement defense; `test_bridge_lifecycle.py` covers active-session delete + landing-page navigation; `test_executor_profile.py` pins the staging-tuple ↔ runtime-directory invariant in both directions (every staged file exists; every file is staged) |
 
 ## Decisions worth not re-litigating
 
