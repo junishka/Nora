@@ -1,65 +1,20 @@
 # Nora — architectural direction
 
-Working document. Last substantive update **2026-08-20**, after
-the 0.11.x releases: the model catalog moved to the Claude 5 and
-GPT-5.6 families, and reasoning effort became a researcher-facing
-per-session setting with provider-specific ladders — the picker,
-both provider adapters, the runner, and `session_state.json` all
-carry it, and cross-provider switches map ceiling-to-ceiling
-(`max` ↔ `pro`) rather than resetting to the default. A UI batch
-rode along: the model popup anchors right so it fits on screen,
-transcript scrolling is follow-if-at-bottom instead of per-reply
-top-anchoring, and messages reveal with a staggered fade. The
-executor sandbox also gained venv base-prefix grants so
-uv-managed CPython interpreters work. The previous substantive
-update (**2026-05-16**) was the 0.10.0 Stata-parity pass:
-extended `nora_result_regress` to
-emit mixed-effects variance components / group counts / fit method
-/ ICC for `mixed` and `meglm` fits; new `nora_result_cluster.ado`
-covers `cluster kmeans` / `cluster wardslinkage` and family with
-centroids + within-SS computed from the dataset directly; new
-`nora_result_factor.ado` covers `pca` and `factor` (pcf / pf / ml /
-ipf) with loadings + eigenvalues + explained-variance ratios; the
-runtime-staging gap that left `nora_result_km.ado` physically
-present but unreachable under 0.9.x is fixed in the executor and
-pinned by a new disk↔staging invariant test; the DiD Stata path is
-reframed in the system prompt as no-realistic-workflow (recommend
-R / Python in the same session), and RDD Stata was targeted for
-0.10.3 with a documented cross-language numerics protocol. The
-previous substantive update **2026-05-15** was the audit-fixes
-pass: install-packages consent is modal-only, the
-script-failure `debug_excerpt` is documented at its stricter
-redaction posture (exception bodies redacted wholesale, only
-parser-anchored framing crosses), `load_data` and the schema fast
-paths share a CSV/TSV header peek so they no longer disagree on
-headerless files, `_names_only_payload` distinguishes
-"row_count unknown" from "empty dataset", JSONL `names_only`
-unions keys across the file, malformed per-dataset policy entries
-clamp to the strictest tier (rather than fail open), the
-`chat_history` lightweight readers honour their "never raises"
-contract through concurrent-delete races, cancelled
-`submit_script` runs no longer emit a model-visible cancelled
-tool result, `delete_credential` notices external Keychain
-deletions, the session-focus switch leaves model-captured plot
-images intact, the loop-shutdown race that could leave a runner
-permanently busy is fixed, pywebview's deprecated `OPEN_DIALOG` /
-`FOLDER_DIALOG` are replaced by `FileDialog.OPEN` /
-`FileDialog.FOLDER`, and `_materialize_cache_busted_index` routes
-its bust file to a temp directory in packaged builds so the write
-no longer modifies the codesigned bundle. The previous batch
-(2026-05-12) was the release-readiness / documentation alignment
-pass: multi-provider framing, fourteen-tool MCP surface, seven
-supported data formats, R / Stata / Python as selectable analysis
-runtimes, signed + notarized `.dmg`. The core decision — stay
-with script-submission ("Option A") rather than pivot to
-plan-submission with a bundled local LLM — still stands from
-2026-04-20.
+Working document: the long-form record of what Nora's
+architecture is, what it isn't, and why. It records decisions and
+their reasons, not releases — release-by-release detail lives in
+[`CHANGELOG.md`](../CHANGELOG.md), and this doc does not repeat
+it. Last reviewed **2026-08-20**, at version 0.11.2.
 
-For the single-page overview aimed at someone picking this up, see
-[`docs/handoff.md`](handoff.md). [`docs/overview.md`](overview.md)
-is the plain-language description of what Nora is and why. This
-doc is the long-form record of what the architecture is, what it
-isn't, and why.
+The core decision stands unchanged since 2026-04-20: the frontier
+model writes analysis scripts directly, and privacy is enforced by
+the tool interface, the sandbox, and the sanitizer — not by
+controlling who authors the code.
+
+For the single-page project status aimed at someone picking this
+up, see [`docs/handoff.md`](handoff.md). For the plain-language
+description of what Nora is and why, see
+[`docs/overview.md`](overview.md).
 
 ## The decision
 
@@ -109,7 +64,7 @@ researcher use case demands it.
 
 ## What's built
 
-As of 2026-05-16, the implementation covers:
+As of 2026-08-20 (0.11.2), the implementation covers:
 
 - Spine + full SDK lockdown (14 MCP tools — get_schema, search_schema,
   request_data, submit_script, submit_script_file, expand_result,
@@ -201,10 +156,12 @@ As of 2026-05-16, the implementation covers:
   installed instead of trial-and-error through missing-package
   failures.
 - Web UI: pywebview shell, sessions sidebar with per-session
-  busy dot, theme toggle, model
-  picker, drag-drop file/image upload, Lottie cat loading indicator,
+  busy dot, theme toggle, model picker with a per-session
+  reasoning-effort control (both remembered per session),
+  drag-drop file/image upload, Lottie cat loading indicator,
   status line, Permission/Model chips with popups, image-paste
-  support.
+  support, follow-if-at-bottom transcript scrolling, staggered
+  message reveal.
 - Packaging: `.app` launches the web UI directly (no Terminal popup);
   the release `.dmg` is signed and notarized.
 - 1726 pytest cases collected via `uv run pytest --collect-only -q`

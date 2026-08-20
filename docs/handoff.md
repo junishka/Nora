@@ -1,32 +1,34 @@
 # Nora — handoff
 
 Single-page entry point for picking this project up. Last
-substantive update **2026-08-20**, after the 0.11.x releases
-(0.11.0 / 0.11.1 / 0.11.2, each signed + notarized): the model
-picker moved to the Claude 5 family (Sonnet 5 default / Opus 5 /
-Fable 5) and the GPT-5.6 family (Terra / Sol default) with
-same-price successors as the defaults; reasoning effort —
-previously pinned to `xhigh` at both provider boundaries — is now
-a researcher-facing per-session dial in the model popup with
-provider-specific ladders (`low`…`max` on Anthropic, `low`…`pro`
-on OpenAI, where `pro` is OpenAI's separate `reasoning.mode`
-unpacked into `mode="pro"` + `effort="xhigh"` so the top rung
-never reasons less than the rung below it), persisted as
-`active_effort` in `session_state.json` and restored
-independently of the model, with cross-provider switches mapping
-ceiling-to-ceiling by rank rather than resetting; an Anthropic
-effort change re-warms the session on the next message (the
-Agent SDK takes `--effort` at CLI launch only — no in-place
-control request) while OpenAI applies it per request; the
-executor sandbox grants venv *base* prefixes so uv-managed
-CPython interpreters can load their own stdlib; the model popup
-anchors to its right edge so it fits on screen at the default
-window; transcript scrolling is follow-if-at-bottom (replacing
-per-reply top-anchoring, which re-anchored every reply of a turn
-on the same originating question and yanked the view mid-read);
-and messages reveal with a stronger fade plus a capped per-block
-stagger on assistant answers. The previous substantive update
-(**2026-05-16**) was the 0.10.0 Stata-parity pass:
+substantive update **2026-08-20**, covering the 0.11.x releases
+(0.11.0 / 0.11.1 / 0.11.2, each signed and notarized).
+
+The 0.11.x batch in brief. The model picker moved to the current
+families: Sonnet 5 (default) / Opus 5 / Fable 5 on Anthropic, and
+GPT-5.6 Terra / Sol (default) on OpenAI. Each new default costs
+the same per token as the model it replaced. Reasoning effort,
+previously fixed at `xhigh` internally, is now a per-session
+setting in the model popup. Each provider's bar shows only the
+levels it supports — `low` through `max` on Anthropic, `low`
+through `pro` on OpenAI — the choice is saved in
+`session_state.json` and restored on reopen, and switching
+providers keeps you at an equivalent level. One asymmetry worth
+knowing: OpenAI applies an effort change on the next request,
+while Anthropic must restart its session process to apply it (the
+conversation carries across via the warm-start prefix, the same
+path a provider switch takes). How the `pro` rung maps onto
+OpenAI's API lives in `provider/catalog.py` and
+`provider/openai.py::_reasoning_params`. Smaller fixes rode
+along: the Python sandbox now grants a virtualenv's base
+prefixes, so uv-managed interpreters no longer die on startup;
+the model popup opens leftward so it fits on screen; the
+transcript follows new replies only when you are already at the
+bottom, instead of yanking the view mid-read; and messages reveal
+with a staggered fade rather than appearing all at once.
+
+The previous substantive update (**2026-05-16**) was the 0.10.0
+Stata-parity pass:
 `nora_result_regress` now handles `mixed` / `meglm` fits
 (reads `estat recovariance` for variance components, `estat icc`
 for the single-grouping intercept-only case, restricts the
