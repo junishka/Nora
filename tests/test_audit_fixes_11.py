@@ -315,42 +315,94 @@ def test_install_confirmation_modal_enter_does_not_unconditionally_approve() -> 
 # ---------------------------------------------------------------------------
 
 
-def test_fire_queued_message_gates_active_live_turn_on_focused() -> None:
-    """JS-side guard: the queued-message dispatcher must only promote
-    its local turn handle to the focused-session global when the
-    queue's cwd matches the currently-focused session. Without that
-    gate, a background flush corrupted Stop / hasVisibleReply / the
-    disposable-turn cleanup for the focused turn."""
+def _app_js() -> str:
     app_js = Path(__file__).resolve().parent.parent / "src" / "nora" / "web" / "app.js"
-    src = app_js.read_text(encoding="utf-8")
+    return app_js.read_text(encoding="utf-8")
 
-    # Pull out the fireQueuedMessage function body so we don't pick up
-    # other call sites (the focused-only send path elsewhere keeps an
-    # unconditional ``activeLiveTurn = {...}`` assignment — that's
-    # correct there because that path is only taken for the focused
-    # session). The function is async; we extract from declaration to
-    # the next top-level function.
+
+def _strip_js_comments(src: str) -> str:
+    """Drop // and /* */ comments so source assertions match real code
+    rather than prose describing the bug that motivated it."""
+    src = re.sub(r"/\*.*?\*/", "", src, flags=re.DOTALL)
+    return re.sub(r"^\s*//.*$", "", src, flags=re.MULTILINE)
+
+
+def test_live_turns_are_keyed_by_session_not_a_global() -> None:
+    """The in-flight turn handle must be per-cwd, never a single
+    global.
+
+    A global meaning "the focused session's live turn" is only correct
+    while one session runs. It is written by whichever session sent
+    last and nothing rebinds it on a focus change, so with two sessions
+    running it points at the wrong turn. That is a P1: Stop then
+    blacklists the wrong turn id (see the regression test below), and a
+    background queue flush steals the focused session's
+    ``hasVisibleReply`` / disposable-turn cleanup.
+
+    Keying by cwd removes the failure mode structurally, so this test
+    pins the shape rather than any one call site's guard."""
+    code = _strip_js_comments(_app_js())
+
+    assert "const liveTurnByCwd = new Map();" in code, (
+        "live turns must be tracked per-cwd in a Map"
+    )
+    assert "activeLiveTurn" not in code, (
+        "no code path may reintroduce a single global live-turn "
+        "handle; every read/write must name its session via "
+        "getLiveTurn / setLiveTurn / clearLiveTurn"
+    )
+
+
+def test_fire_queued_message_registers_turn_under_its_own_session() -> None:
+    """A queued message can fire AFTER the researcher has switched
+    sessions, so its turn must be registered under the queue's own cwd
+    — not promoted onto whatever session happens to be focused."""
     m = re.search(
         r"async function fireQueuedMessage\(.*?\n\}\n",
-        src,
+        _app_js(),
         re.DOTALL,
     )
     assert m is not None, "fireQueuedMessage function not found"
-    body = m.group(0)
+    body = _strip_js_comments(m.group(0))
 
-    assert "const isFocused = (cwd === currentCwd);" in body, (
-        "fireQueuedMessage must capture the focused-session match "
-        "before deciding whether to promote the local turn"
+    assert "setLiveTurn(cwd, localTurn);" in body, (
+        "fireQueuedMessage must register its turn under the queue's "
+        "own cwd"
     )
-    assert "if (isFocused) activeLiveTurn = localTurn;" in body, (
-        "fireQueuedMessage must gate the activeLiveTurn assignment "
-        "on isFocused — without the gate a background queue flush "
-        "steals the focused session's live-turn tracking"
+    assert "setLiveTurn(currentCwd" not in body, (
+        "fireQueuedMessage must not register its turn against the "
+        "focused session — the flush may be for a background one"
     )
-    # The unconditional write must be gone.
-    assert "activeLiveTurn = { id: null, nodes:" not in body, (
-        "the old unconditional ``activeLiveTurn = {...}`` write must "
-        "be removed from fireQueuedMessage"
+
+
+def test_stop_cancels_the_focused_sessions_turn() -> None:
+    """Regression: switching between two running sessions must not
+    corrupt cancellation state.
+
+    Sequence that broke it: start A, switch to B and start B, switch
+    back to A, press Stop. The bridge correctly cancelled focused A,
+    but the JS blacklisted the stale global — B's turn id. B kept
+    running while every subsequent B event, including its terminal one,
+    was dropped at the top of ``nora_event`` before the busy-state
+    cleanup: B's output vanished from the live UI and its sidebar dot
+    stayed stuck busy.
+
+    The Stop handler must therefore resolve the turn to cancel by the
+    FOCUSED cwd."""
+    m = re.search(
+        r"stopBtn\.addEventListener\('click'.*?\n  \}\);\n",
+        _app_js(),
+        re.DOTALL,
+    )
+    assert m is not None, "Stop click handler not found"
+    body = _strip_js_comments(m.group(0))
+
+    assert "getLiveTurn(currentCwd)" in body, (
+        "Stop must look the turn up by the focused cwd, so it can "
+        "never blacklist another session's still-running turn"
+    )
+    assert "clearLiveTurn(currentCwd)" in body, (
+        "Stop must retire only the focused session's live turn"
     )
 
 

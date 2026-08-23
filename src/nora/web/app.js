@@ -629,7 +629,47 @@ function showChat(payload) {
 // just long enough for the researcher to notice the failure, then
 // sweep them the next time a new message is sent so the transcript
 // doesn't fill with dead-end bubbles.
-let activeLiveTurn = null;
+// Live turn per session, keyed by cwd — NOT a single global.
+//
+// This used to be one ``activeLiveTurn`` object meaning "the focused
+// session's in-flight turn", written by whichever session sent last.
+// Focus changes never rebound it, so with two sessions running it
+// pointed at the wrong turn: start A, switch to B and start B, switch
+// back to A, press Stop. The bridge correctly cancelled focused A,
+// but the JS blacklisted the stale global — B's id — and every
+// subsequent B event including its terminal one was dropped at the
+// top of ``nora_event``, before the busy-state cleanup. B's output
+// vanished from the live UI and its sidebar dot stayed stuck busy.
+//
+// Keying by cwd removes the failure mode rather than patching it:
+// there is no global to go stale, so a focus change needs no
+// rebinding and every reader names the session it means. Mirrors
+// ``pendingByCwd`` here and ``dict[cwd -> SessionRunner]`` on the
+// Python side.
+const liveTurnByCwd = new Map();
+
+function getLiveTurn(cwd) {
+  return cwd ? liveTurnByCwd.get(cwd) || null : null;
+}
+
+function setLiveTurn(cwd, turn) {
+  if (!cwd) return;
+  liveTurnByCwd.set(cwd, turn);
+}
+
+function clearLiveTurn(cwd) {
+  if (cwd) liveTurnByCwd.delete(cwd);
+}
+
+function markVisibleReply(cwd) {
+  /* Record that this session's live turn produced something the
+   * researcher can see, so the disposable-turn sweep doesn't treat
+   * it as a dead end. Keyed by the EMITTING session: a background
+   * session's reply must not flip the focused session's flag. */
+  const turn = getLiveTurn(cwd || currentCwd);
+  if (turn) turn.hasVisibleReply = true;
+}
+
 let replayTailTurn = null;
 let staleTranscriptTurns = [];
 
@@ -1718,20 +1758,15 @@ function pendingFor(cwd) {
 
 async function fireQueuedMessage(cwd, item) {
   item.userEl.classList.remove('queued');
-  // ``activeLiveTurn`` is the focused-session global the Stop button
-  // and ``assistant_*`` event handlers read. A queued message can
-  // fire AFTER the researcher has switched sessions — if we
-  // unconditionally wrote the global, a background flush would
-  // steal Stop / hasVisibleReply / disposable-turn cleanup from the
-  // focused session's live turn (clicking Stop would cancel the
-  // wrong turn; the focused turn's "model replied" flag would land
-  // on the background turn's tracking object). The local handle
-  // still exists so this function's own try/catch can attach error
-  // nodes to the queued user bubble; we just don't promote it to
-  // the focused-only global when the queue isn't for the focus.
+  // A queued message can fire AFTER the researcher has switched
+  // sessions. The turn is registered under ITS OWN cwd, so a
+  // background flush can't disturb the focused session's live turn —
+  // Stop, hasVisibleReply, and the disposable-turn cleanup each look
+  // up by cwd and get their own. ``isFocused`` below still gates the
+  // error bubbles, which are a visible-transcript surface.
   const isFocused = (cwd === currentCwd);
   const localTurn = { id: null, nodes: [item.userEl], hasVisibleReply: false };
-  if (isFocused) activeLiveTurn = localTurn;
+  setLiveTurn(cwd, localTurn);
   // Use the explicit-target send variants. The plain ``send_message``
   // routes to the bridge's ``self.cwd`` (focused session); a queue
   // can flush AFTER the user has switched sessions, so falling back
@@ -1778,8 +1813,8 @@ async function fireQueuedMessage(cwd, item) {
           const errEl = appendError('Restart Nora to send images.');
           localTurn.nodes.push(errEl);
           queueDisposableTurn(localTurn.nodes);
-          activeLiveTurn = null;
         }
+        clearLiveTurn(cwd);
         setSending(false, cwd);
         return;
       }
@@ -1797,8 +1832,8 @@ async function fireQueuedMessage(cwd, item) {
       const errEl = appendError('send failed: ' + err);
       localTurn.nodes.push(errEl);
       queueDisposableTurn(localTurn.nodes);
-      activeLiveTurn = null;
     }
+    clearLiveTurn(cwd);
     setSending(false, cwd);
   }
 }
@@ -1939,7 +1974,15 @@ form.addEventListener('submit', async (e) => {
   // from the previously-cancelled turn keep getting dropped because
   // they carry the OLD id; new events flow because they carry the
   // NEW id. That's the whole point of the turn-identity rewrite.
-  activeLiveTurn = { id: null, nodes: [userEl], hasVisibleReply: false };
+  //
+  // Capture the cwd this send belongs to: ``currentCwd`` can change
+  // while the send await is in flight (the researcher switches
+  // sessions), so every write below names the session that actually
+  // sent rather than whichever happens to be focused when the
+  // promise settles.
+  const sendCwd = currentCwd;
+  const localTurn = { id: null, nodes: [userEl], hasVisibleReply: false };
+  setLiveTurn(sendCwd, localTurn);
   setSending(true);
   try {
     // If images are attached, use the richer send method. The
@@ -1950,11 +1993,11 @@ form.addEventListener('submit', async (e) => {
       turnId = await window.pywebview.api.send_message_with_images(text, payload);
     } else if (images.length > 0) {
       const errEl = appendError('Restart Nora to send images.');
-      if (activeLiveTurn && !activeLiveTurn.hasVisibleReply) {
-        activeLiveTurn.nodes.push(errEl);
-        queueDisposableTurn(activeLiveTurn.nodes);
+      if (!localTurn.hasVisibleReply) {
+        localTurn.nodes.push(errEl);
+        queueDisposableTurn(localTurn.nodes);
       }
-      activeLiveTurn = null;
+      clearLiveTurn(sendCwd);
       setSending(false);
       return;
     } else {
@@ -1965,18 +2008,18 @@ form.addEventListener('submit', async (e) => {
     // (unexpected: the bridge returns null only on early failure
     // paths that already dispatched a turn_error), leave id null
     // and let the turn_error event clean up.
-    if (activeLiveTurn) activeLiveTurn.id = turnId;
+    localTurn.id = turnId;
     // Don't clear setSending here — the await resolves as soon as
     // the turn is QUEUED on the Python side, not when it finishes.
     // The turn_done / turn_error / auth_failure event handler
     // below is what flips the button back on.
   } catch (err) {
     const errEl = appendError('send failed: ' + err);
-    if (activeLiveTurn && !activeLiveTurn.hasVisibleReply) {
-      activeLiveTurn.nodes.push(errEl);
-      queueDisposableTurn(activeLiveTurn.nodes);
+    if (!localTurn.hasVisibleReply) {
+      localTurn.nodes.push(errEl);
+      queueDisposableTurn(localTurn.nodes);
     }
-    activeLiveTurn = null;
+    clearLiveTurn(sendCwd);
     setSending(false);
   }
 });
@@ -2236,26 +2279,30 @@ if (stopBtn) {
     // Mark this turn's events as suppressed BEFORE awaiting the
     // bridge cancel. Two ids go into ``cancelledTurnIds``, belt and
     // suspenders:
-    //   1. ``activeLiveTurn?.id`` — the id we captured when the send
-    //      Promise resolved. Available unless Stop fires in the
-    //      tiny window between Send and the await returning.
+    //   1. The FOCUSED session's live turn id, captured when its
+    //      send Promise resolved. Available unless Stop fires in the
+    //      tiny window between Send and the await returning. Looked
+    //      up by cwd: another session may have sent more recently,
+    //      and blacklisting its id here would silence a session that
+    //      is still legitimately running.
     //   2. The id the bridge returns from ``interrupt_turn``. The
     //      bridge knows which turn it just cancelled and surfaces
     //      the id explicitly. Covers the race above.
     // Either path alone would usually be enough; together they
     // guarantee the JS-side filter has the cancelled id no matter
     // when Stop fires relative to the send Promise.
-    if (activeLiveTurn) markTurnCancelled(activeLiveTurn.id);
+    const stoppingTurn = getLiveTurn(currentCwd);
+    if (stoppingTurn) markTurnCancelled(stoppingTurn.id);
     // The terminal turn_error that the runner emits is now also
-    // dropped (see ``nora_event`` for why), so handle the activeLiveTurn
+    // dropped (see ``nora_event`` for why), so handle the live-turn
     // cleanup the terminal handler used to do. If the cancelled
     // turn produced no visible reply (the model hadn't written
     // anything when Stop fired), queue the user-bubble nodes for
     // the staleness sweep so they don't accumulate.
-    if (activeLiveTurn && !activeLiveTurn.hasVisibleReply) {
-      queueDisposableTurn(activeLiveTurn.nodes);
+    if (stoppingTurn && !stoppingTurn.hasVisibleReply) {
+      queueDisposableTurn(stoppingTurn.nodes);
     }
-    activeLiveTurn = null;
+    clearLiveTurn(currentCwd);
     // Stop = "stop everything for this session": cancel the
     // running turn AND drain any queued follow-ups. Cancelled
     // queued messages get marked ``.not-sent`` so the researcher
@@ -2275,7 +2322,7 @@ if (stopBtn) {
       const res = await window.pywebview.api.interrupt_turn();
       // Belt-and-suspenders: if the bridge tells us which turn id
       // it cancelled, add that to the drop set too. Covers the
-      // case where ``activeLiveTurn`` was null at click time
+      // case where the focused session had no live turn at click time
       // (e.g., Stop fired between fireQueuedMessage clearing the
       // turn and the next message starting).
       if (res && res.turn_id) markTurnCancelled(res.turn_id);
@@ -2332,24 +2379,24 @@ window.nora_event = function (evt) {
       break;
     case 'assistant_text':
       if (!isFocused) return;
-      if (activeLiveTurn) activeLiveTurn.hasVisibleReply = true;
+      markVisibleReply(evtCwd);
       appendAssistant(evt.text);
       break;
     case 'assistant_thinking':
       if (!isFocused) return;
-      if (activeLiveTurn) activeLiveTurn.hasVisibleReply = true;
+      markVisibleReply(evtCwd);
       appendThinking(evt.text);
       break;
     case 'tool_call': {
       if (!isFocused) return;
       const card = appendToolCall(evt);
-      if (card && activeLiveTurn) activeLiveTurn.hasVisibleReply = true;
+      if (card) markVisibleReply(evtCwd);
       break;
     }
     case 'tool_result': {
       if (!isFocused) return;
       const card = appendToolResult(evt);
-      if (card && activeLiveTurn) activeLiveTurn.hasVisibleReply = true;
+      if (card) markVisibleReply(evtCwd);
       // Refresh the Files panel only when the tool that just finished
       // could plausibly have written to disk. ``run_dir`` is populated
       // by the provider layer iff this result came from
@@ -2391,11 +2438,15 @@ window.nora_event = function (evt) {
           // Diagnostic only; not on the chip.
         }
         triggerContextRecount('turn_done');
-        if (activeLiveTurn && !activeLiveTurn.hasVisibleReply) {
-          queueDisposableTurn(activeLiveTurn.nodes);
+        const doneTurn = getLiveTurn(evtCwd || currentCwd);
+        if (doneTurn && !doneTurn.hasVisibleReply) {
+          queueDisposableTurn(doneTurn.nodes);
         }
-        activeLiveTurn = null;
       }
+      // Retire the entry whether or not this session is focused, so a
+      // background session's finished turn can't linger in the map
+      // and be mistaken for live work later.
+      clearLiveTurn(evtCwd || currentCwd);
       // ``flushPendingFor`` returns true iff a queued message just
       // fired. In that case ``setSending(true, evtCwd)`` was
       // re-asserted inside, so we leave the composer in the busy
@@ -2424,12 +2475,13 @@ window.nora_event = function (evt) {
       // one after another is just noise.
       if (isFocused) {
         const errEl = appendError('Auth failure: ' + (evt.reason || 'unknown'));
-        if (activeLiveTurn && !activeLiveTurn.hasVisibleReply) {
-          activeLiveTurn.nodes.push(errEl);
-          queueDisposableTurn(activeLiveTurn.nodes);
+        const failedTurn = getLiveTurn(evtCwd || currentCwd);
+        if (failedTurn && !failedTurn.hasVisibleReply) {
+          failedTurn.nodes.push(errEl);
+          queueDisposableTurn(failedTurn.nodes);
         }
-        activeLiveTurn = null;
       }
+      clearLiveTurn(evtCwd || currentCwd);
       drainPendingFor(evtCwd);
       setSending(false, evtCwd);
       if (evtCwd === currentCwd) triggerContextRecount('turn_settled');
@@ -2437,12 +2489,13 @@ window.nora_event = function (evt) {
     case 'turn_error':
       if (isFocused) {
         const errEl = appendError(evt.message || 'unknown error');
-        if (activeLiveTurn && !activeLiveTurn.hasVisibleReply) {
-          activeLiveTurn.nodes.push(errEl);
-          queueDisposableTurn(activeLiveTurn.nodes);
+        const failedTurn = getLiveTurn(evtCwd || currentCwd);
+        if (failedTurn && !failedTurn.hasVisibleReply) {
+          failedTurn.nodes.push(errEl);
+          queueDisposableTurn(failedTurn.nodes);
         }
-        activeLiveTurn = null;
       }
+      clearLiveTurn(evtCwd || currentCwd);
       // For ordinary turn errors (e.g., model returned a tool-use
       // error), drain the queue: the researcher's follow-ups were
       // probably reasoning-conditioned on the previous turn
@@ -3931,10 +3984,13 @@ async function runEditedMessage(wrapper) {
   await replayHistory();
 
   // Render the new user bubble + busy state, mirroring the
-  // composer's submit handler. ``activeLiveTurn`` carries the
-  // bubble nodes so disposable-turn cleanup recognises it.
+  // composer's submit handler. The live turn carries the bubble
+  // nodes so disposable-turn cleanup recognises it, and is keyed by
+  // the cwd that is sending — same reason as the submit handler.
   const userEl = appendUser(newText, [], []);
-  activeLiveTurn = { id: null, nodes: [userEl], hasVisibleReply: false };
+  const rewindCwd = currentCwd;
+  const localTurn = { id: null, nodes: [userEl], hasVisibleReply: false };
+  setLiveTurn(rewindCwd, localTurn);
   setSending(true);
 
   if (typeof window.pywebview.api.send_message === 'function') {
@@ -3942,8 +3998,8 @@ async function runEditedMessage(wrapper) {
       const turnId = await window.pywebview.api.send_message(newText);
       // Stop reads this id to mark the turn cancelled. Same
       // capture pattern as the composer's submit handler.
-      if (activeLiveTurn && typeof turnId === 'string' && turnId) {
-        activeLiveTurn.id = turnId;
+      if (typeof turnId === 'string' && turnId) {
+        localTurn.id = turnId;
       }
     } catch (err) {
       console.warn('send_message after rewind failed', err);
@@ -3955,7 +4011,7 @@ async function runEditedMessage(wrapper) {
       // Roll back the busy state — the send didn't take, so the
       // composer should be ready to accept another attempt.
       setSending(false);
-      activeLiveTurn = null;
+      clearLiveTurn(rewindCwd);
       return;
     }
   }
