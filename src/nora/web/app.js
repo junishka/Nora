@@ -4787,7 +4787,7 @@ async function setModel(modelId, silent) {
     if (!res || !res.ok) {
       if (!silent) {
         const reason = res && res.reason ? res.reason : 'unknown';
-        toast('Model switch failed — ' + reason, 'error', 'model');
+        toast('Model switch failed. ' + sentenceCase(reason), 'error', 'model');
       }
       return;
     }
@@ -4815,7 +4815,7 @@ async function setModel(modelId, silent) {
     }
   } catch (err) {
     console.warn('set_model failed', err);
-    if (!silent) toast('Model switch failed — ' + err, 'error', 'model');
+    if (!silent) toast('Model switch failed. ' + sentenceCase(err), 'error', 'model');
   }
 }
 
@@ -4842,7 +4842,7 @@ async function setEffort(effortId) {
       : requestCwd === currentCwd;
     if (!res || !res.ok) {
       const reason = res && res.reason ? res.reason : 'unknown';
-      toast('Effort switch failed — ' + reason, 'error', 'model');
+      toast('Effort switch failed. ' + sentenceCase(reason), 'error', 'model');
       return;
     }
     if (!stillFocused) {
@@ -4861,7 +4861,7 @@ async function setEffort(effortId) {
     }
   } catch (err) {
     console.warn('set_effort failed', err);
-    toast('Effort switch failed — ' + err, 'error', 'model');
+    toast('Effort switch failed. ' + sentenceCase(err), 'error', 'model');
   }
 }
 
@@ -5581,6 +5581,14 @@ function dataUrlFromBase64(b64, mime) {
 // flows through this one channel.
 const statusLineEl = document.getElementById('status-line');
 let statusClearTimer = null;
+
+// Backend ``reason`` strings are lowercase fragments ("wait for the
+// turn in flight to finish"). Notices read them as a second sentence
+// after "... failed.", so lift the first letter.
+function sentenceCase(text) {
+  const s = String(text);
+  return s.charAt(0).toUpperCase() + s.slice(1);
+}
 
 function toast(message, kind /*, anchor */) {
   if (!statusLineEl) { console.log('[status]', kind, message); return; }
