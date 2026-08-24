@@ -1164,7 +1164,20 @@ function renderAttachments() {
   });
 }
 
-async function stageImageFile(file) {
+// Composer uploads read the file before they touch anything
+// session-bound, and a FileReader read is long enough for the
+// researcher to click another session mid-read. Every upload path
+// therefore captures its session up front and re-checks it here
+// before writing session-scoped state. ``currentCwd`` changes on
+// exactly one line (the focus handler), so this is the whole rule.
+function stillFocusedOn(cwd) {
+  return cwd === currentCwd;
+}
+
+// ``targetCwd`` defaults at CALL time, so a direct caller with no
+// session to name still gets the session that was focused when it
+// called — never one the researcher moved to during the read.
+async function stageImageFile(file, targetCwd = currentCwd) {
   if (!ALLOWED_IMAGE_MIMES.has(file.type)) {
     appendError('Only PNG, JPEG, WebP, and GIF images are supported.');
     return false;
@@ -1183,6 +1196,17 @@ async function stageImageFile(file) {
     reader.onerror = () => reject(reader.error);
     reader.readAsDataURL(file);
   });
+  if (!stillFocusedOn(targetCwd)) {
+    // The composer belongs to whichever session is focused now, so
+    // there is nowhere to put this one's attachment — pushing it
+    // here is the leak the focus handler's stagedImages clear
+    // exists to prevent, arriving just after that clear ran. The
+    // bytes still reach the session it was dropped in via
+    // stageDataFile, which reports where they landed; vision
+    // staging is one-turn state that the switch would have
+    // discarded anyway.
+    return true;
+  }
   stagedImages.push({
     data,
     mime: file.type,
@@ -1218,7 +1242,7 @@ function acceptedByComposer(file) {
 // Stage a non-image data/script file by shipping it to the backend,
 // which copies it into the session cwd. Shows a named chip in the
 // attachment bar as confirmation. Errors go into the chat transcript.
-async function stageDataFile(file) {
+async function stageDataFile(file, targetCwd = currentCwd) {
   if (!window.pywebview || !window.pywebview.api) return;
   if (typeof window.pywebview.api.add_files_from_blobs !== 'function') {
     appendError('Restart Nora to drop files into the chat.');
@@ -1236,12 +1260,6 @@ async function stageDataFile(file) {
     );
     return;
   }
-  // Capture the session BEFORE the read, not after. FileReader on a
-  // large file takes seconds, and a researcher who drops a file in A
-  // and clicks over to B during the read would otherwise have the
-  // bytes follow them into B — the backend binds to whatever is
-  // focused when the request lands unless we name the target.
-  const uploadCwd = currentCwd;
   const data = await new Promise((resolve, reject) => {
     const reader = new FileReader();
     reader.onload = () => {
@@ -1255,7 +1273,7 @@ async function stageDataFile(file) {
   try {
     const res = await window.pywebview.api.add_files_from_blobs([
       { name: file.name, content: data, mime: file.type || '' },
-    ], uploadCwd);
+    ], targetCwd);
     // The backend puts the bytes in the session we named. But the
     // receipts below paint the focused one, so skip them if focus
     // moved — otherwise another session's file shows up here.
@@ -1263,7 +1281,7 @@ async function stageDataFile(file) {
     // backend may hand back a resolved path where ``currentCwd``
     // holds the unresolved one, and that mismatch would read as a
     // focus change on every single upload.
-    const stillFocused = uploadCwd === currentCwd;
+    const stillFocused = stillFocusedOn(targetCwd);
     if (!res || !res.ok) {
       appendError(friendlyAddFilesError(res && res.reason ? res.reason : 'unknown'));
       return;
@@ -1370,6 +1388,13 @@ if (form) {
         '. Only images and data/script files (.csv, .tsv, .dta, .rds, .parquet, .jsonl, .do, .r, .py, .ipynb, .log, .smcl, .gph, .rmd) can be dropped here.'
       );
     }
+    // Capture the session ONCE, before the first read. Each
+    // iteration awaits a full FileReader pass, so a capture taken
+    // per file would already be late for every file after the
+    // first: drop a 900 MB .dta plus a script, switch sessions
+    // while the .dta reads, and the script lands in the session
+    // the researcher moved to.
+    const dropCwd = currentCwd;
     for (const file of usable) {
       if (ALLOWED_IMAGE_MIMES.has(file.type)) {
         // Stage for one-turn vision AND persist to the session cwd
@@ -1385,12 +1410,12 @@ if (form) {
         // the 1 GB drag-drop cap, freezing the UI on the very
         // payload the image cap was meant to refuse. Treat the
         // image cap as the floor for both paths.
-        const accepted = await stageImageFile(file);
+        const accepted = await stageImageFile(file, dropCwd);
         if (accepted) {
-          await stageDataFile(file);
+          await stageDataFile(file, dropCwd);
         }
       } else {
-        await stageDataFile(file);
+        await stageDataFile(file, dropCwd);
       }
     }
     input.focus();
@@ -1412,6 +1437,8 @@ if (input) {
     }
     if (usable.length === 0) return;
     e.preventDefault();
+    // Same capture as the drop handler above, for the same reason.
+    const pasteCwd = currentCwd;
     for (const f of usable) {
       if (ALLOWED_IMAGE_MIMES.has(f.type)) {
         // Stage for vision AND persist — same dual-tracking as the
@@ -1419,12 +1446,12 @@ if (input) {
         // applies here: an oversize pasted screenshot must not slip
         // through the data path's larger cap. See the drop handler
         // above for the full rationale.
-        const accepted = await stageImageFile(f);
+        const accepted = await stageImageFile(f, pasteCwd);
         if (accepted) {
-          await stageDataFile(f);
+          await stageDataFile(f, pasteCwd);
         }
       } else {
-        await stageDataFile(f);
+        await stageDataFile(f, pasteCwd);
       }
     }
   });

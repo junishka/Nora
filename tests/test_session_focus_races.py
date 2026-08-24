@@ -159,6 +159,114 @@ def test_upload_lands_in_the_session_it_started_in(
     assert Path(res["cwd"]).resolve() == a.resolve()
 
 
+def test_dropped_script_is_described_to_the_session_that_got_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The bytes and the inline copy must land together.
+
+    The old code wrote the file into the captured session but then
+    asked for the FOCUSED runner to stage its contents, so a script
+    dropped on A was written to A and described to B — B's next
+    prompt carried source the researcher never showed it.
+    """
+    a = _mk_session(tmp_path, "A")
+    b = _mk_session(tmp_path, "B")
+
+    bridge = NoraBridge(cwd=None)
+    bridge._set_cwd(a)
+    bridge._ensure_runner_for_cwd(b)
+
+    code = b"import pandas as pd\nprint(secret_df.head())\n"
+    payload = base64.b64encode(code).decode()
+    real_decode = base64.b64decode
+    fired = {"done": False}
+
+    def decode_then_switch(*args: Any, **kwargs: Any):
+        if not fired["done"]:
+            fired["done"] = True
+            bridge._set_cwd(b)  # researcher clicks session B mid-decode
+        return real_decode(*args, **kwargs)
+
+    monkeypatch.setattr(base64, "b64decode", decode_then_switch)
+    res = bridge.add_files_from_blobs(
+        [{"name": "A-analysis.py", "content": payload}]
+    )
+
+    assert res["ok"] is True
+    assert (a / "A-analysis.py").exists()
+    staged_a = bridge._runners[str(a.resolve())].pending_script_attachments
+    assert [s["name"] for s in staged_a] == ["A-analysis.py"], (
+        "the file's own session must be told about it"
+    )
+    assert bridge._runners[str(b.resolve())].pending_script_attachments == [], (
+        "the session merely focused mid-upload must not be handed "
+        "another session's source"
+    )
+
+
+def test_upload_honours_the_session_the_drop_named(tmp_path: Path) -> None:
+    """The browser reads the file before it calls, so ``self.cwd`` can
+    already be B by the time the request arrives — the switch happens
+    entirely outside the bridge, where no seam can catch it. The drop
+    names the session it started on, and that name wins over focus.
+    """
+    a = _mk_session(tmp_path, "A")
+    b = _mk_session(tmp_path, "B")
+
+    bridge = NoraBridge(cwd=None)
+    bridge._set_cwd(a)
+    bridge._set_cwd(b)  # switched during the FileReader read
+
+    payload = base64.b64encode(b"col1,col2\n1,2\n").decode()
+    res = bridge.add_files_from_blobs(
+        [{"name": "A-confidential.csv", "content": payload}], str(a),
+    )
+
+    assert res["ok"] is True
+    assert (a / "A-confidential.csv").exists()
+    assert not (b / "A-confidential.csv").exists()
+
+
+def test_upload_into_a_closed_session_is_refused(tmp_path: Path) -> None:
+    """If the named session was deleted while the browser read the
+    file, refuse it. Falling back to the focused session would be the
+    original bug wearing a parameter."""
+    a = _mk_session(tmp_path, "A")
+    gone = _mk_session(tmp_path, "deleted")
+
+    bridge = NoraBridge(cwd=None)
+    bridge._set_cwd(a)
+
+    payload = base64.b64encode(b"print(1)\n").decode()
+    res = bridge.add_files_from_blobs(
+        [{"name": "orphan.py", "content": payload}], str(gone),
+    )
+
+    assert res["ok"] is False
+    assert "no longer open" in res["reason"]
+    assert not (gone / "orphan.py").exists()
+    assert not (a / "orphan.py").exists()
+    assert bridge._pending_script_attachments == []
+
+
+def test_upload_without_a_named_session_uses_the_focused_one(
+    tmp_path: Path,
+) -> None:
+    """Back-compat: JS that sends one argument still gets the old
+    focused-session behaviour."""
+    a = _mk_session(tmp_path, "A")
+
+    bridge = NoraBridge(cwd=None)
+    bridge._set_cwd(a)
+
+    payload = base64.b64encode(b"print(1)\n").decode()
+    res = bridge.add_files_from_blobs([{"name": "a.py", "content": payload}])
+
+    assert res["ok"] is True
+    assert (a / "a.py").exists()
+    assert len(bridge._pending_script_attachments) == 1
+
+
 # ---------------------------------------------------------------------------
 # 3. set_model / set_effort persistence
 # ---------------------------------------------------------------------------
@@ -268,10 +376,89 @@ def test_picker_does_not_paint_another_sessions_setting(fn: str) -> None:
     )
 
 
+def test_upload_paths_take_their_session_from_the_caller() -> None:
+    """Both stagers must accept the session as a parameter, and the
+    data one must forward it to the bridge.
+
+    A default evaluated at CALL time means even a caller that names
+    nothing gets the session focused when it called — never the one
+    the researcher moved to during the read. Capturing it locally
+    while the bridge still binds to ``self.cwd`` fixes nothing, so the
+    forwarding is half the assertion.
+    """
+    code = _app_js_without_comments()
+    assert "async function stageDataFile(file, targetCwd = currentCwd) {" in code
+    assert "async function stageImageFile(file, targetCwd = currentCwd) {" in code
+    assert "add_files_from_blobs([" in code and "], targetCwd);" in code, (
+        "stageDataFile does not forward its session to the bridge"
+    )
+
+
 def test_upload_receipts_are_gated_on_focus() -> None:
     """Upload receipts paint the focused session, so skip them when
     the file landed somewhere else."""
     code = _app_js_without_comments()
-    assert "const uploadCwd = currentCwd;" in code, (
-        "the upload handler must capture the session it started in"
+    assert "const stillFocused = stillFocusedOn(targetCwd);" in code, (
+        "the upload receipts must be gated on the session the upload "
+        "was bound to"
+    )
+
+
+def test_drop_and_paste_capture_the_session_before_any_read() -> None:
+    """One capture per batch, not per file.
+
+    Each iteration awaits a full FileReader pass, so a capture taken
+    inside the loop is already late for every file behind the first:
+    drop a 900 MB .dta alongside a script, switch sessions while the
+    .dta reads, and the script follows the researcher.
+    """
+    code = _app_js_without_comments()
+    for handler, var in (
+        ("form.addEventListener('drop'", "dropCwd"),
+        ("input.addEventListener('paste'", "pasteCwd"),
+    ):
+        block = code.split(handler, 1)[1].split("\n  });", 1)[0]
+        capture = f"const {var} = currentCwd;"
+        assert capture in block, (
+            f"{handler}: captures no session for the batch, so each file "
+            f"binds to whatever is focused when it happens to land"
+        )
+        # Anchor on the first staging await rather than the first loop:
+        # the paste handler runs a synchronous filter loop first, and a
+        # capture after THAT is still early enough.
+        first_stage = min(
+            block.index("await stageImageFile("),
+            block.index("await stageDataFile("),
+        )
+        assert block.index(capture) < first_stage, (
+            f"{handler}: session captured after staging begins"
+        )
+        for stager in ("stageImageFile", "stageDataFile"):
+            assert f"{stager}(f, {var})" in block or \
+                   f"{stager}(file, {var})" in block, (
+                f"{handler}: {stager} is not given the batch's session"
+            )
+
+
+def test_image_staging_checks_focus_before_touching_the_composer() -> None:
+    """``stagedImages`` is cleared on switch precisely so an image
+    staged in A can't ride along with B's next message. A push that
+    lands after its own read arrives just past that clear, so it needs
+    its own check — the file itself still reaches A through
+    ``stageDataFile``, which reports where it went.
+    """
+    import re
+
+    code = _app_js_without_comments()
+    m = re.search(
+        r"async function stageImageFile\(.*?\n\}\n", code, re.DOTALL
+    )
+    assert m is not None, "stageImageFile not found"
+    body = m.group(0)
+
+    assert body.index("stillFocusedOn(targetCwd)") < body.index(
+        "stagedImages.push("
+    ), (
+        "stageImageFile pushes into the composer without checking that "
+        "the drop's session is still focused"
     )
