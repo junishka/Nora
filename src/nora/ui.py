@@ -519,7 +519,7 @@ class NoraBridge:
             new_provider = self._default_provider
             new_model = self._default_model
             self._run_on_loop(active.swap_model(new_model, new_provider))
-            self._persist_active_model()
+            self._persist_active_model(active)
 
     def choose_files(self) -> dict[str, Any]:
         """Open a native file-picker dialog (multi-select) restricted
@@ -1385,6 +1385,10 @@ class NoraBridge:
             }
         if not files:
             return {"ok": False, "reason": "no files"}
+        # Bind to the session the drop landed on. Decoding is slow
+        # enough for the researcher to switch sessions, and re-reading
+        # ``self.cwd`` per write would drop the file in the wrong one.
+        cwd = self.cwd
 
         import base64
         from nora.schema import DATA_EXTENSIONS
@@ -1500,7 +1504,7 @@ class NoraBridge:
                             f"larger batches with no aggregate limit."
                         ),
                     }
-                dst = self.cwd / safe_name
+                dst = cwd / safe_name
                 if dst.exists():
                     skipped_existing.append(safe_name)
                     continue
@@ -1528,7 +1532,7 @@ class NoraBridge:
                 # rationale (researchers expect "I uploaded this"
                 # to mean the file is in their session, not just
                 # that the model can see it once).
-                img_dst = _disambiguate_target(self.cwd, safe_name)
+                img_dst = _disambiguate_target(cwd, safe_name)
                 try:
                     img_dst.write_bytes(blob)
                 except OSError as e:
@@ -1555,7 +1559,7 @@ class NoraBridge:
         try:
             from nora.file_provenance import mark_known
             mark_known(
-                self.cwd,
+                cwd,
                 [*added, *(img["name"] for img in images)],
             )
         except Exception:  # noqa: BLE001 — provenance is best-effort
@@ -1567,8 +1571,11 @@ class NoraBridge:
             "images": images,
             "skipped": skipped,
             "skipped_existing": skipped_existing,
-            "policy": self._policy_summary(),
-            "session_title": _session_title(self.cwd),
+            # Which session the files landed in. May not be the focused
+            # one, so JS checks before painting ``policy`` / title.
+            "cwd": str(cwd),
+            "policy": self._policy_summary(cwd),
+            "session_title": _session_title(cwd),
         }
 
     def list_models(self) -> dict[str, Any]:
@@ -2741,7 +2748,7 @@ class NoraBridge:
             self._run_on_loop(
                 active.swap_model(self._default_model, provider)
             )
-            self._persist_active_model()
+            self._persist_active_model(active)
         return {
             "ok": True,
             "provider": provider,
@@ -2873,13 +2880,18 @@ class NoraBridge:
         res = self._run_on_loop(active.swap_model(model_id, new_provider))
         if res is None or not res.get("ok"):
             return res or {"ok": False, "reason": "model switch failed"}
-        self._persist_active_model()
+        # Save the runner we swapped, not whatever is focused now —
+        # the swap is slow enough for the focus to change.
+        self._persist_active_model(active)
         return {
             "ok": True,
             "model": model_id,
             "label": info.label,
             "context_window": info.context_window,
             "provider": new_provider,
+            # Which session this applied to. Focus may have moved
+            # during the swap, so JS checks before repainting.
+            "cwd": str(active.cwd),
             # A cross-provider swap can clamp the effort (Anthropic
             # ``max`` has no OpenAI rung), and the bar itself is a
             # different ladder either way — hand both back so the JS
@@ -2937,21 +2949,27 @@ class NoraBridge:
         res = self._run_on_loop(active.swap_effort(effort))
         if res is None or not res.get("ok"):
             return res or {"ok": False, "reason": "effort switch failed"}
-        self._persist_active_model()
+        # Save the runner we swapped — see set_model.
+        self._persist_active_model(active)
         return {
             "ok": True,
             "effort": effort,
             "label": info.label,
+            # Which session this applied to — see set_model.
+            "cwd": str(active.cwd),
             "conversation_rewarmed": bool(res.get("conversation_rewarmed")),
         }
 
-    def _persist_active_model(self) -> None:
-        """Refresh ``.nora/session_state.json`` so a successful
-        ``set_model`` survives an app restart even before the
-        researcher sends the first message in this session. Writes
-        the focused runner's current model — per-session memory.
+    def _persist_active_model(self, runner: SessionRunner | None = None) -> None:
+        """Save the runner's model + effort to
+        ``.nora/session_state.json`` so the choice survives a restart.
+
+        Pass ``runner`` if anything slow ran since you resolved it — a
+        provider swap gives the researcher time to switch sessions, and
+        the focused runner would then be the wrong one to save.
+        Defaults to the focused runner.
         """
-        active = self._active_runner()
+        active = runner if runner is not None else self._active_runner()
         if active is None:
             return
         try:
@@ -4055,6 +4073,11 @@ class NoraBridge:
         runner = self._active_runner()
         if runner is None or self.cwd is None:
             return {"ok": False, "reason": "no active session"}
+        # Bind to this session. ``self.cwd`` follows the focused
+        # session and can change mid-method — pywebview runs each JS
+        # call on its own thread — so re-reading it below would hide
+        # another session's results using this one's ids.
+        cwd = runner.cwd
         if runner.is_busy():
             return {
                 "ok": False,
@@ -4069,7 +4092,7 @@ class NoraBridge:
                 "reason": f"turn_index must be a non-negative int, got {turn_index!r}",
             }
 
-        history_path = self.cwd / ".nora" / "chat_history.jsonl"
+        history_path = cwd / ".nora" / "chat_history.jsonl"
         if not history_path.exists():
             return {
                 "ok": False,
@@ -4101,7 +4124,7 @@ class NoraBridge:
         # the local-import pattern was set up to avoid.
         try:
             from nora.store import get_store
-            store = get_store(self.cwd)
+            store = get_store(cwd)
             hidden_ids = store.hide_results_not_in(kept_ids, reason="rewind")
         except Exception as e:  # noqa: BLE001 — surface store errors to JS
             return {
@@ -4184,7 +4207,7 @@ class NoraBridge:
         try:
             from nora.session_state import write_session_state
             write_session_state(
-                self.cwd, model=runner.model, effort=runner.effort,
+                cwd, model=runner.model, effort=runner.effort,
             )
         except Exception:  # noqa: BLE001 — snapshot is advisory
             pass
@@ -4193,6 +4216,9 @@ class NoraBridge:
             "ok": True,
             "truncated_from_index": turn_index,
             "hidden_count": hidden_count,
+            # Which session this applied to. JS checks it before
+            # sending the edit, so the edit can't land elsewhere.
+            "cwd": str(cwd),
         }
 
     def get_chat_history(self) -> dict[str, Any]:
@@ -4373,14 +4399,20 @@ class NoraBridge:
         except Exception:  # noqa: BLE001
             return "anthropic"
 
-    def _policy_summary(self) -> dict[str, Any]:
-        """Compact JSON-serializable summary of the current policy +
-        dataset list for the topbar footer."""
-        if self.cwd is None:
+    def _policy_summary(self, cwd: Path | None = None) -> dict[str, Any]:
+        """Compact summary of a session's policy + datasets for the
+        topbar footer.
+
+        ``cwd`` defaults to the focused session. Pass it if you
+        captured a session earlier, so a focus change can't swap in
+        another session's datasets.
+        """
+        target = cwd if cwd is not None else self.cwd
+        if target is None:
             from nora.policy import DEFAULT_MAX_DEPTH
             return {"default_max_depth": DEFAULT_MAX_DEPTH, "datasets": []}
         from nora.system_prompt import scan_datasets as _scan_datasets
-        policy = load_policy(self.cwd)
+        policy = load_policy(target)
         return {
             "default_max_depth": policy.default_max_depth,
             "datasets": [
@@ -4389,7 +4421,7 @@ class NoraBridge:
                     "ceiling": get_max_depth(policy, p.name),
                     "explicit": has_explicit_policy(policy, p.name),
                 }
-                for p in _scan_datasets(self.cwd)
+                for p in _scan_datasets(target)
             ],
         }
 

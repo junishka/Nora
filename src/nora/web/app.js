@@ -1247,11 +1247,27 @@ async function stageDataFile(file) {
     reader.readAsDataURL(file);
   });
   try {
+    const uploadCwd = currentCwd;
     const res = await window.pywebview.api.add_files_from_blobs([
       { name: file.name, content: data, mime: file.type || '' },
     ]);
+    // The backend puts the bytes in the right session. But the
+    // receipts below paint the focused one, so skip them if focus
+    // moved — otherwise another session's file shows up here.
+    const stillFocused = (res && res.cwd)
+      ? res.cwd === currentCwd
+      : uploadCwd === currentCwd;
     if (!res || !res.ok) {
       appendError(friendlyAddFilesError(res && res.reason ? res.reason : 'unknown'));
+      return;
+    }
+    if (!stillFocused) {
+      // Landed in a session the researcher left. Say where it went.
+      const names = (res.added || []).join(', ');
+      if (names) {
+        toast('Added ' + names + ' to the previous session.', 'info');
+      }
+      if (typeof loadSessions === 'function') loadSessions();
       return;
     }
     if (addStagedDataNotices(res.added || [])) {
@@ -3949,6 +3965,12 @@ async function runEditedMessage(wrapper) {
   const buttons = editor.querySelectorAll('button');
   buttons.forEach((b) => { b.disabled = true; });
 
+  // Which session this edit belongs to, captured before the rewind.
+  // The rewind is slow, and everything after it (replay, send) acts
+  // on the focused session — so without this the edit could be sent
+  // into a different session.
+  const editCwd = currentCwd;
+
   let res;
   try {
     res = await window.pywebview.api.rewind_to(turnIndex);
@@ -3965,6 +3987,23 @@ async function runEditedMessage(wrapper) {
     const reason = (res && res.reason) || 'unknown';
     toast('Rewind refused: ' + reason, 'error');
     buttons.forEach((b) => { b.disabled = false; });
+    return;
+  }
+
+  // Focus moved during the rewind. The rewind went to the right
+  // session, but replay and send act on the focused one — so stop
+  // here. The rewind already committed, so say so rather than
+  // looking like nothing happened.
+  const rewoundCwd = res.cwd || editCwd;
+  if (rewoundCwd !== currentCwd) {
+    toast(
+      'Rewind applied to the previous session, but you switched away '
+      + 'before it finished — the edited message was not sent. Switch '
+      + 'back and resend it.',
+      'info',
+    );
+    buttons.forEach((b) => { b.disabled = false; });
+    activeEditWrapper = null;
     return;
   }
 
@@ -4736,11 +4775,27 @@ async function setModel(modelId, silent) {
     return;
   }
   try {
+    const requestCwd = currentCwd;
     const res = await window.pywebview.api.set_model(modelId);
+    // The swap is slow, so focus may have moved. The picker shows the
+    // focused session, so painting another session's model here would
+    // advertise the wrong one. The backend already applied it
+    // correctly; we just skip the repaint.
+    const stillFocused = (res && res.cwd)
+      ? res.cwd === currentCwd
+      : requestCwd === currentCwd;
     if (!res || !res.ok) {
       if (!silent) {
         const reason = res && res.reason ? res.reason : 'unknown';
         toast('Model switch failed: ' + reason, 'error', 'model');
+      }
+      return;
+    }
+    if (!stillFocused) {
+      // Landed in a session the researcher left. Say so, otherwise
+      // the click looks like it did nothing.
+      if (!silent && !res.unchanged) {
+        toast('Model set to ' + (res.label || modelId) + ' for the previous session.', 'info', 'model');
       }
       return;
     }
@@ -4778,10 +4833,22 @@ async function setEffort(effortId) {
     return;
   }
   try {
+    const requestCwd = currentCwd;
     const res = await window.pywebview.api.set_effort(effortId);
+    // Same focus race as setModel — don't paint another session's
+    // setting onto the picker.
+    const stillFocused = (res && res.cwd)
+      ? res.cwd === currentCwd
+      : requestCwd === currentCwd;
     if (!res || !res.ok) {
       const reason = res && res.reason ? res.reason : 'unknown';
       toast('Effort switch failed: ' + reason, 'error', 'model');
+      return;
+    }
+    if (!stillFocused) {
+      if (!res.unchanged) {
+        toast('Effort set to ' + (res.label || effortId) + ' for the previous session.', 'info', 'model');
+      }
       return;
     }
     currentEffortId = effortId;
