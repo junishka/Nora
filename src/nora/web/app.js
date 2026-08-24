@@ -1236,6 +1236,12 @@ async function stageDataFile(file) {
     );
     return;
   }
+  // Capture the session BEFORE the read, not after. FileReader on a
+  // large file takes seconds, and a researcher who drops a file in A
+  // and clicks over to B during the read would otherwise have the
+  // bytes follow them into B — the backend binds to whatever is
+  // focused when the request lands unless we name the target.
+  const uploadCwd = currentCwd;
   const data = await new Promise((resolve, reject) => {
     const reader = new FileReader();
     reader.onload = () => {
@@ -1247,16 +1253,17 @@ async function stageDataFile(file) {
     reader.readAsDataURL(file);
   });
   try {
-    const uploadCwd = currentCwd;
     const res = await window.pywebview.api.add_files_from_blobs([
       { name: file.name, content: data, mime: file.type || '' },
-    ]);
-    // The backend puts the bytes in the right session. But the
+    ], uploadCwd);
+    // The backend puts the bytes in the session we named. But the
     // receipts below paint the focused one, so skip them if focus
     // moved — otherwise another session's file shows up here.
-    const stillFocused = (res && res.cwd)
-      ? res.cwd === currentCwd
-      : uploadCwd === currentCwd;
+    // Compare against what we sent rather than ``res.cwd``: the
+    // backend may hand back a resolved path where ``currentCwd``
+    // holds the unresolved one, and that mismatch would read as a
+    // focus change on every single upload.
+    const stillFocused = uploadCwd === currentCwd;
     if (!res || !res.ok) {
       appendError(friendlyAddFilesError(res && res.reason ? res.reason : 'unknown'));
       return;

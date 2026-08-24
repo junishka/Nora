@@ -1239,6 +1239,12 @@ class NoraBridge:
         if not result:
             return {"ok": False, "reason": "cancelled"}
 
+        # Same capture the drop path makes: copying a multi-GB .dta
+        # takes long enough for the researcher to switch sessions,
+        # and re-reading ``self.cwd`` per file would split one
+        # selection across two sessions.
+        cwd = self.cwd
+
         import base64
         # Anything in this set is copied into the session cwd so
         # Claude can reference it through get_schema / submit_script,
@@ -1284,7 +1290,7 @@ class NoraBridge:
                 return {"ok": False, "reason": f"not a file: {src}"}
             ext = src.suffix.lower()
             if ext in _COPY_EXTS:
-                dst = self.cwd / src.name
+                dst = cwd / src.name
                 if dst.exists():
                     skipped_existing.append(src.name)
                     continue
@@ -1299,7 +1305,10 @@ class NoraBridge:
                 # silently lands in cwd and the researcher's "what
                 # does this do?" hits the model with no context.
                 if ext in _INLINE_SCRIPT_EXTS:
-                    runner = self._active_runner()
+                    # Attach to the session that received the file,
+                    # not whatever is focused now — see the drop
+                    # path in ``add_files_from_blobs``.
+                    runner = self._runner_for_cwd(cwd)
                     if runner is not None:
                         try:
                             _stage_script_for_next_turn(
@@ -1325,7 +1334,7 @@ class NoraBridge:
                 # going back to the original. Auto-rename on
                 # collision so two ``chart.png`` drops don't
                 # silently overwrite.
-                img_dst = _disambiguate_target(self.cwd, src.name)
+                img_dst = _disambiguate_target(cwd, src.name)
                 try:
                     img_dst.write_bytes(raw)
                 except OSError as e:
@@ -1351,7 +1360,7 @@ class NoraBridge:
         try:
             from nora.file_provenance import mark_known
             mark_known(
-                self.cwd,
+                cwd,
                 [*added, *(img["name"] for img in images)],
             )
         except Exception:  # noqa: BLE001 — provenance is best-effort
@@ -1363,20 +1372,31 @@ class NoraBridge:
             "images": images,
             "skipped": skipped,
             "skipped_existing": skipped_existing,
-            "policy": self._policy_summary(),
-            "session_title": _session_title(self.cwd),
+            # Which session the files landed in — the focus may have
+            # moved during the copy. Mirrors ``add_files_from_blobs``.
+            "cwd": str(cwd),
+            "policy": self._policy_summary(cwd),
+            "session_title": _session_title(cwd),
         }
 
     def add_files_from_blobs(
-        self, files: list[dict[str, Any]]
+        self, files: list[dict[str, Any]], target_cwd: str | None = None
     ) -> dict[str, Any]:
         """Twin of :meth:`add_files`, but for files dropped or pasted
         directly onto the composer from JS — no native dialog involved.
 
         Each ``files[i]`` is ``{name, content (base64), mime?}``. Data
-        and script files are copied into ``self.cwd``; images are
-        decoded and returned so the frontend can stage them as vision
-        attachments. Returns the same shape as :meth:`add_files`.
+        and script files are copied into the target session; images
+        are decoded and returned so the frontend can stage them as
+        vision attachments. Returns the same shape as
+        :meth:`add_files`.
+
+        ``target_cwd`` is the session the drop landed on, captured by
+        the JS before it reads the file. Reading a large file with
+        FileReader takes long enough for the researcher to switch
+        sessions, so without it the bytes follow focus into whatever
+        session happens to be up when the request arrives. Omitted
+        (older JS) falls back to the focused session.
         """
         if self.cwd is None:
             return {
@@ -1385,10 +1405,29 @@ class NoraBridge:
             }
         if not files:
             return {"ok": False, "reason": "no files"}
-        # Bind to the session the drop landed on. Decoding is slow
-        # enough for the researcher to switch sessions, and re-reading
-        # ``self.cwd`` per write would drop the file in the wrong one.
+        # Bind to the session the drop landed on, once, up front.
+        # Decoding is slow enough for the researcher to switch
+        # sessions, and re-reading ``self.cwd`` per write would drop
+        # the file in the wrong one.
         cwd = self.cwd
+        if target_cwd:
+            try:
+                requested = Path(target_cwd).expanduser().resolve()
+            except OSError as e:
+                return {"ok": False, "reason": f"bad path: {e}"}
+            # Only a session the bridge already knows. The caller is
+            # naming where its own drop started, so anything else is
+            # either a deleted session or a caller we shouldn't be
+            # writing for.
+            if (
+                self._runners.get(str(requested)) is None
+                and requested != cwd.resolve()
+            ):
+                return {
+                    "ok": False,
+                    "reason": "that session is no longer open",
+                }
+            cwd = requested
 
         import base64
         from nora.schema import DATA_EXTENSIONS
@@ -1519,7 +1558,10 @@ class NoraBridge:
                 # inline. See ``add_files`` for the docstring on
                 # which extensions qualify and why.
                 if ext in _INLINE_SCRIPT_EXTS:
-                    runner = self._active_runner()
+                    # The runner for ``cwd``, not the focused one:
+                    # the bytes went to ``cwd``, so its contents have
+                    # to be attached to the same conversation.
+                    runner = self._runner_for_cwd(cwd)
                     if runner is not None:
                         _stage_script_for_next_turn(
                             runner.pending_script_attachments,
@@ -3514,11 +3556,22 @@ class NoraBridge:
             return clamp_effort(self._default_effort, provider)
         return clamp_effort(state.active_effort, provider)
 
+    def _runner_for_cwd(self, cwd: Path) -> SessionRunner | None:
+        """The runner for a named session, focused or not.
+
+        Upload paths capture their target session before the slow
+        part (a FileReader read in the browser, a multi-file copy
+        loop here) and must stage against THAT runner.
+        ``_active_runner`` would follow a focus change that landed
+        mid-upload and attach the file to the wrong conversation.
+        """
+        return self._runners.get(str(cwd.resolve()))
+
     def _active_runner(self) -> SessionRunner | None:
         """Convenience accessor: the runner for the focused session."""
         if self.cwd is None:
             return None
-        return self._runners.get(str(self.cwd.resolve()))
+        return self._runner_for_cwd(self.cwd)
 
     # Back-compat read-only views for tests and legacy callers that
     # treat the bridge as the single-session shape it used to be.
