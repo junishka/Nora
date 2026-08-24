@@ -4787,7 +4787,7 @@ async function setModel(modelId, silent) {
     if (!res || !res.ok) {
       if (!silent) {
         const reason = res && res.reason ? res.reason : 'unknown';
-        toast('Model switch failed: ' + reason, 'error', 'model');
+        toast('Model switch failed — ' + reason, 'error', 'model');
       }
       return;
     }
@@ -4815,7 +4815,7 @@ async function setModel(modelId, silent) {
     }
   } catch (err) {
     console.warn('set_model failed', err);
-    if (!silent) toast('Model switch failed: ' + err, 'error', 'model');
+    if (!silent) toast('Model switch failed — ' + err, 'error', 'model');
   }
 }
 
@@ -4842,7 +4842,7 @@ async function setEffort(effortId) {
       : requestCwd === currentCwd;
     if (!res || !res.ok) {
       const reason = res && res.reason ? res.reason : 'unknown';
-      toast('Effort switch failed: ' + reason, 'error', 'model');
+      toast('Effort switch failed — ' + reason, 'error', 'model');
       return;
     }
     if (!stillFocused) {
@@ -4861,7 +4861,7 @@ async function setEffort(effortId) {
     }
   } catch (err) {
     console.warn('set_effort failed', err);
-    toast('Effort switch failed: ' + err, 'error', 'model');
+    toast('Effort switch failed — ' + err, 'error', 'model');
   }
 }
 

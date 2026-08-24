@@ -2729,7 +2729,7 @@ class NoraBridge:
         if active is not None and active.is_busy():
             return {
                 "ok": False,
-                "reason": "a turn is in flight; wait for it to finish",
+                "reason": "a turn is in flight, wait for it to finish",
             }
         from nora import auth as _auth
         from nora.provider import detect_auth as _detect
@@ -2872,7 +2872,7 @@ class NoraBridge:
         if active.is_busy():
             return {
                 "ok": False,
-                "reason": "a turn is in flight; wait for it to finish",
+                "reason": "a turn is in flight, wait for it to finish",
             }
         if model_id == active.model and new_provider == active.provider:
             return {"ok": True, "model": model_id, "unchanged": True}
@@ -2939,7 +2939,7 @@ class NoraBridge:
         if active.is_busy():
             return {
                 "ok": False,
-                "reason": "a turn is in flight; wait for it to finish",
+                "reason": "a turn is in flight, wait for it to finish",
             }
         if effort == active.effort:
             return {
