@@ -626,3 +626,61 @@ def test_mention_receipt_is_gated_on_focus() -> None:
         "stageMentionedFile paints its receipt chip without checking "
         "that the mention's session is still focused"
     )
+
+
+def test_switch_session_drops_superseded_responses() -> None:
+    """Rapid A→B→C clicking puts two ``switch_session`` responses in
+    flight at once, and they can settle in either order. Applying
+    every response unconditionally lets a late loser repaint the UI
+    to a session the researcher already left — visibly showing one
+    session while the backend focuses another, so the next
+    focus-routed call lands in the wrong one. Each switchSession call
+    must take a ticket and only the NEWEST may apply its response."""
+    import re
+
+    code = _app_js_without_comments()
+    m = re.search(
+        r"async function switchSession\(.*?\n\}\n", code, re.DOTALL
+    )
+    assert m is not None, "switchSession not found"
+    body = m.group(0)
+
+    assert "const seq = ++switchSeq;" in body, (
+        "switchSession must take a monotonic ticket before its await"
+    )
+    assert body.index("const seq = ++switchSeq;") < body.index(
+        "await window.pywebview.api.switch_session("
+    ), "the ticket must be taken before the switch await, not after"
+    assert "seq !== switchSeq" in body, (
+        "switchSession must compare its ticket after the await and "
+        "drop superseded responses"
+    )
+    assert body.index("seq !== switchSeq") < body.index("showChat(res)"), (
+        "the supersession check must run before the response is "
+        "applied to the UI"
+    )
+
+
+def test_direct_sends_name_their_session() -> None:
+    """The composer submit and the rewind resend must use the
+    explicit-target ``_to_session`` send variants.
+
+    The plain ``send_message`` routes to the bridge's focused cwd at
+    the moment the RPC ARRIVES — so a session switch in flight when
+    the researcher hits Enter (its response pending, or its backend
+    focus change already landed) sends the message into the session
+    being switched to while its bubble renders in the one on screen.
+    The queue-flush path already routes explicitly for the same
+    reason; the direct paths must too."""
+    code = _app_js_without_comments()
+    assert "send_message_to_session(sendCwd, text)" in code, (
+        "the composer's text send must name the session captured at "
+        "submit time"
+    )
+    assert "send_message_with_images_to_session(sendCwd, text, payload)" in code, (
+        "the composer's image send must name the session captured at "
+        "submit time"
+    )
+    assert "send_message_to_session(rewindCwd, newText)" in code, (
+        "the rewind resend must name the session that was rewound"
+    )

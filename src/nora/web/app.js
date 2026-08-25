@@ -2054,21 +2054,39 @@ form.addEventListener('submit', async (e) => {
   try {
     // If images are attached, use the richer send method. The
     // simpler string send stays as the fast path for text-only.
+    //
+    // Prefer the explicit-target ``_to_session`` variants, naming
+    // ``sendCwd``. The plain ``send_message`` routes to the bridge's
+    // ``self.cwd`` — whichever session is focused when the RPC
+    // ARRIVES, not when the researcher hit Enter. A session switch
+    // in flight at submit time (its response still pending, or its
+    // backend focus change already landed) would route this message
+    // into the session being switched TO while its bubble renders
+    // in the one on screen. The targeted variants pin the message
+    // to the session whose composer it was typed in, regardless of
+    // focus; the plain sends remain only as older-bridge fallbacks.
+    const sendApi = window.pywebview.api;
     let turnId = null;
-    if (images.length > 0 && typeof window.pywebview.api.send_message_with_images === 'function') {
+    if (images.length > 0) {
       const payload = images.map((img) => ({ data: img.data, mime: img.mime }));
-      turnId = await window.pywebview.api.send_message_with_images(text, payload);
-    } else if (images.length > 0) {
-      const errEl = appendError('Restart Nora to send images.');
-      if (!localTurn.hasVisibleReply) {
-        localTurn.nodes.push(errEl);
-        queueDisposableTurn(localTurn.nodes);
+      if (typeof sendApi.send_message_with_images_to_session === 'function') {
+        turnId = await sendApi.send_message_with_images_to_session(sendCwd, text, payload);
+      } else if (typeof sendApi.send_message_with_images === 'function') {
+        turnId = await sendApi.send_message_with_images(text, payload);
+      } else {
+        const errEl = appendError('Restart Nora to send images.');
+        if (!localTurn.hasVisibleReply) {
+          localTurn.nodes.push(errEl);
+          queueDisposableTurn(localTurn.nodes);
+        }
+        clearLiveTurn(sendCwd);
+        setSending(false);
+        return;
       }
-      clearLiveTurn(sendCwd);
-      setSending(false);
-      return;
+    } else if (typeof sendApi.send_message_to_session === 'function') {
+      turnId = await sendApi.send_message_to_session(sendCwd, text);
     } else {
-      turnId = await window.pywebview.api.send_message(text);
+      turnId = await sendApi.send_message(text);
     }
     // Capture the turn id the bridge assigned. Stop reads this to
     // mark the turn cancelled. If the await resolved with no id
@@ -4085,7 +4103,15 @@ async function runEditedMessage(wrapper) {
 
   if (typeof window.pywebview.api.send_message === 'function') {
     try {
-      const turnId = await window.pywebview.api.send_message(newText);
+      // Same explicit-target routing as the composer's submit
+      // handler: the rewound history lives in ``rewindCwd``, so the
+      // edited message must go there even if a session switch is in
+      // flight when this send arrives at the bridge.
+      const turnId = (
+        typeof window.pywebview.api.send_message_to_session === 'function'
+          ? await window.pywebview.api.send_message_to_session(rewindCwd, newText)
+          : await window.pywebview.api.send_message(newText)
+      );
       // Stop reads this id to mark the turn cancelled. Same
       // capture pattern as the composer's submit handler.
       if (typeof turnId === 'string' && turnId) {
@@ -5383,6 +5409,14 @@ function formatSessionAge(epochSeconds) {
   return Math.floor(secs / (86400 * 30)) + 'mo';
 }
 
+// Monotonic id for session-switch transitions. Rapid A→B→C clicks
+// put two switch_session RPCs in flight at once, and their responses
+// can settle in either order — applying both (or applying a late
+// loser) leaves the transcript showing one session while the backend
+// focuses another. Each switchSession call takes a ticket; only the
+// NEWEST ticket may apply its response.
+let switchSeq = 0;
+
 async function switchSession(path, isCurrent) {
   if (isCurrent) return;  // already on it — click is a no-op
   if (!window.pywebview || !window.pywebview.api) return;
@@ -5392,40 +5426,59 @@ async function switchSession(path, isCurrent) {
     toast('Restart Nora to enable session switching.', 'info');
     return;
   }
-  // Clear the LEAVING session's backend pending lists. ``showChat``
-  // wipes the JS-side staged composer state (image thumbs, data
-  // notices, mention chips) on the way in to the new session — but
-  // the runner's ``pending_*`` lists are per-cwd and survive a focus
-  // switch. Without this call, a script attachment / @-mention
-  // staged in A but never sent rides invisibly with the next plain
-  // message in A: the UI shows no chip, the backend silently
-  // inlines the file. Best-effort: a missing bridge method or a
-  // failing RPC just means we keep the prior behaviour, not a
-  // hard error.
+  const seq = ++switchSeq;
   const leavingCwd = currentCwd;
-  if (
-    leavingCwd
-    && leavingCwd !== path
-    && typeof window.pywebview.api.clear_pending_for_session === 'function'
-  ) {
-    try {
-      await window.pywebview.api.clear_pending_for_session(leavingCwd);
-    } catch (err) {
-      console.warn('clear_pending_for_session failed', err);
-    }
-  }
   try {
     const res = await window.pywebview.api.switch_session(path);
+    if (seq !== switchSeq) {
+      // A newer switch superseded this one while its response was in
+      // flight. Applying this (stale) response would repaint the UI
+      // to a session the researcher already navigated away from —
+      // and desync it from the backend's focus. Drop it silently;
+      // the newest call's response is the one that lands.
+      return;
+    }
     if (!res || !res.ok) {
       const reason = res && res.reason ? res.reason : 'unknown';
       toast('Session switch failed: ' + reason, 'error');
       return;
+    }
+    // Clear the LEAVING session's backend pending lists — only now
+    // that the switch is known to have succeeded. ``showChat`` wipes
+    // the JS-side staged composer state (image thumbs, data notices,
+    // mention chips) on the way in to the new session — but the
+    // runner's ``pending_*`` lists are per-cwd and survive a focus
+    // switch. Without this call, a script attachment / @-mention
+    // staged in A but never sent rides invisibly with the next plain
+    // message in A: the UI shows no chip, the backend silently
+    // inlines the file. It must NOT run before the switch resolves:
+    // a failed switch leaves the researcher on the current session
+    // with its chips still painted, and clearing first would have
+    // already deleted the attachments behind them. Best-effort: a
+    // missing bridge method or a failing RPC just means we keep the
+    // prior behaviour, not a hard error.
+    if (
+      leavingCwd
+      && leavingCwd !== path
+      && typeof window.pywebview.api.clear_pending_for_session === 'function'
+    ) {
+      try {
+        await window.pywebview.api.clear_pending_for_session(leavingCwd);
+      } catch (err) {
+        console.warn('clear_pending_for_session failed', err);
+      }
+      // The clear was an await of its own — a newer switch may have
+      // started during it, and painting this response now would
+      // clobber that one's. (The clear itself was still correct:
+      // this switch DID succeed, so the leaving session was left.)
+      if (seq !== switchSeq) return;
     }
     // showChat handles everything: hide landing, reveal chat, reset
     // transcript, refresh cwd pill + policy + sidebar + model chip,
     // hide the context chip, replay persisted history.
     showChat(res);
   } catch (err) {
+    if (seq !== switchSeq) return;  // superseded — newer call owns the UI
     console.warn('switch_session failed', err);
     toast('Session switch failed: ' + (err && err.message ? err.message : err), 'error');
   }
