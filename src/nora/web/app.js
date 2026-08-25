@@ -1696,10 +1696,27 @@ async function stageMentionedFile(name, path) {
   if (!window.pywebview || !window.pywebview.api) return;
   if (typeof window.pywebview.api.attach_session_file !== 'function') return;
   try {
+    // The backend stages onto the session focused when the call
+    // arrives and names it in ``res.cwd``. The receipt chip below
+    // paints the FOCUSED composer, so if the researcher switched
+    // sessions while the bridge worked, skip it — otherwise a chip
+    // for another session's file shows up here just after the focus
+    // handler cleared the composer state. Fall back to the pre-call
+    // capture for older backends without ``cwd`` in the payload.
+    const requestCwd = currentCwd;
     const res = await window.pywebview.api.attach_session_file(name, path);
+    const stillFocused = (res && res.cwd)
+      ? res.cwd === currentCwd
+      : requestCwd === currentCwd;
     if (!res || !res.ok) {
       const reason = (res && res.reason) || 'unknown';
       toast('Could not attach: ' + reason, 'error');
+      return;
+    }
+    if (!stillFocused) {
+      if (!res.already_attached) {
+        toast('Attached ' + (res.name || name) + ' to the previous session.', 'info');
+      }
       return;
     }
     if (!res.already_attached) {
@@ -5502,7 +5519,18 @@ if (addFilesBtn) {
     }
     addFilesBtn.disabled = true;
     try {
+      // The native dialog (plus the copy loop behind it) is slow
+      // enough for the researcher to switch sessions before the
+      // response lands. The backend pins the copy to the session
+      // that owned the click and names it in ``res.cwd``; everything
+      // below paints the FOCUSED session, so gate on the two still
+      // matching — same rule as setModel / stageDataFile. Fall back
+      // to the pre-call capture for older backends without ``cwd``.
+      const requestCwd = currentCwd;
       const res = await window.pywebview.api.add_files();
+      const stillFocused = (res && res.cwd)
+        ? res.cwd === currentCwd
+        : requestCwd === currentCwd;
       if (!res || !res.ok) {
         const reason = res && res.reason ? res.reason : 'unknown';
         if (reason !== 'cancelled') {
@@ -5516,6 +5544,27 @@ if (addFilesBtn) {
       const added = res.added || [];
       const images = res.images || [];
       const skipped = res.skipped || [];
+
+      if (!stillFocused) {
+        // The files landed in the session whose "+" was clicked —
+        // the backend pinned that — but the composer now belongs to
+        // a different session. Pushing into ``stagedImages`` here
+        // would ride another session's image on THIS session's next
+        // message (the leak the focus handler's clear exists to
+        // prevent), and the receipts / chips would decorate the
+        // wrong session. Images are also saved into that session's
+        // cwd on disk, so nothing is lost — just say where it went.
+        const wentParts = [];
+        if (added.length === 1) wentParts.push(added[0]);
+        else if (added.length > 1) wentParts.push(added.length + ' files');
+        if (images.length === 1) wentParts.push('1 image');
+        else if (images.length > 1) wentParts.push(images.length + ' images');
+        if (wentParts.length > 0) {
+          toast('Added ' + wentParts.join(' and ') + ' to the previous session.', 'info');
+        }
+        loadSessions();
+        return;
+      }
 
       // Stage any images the researcher picked as attachments on
       // the composer's next message. Images don't go into the

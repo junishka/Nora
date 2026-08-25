@@ -1216,6 +1216,14 @@ class NoraBridge:
             return {"ok": False, "reason": "window not ready"}
         if self.cwd is None:
             return {"ok": False, "reason": "no active session — start one first"}
+        # Bind to the session whose "+" button was clicked BEFORE the
+        # dialog opens. The dialog is the slow part of this method —
+        # where it isn't app-modal the researcher can focus another
+        # session while it sits open — and a capture taken after it
+        # (or ``self.cwd`` re-read per file in the copy loop) would
+        # route the picked files into whichever session is focused
+        # when the dialog closes, not the one the click belonged to.
+        cwd = self.cwd
         try:
             import webview
             # pywebview validates filter strings with a regex that only
@@ -1238,12 +1246,6 @@ class NoraBridge:
             return {"ok": False, "reason": f"dialog error: {e}"}
         if not result:
             return {"ok": False, "reason": "cancelled"}
-
-        # Same capture the drop path makes: copying a multi-GB .dta
-        # takes long enough for the researcher to switch sessions,
-        # and re-reading ``self.cwd`` per file would split one
-        # selection across two sessions.
-        cwd = self.cwd
 
         import base64
         # Anything in this set is copied into the session cwd so
@@ -2157,8 +2159,20 @@ class NoraBridge:
         directly after the same containment check the name-only
         path would have applied; without it we fall through to
         the name-based search for back-compat with older JS.
+
+        Success payloads carry ``cwd`` — the session the file was
+        staged on — so the frontend can skip its receipt chip when
+        the researcher has already moved to another session.
         """
-        if self.cwd is None:
+        # Bind to the focused session ONCE, up front. pywebview runs
+        # each JS call on its own thread, so ``self.cwd`` can move to
+        # another session at any point inside this method. The old
+        # code resolved and read the file against the session focused
+        # at entry but looked the runner up at the end — a focus
+        # switch in between staged one session's file contents onto
+        # another session's next prompt.
+        cwd = self.cwd
+        if cwd is None:
             return {"ok": False, "reason": "no active session"}
         if not name:
             return {"ok": False, "reason": "no file name"}
@@ -2166,8 +2180,8 @@ class NoraBridge:
         # JS side only sends filenames from list_session_files /
         # list_mentionable_files.
         safe_name = Path(name).name
-        cwd_resolved = self.cwd.resolve()
-        candidate = (self.cwd / safe_name).resolve()
+        cwd_resolved = cwd.resolve()
+        candidate = (cwd / safe_name).resolve()
         target: Path | None = None
         # Rewind-aware: ``list_session_files`` and
         # ``read_attached_file`` already filter run-dir artifacts to
@@ -2179,7 +2193,7 @@ class NoraBridge:
         # it on both the helper-plot iteration and the run-script
         # lookup below.
         from nora.session_files import visible_run_dir_names
-        visible_runs = visible_run_dir_names(self.cwd)
+        visible_runs = visible_run_dir_names(cwd)
         # Explicit path wins. The JS mention dropdown carries the
         # exact ``path`` of the clicked row, so passing it through
         # avoids the basename-collision bug: helper plots in
@@ -2203,7 +2217,7 @@ class NoraBridge:
                 and not supplied.is_symlink()
             ):
                 runs_root_resolved = (
-                    (self.cwd / ".nora" / "runs").resolve()
+                    (cwd / ".nora" / "runs").resolve()
                 )
                 in_run_dir = _is_within(supplied, runs_root_resolved)
                 run_dir_visible = True
@@ -2228,7 +2242,7 @@ class NoraBridge:
             # Fall through to the helper-plot dirs so an @-mention of
             # a plot like ``residuals_lm1.png`` (which lives in
             # ``.nora/runs/<id>/_nora_plots/``) resolves correctly.
-            runs_root = self.cwd / ".nora" / "runs"
+            runs_root = cwd / ".nora" / "runs"
             if runs_root.is_dir():
                 try:
                     for run_dir in runs_root.iterdir():
@@ -2261,7 +2275,7 @@ class NoraBridge:
             # actually works.
             from nora.run_files import find_run_dir_script_by_name
             run_script = find_run_dir_script_by_name(
-                self.cwd, safe_name, visible_run_dirs=visible_runs,
+                cwd, safe_name, visible_run_dirs=visible_runs,
             )
             if (
                 run_script is not None
@@ -2271,9 +2285,13 @@ class NoraBridge:
                 target = run_script
         if target is None:
             return {"ok": False, "reason": f"not found: {safe_name}"}
-        runner = self._active_runner()
+        # The runner for the session bound at entry — NOT whatever is
+        # focused now. ``_active_runner`` here was the leak: the file
+        # above resolved (and below is read) from the entry session,
+        # so its contents must stage on that session's pending lists.
+        runner = self._runner_for_cwd(cwd)
         if runner is None:
-            return {"ok": False, "reason": "no active session"}
+            return {"ok": False, "reason": "that session is no longer open"}
 
         # @-mention is an explicit researcher action — they clicked a
         # row in the Files panel / mention dropdown vouching for this
@@ -2293,7 +2311,7 @@ class NoraBridge:
         if target_resolved.parent == cwd_resolved:
             try:
                 from nora.file_provenance import mark_known
-                mark_known(self.cwd, [target_resolved.name])
+                mark_known(cwd, [target_resolved.name])
             except Exception:  # noqa: BLE001 — provenance is best-effort
                 pass
 
@@ -2324,12 +2342,16 @@ class NoraBridge:
                         "name": safe_name,
                         "kind": "script",
                         "already_attached": True,
+                        "cwd": str(cwd),
                     }
             _stage_script_for_next_turn(
                 runner.pending_script_attachments, safe_name, ext, content,
                 path=target_str,
             )
-            return {"ok": True, "name": safe_name, "kind": "script"}
+            return {
+                "ok": True, "name": safe_name, "kind": "script",
+                "cwd": str(cwd),
+            }
 
         if ext in _MENTION_VISION_EXTS:
             blob_path = target
@@ -2341,9 +2363,12 @@ class NoraBridge:
                     blob_path = sidecar
                     mime = "image/png"
                 else:
-                    return _attach_as_announcement(
-                        runner, safe_name, kind="graph",
-                    )
+                    return {
+                        **_attach_as_announcement(
+                            runner, safe_name, kind="graph",
+                        ),
+                        "cwd": str(cwd),
+                    }
             try:
                 blob_size = blob_path.stat().st_size
             except OSError as e:
@@ -2380,6 +2405,7 @@ class NoraBridge:
                         "name": safe_name,
                         "kind": "image",
                         "already_attached": True,
+                        "cwd": str(cwd),
                     }
             import base64 as _b64
             runner.pending_mentioned_images.append({
@@ -2396,7 +2422,10 @@ class NoraBridge:
             })
             if safe_name not in runner.pending_mentioned_files:
                 runner.pending_mentioned_files.append(safe_name)
-            return {"ok": True, "name": safe_name, "kind": "image"}
+            return {
+                "ok": True, "name": safe_name, "kind": "image",
+                "cwd": str(cwd),
+            }
 
         # Anything else: data files (.csv, .dta, .parquet, …),
         # logs (.log, .smcl), Stata graphs (.gph). Announce by name
@@ -2404,9 +2433,12 @@ class NoraBridge:
         # system prompt's listing (or the mid-session diff notice
         # for late additions); the mention notice just brings the
         # file to the foreground for THIS message.
-        return _attach_as_announcement(
-            runner, safe_name, kind=_classify_kind(ext),
-        )
+        return {
+            **_attach_as_announcement(
+                runner, safe_name, kind=_classify_kind(ext),
+            ),
+            "cwd": str(cwd),
+        }
 
     def list_mentionable_files(self) -> dict[str, Any]:
         """Return every session-resident file the @-mention dropdown
