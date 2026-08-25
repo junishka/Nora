@@ -200,9 +200,17 @@ def load_data(dataset_path: Path) -> Any:
     )
 
 
+def _cell_is_numeric(s: str) -> bool:
+    try:
+        float(s)
+    except ValueError:
+        return False
+    return True
+
+
 def _record_looks_like_header(record: list[str]) -> bool:
-    """Heuristic: does a parsed CSV/TSV record look like a header row
-    (column names) or a data row?
+    """First-record-only heuristic: does a parsed CSV/TSV record look
+    like a header row (column names) or a data row?
 
     Takes an already-parsed list of cells from ``csv.reader`` (which
     correctly handles quoted, multi-line fields) rather than raw
@@ -214,6 +222,14 @@ def _record_looks_like_header(record: list[str]) -> bool:
       column file with a name like ``"id"`` is the common case).
     - Every cell is numeric (raw sensor dump etc.): treated as data,
       no header offset applied.
+
+    This is the FALLBACK rule — it only sees one record, so it calls
+    every text-bearing first row a header, which silently eats the
+    first observation of headerless categorical data (a file starting
+    ``control,north``). :func:`_records_look_like_header` compares the
+    first record against the rows below it and should be preferred
+    whenever body records are available; it falls back here when the
+    comparison finds no signal.
     """
     if not record:
         return True
@@ -223,13 +239,80 @@ def _record_looks_like_header(record: list[str]) -> bool:
         if not s:
             continue
         saw_any = True
-        try:
-            float(s)
-        except ValueError:
+        if not _cell_is_numeric(s):
             return True
     if not saw_any:
         return True
     return False
+
+
+# Body records to compare the first record against. Enough to see
+# categorical values recur; small enough that the peek stays
+# constant-time on any file size.
+_HEADER_SAMPLE_ROWS = 20
+
+
+def _records_look_like_header(
+    first: list[str], body: list[list[str]],
+) -> bool:
+    """Body-aware header inference: compare the first record against a
+    sample of the records below it, column by column.
+
+    The one-record rule ("any text cell → header") misreads real
+    datasets in both directions: headerless categorical data
+    (``control,north`` over more control/treatment rows) loses its
+    first observation to the column names, and a text label over a
+    text column is genuinely ambiguous without looking down the
+    column. Votes, per column with a non-empty first cell and at
+    least one non-empty body cell:
+
+    - body all-numeric, first cell text  → header (a name over a
+      numeric column: ``id,score`` over ``1,9.5``).
+    - body has text, first cell numeric  → header (a numeric name
+      such as a year over a text column: ``2020`` over country
+      names).
+    - both text and the first cell's value RECURS in the body
+      → data (header names don't reappear as values; a recurring
+      ``control`` is an observation).
+    - anything else → no signal. Numeric-over-numeric is genuinely
+      undecidable (``2020,2021`` year names over measurements reads
+      identically to a headerless numeric dump), and a text label
+      that never recurs is as plausible a name as a unique value.
+      An empty first cell also abstains — pandas writes an empty
+      header cell for the index column.
+
+    Majority wins; a tie (including no votes at all) falls back to
+    :func:`_record_looks_like_header` so the documented posture for
+    ambiguous files — text row 1 is a header, all-numeric row 1 is
+    data — is unchanged. The undecidable cases are additionally
+    surfaced to the model via ``header_note`` in the schema payload
+    so a wrong guess is visible rather than silent.
+    """
+    if not body:
+        return _record_looks_like_header(first)
+    header_votes = 0
+    data_votes = 0
+    for i, raw in enumerate(first):
+        f = (raw or "").strip()
+        if not f:
+            continue
+        cells = [
+            c for rec in body if i < len(rec)
+            if (c := (rec[i] or "").strip())
+        ]
+        if not cells:
+            continue
+        body_numeric = all(_cell_is_numeric(c) for c in cells)
+        f_numeric = _cell_is_numeric(f)
+        if body_numeric and not f_numeric:
+            header_votes += 1
+        elif not body_numeric and f_numeric:
+            header_votes += 1
+        elif not body_numeric and not f_numeric and f in cells:
+            data_votes += 1
+    if header_votes != data_votes:
+        return header_votes > data_votes
+    return _record_looks_like_header(first)
 
 
 def _csv_has_header(path: Path, delimiter: str) -> bool:
@@ -245,9 +328,10 @@ def _csv_has_header(path: Path, delimiter: str) -> bool:
     return. The schema response then looks internally inconsistent
     (variable names look like data, observation count is one too many).
 
-    Reads only the first parsed record — constant-time on any file
-    size. Returns ``True`` (header present) on read errors so callers
-    fall back to pandas' usual behaviour rather than guessing.
+    Reads the first record plus a bounded sample of body records —
+    still constant-time on any file size. Returns ``True`` (header
+    present) on read errors so callers fall back to pandas' usual
+    behaviour rather than guessing.
     """
     import csv
 
@@ -256,14 +340,24 @@ def _csv_has_header(path: Path, delimiter: str) -> bool:
             path, "r", encoding="utf-8", errors="replace", newline="",
         ) as f:
             reader = csv.reader(f, delimiter=delimiter)
+            first: list[str] | None = None
+            body: list[list[str]] = []
             for record in reader:
-                return _record_looks_like_header(record)
+                if first is None:
+                    first = record
+                    continue
+                body.append(record)
+                if len(body) >= _HEADER_SAMPLE_ROWS:
+                    break
+            if first is None:
+                # Empty file — no record at all. Default to "has
+                # header" so the downstream pandas read uses its
+                # default and yields a zero-row frame rather than
+                # failing on an unexpected option.
+                return True
+            return _records_look_like_header(first, body)
     except OSError:
         return True
-    # Empty file — no record at all. Default to "has header" so the
-    # downstream pandas read uses its default and yields a zero-row
-    # frame rather than failing on an unexpected option.
-    return True
 
 
 def row_count(dataset_path: Path) -> int | None:
@@ -282,16 +376,17 @@ def row_count(dataset_path: Path) -> int | None:
     - ``.parquet``: ``pyarrow.parquet.ParquetFile(...).metadata.num_rows``.
       Reads only the footer.
     - ``.csv`` / ``.tsv``: byte-streamed line count, minus 1 if the
-      first line looks like a header (any non-numeric token in the
-      first row). The previous unconditional ``-1`` was wrong for
-      headerless dumps (raw instrument files, anonymous panel data,
-      log files renamed to .csv) — it produced an audit count off
-      by one and the row-count check then false-flagged scripts
-      that correctly counted the headerless row. Heuristic-only;
-      a CSV whose header happens to be numeric (rare but possible
-      — column names like ``"123"``) still gets misclassified, but
-      the audit treats ``None`` and "off by 1" the same way (best-
-      effort flag, not a gate).
+      first record looks like a header under the shared body-aware
+      inference (:func:`_records_look_like_header`). The previous
+      unconditional ``-1`` was wrong for headerless dumps (raw
+      instrument files, anonymous panel data, log files renamed to
+      .csv) — it produced an audit count off by one and the
+      row-count check then false-flagged scripts that correctly
+      counted the headerless row. Heuristic-only; a CSV whose
+      header is entirely numeric over numeric data (year columns
+      like ``"2020"``) still gets misclassified, but the audit
+      treats ``None`` and "off by 1" the same way (best-effort
+      flag, not a gate).
     - ``.jsonl`` / ``.ndjson``: byte-streamed line count.
     - ``.rds``: no light path available without spinning up R; falls
       back to ``load_data`` and counts.
@@ -330,6 +425,11 @@ def row_count(dataset_path: Path) -> int | None:
             delimiter = "," if suffix == ".csv" else "\t"
             n_records = 0
             first_record: list[str] | None = None
+            # Sample of the records below the first, for the
+            # body-aware header inference — the same comparison
+            # ``_csv_has_header`` makes, collected during this
+            # counting pass so the two surfaces can't disagree.
+            body_sample: list[list[str]] = []
             with open(
                 dataset_path, "r", encoding="utf-8",
                 errors="replace", newline="",
@@ -338,10 +438,14 @@ def row_count(dataset_path: Path) -> int | None:
                 for record in reader:
                     if first_record is None:
                         first_record = record
+                    elif len(body_sample) < _HEADER_SAMPLE_ROWS:
+                        body_sample.append(record)
                     n_records += 1
             if n_records == 0:
                 return 0
-            has_header = _record_looks_like_header(first_record or [])
+            has_header = _records_look_like_header(
+                first_record or [], body_sample,
+            )
             return max(0, n_records - 1 if has_header else n_records)
         if suffix in (".jsonl", ".ndjson"):
             n_lines = 0
@@ -598,6 +702,30 @@ def _names_only_payload(
 # CSV — pandas
 # ---------------------------------------------------------------------------
 
+def _csv_header_note(has_header: bool) -> str:
+    """One-line provenance for the header inference, carried in the
+    CSV/TSV schema payload. The inference is a heuristic and two real
+    file shapes are genuinely undecidable from content alone (an
+    all-numeric header over numeric data, and a text first row whose
+    values never recur). Saying which way the guess went lets the
+    model and the researcher catch a wrong guess instead of silently
+    analysing a shifted dataset."""
+    if has_header:
+        return (
+            "First row treated as column names (inferred from the "
+            "file contents). If these names look like data values, "
+            "the file is likely headerless — flag it to the "
+            "researcher before analysing."
+        )
+    return (
+        "No header row inferred: the first row is treated as data "
+        "and columns are auto-named 0..N-1. An all-numeric header "
+        "(e.g. year columns) is indistinguishable from data — if "
+        "these column positions should have names, flag it to the "
+        "researcher before analysing."
+    )
+
+
 def _extract_csv(path: Path, depth: str) -> dict[str, Any]:
     import pandas as pd
 
@@ -623,9 +751,11 @@ def _extract_csv(path: Path, depth: str) -> dict[str, Any]:
             if has_header
             else pd.read_csv(path, header=None, nrows=0)
         )
-        return _names_only_payload(
+        payload = _names_only_payload(
             list(header_df.columns), path, "csv",
         )
+        payload["header_note"] = _csv_header_note(has_header)
+        return payload
     # low_memory=False gives a single-pass type inference — more accurate
     # for columns where the type isn't obvious from the first chunk. For
     # genuinely huge CSVs this will be slow; step 7 can add streaming.
@@ -635,9 +765,11 @@ def _extract_csv(path: Path, depth: str) -> dict[str, Any]:
         if has_header
         else pd.read_csv(path, header=None, low_memory=False)
     )
-    return _extract_from_pandas(
+    payload = _extract_from_pandas(
         df, depth=depth, dataset_name=path.name, file_type="csv"
     )
+    payload["header_note"] = _csv_header_note(has_header)
+    return payload
 
 
 # ---------------------------------------------------------------------------
@@ -656,18 +788,22 @@ def _extract_tsv(path: Path, depth: str) -> dict[str, Any]:
             if has_header
             else pd.read_csv(path, sep="\t", header=None, nrows=0)
         )
-        return _names_only_payload(
+        payload = _names_only_payload(
             list(header_df.columns), path, "tsv",
         )
+        payload["header_note"] = _csv_header_note(has_header)
+        return payload
     has_header = _csv_has_header(path, "\t")
     df = (
         pd.read_csv(path, sep="\t", low_memory=False)
         if has_header
         else pd.read_csv(path, sep="\t", header=None, low_memory=False)
     )
-    return _extract_from_pandas(
+    payload = _extract_from_pandas(
         df, depth=depth, dataset_name=path.name, file_type="tsv"
     )
+    payload["header_note"] = _csv_header_note(has_header)
+    return payload
 
 
 # ---------------------------------------------------------------------------
