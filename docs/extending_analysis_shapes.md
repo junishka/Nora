@@ -403,15 +403,13 @@ Two patterns surface in the current shapes:
     (Stata vs R vs Python `rdrobust` on the same DGP at 0.5%
     relative tolerance) is the go/no-go gate. Protocol in
     [CHANGELOG.md](../CHANGELOG.md) deferred section.
-  - **DiD: no realistic Stata workflow.** `csdid` is
-    SSC-distributed and `install_packages` does not reach SSC, so
-    Nora cannot install it. Even if a researcher runs
-    `ssc install csdid` themselves, the only path to emit a
-    `did_event_study` payload from Stata is hand-authoring JSON
-    against the field schema — that's a contributor escape hatch,
-    not an end-user workflow. System prompt directs the model to
-    recommend opening R or Python in the same session
-    (the `.dta` opens via `haven` / `pyreadstat`).
+  - **DiD: no payload helper.** `install_packages` installs
+    `csdid` from SSC fine; what's missing is a `nora_result_*`
+    command to emit the payload. Without one the only path is
+    hand-authoring JSON against the field schema, a contributor
+    escape hatch rather than an end-user workflow. System prompt
+    directs the model to recommend opening R or Python in the
+    same session (the `.dta` opens via `haven` / `pyreadstat`).
 - **Implement a minimal version** — the runtime helper itself
   doesn't need a package; if the canonical package is unavailable
   but the math is tractable, compute it. KM survival probabilities

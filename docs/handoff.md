@@ -184,8 +184,8 @@ keep streaming.
 The sanitizer recognises thirteen analysis shapes. The 0.10.0 release
 ships Stata parity for the four high-usage shapes that were
 previously R+Python-only (cluster, factor, mixed-effects, KM). Two
-shapes remain Stata-deferred for substantive reasons (DiD: SSC
-install flow; RDD: numerics-unverified). The earlier-shipped KM
+shapes remain Stata-deferred for substantive reasons (DiD: no
+payload helper; RDD: numerics-unverified). The earlier-shipped KM
 helper is now actually reachable — the `.ado` was in the runtime
 directory under 0.9.x but never in the executor's staging list, so
 `nora_result_km` failed with "command not found" on every prior
@@ -207,7 +207,7 @@ release.
 | Mixed-effects (sub-feature of `coefficient_table_with_fit_stats`: `random_effects_variance`, `n_groups_per_level`, `icc`, `fit_method`) | ✓ via `from_lm` on `lmer` / `glmer` | ✓ via `from_lm` on `statsmodels.mixedlm` | ✓ Stata `mixed` / `meglm` now routed through `nora_result_regress` — `estat recovariance` for variance components, `estat icc` for the single-grouping intercept-only case | **shipped 0.10.0** |
 | Panel-data diagnostics (sub-feature: `f_test_fe_chi2/p`, `hausman_chi2/p`, `breusch_pagan_chi2/p`, `wooldridge_ar1_chi2/p`) | ✓ R `from_lm` auto-runs `plm::pFtest` / `phtest` / `pbgtest` / `pwartest` on `plm` fits | ✓ Python `from_lm` accepts these as caller kwargs (linearmodels PanelOLS) | ✓ Stata `xtreg, fe` auto-emits `f_test_fe_chi2` + `f_test_fe_p` from `e(F_f)`; other tests pass via caller (run `xttest0` / `xtserial` in the script) | **shipped 0.10.0** |
 | Cluster-robust SE + typed `robust_se_type` enum (`classical`, `hc0..hc3`, `hac_newey_west`, `cluster`, `bootstrap`) (sub-feature) | ✓ fixest `vcov=` arg auto-detected | ✓ `cov_type=` auto-mapped (`HC0..HC3`, `HAC`, `cluster`) | ✓ `vce(cluster id)` + `e(cmd)=="newey"` auto-emit cluster / hac_newey_west; `cluster_variables` + `n_clusters` populated when applicable | shipped |
-| `did_event_study` | ✓ `from_callaway_santanna` + `from_sun_abraham` + `from_twfe_event_study`; de Chaisemartin via `nora$result(...)` | ✓ `from_callaway_santanna`; sun_abraham / twfe_event_study / de_chaisemartin via `nora.result(...)` | ✗ no helper; `csdid` is SSC-distributed and Nora's `install_packages` can't reach SSC | **deferred — no realistic Stata workflow.** The only way to emit `did_event_study` from Stata today is hand-authoring JSON to `NORA_RESULT_PATH` against the field schema — that's a contributor-level escape hatch, not an end-user workflow. System prompt now directs the model to recommend running CS DiD in R or Python via the same session (the `.dta` opens via `haven` / `pyreadstat`; the data stays on the machine). Adding a real Stata helper waits on a contributor pinning the `csdid` API surface |
+| `did_event_study` | ✓ `from_callaway_santanna` + `from_sun_abraham` + `from_twfe_event_study`; de Chaisemartin via `nora$result(...)` | ✓ `from_callaway_santanna`; sun_abraham / twfe_event_study / de_chaisemartin via `nora.result(...)` | ✗ no helper; `install_packages` installs `csdid` from SSC fine, but nothing emits the payload | **deferred — no payload helper.** Hand-authoring JSON to `NORA_RESULT_PATH` is the only route from Stata, and that's a contributor escape hatch, not an end-user workflow. System prompt directs the model to recommend running CS DiD in R or Python via the same session (the `.dta` opens via `haven` / `pyreadstat`; the data stays on the machine). A real Stata helper waits on a contributor pinning the `csdid` API surface |
 | `rdd` | ✓ `from_rdd` (wraps `rdrobust::rdrobust`) | ✓ `from_rdd` (wraps `rdrobust` Python) | ✗ no helper; SSC Stata `rdrobust` port has maintenance lag and numerics haven't been verified against CCT 2014 reference | **deferred — 0.10.3 shipped without it; no target release.** Go / no-go is empirical and roughly one Stata session: fit `rdrobust` in Stata and R / Python on the same simulated DGP, compare τ / SE / bandwidths at the 0.5% relative-tolerance level. If they agree, write the helper following the `nora_result_factor.ado` pattern. If they disagree, document the divergence and keep deferred. See [CHANGELOG.md](../CHANGELOG.md) deferred section for the protocol |
 
 **Operational meaning of the two Stata-deferred entries.** Both
@@ -226,15 +226,13 @@ Stata helper is missing:
   section for the protocol). It was targeted for 0.10.3, which
   shipped without it; the deferral is open-ended until someone
   runs the check.
-- **DiD: no realistic Stata workflow exists today.** `csdid` is
-  SSC-distributed and `install_packages` does not reach SSC, so
-  Nora cannot install it. Even with a researcher who runs
-  `ssc install csdid` in their own Stata window, the only way to
-  emit a `did_event_study` payload from Stata is hand-authoring
-  JSON to `NORA_RESULT_PATH` against the field schema — that's a
-  contributor-level escape hatch, not an end-user path. Adding a
-  real Stata helper waits on a contributor pinning the `csdid` API
-  surface and following the `nora_result_*` ado-file convention.
+- **DiD: no payload helper.** `install_packages` installs
+  `csdid` from SSC fine. What's missing is a `nora_result_*`
+  command to emit the payload, so the only route from Stata is
+  hand-authoring JSON to `NORA_RESULT_PATH`, a contributor escape
+  hatch rather than an end-user path. A real Stata helper waits on
+  a contributor pinning the `csdid` API surface and following the
+  `nora_result_*` ado-file convention.
 
 **1726 pytest cases collected** via `uv run pytest --collect-only -q`
 on 2026-08-20. Full pass/fail depends on local sandbox/runtime

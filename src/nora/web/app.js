@@ -1164,7 +1164,20 @@ function renderAttachments() {
   });
 }
 
-async function stageImageFile(file) {
+// Composer uploads read the file before they touch anything
+// session-bound, and a FileReader read is long enough for the
+// researcher to click another session mid-read. Every upload path
+// therefore captures its session up front and re-checks it here
+// before writing session-scoped state. ``currentCwd`` changes on
+// exactly one line (the focus handler), so this is the whole rule.
+function stillFocusedOn(cwd) {
+  return cwd === currentCwd;
+}
+
+// ``targetCwd`` defaults at CALL time, so a direct caller with no
+// session to name still gets the session that was focused when it
+// called — never one the researcher moved to during the read.
+async function stageImageFile(file, targetCwd = currentCwd) {
   if (!ALLOWED_IMAGE_MIMES.has(file.type)) {
     appendError('Only PNG, JPEG, WebP, and GIF images are supported.');
     return false;
@@ -1183,6 +1196,17 @@ async function stageImageFile(file) {
     reader.onerror = () => reject(reader.error);
     reader.readAsDataURL(file);
   });
+  if (!stillFocusedOn(targetCwd)) {
+    // The composer belongs to whichever session is focused now, so
+    // there is nowhere to put this one's attachment — pushing it
+    // here is the leak the focus handler's stagedImages clear
+    // exists to prevent, arriving just after that clear ran. The
+    // bytes still reach the session it was dropped in via
+    // stageDataFile, which reports where they landed; vision
+    // staging is one-turn state that the switch would have
+    // discarded anyway.
+    return true;
+  }
   stagedImages.push({
     data,
     mime: file.type,
@@ -1218,7 +1242,7 @@ function acceptedByComposer(file) {
 // Stage a non-image data/script file by shipping it to the backend,
 // which copies it into the session cwd. Shows a named chip in the
 // attachment bar as confirmation. Errors go into the chat transcript.
-async function stageDataFile(file) {
+async function stageDataFile(file, targetCwd = currentCwd) {
   if (!window.pywebview || !window.pywebview.api) return;
   if (typeof window.pywebview.api.add_files_from_blobs !== 'function') {
     appendError('Restart Nora to drop files into the chat.');
@@ -1247,16 +1271,17 @@ async function stageDataFile(file) {
     reader.readAsDataURL(file);
   });
   try {
-    const uploadCwd = currentCwd;
     const res = await window.pywebview.api.add_files_from_blobs([
       { name: file.name, content: data, mime: file.type || '' },
-    ]);
-    // The backend puts the bytes in the right session. But the
+    ], targetCwd);
+    // The backend puts the bytes in the session we named. But the
     // receipts below paint the focused one, so skip them if focus
     // moved — otherwise another session's file shows up here.
-    const stillFocused = (res && res.cwd)
-      ? res.cwd === currentCwd
-      : uploadCwd === currentCwd;
+    // Compare against what we sent rather than ``res.cwd``: the
+    // backend may hand back a resolved path where ``currentCwd``
+    // holds the unresolved one, and that mismatch would read as a
+    // focus change on every single upload.
+    const stillFocused = stillFocusedOn(targetCwd);
     if (!res || !res.ok) {
       appendError(friendlyAddFilesError(res && res.reason ? res.reason : 'unknown'));
       return;
@@ -1363,6 +1388,13 @@ if (form) {
         '. Only images and data/script files (.csv, .tsv, .dta, .rds, .parquet, .jsonl, .do, .r, .py, .ipynb, .log, .smcl, .gph, .rmd) can be dropped here.'
       );
     }
+    // Capture the session ONCE, before the first read. Each
+    // iteration awaits a full FileReader pass, so a capture taken
+    // per file would already be late for every file after the
+    // first: drop a 900 MB .dta plus a script, switch sessions
+    // while the .dta reads, and the script lands in the session
+    // the researcher moved to.
+    const dropCwd = currentCwd;
     for (const file of usable) {
       if (ALLOWED_IMAGE_MIMES.has(file.type)) {
         // Stage for one-turn vision AND persist to the session cwd
@@ -1378,12 +1410,12 @@ if (form) {
         // the 1 GB drag-drop cap, freezing the UI on the very
         // payload the image cap was meant to refuse. Treat the
         // image cap as the floor for both paths.
-        const accepted = await stageImageFile(file);
+        const accepted = await stageImageFile(file, dropCwd);
         if (accepted) {
-          await stageDataFile(file);
+          await stageDataFile(file, dropCwd);
         }
       } else {
-        await stageDataFile(file);
+        await stageDataFile(file, dropCwd);
       }
     }
     input.focus();
@@ -1405,6 +1437,8 @@ if (input) {
     }
     if (usable.length === 0) return;
     e.preventDefault();
+    // Same capture as the drop handler above, for the same reason.
+    const pasteCwd = currentCwd;
     for (const f of usable) {
       if (ALLOWED_IMAGE_MIMES.has(f.type)) {
         // Stage for vision AND persist — same dual-tracking as the
@@ -1412,12 +1446,12 @@ if (input) {
         // applies here: an oversize pasted screenshot must not slip
         // through the data path's larger cap. See the drop handler
         // above for the full rationale.
-        const accepted = await stageImageFile(f);
+        const accepted = await stageImageFile(f, pasteCwd);
         if (accepted) {
-          await stageDataFile(f);
+          await stageDataFile(f, pasteCwd);
         }
       } else {
-        await stageDataFile(f);
+        await stageDataFile(f, pasteCwd);
       }
     }
   });
@@ -4787,7 +4821,7 @@ async function setModel(modelId, silent) {
     if (!res || !res.ok) {
       if (!silent) {
         const reason = res && res.reason ? res.reason : 'unknown';
-        toast('Model switch failed: ' + reason, 'error', 'model');
+        toast('Model switch failed. ' + sentenceCase(reason), 'error', 'model');
       }
       return;
     }
@@ -4815,7 +4849,7 @@ async function setModel(modelId, silent) {
     }
   } catch (err) {
     console.warn('set_model failed', err);
-    if (!silent) toast('Model switch failed: ' + err, 'error', 'model');
+    if (!silent) toast('Model switch failed. ' + sentenceCase(err), 'error', 'model');
   }
 }
 
@@ -4842,7 +4876,7 @@ async function setEffort(effortId) {
       : requestCwd === currentCwd;
     if (!res || !res.ok) {
       const reason = res && res.reason ? res.reason : 'unknown';
-      toast('Effort switch failed: ' + reason, 'error', 'model');
+      toast('Effort switch failed. ' + sentenceCase(reason), 'error', 'model');
       return;
     }
     if (!stillFocused) {
@@ -4861,7 +4895,7 @@ async function setEffort(effortId) {
     }
   } catch (err) {
     console.warn('set_effort failed', err);
-    toast('Effort switch failed: ' + err, 'error', 'model');
+    toast('Effort switch failed. ' + sentenceCase(err), 'error', 'model');
   }
 }
 
@@ -5581,6 +5615,14 @@ function dataUrlFromBase64(b64, mime) {
 // flows through this one channel.
 const statusLineEl = document.getElementById('status-line');
 let statusClearTimer = null;
+
+// Backend ``reason`` strings are lowercase fragments ("wait for the
+// turn in flight to finish"). Notices read them as a second sentence
+// after "... failed.", so lift the first letter.
+function sentenceCase(text) {
+  const s = String(text);
+  return s.charAt(0).toUpperCase() + s.slice(1);
+}
 
 function toast(message, kind /*, anchor */) {
   if (!statusLineEl) { console.log('[status]', kind, message); return; }
