@@ -827,15 +827,27 @@ class NoraBridge:
         No-ops cleanly if ``cwd`` isn't set or the depth isn't one of
         the valid tiers — a malformed JS caller shouldn't be able to
         corrupt the policy file.
+
+        The success payload names the session it changed (``cwd``) so
+        the frontend can skip its chip repaint when focus has already
+        moved on.
         """
-        if self.cwd is None:
+        # Bind to the focused session ONCE — load, mutate, save, and
+        # summarise against the SAME session. pywebview runs each JS
+        # call on its own thread, so a focus switch landing between
+        # ``load_policy`` and ``save_policy`` would write this
+        # session's disclosure ceilings over the newly-focused
+        # session's ``policy.json`` — silently replacing that
+        # session's permission table with another's.
+        cwd = self.cwd
+        if cwd is None:
             return {"ok": False, "reason": "session not started"}
         if depth not in VALID_DEPTHS:
             return {"ok": False, "reason": f"invalid depth: {depth!r}"}
         if not isinstance(name, str) or not name:
             return {"ok": False, "reason": "empty dataset name"}
 
-        current = load_policy(self.cwd)
+        current = load_policy(cwd)
         existing = current.datasets.get(name)
         # When the researcher selects the same depth as the app-wide
         # default, drop the explicit ``max_depth`` entry rather than
@@ -875,10 +887,14 @@ class NoraBridge:
             datasets=updated_datasets,
         )
         try:
-            save_policy(self.cwd, updated)
+            save_policy(cwd, updated)
         except OSError as e:
             return {"ok": False, "reason": f"save failed: {e}"}
-        return {"ok": True, "policy": self._policy_summary()}
+        return {
+            "ok": True,
+            "policy": self._policy_summary(cwd),
+            "cwd": str(cwd),
+        }
 
     def send_message(self, text: str) -> str | None:
         """Schedule a turn on the active session's runner.
@@ -1824,7 +1840,15 @@ class NoraBridge:
         still show even though the file is gone, and the next send
         would silently no-op the inline content.
         """
-        if self.cwd is None:
+        # Bind to the focused session ONCE. The listing gate below
+        # walks the session directory and the unlink hits the disk —
+        # long enough for a focus switch to land mid-call, and the
+        # pending-unstage at the end used to consult the runner
+        # focused THEN: it stripped same-named attachments from the
+        # wrong session while the deleted file's stale inline content
+        # stayed staged on this one.
+        cwd = self.cwd
+        if cwd is None:
             return {"ok": False, "reason": "no active session"}
         if not path:
             return {"ok": False, "reason": "no path"}
@@ -1832,7 +1856,7 @@ class NoraBridge:
             target = Path(path).expanduser().resolve()
         except OSError as e:
             return {"ok": False, "reason": f"bad path: {e}"}
-        cwd_resolved = self.cwd.resolve()
+        cwd_resolved = cwd.resolve()
         if not _is_within(target, cwd_resolved):
             return {
                 "ok": False,
@@ -1905,7 +1929,9 @@ class NoraBridge:
         # wrong entry.
         target_str = str(target)
         unstaged_names: list[str] = []
-        runner = self._active_runner()
+        # The runner for the session the file was deleted from — not
+        # whatever is focused now.
+        runner = self._runner_for_cwd(cwd)
         if runner is not None:
             kept_scripts: list[dict[str, Any]] = []
             for a in runner.pending_script_attachments:
@@ -1966,6 +1992,10 @@ class NoraBridge:
             "ok": True,
             "name": target.name,
             "unstaged": [n for n in unstaged_names if n],
+            # Which session the delete (and unstage) acted on, so the
+            # frontend can skip its composer-chip splice when focus
+            # has already moved to another session.
+            "cwd": str(cwd),
         }
 
     def read_session_file_text(self, path: str) -> dict[str, Any]:
@@ -4376,12 +4406,19 @@ class NoraBridge:
         ``web/app.js`` ``updateContextChip`` for the rendering
         contract).
         """
-        if self.cwd is None:
+        # Bind to the focused session ONCE — the system-prompt build
+        # below is the slow piece (cold runs walk the dataset
+        # listing), and a focus switch landing mid-call used to mix
+        # one session's prompt bytes with another's history, model
+        # ceiling, and pending attachments into a single number.
+        cwd = self.cwd
+        if cwd is None:
             return {
                 "ok": False,
                 "reason": "no active session",
                 "request_id": request_id,
             }
+        runner = self._runner_for_cwd(cwd)
 
         from nora.context_count import count_next_context, to_payload
         from nora.system_prompt import build_system_prompt
@@ -4390,10 +4427,13 @@ class NoraBridge:
         # the one expensive piece (a few hundred KB of template +
         # dataset listing + runtime probe), but it's cached at
         # session level and the call is cheap on warm runs.
-        provider = self._provider_id() if hasattr(self, "_provider_id") else "anthropic"
+        provider = (
+            (getattr(runner, "provider", None) or "anthropic")
+            if runner is not None else "anthropic"
+        )
         try:
             sys_prompt = build_system_prompt(
-                self.cwd, "nora", provider=provider,
+                cwd, "nora", provider=provider,
             )
             system_prompt_chars = len(sys_prompt)
         except Exception:  # noqa: BLE001
@@ -4407,7 +4447,7 @@ class NoraBridge:
         # caller-provided draft / image counts; refine later.
         tool_schema_chars = 50_000
 
-        ceiling = self._context_ceiling_for_active_model()
+        ceiling = self._context_ceiling_for_active_model(runner)
 
         # Override the JS-supplied attachment count with the runner's
         # actual staging list, and compute the inlined content bytes
@@ -4425,21 +4465,20 @@ class NoraBridge:
         # totals here the chip would recount as if no images were
         # pending right after a script emitted plots — even though
         # the next send would silently attach them.
-        active = self._active_runner()
-        if active is not None:
-            attachments = active.pending_script_attachments
+        if runner is not None:
+            attachments = runner.pending_script_attachments
             n_pending_attachments = len(attachments)
             pending_attachment_chars = _sum_inline_attachment_chars(attachments)
             n_images = (
                 n_images
-                + len(active.pending_plot_images)
-                + len(active.pending_mentioned_images)
+                + len(runner.pending_plot_images)
+                + len(runner.pending_mentioned_images)
             )
         else:
             pending_attachment_chars = 0
 
         count = count_next_context(
-            cwd=self.cwd,
+            cwd=cwd,
             draft_text=draft_text,
             n_images=n_images,
             n_pending_attachments=n_pending_attachments,
@@ -4451,8 +4490,14 @@ class NoraBridge:
         )
         return {"ok": True, **to_payload(count)}
 
-    def _context_ceiling_for_active_model(self) -> int:
-        """Resolve the active model's context window in tokens.
+    def _context_ceiling_for_active_model(
+        self, runner: SessionRunner | None = None,
+    ) -> int:
+        """Resolve a runner's model context window in tokens.
+
+        ``runner`` defaults to the focused session's. Pass it when
+        the caller captured a session earlier, so a focus change
+        can't swap in another session's model ceiling.
 
         Falls back to 1M when the runner / model registry can't be
         consulted — every frontier model on both providers is in
@@ -4461,7 +4506,8 @@ class NoraBridge:
         """
         try:
             from nora.provider.catalog import ALL_MODELS
-            runner = self._active_runner()
+            if runner is None:
+                runner = self._active_runner()
             if runner is None:
                 return 1_000_000
             model = getattr(runner, "model", None)

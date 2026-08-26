@@ -377,6 +377,121 @@ def test_mentioned_file_stages_into_the_session_that_resolved_it(
 
 
 # ---------------------------------------------------------------------------
+# 2d. set_dataset_policy
+# ---------------------------------------------------------------------------
+
+def test_policy_change_saves_into_the_session_it_loaded(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A depth change must load, mutate, and save the SAME session's
+    policy. The old code re-read ``self.cwd`` for the save, so a
+    focus switch between ``load_policy`` and ``save_policy`` wrote
+    session A's disclosure ceilings over session B's ``policy.json``
+    — silently replacing B's permission table.
+    """
+    a = _mk_session(tmp_path, "A")
+    b = _mk_session(tmp_path, "B")
+
+    bridge = NoraBridge(cwd=None)
+    bridge._set_cwd(a)
+
+    import nora.policy as policy_mod
+    from nora.policy import load_policy
+    real_load = policy_mod.load_policy
+    fired = {"done": False}
+
+    def load_then_switch(cwd: Path):
+        result = real_load(cwd)
+        if not fired["done"]:
+            fired["done"] = True
+            bridge._set_cwd(b)  # researcher clicks session B mid-change
+        return result
+
+    monkeypatch.setattr(ui, "load_policy", load_then_switch)
+    res = bridge.set_dataset_policy("A-panel.dta", "names_only")
+
+    assert res["ok"] is True
+    assert Path(res["cwd"]).resolve() == a.resolve(), (
+        "the response must name the session whose policy changed"
+    )
+    pol_a = load_policy(a)
+    assert "A-panel.dta" in pol_a.datasets, (
+        "the change must land in the session it was made in"
+    )
+    assert not (b / ".nora" / "policy.json").exists(), (
+        "the session merely focused mid-change must not have a "
+        "policy file written for it"
+    )
+
+
+# ---------------------------------------------------------------------------
+# 2e. delete_session_file
+# ---------------------------------------------------------------------------
+
+def test_deleting_a_file_unstages_from_its_own_session(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Deleting a file must drop its staged attachment from the
+    session the file lived in — not from whatever is focused when
+    the (slow) listing gate and unlink finish.
+
+    The old code looked the runner up at the end via
+    ``_active_runner``: a switch mid-delete stripped same-named
+    attachments from the newly-focused session while the deleted
+    file's stale inline content stayed staged on its own — the next
+    send there would inline a file the researcher just deleted.
+    """
+    a = _mk_session(tmp_path, "A")
+    b = _mk_session(tmp_path, "B")
+    target = a / "analysis.py"
+    target.write_text("print('a')\n")
+    (b / "analysis.py").write_text("print('b')\n")
+
+    bridge = NoraBridge(cwd=None)
+    bridge._set_cwd(a)
+    bridge._ensure_runner_for_cwd(b)
+    runner_a = bridge._runners[str(a.resolve())]
+    runner_b = bridge._runners[str(b.resolve())]
+    runner_a.pending_script_attachments = [
+        {"name": "analysis.py", "path": str(target.resolve())},
+    ]
+    runner_b.pending_script_attachments = [
+        {"name": "analysis.py", "path": str((b / "analysis.py").resolve())},
+    ]
+
+    # Seam: the panel-listing gate runs after the entry check and
+    # before the unlink + unstage.
+    import nora.session_files as session_files
+    real_enum = session_files.enumerate_session_files
+    fired = {"done": False}
+
+    def enumerate_then_switch(*args: Any, **kwargs: Any):
+        if not fired["done"]:
+            fired["done"] = True
+            bridge._set_cwd(b)  # researcher clicks session B mid-delete
+        return real_enum(*args, **kwargs)
+
+    monkeypatch.setattr(
+        session_files, "enumerate_session_files", enumerate_then_switch,
+    )
+    res = bridge.delete_session_file(str(target))
+
+    assert res["ok"] is True, res
+    assert Path(res["cwd"]).resolve() == a.resolve()
+    assert not target.exists()
+    assert runner_a.pending_script_attachments == [], (
+        "the deleted file's own session must lose its staged copy"
+    )
+    assert [s["name"] for s in runner_b.pending_script_attachments] == [
+        "analysis.py"
+    ], (
+        "the session merely focused mid-delete must keep its "
+        "same-named attachment"
+    )
+    assert (b / "analysis.py").exists()
+
+
+# ---------------------------------------------------------------------------
 # 3. set_model / set_effort persistence
 # ---------------------------------------------------------------------------
 
@@ -683,4 +798,68 @@ def test_direct_sends_name_their_session() -> None:
     )
     assert "send_message_to_session(rewindCwd, newText)" in code, (
         "the rewind resend must name the session that was rewound"
+    )
+
+
+@pytest.mark.parametrize("fn", [
+    "ensureMentionFiles",
+    "refreshFilesChip",
+    "loadModels",
+    "triggerContextRecount",
+])
+def test_async_loaders_guard_the_focused_repaint(fn: str) -> None:
+    """Every async loader that paints focused-session state (the
+    mention cache, the Files chip/popup, the model chip, the context
+    chip) must capture the session before its await and drop the
+    response when focus moved.
+
+    The mention cache was the sharpest of these: a fetch for A that
+    resolved after a switch re-marked the cache fresh with A's rows,
+    so the next "@" in B offered another session's file names and
+    paths."""
+    import re
+
+    code = _app_js_without_comments()
+    m = re.search(
+        rf"async function {fn}\(.*?\n\}}\n", code, re.DOTALL
+    )
+    assert m is not None, f"{fn} not found"
+    body = m.group(0)
+
+    assert "const requestCwd = currentCwd;" in body, (
+        f"{fn} must capture the focused session before its await"
+    )
+    assert "requestCwd !== currentCwd" in body, (
+        f"{fn} must drop its response when focus moved during the fetch"
+    )
+
+
+def test_delete_and_policy_responses_are_gated_on_focus() -> None:
+    """``deleteSessionFile``'s chip splice and the permission popup's
+    ``set_dataset_policy`` repaint both edit focused-session UI from
+    a response that names the session actually acted on — same
+    ``res.cwd`` rule as setModel."""
+    import re
+
+    code = _app_js_without_comments()
+    m = re.search(
+        r"async function deleteSessionFile\(.*?\n\}\n", code, re.DOTALL
+    )
+    assert m is not None, "deleteSessionFile not found"
+    body = m.group(0)
+    assert "const requestCwd = currentCwd;" in body
+    assert "res.cwd === currentCwd" in body
+    assert body.index("stillFocused") < body.index("stagedDataNotices"), (
+        "the composer-chip splice must be gated on the delete's "
+        "session still being focused"
+    )
+
+    policy_window = code.split("set_dataset_policy(", 1)[1][:2000]
+    assert "result.cwd === currentCwd" in policy_window, (
+        "the policy-chip repaint must compare the changed session "
+        "against the focused one"
+    )
+    assert "result.policy && stillFocused" in policy_window, (
+        "updatePolicyChip must be skipped when focus moved during "
+        "the policy change"
     )

@@ -1481,17 +1481,27 @@ async function ensureMentionFiles() {
   if (mentionFilesFresh && Array.isArray(mentionFiles)) return mentionFiles;
   if (!window.pywebview || !window.pywebview.api) return [];
   if (typeof window.pywebview.api.list_mentionable_files !== 'function') return [];
+  const requestCwd = currentCwd;
+  let files = [];
   try {
     const res = await window.pywebview.api.list_mentionable_files();
     if (res && res.ok && Array.isArray(res.files)) {
-      mentionFiles = res.files;
-      mentionFilesFresh = true;
-      return mentionFiles;
+      files = res.files;
     }
   } catch (err) {
     console.warn('list_mentionable_files failed', err);
   }
-  mentionFiles = [];
+  if (requestCwd !== currentCwd) {
+    // The fetch belongs to a session the researcher already left.
+    // Caching it would mark the cache fresh with the OLD session's
+    // rows — the focus handler's invalidateMentionCache ran before
+    // this response landed — so the next "@" in the new session
+    // would offer another session's file names and paths. Drop it;
+    // the next "@" here re-fetches for the session that's actually
+    // focused.
+    return [];
+  }
+  mentionFiles = files;
   mentionFilesFresh = true;
   return mentionFiles;
 }
@@ -3448,6 +3458,7 @@ async function triggerContextRecount(reason) {
 
   contextCountRequestId += 1;
   const id = contextCountRequestId;
+  const requestCwd = currentCwd;
   contextChip.classList.add('stale');
 
   // Pull whatever the composer currently shows. Empty when the chip
@@ -3475,6 +3486,14 @@ async function triggerContextRecount(reason) {
   if (!res || !res.ok) return;
   if (res.request_id !== contextCountRequestId) {
     // Stale response — newer recount in flight. Drop silently.
+    return;
+  }
+  if (requestCwd !== currentCwd) {
+    // Same id but a different session: focus moved after this
+    // recount fired and before the switch's own recount bumped the
+    // id. showChat already hid the chip for the new session; letting
+    // this response through would un-hide it with the OLD session's
+    // number.
     return;
   }
   lastContextCount = {
@@ -3560,11 +3579,20 @@ async function refreshFilesChip() {
   if (!filesChip) return;
   if (!window.pywebview || !window.pywebview.api) return;
   if (typeof window.pywebview.api.list_session_files !== 'function') return;
+  const requestCwd = currentCwd;
   let res;
   try {
     res = await window.pywebview.api.list_session_files();
   } catch (err) {
     console.warn('list_session_files failed', err);
+    return;
+  }
+  if (requestCwd !== currentCwd) {
+    // Focus moved while the listing was in flight. The chip and
+    // popup show the FOCUSED session's files; painting this
+    // response would list another session's artifacts here until
+    // the next refresh. The switch's own updatePolicyChip →
+    // refreshFilesChip call repaints for the new session.
     return;
   }
   const allFiles = (res && res.files) || [];
@@ -4261,6 +4289,7 @@ async function deleteSessionFile(path, displayName) {
   const ok = window.confirm(`Delete ${label}?\n\nThis cannot be undone.`);
   if (!ok) return;
   try {
+    const requestCwd = currentCwd;
     const res = await window.pywebview.api.delete_session_file(path);
     if (!res || !res.ok) {
       const reason = (res && res.reason) || 'unknown';
@@ -4268,6 +4297,19 @@ async function deleteSessionFile(path, displayName) {
       return;
     }
     toast('Deleted ' + (res.name || label) + '.', 'success');
+    // The chip splice below edits the FOCUSED composer's receipt
+    // chips. The backend unstaged from the session it deleted in
+    // (named in ``res.cwd``); if focus moved while the delete was in
+    // flight, splicing here would remove a same-named chip from a
+    // session whose attachment is still staged — an invisible
+    // ride-along, the exact desync the splice exists to prevent.
+    const stillFocused = (res && res.cwd)
+      ? res.cwd === currentCwd
+      : requestCwd === currentCwd;
+    if (!stillFocused) {
+      loadSessions();
+      return;
+    }
     refreshFilesChip();
     // Drop matching composer chips before re-rendering. ``res.unstaged``
     // is the authoritative list of staged names the backend just
@@ -4381,9 +4423,16 @@ function buildPolicyPopup(policy) {
         if (c) c.textContent = '●';
 
         try {
+          const requestCwd = currentCwd;
           const result = await window.pywebview.api.set_dataset_policy(
             d.name, tier.value
           );
+          // The backend applied (and names) the session it changed;
+          // the chip shows the focused one. Same rule as setModel —
+          // skip the repaint when they no longer match.
+          const stillFocused = (result && result.cwd)
+            ? result.cwd === currentCwd
+            : requestCwd === currentCwd;
           if (!result || !result.ok) {
             // Revert on failure.
             opt.classList.remove('selected');
@@ -4398,7 +4447,7 @@ function buildPolicyPopup(policy) {
             err.textContent = result && result.reason ? result.reason : 'failed';
             group.appendChild(err);
             setTimeout(() => err.remove(), 4000);
-          } else if (result.policy) {
+          } else if (result.policy && stillFocused) {
             updatePolicyChip(result.policy);
           }
         } catch (e) {
@@ -4462,9 +4511,18 @@ async function loadModels() {
    */
   if (!modelChip || !window.pywebview || !window.pywebview.api) return;
   if (typeof window.pywebview.api.list_models !== 'function') return;
+  const requestCwd = currentCwd;
   try {
     const res = await window.pywebview.api.list_models();
     if (!res || !res.ok) return;
+    if (requestCwd !== currentCwd) {
+      // ``res.current`` / ``res.current_effort`` are per-session.
+      // Focus moved while the fetch was in flight, so painting this
+      // response would advertise another session's model on the chip
+      // (setModel's guard exists for exactly this). The switch's own
+      // loadModels call repaints for the session actually focused.
+      return;
+    }
     availableModels = res.models || [];
     currentModelId = res.current;
     effortsByProvider = res.efforts_by_provider || {};
