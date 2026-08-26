@@ -3,8 +3,8 @@
 ``self.cwd`` follows the focused session and can change at any point
 inside a bridge method — pywebview runs each JS call on its own
 thread. A method that resolves a session at entry, then re-reads
-``self.cwd`` later, races the researcher's next click. Three bugs came
-from this, all of which moved data between unrelated sessions.
+``self.cwd`` later, races the researcher's next click. Several bugs
+came from this, all of which moved data between unrelated sessions.
 
 Each test forces the race by patching a seam that runs after the entry
 check and before the session-dependent work. Don't switch these to
@@ -268,6 +268,115 @@ def test_upload_without_a_named_session_uses_the_focused_one(
 
 
 # ---------------------------------------------------------------------------
+# 2b. add_files (native picker)
+# ---------------------------------------------------------------------------
+
+def test_native_picker_files_land_in_the_session_that_opened_it(
+    tmp_path: Path,
+) -> None:
+    """Files picked via "+" must land in the session whose button was
+    clicked, even if the researcher switches while the dialog is open.
+
+    The old code captured ``self.cwd`` only after the dialog returned,
+    so a focus switch while it sat open re-routed the whole selection
+    — bytes on disk AND the inline script description — into the
+    newly-focused session.
+    """
+    a = _mk_session(tmp_path, "A")
+    b = _mk_session(tmp_path, "B")
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    data = outside / "A-data.csv"
+    data.write_text("col1,col2\n1,2\n")
+    script = outside / "A-analysis.py"
+    script.write_text("import pandas as pd\nprint(secret_df.head())\n")
+
+    bridge = NoraBridge(cwd=None)
+    bridge._set_cwd(a)
+
+    class _DialogSwitchesFocus:
+        def create_file_dialog(self, *args: Any, **kwargs: Any):
+            bridge._set_cwd(b)  # researcher clicks session B mid-dialog
+            return [str(data), str(script)]
+
+    bridge._window = _DialogSwitchesFocus()  # type: ignore[assignment]
+    res = bridge.add_files()
+
+    assert res["ok"] is True
+    # The response names the session the files went to, so the
+    # frontend can refuse to stage the returned images / receipts
+    # onto the now-focused composer.
+    assert Path(res["cwd"]).resolve() == a.resolve()
+    assert (a / "A-data.csv").exists() and (a / "A-analysis.py").exists(), (
+        "the picked files must land in the session that opened the picker"
+    )
+    assert not (b / "A-data.csv").exists() and not (b / "A-analysis.py").exists(), (
+        "the files must NOT follow the focus switch into another session"
+    )
+    staged_a = bridge._runners[str(a.resolve())].pending_script_attachments
+    assert [s["name"] for s in staged_a] == ["A-analysis.py"]
+    assert bridge._runners[str(b.resolve())].pending_script_attachments == [], (
+        "the session merely focused mid-dialog must not be handed "
+        "another session's source"
+    )
+
+
+# ---------------------------------------------------------------------------
+# 2c. attach_session_file (@-mention / Files panel)
+# ---------------------------------------------------------------------------
+
+def test_mentioned_file_stages_into_the_session_that_resolved_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An @-mentioned file must stage on the session it was resolved
+    against, even if the researcher switches before staging happens.
+
+    The old code resolved and read the file against the session
+    focused at entry but asked for the FOCUSED runner at the end, so
+    a switch in between appended A's script contents to B's pending
+    attachments — B's next prompt carried source from an unrelated
+    analysis.
+    """
+    a = _mk_session(tmp_path, "A")
+    b = _mk_session(tmp_path, "B")
+    (a / "A-secret.py").write_text("print('confidential')\n")
+
+    bridge = NoraBridge(cwd=None)
+    bridge._set_cwd(a)
+    bridge._ensure_runner_for_cwd(b)
+
+    # Seam: runs after the entry check, before resolution / staging.
+    import nora.session_files as session_files
+    real_visible = session_files.visible_run_dir_names
+    fired = {"done": False}
+
+    def visible_then_switch(*args: Any, **kwargs: Any):
+        if not fired["done"]:
+            fired["done"] = True
+            bridge._set_cwd(b)  # researcher clicks session B mid-attach
+        return real_visible(*args, **kwargs)
+
+    monkeypatch.setattr(
+        session_files, "visible_run_dir_names", visible_then_switch,
+    )
+    res = bridge.attach_session_file("A-secret.py")
+
+    assert res["ok"] is True
+    # The response names the session the file was staged on, so the
+    # frontend can skip its receipt chip when focus already moved.
+    assert Path(res["cwd"]).resolve() == a.resolve()
+    staged_a = bridge._runners[str(a.resolve())].pending_script_attachments
+    assert [s["name"] for s in staged_a] == ["A-secret.py"], (
+        "the mention must stage on the session it was resolved against"
+    )
+    assert bridge._runners[str(b.resolve())].pending_script_attachments == [], (
+        "the session merely focused mid-attach must not be handed "
+        "another session's script contents"
+    )
+    assert bridge._runners[str(b.resolve())].pending_mentioned_files == []
+
+
+# ---------------------------------------------------------------------------
 # 3. set_model / set_effort persistence
 # ---------------------------------------------------------------------------
 
@@ -461,4 +570,117 @@ def test_image_staging_checks_focus_before_touching_the_composer() -> None:
     ), (
         "stageImageFile pushes into the composer without checking that "
         "the drop's session is still focused"
+    )
+
+
+def test_add_files_button_gates_staging_on_focus() -> None:
+    """The "+" handler must not stage the backend's returned images
+    into the composer when focus moved during the dialog / copy.
+
+    ``stagedImages`` is global composer state; an unconditional push
+    after the ``add_files`` await lands just past the focus handler's
+    clear and rides another session's image on the next message here.
+    The backend pins the copy and names its session in ``res.cwd`` —
+    the handler must compare that against the focused one.
+    """
+    code = _app_js_without_comments()
+    block = code.split("addFilesBtn.addEventListener('click'", 1)[1]
+    block = block.split("\n  });", 1)[0]
+
+    assert "const requestCwd = currentCwd;" in block, (
+        "the add-files handler must capture the focused session "
+        "before its await"
+    )
+    assert "stillFocused" in block, (
+        "the add-files handler must gate on focus being unchanged"
+    )
+    assert block.index("if (!stillFocused)") < block.index(
+        "stagedImages.push("
+    ), (
+        "the add-files handler pushes into the composer before "
+        "checking that the picker's session is still focused"
+    )
+
+
+def test_mention_receipt_is_gated_on_focus() -> None:
+    """``stageMentionedFile``'s receipt chip paints the focused
+    composer. The backend stages onto the session it names in
+    ``res.cwd``; when that isn't the focused one any more, painting
+    the chip advertises another session's attachment here."""
+    import re
+
+    code = _app_js_without_comments()
+    m = re.search(
+        r"async function stageMentionedFile\(.*?\n\}\n", code, re.DOTALL
+    )
+    assert m is not None, "stageMentionedFile not found"
+    body = m.group(0)
+
+    assert "const requestCwd = currentCwd;" in body, (
+        "stageMentionedFile must capture the focused session before "
+        "its await"
+    )
+    assert body.index("stillFocused") < body.index(
+        "addStagedDataNotices("
+    ), (
+        "stageMentionedFile paints its receipt chip without checking "
+        "that the mention's session is still focused"
+    )
+
+
+def test_switch_session_drops_superseded_responses() -> None:
+    """Rapid A→B→C clicking puts two ``switch_session`` responses in
+    flight at once, and they can settle in either order. Applying
+    every response unconditionally lets a late loser repaint the UI
+    to a session the researcher already left — visibly showing one
+    session while the backend focuses another, so the next
+    focus-routed call lands in the wrong one. Each switchSession call
+    must take a ticket and only the NEWEST may apply its response."""
+    import re
+
+    code = _app_js_without_comments()
+    m = re.search(
+        r"async function switchSession\(.*?\n\}\n", code, re.DOTALL
+    )
+    assert m is not None, "switchSession not found"
+    body = m.group(0)
+
+    assert "const seq = ++switchSeq;" in body, (
+        "switchSession must take a monotonic ticket before its await"
+    )
+    assert body.index("const seq = ++switchSeq;") < body.index(
+        "await window.pywebview.api.switch_session("
+    ), "the ticket must be taken before the switch await, not after"
+    assert "seq !== switchSeq" in body, (
+        "switchSession must compare its ticket after the await and "
+        "drop superseded responses"
+    )
+    assert body.index("seq !== switchSeq") < body.index("showChat(res)"), (
+        "the supersession check must run before the response is "
+        "applied to the UI"
+    )
+
+
+def test_direct_sends_name_their_session() -> None:
+    """The composer submit and the rewind resend must use the
+    explicit-target ``_to_session`` send variants.
+
+    The plain ``send_message`` routes to the bridge's focused cwd at
+    the moment the RPC ARRIVES — so a session switch in flight when
+    the researcher hits Enter (its response pending, or its backend
+    focus change already landed) sends the message into the session
+    being switched to while its bubble renders in the one on screen.
+    The queue-flush path already routes explicitly for the same
+    reason; the direct paths must too."""
+    code = _app_js_without_comments()
+    assert "send_message_to_session(sendCwd, text)" in code, (
+        "the composer's text send must name the session captured at "
+        "submit time"
+    )
+    assert "send_message_with_images_to_session(sendCwd, text, payload)" in code, (
+        "the composer's image send must name the session captured at "
+        "submit time"
+    )
+    assert "send_message_to_session(rewindCwd, newText)" in code, (
+        "the rewind resend must name the session that was rewound"
     )

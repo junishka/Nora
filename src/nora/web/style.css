@@ -3385,27 +3385,58 @@ kbd {
 }
 
 #model-popup {
-  /* Anchor to the wrapper's RIGHT edge, not the left. The shared
-   * .policy-popup rule uses `left: 0`, which is right for the
-   * permission chip (it sits at the left end of the composer row)
-   * but wrong here: the model chip sits at the right end, so a
-   * left-anchored 320px popup ran ~170px past the viewport at the
-   * default 960px window and forced a horizontal scroll to read.
-   * Opening leftward from the chip keeps it on screen at any
-   * window width.
+  /* Position against the VIEWPORT, not the chip wrapper. The shared
+   * .policy-popup rule left-anchors to its wrap, which put this
+   * popup ~170px past the right edge of the default 960px window; a
+   * first fix re-anchored it `right: 0` with a viewport-clamped
+   * max-width, but any wrap-relative anchor inherits the wrap's
+   * inset from the window edge — footer padding plus, mid-session,
+   * the context chip (up to ~110px at narrow widths) — which no
+   * static calc() can see. The window is freely resizable with no
+   * minimum size, and measured against the real layout the old
+   * anchoring put the popup's left at -28px at 320px wide and its
+   * top at -92px at 480x320, with the shared min-width: 320px
+   * beating the viewport clamp (min-width wins over max-width).
    *
-   * max-width is additionally clamped to the viewport so a narrow
-   * window can't reintroduce the overflow from the other side. */
+   * position: fixed makes the viewport the containing block, so
+   * every clamp below is exact. No ancestor creates a fixed-pos
+   * containing block (no transform / filter / contain up the
+   * chain — keep it that way). The offsets reproduce where the
+   * chip anchor visually put it: bottom 48px sits 8px above the
+   * chip row, right 12px matches the composer's edge padding. */
+  position: fixed;
   left: auto;
-  right: 0;
+  right: 12px;
+  bottom: 48px;
   max-width: min(560px, calc(100vw - 24px));
+  /* The shared rule's min-width: 320px must yield to the same
+   * viewport clamp, or it reintroduces the horizontal overflow the
+   * max-width exists to prevent. */
+  min-width: min(320px, calc(100vw - 24px));
 
   /* Override the shared .policy-popup's overflow-y: auto so the
    * per-option hover tooltips aren't clipped when they extend
    * outside the popup's edge. The list is short (five models plus
-   * the effort bar), so max-height scrolling isn't needed. */
+   * the effort bar), so max-height scrolling isn't needed at
+   * normal window heights. */
   overflow: visible;
   max-height: none;
+}
+
+/* Short windows: the popup is ~364px tall and needs ~425px of
+ * window height to clear its bottom offset; below that the top ran
+ * off-screen (measured: top -12px at 600x400, -92px at 480x320)
+ * and, with overflow: visible, the clipped options were unreachable.
+ * Cap it to the viewport and restore scrolling. The hover tooltips
+ * clip in this state — acceptable: they only annotate un-authed
+ * models, whose click still lands on the auth screen. 500px leaves
+ * headroom over today's content height so a grown model list fails
+ * soft (scrolls) rather than off-screen. */
+@media (max-height: 500px) {
+  #model-popup {
+    max-height: calc(100vh - 60px);
+    overflow-y: auto;
+  }
 }
 
 .model-option[data-tooltip]:hover::after {

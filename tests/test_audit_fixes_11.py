@@ -1002,12 +1002,21 @@ def test_clear_pending_for_session_does_not_clear_queued_frozen_snapshots(
     assert "token-queued" in runner.frozen_pending_attachments
 
 
-def test_switch_session_calls_clear_pending_for_leaving_session() -> None:
+def test_switch_session_clears_leaving_session_only_after_success() -> None:
     """JS-side structural check: ``switchSession`` must call
-    ``clear_pending_for_session`` against the LEAVING session before
-    swapping focus. Without that call the backend pending lists for
-    the leaving session survive hidden, and the next plain message
-    on return inlines the (no-longer-visible) staged attachment.
+    ``clear_pending_for_session`` against the LEAVING session — but
+    only AFTER the switch is known to have succeeded, and addressed
+    by the ``leavingCwd`` captured before the await (so it still
+    targets the OLD session, not the new focus).
+
+    Both halves matter. Without the clear, the backend pending lists
+    for the leaving session survive hidden and the next plain message
+    on return inlines the (no-longer-visible) staged attachment. But
+    clearing BEFORE the switch — the original ordering — erased the
+    attachments behind the still-visible chips whenever the switch
+    failed: the researcher stayed on the old session with its chips
+    painted while the runner's lists were already empty, so the next
+    message silently sent without them.
     """
     app_js = Path(__file__).resolve().parent.parent / "src" / "nora" / "web" / "app.js"
     src = app_js.read_text(encoding="utf-8")
@@ -1028,13 +1037,22 @@ def test_switch_session_calls_clear_pending_for_leaving_session() -> None:
         "leaving session — without it, attachments staged in the prior "
         "session ride invisibly with that session's next plain message"
     )
-    # The clear must happen before the focus swap, so it targets the
-    # OLD cwd (``leavingCwd``), not the new one.
-    clear_idx = body.find("clear_pending_for_session")
+    leaving_idx = body.find("const leavingCwd = currentCwd;")
     switch_idx = body.find("switch_session(")
-    assert 0 <= clear_idx < switch_idx, (
-        "clear_pending_for_session must be invoked BEFORE switch_session, "
-        "while currentCwd still points at the session being left"
+    ok_idx = body.find("res.ok")
+    clear_idx = body.find("clear_pending_for_session")
+    assert 0 <= leaving_idx < switch_idx, (
+        "the leaving session must be captured before the switch await, "
+        "so the clear targets the OLD cwd even after focus moves"
+    )
+    assert 0 <= switch_idx < clear_idx, (
+        "clear_pending_for_session must run only after switch_session "
+        "resolves — clearing first destroys the attachments behind the "
+        "still-visible chips when the switch fails"
+    )
+    assert 0 <= ok_idx < clear_idx, (
+        "the clear must be gated on the switch actually succeeding "
+        "(res.ok), not merely on the RPC resolving"
     )
 
 
