@@ -525,3 +525,213 @@ def test_list_results_global_skips_symlink_escape(
     assert "legit row" in labels
     # The symlinked-out content must NOT appear.
     assert "LEAKED through symlink" not in labels
+
+
+# ---------------------------------------------------------------------------
+# compose_results — cross-session rows
+# ---------------------------------------------------------------------------
+#
+# Every session's store numbers results from M1, so "compare this
+# session's M1 with that session's M1" is the NORMAL cross-session
+# composition, not an edge case. The renderer keys cells by
+# result_id alone; compose_results therefore re-keys cross-session
+# rows onto call-private aliases before rendering (see the handler).
+# These tests pin the observable contract: colliding ids compose
+# cleanly, a denied foreign row can't borrow the local payload, and
+# the alias never leaks into researcher-facing output.
+
+
+def _insert_regression_result(
+    cwd: Path, *, label: str, estimate: float,
+) -> StoredResult:
+    """Plant a regression-shaped result whose composed cell carries a
+    recognizable estimate, so tests can tell WHICH session's payload
+    rendered into a row."""
+    store = get_store(cwd)
+    return store.insert(
+        label=label,
+        analysis_type="linear_regression",
+        sanitized_payload={
+            "type": "linear_regression",
+            "coefficients": {"x": estimate},
+            "standard_errors": {"x": 0.05},
+            "p_values": {"x": 0.01},
+            "n": 100,
+        },
+        language="R",
+        script_code="lm(y ~ x, data=df)",
+        transformations=[],
+        raw_log_path=None,
+    )
+
+
+def _compose_spec(rows: list) -> dict:
+    return {
+        "columns": [{"id": "x", "label": "x"}],
+        "groups": [{"rows": rows}],
+    }
+
+
+def test_compose_results_local_rows_happy_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Baseline: two local results compose without any cross-session
+    machinery involved."""
+    _patch_sessions_root(monkeypatch, tmp_path)
+    current = tmp_path / "20260101T000000Z_current"
+    current.mkdir()
+    _insert_regression_result(current, label="ln_revenue", estimate=0.111)
+    _insert_regression_result(current, label="ln_expenses", estimate=0.333)
+
+    with use_cwd(current):
+        res = asyncio.run(HANDLERS["compose_results"]({
+            "spec": _compose_spec(["M1", "M2"]),
+        }))
+    body = _mcp_text(res)
+    assert body["status"] == "ok"
+    assert body["rows_rendered"] == 2
+    md = body["markdown"]
+    assert "ln_revenue" in md and "ln_expenses" in md
+    assert "0.111" in md and "0.333" in md
+    assert "missing_result_ids" not in body
+
+
+def test_compose_results_same_result_id_across_sessions_renders_both(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The headline cross-session case: this session's M1 next to
+    another session's M1 in one table. Both sessions' stores assign
+    M1 independently; the composite must render BOTH payloads, each
+    under its own stored label, with no collision error and no
+    internal alias leaking into the markdown."""
+    monkeypatch.setenv("NORA_ALLOW_CROSS_SESSION_RECALL", "1")
+    _patch_sessions_root(monkeypatch, tmp_path)
+    current = tmp_path / "20260101T000000Z_current"
+    other = tmp_path / "20260101T000000Z_other"
+    for d in (current, other):
+        d.mkdir()
+    local = _insert_regression_result(
+        current, label="this project", estimate=0.111,
+    )
+    foreign = _insert_regression_result(
+        other, label="prior project", estimate=0.222,
+    )
+    # The collision under test: independent stores, identical ids.
+    assert local.id == foreign.id == "M1"
+
+    with use_cwd(current):
+        res = asyncio.run(HANDLERS["compose_results"]({
+            "spec": _compose_spec([
+                "M1",
+                {"result_id": "M1", "session_path": str(other)},
+            ]),
+        }))
+    body = _mcp_text(res)
+    assert body["status"] == "ok", body.get("reason")
+    assert body["rows_rendered"] == 2
+    md = body["markdown"]
+    assert "this project" in md and "prior project" in md
+    assert "0.111" in md and "0.222" in md
+    # The re-keying alias is an internal render key only.
+    assert "\x1f" not in md
+    # Researcher-facing id list keeps the original ids.
+    assert body["result_ids_referenced"] == ["M1"]
+
+
+def test_compose_results_denied_foreign_row_cannot_borrow_local_payload(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """With the env gate OFF, a row naming another session renders as
+    a missing-result em-dash — and specifically must NOT pick up the
+    local store's payload for the same id through the shared render
+    key. (Pre-fix, the renderer keyed by bare rid, so a denied
+    foreign M1 silently rendered the local M1's numbers.)"""
+    _patch_sessions_root(monkeypatch, tmp_path)
+    current = tmp_path / "20260101T000000Z_current"
+    other = tmp_path / "20260101T000000Z_other"
+    for d in (current, other):
+        d.mkdir()
+    _insert_regression_result(current, label="this project", estimate=0.111)
+    _insert_regression_result(other, label="prior project", estimate=0.222)
+
+    with use_cwd(current):
+        res = asyncio.run(HANDLERS["compose_results"]({
+            "spec": _compose_spec([
+                "M1",
+                {
+                    "result_id": "M1",
+                    "session_path": str(other),
+                    "label": "prior project",
+                },
+            ]),
+        }))
+    body = _mcp_text(res)
+    assert body["status"] == "ok"
+    md = body["markdown"]
+    # Local row renders its own numbers; denied row renders em-dash.
+    assert "0.111" in md
+    assert "0.222" not in md
+    assert "—" in md
+    assert body["denied_result_ids"] == ["M1"]
+    assert "NORA_ALLOW_CROSS_SESSION_RECALL" in body["hint"]
+
+
+def test_compose_results_missing_foreign_id_keeps_readable_label(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A cross-session row whose id isn't in the target store renders
+    with the ORIGINAL rid as its row label (never the internal
+    alias), em-dash cells, and lands in missing_result_ids."""
+    monkeypatch.setenv("NORA_ALLOW_CROSS_SESSION_RECALL", "1")
+    _patch_sessions_root(monkeypatch, tmp_path)
+    current = tmp_path / "20260101T000000Z_current"
+    other = tmp_path / "20260101T000000Z_other"
+    for d in (current, other):
+        d.mkdir()
+
+    with use_cwd(current):
+        res = asyncio.run(HANDLERS["compose_results"]({
+            "spec": _compose_spec([
+                {"result_id": "M9", "session_path": str(other)},
+            ]),
+        }))
+    body = _mcp_text(res)
+    assert body["status"] == "ok"
+    assert body["missing_result_ids"] == ["M9"]
+    md = body["markdown"]
+    assert "M9" in md
+    assert "\x1f" not in md
+    assert "—" in md
+
+
+def test_compose_results_two_spellings_of_same_session_both_render(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Two rows naming the same foreign session through different
+    path spellings mint two aliases but resolve to one store — both
+    rows must render the payload (the lookup cache fills every alias,
+    it doesn't skip repeats)."""
+    monkeypatch.setenv("NORA_ALLOW_CROSS_SESSION_RECALL", "1")
+    _patch_sessions_root(monkeypatch, tmp_path)
+    current = tmp_path / "20260101T000000Z_current"
+    other = tmp_path / "20260101T000000Z_other"
+    for d in (current, other):
+        d.mkdir()
+    _insert_regression_result(other, label="prior project", estimate=0.222)
+
+    spelling_a = str(other)
+    spelling_b = str(other) + "/"
+    with use_cwd(current):
+        res = asyncio.run(HANDLERS["compose_results"]({
+            "spec": _compose_spec([
+                {"result_id": "M1", "session_path": spelling_a,
+                 "label": "row one"},
+                {"result_id": "M1", "session_path": spelling_b,
+                 "label": "row two"},
+            ]),
+        }))
+    body = _mcp_text(res)
+    assert body["status"] == "ok"
+    md = body["markdown"]
+    assert md.count("0.222") == 2, md
+    assert "row one" in md and "row two" in md

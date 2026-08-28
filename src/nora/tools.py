@@ -2545,6 +2545,20 @@ async def compose_results(args: dict[str, Any]) -> dict[str, Any]:
     payloads are pre-sanitized at write time, so cross-session reads
     don't leak unsanitized data — the env gate exists because some
     researchers want explicit project separation regardless.
+
+    Cross-session rows are re-keyed before rendering. The renderer
+    (``compose_layout``) keys payload cells by ``result_id`` alone,
+    but every session's store numbers results from ``M1`` — so the
+    canonical cross-session composition ("this run vs. the previous
+    project's run") collides on the bare id almost by construction,
+    and neither the researcher nor the model can avoid it: ids are
+    store-assigned, and ``session_path`` is a lookup hint, not a
+    render key. We therefore hand the renderer a deep copy of the
+    spec in which each cross-session row's ``result_id`` is replaced
+    by a call-private alias, with the label maps guaranteeing the
+    alias never surfaces in the rendered table. All researcher-facing
+    fields of the response (``missing_result_ids``,
+    ``result_ids_referenced``, hints) keep the original ids.
     """
     spec = args.get("spec")
     if not isinstance(spec, dict):
@@ -2569,14 +2583,51 @@ async def compose_results(args: dict[str, Any]) -> dict[str, Any]:
     cwd = get_cwd()
     cross_enabled = _cross_session_enabled()
 
-    # Walk the spec collecting (rid, session_path) pairs for lookup.
-    # Each row's session_path is optional — when absent we resolve to
-    # the current session. Two row shapes accepted (mirroring
-    # ``compose_layout``): a bare result_id string (minimal-friction
-    # form, store provides the label) OR an explicit dict with
-    # ``result_id`` and optional ``label`` / ``session_path`` overrides.
+    # Walk a DEEP COPY of the spec, resolving every row to a payload
+    # and re-keying cross-session rows as we go. Two row shapes
+    # accepted (mirroring ``compose_layout``): a bare result_id
+    # string (minimal-friction form, store provides the label; can't
+    # carry a session_path) OR an explicit dict with ``result_id``
+    # and optional ``label`` / ``session_path`` overrides.
+    #
+    # Re-keying is what makes cross-session composition work at all:
+    # the renderer looks payloads up by result_id alone, and every
+    # session's store numbers from M1, so "compare this session's M1
+    # with that session's M1" is the NORMAL cross-session shape, not
+    # an edge case. Each row that names another session gets a call-
+    # private alias (original rid + an unrenderable unit-separator
+    # suffix) as its render key. The alias never reaches the
+    # researcher: ``labels_by_id`` always carries an entry for it
+    # (the stored label, or the original rid as fallback), so the
+    # rendered row label stays human-readable even for a missing or
+    # denied cross-session id. The deep copy is bounded by the
+    # layout caps validated above.
+    import copy
+    spec_render = copy.deepcopy(spec)
+    # (raw session_path, rid) → alias. Keyed on the raw string the
+    # model typed (not the resolved path) so the rewrite below can
+    # look aliases up without re-resolving; two spellings of the same
+    # session simply mint two aliases that resolve to the same
+    # payload, which renders identically.
+    alias_by_key: dict[tuple[str, str], str] = {}
+    # (resolved session dir, rid) → stored row or None. Cache so a
+    # rid referenced by several rows (or via several session_path
+    # spellings) costs one disk read, while every alias still gets
+    # its payload — the previous shape skipped repeat lookups
+    # entirely, which the per-alias keying can no longer afford.
+    lookup_cache: dict[tuple[str, str], Any] = {}
     referenced: list[tuple[str, str | None]] = []
-    groups = spec.get("groups")
+    payloads_by_id: dict[str, dict[str, Any]] = {}
+    # Store-resolved helper-call label per RENDER key (bare rid for
+    # local rows, alias for cross-session rows), used by
+    # ``compose_layout`` to auto-label rows when the spec uses the
+    # bare-string row shape. Keeps the model from having to re-type
+    # labels it already named at script time.
+    labels_by_id: dict[str, str] = {}
+    missing: list[str] = []
+    denied: list[str] = []
+
+    groups = spec_render.get("groups")
     if isinstance(groups, list):
         for group in groups:
             if not isinstance(group, dict):
@@ -2586,105 +2637,67 @@ async def compose_results(args: dict[str, Any]) -> dict[str, Any]:
                 continue
             for row in rows:
                 if isinstance(row, str):
-                    if row:
-                        referenced.append((row, None))
+                    rid = row
+                    sp: str | None = None
+                    if not rid:
+                        continue
+                elif isinstance(row, dict):
+                    rid_val = row.get("result_id")
+                    if not isinstance(rid_val, str) or not rid_val:
+                        continue
+                    rid = rid_val
+                    sp_val = row.get("session_path")
+                    sp = sp_val if isinstance(sp_val, str) and sp_val else None
+                else:
                     continue
-                if not isinstance(row, dict):
-                    continue
-                rid = row.get("result_id")
-                if not isinstance(rid, str) or not rid:
-                    continue
-                sp = row.get("session_path")
-                referenced.append(
-                    (rid, sp if isinstance(sp, str) and sp else None)
-                )
+                referenced.append((rid, sp))
 
-    # Resolve each (rid, session) once. Dedupe on the (session, rid)
-    # pair so an unsanitized session_path collision doesn't trigger
-    # multiple disk reads. If the same rid appears with both no
-    # session_path and a session_path pointing to a different session,
-    # we treat them as distinct lookups but the layout's payload dict
-    # is keyed by rid alone — which means a model that emits two
-    # rows with the same rid pointing at different sessions gets
-    # last-write-wins behavior. Surfaced via the
-    # ``rid_collisions_across_sessions`` hint when it actually fires.
-    payloads_by_id: dict[str, dict[str, Any]] = {}
-    # Store-resolved helper-call label per rid, used by
-    # ``compose_layout`` to auto-label rows when the spec uses the
-    # bare-string row shape. Keeps the model from having to re-type
-    # labels it already named at script time.
-    labels_by_id: dict[str, str] = {}
-    missing: list[str] = []
-    denied: list[str] = []
-    collisions: list[str] = []
-    seen: set[tuple[str, str]] = set()
-    for rid, sp in referenced:
-        if sp is None:
-            target_cwd: Path | None = cwd
-        elif not cross_enabled:
-            denied.append(rid)
-            continue
-        else:
-            target_cwd = _resolve_cross_session_cwd(sp)
-            if target_cwd is None:
-                denied.append(rid)
-                continue
-        key = (str(target_cwd), rid)
-        if key in seen:
-            continue
-        seen.add(key)
-        store = get_store(target_cwd)
-        row_obj = store.get(rid)
-        if row_obj is None:
-            missing.append(rid)
-            continue
-        if isinstance(row_obj.sanitized_payload, dict):
-            if rid in payloads_by_id and payloads_by_id[rid] is not row_obj.sanitized_payload:
-                # Same rid resolved to different payloads from
-                # different sessions. The layout can only key cells
-                # by rid, so the second payload would silently
-                # overwrite the first AND the rendered table would
-                # show the wrong numbers under that row's label
-                # before the model ever saw the collision hint.
-                # Flag for the rejection check below.
-                collisions.append(rid)
-            else:
-                payloads_by_id[rid] = row_obj.sanitized_payload
-                # Stored label only on first resolution — colliding
-                # rids hit the error path above anyway.
+                # Resolve the row's store. ``None`` target ⇒ the row
+                # stays payload-less and renders as ``—``.
+                if sp is None:
+                    target_cwd: Path | None = cwd
+                elif not cross_enabled:
+                    denied.append(rid)
+                    target_cwd = None
+                else:
+                    target_cwd = _resolve_cross_session_cwd(sp)
+                    if target_cwd is None:
+                        denied.append(rid)
+
+                # Re-key any row that names a session other than the
+                # current one — including denied / unresolvable rows,
+                # so a foreign ``M1`` can never borrow the local
+                # ``M1``'s numbers through the shared render key.
+                if sp is not None and target_cwd != cwd:
+                    akey = (sp, rid)
+                    alias = alias_by_key.get(akey)
+                    if alias is None:
+                        alias = f"{rid}\x1f{len(alias_by_key)}"
+                        alias_by_key[akey] = alias
+                    row["result_id"] = alias  # dict row by construction
+                    render_key = alias
+                    # Fallback label first; the stored label below
+                    # overrides it when the lookup succeeds.
+                    labels_by_id.setdefault(alias, rid)
+                else:
+                    render_key = rid
+
+                if target_cwd is None:
+                    continue
+                ckey = (str(target_cwd), rid)
+                if ckey not in lookup_cache:
+                    lookup_cache[ckey] = get_store(target_cwd).get(rid)
+                row_obj = lookup_cache[ckey]
+                if row_obj is None:
+                    missing.append(rid)
+                    continue
+                if isinstance(row_obj.sanitized_payload, dict):
+                    payloads_by_id[render_key] = row_obj.sanitized_payload
                 if isinstance(row_obj.label, str) and row_obj.label:
-                    labels_by_id[rid] = row_obj.label
-
-    # Hard-reject the spec when ANY rid resolves to two different
-    # cross-session payloads. Earlier behavior assigned the second
-    # payload anyway (last-write-wins) and only emitted a hint
-    # alongside ``status: ok``, which meant the markdown the model
-    # received was already wrong by the time the hint advised it to
-    # rename. Returning ``status: error`` before rendering forces
-    # the model to disambiguate (use ``session_path`` on one of the
-    # rows, or rename one of the source results) before any wrong
-    # numbers cross.
-    if collisions:
-        unique_collisions = sorted(set(collisions))
-        return _as_mcp_text({
-            "status": "error",
-            "reason": (
-                f"{len(unique_collisions)} result_id(s) resolved to "
-                f"different payloads across sessions: "
-                f"{unique_collisions}. compose_results keys cells by "
-                f"result_id alone, so a colliding pair would render "
-                f"with the wrong numbers under whichever row "
-                f"appeared last. Disambiguate by (a) adding an "
-                f"explicit ``session_path`` to one of the rows so the "
-                f"renderer can resolve them distinctly, or (b) "
-                f"renaming one of the source results so the IDs no "
-                f"longer collide."
-            ),
-            "rid_collisions_across_sessions": unique_collisions,
-        })
+                    labels_by_id[render_key] = row_obj.label
 
     from nora.result_render import compose_layout
-    markdown = compose_layout(spec, payloads_by_id, labels_by_id)
+    markdown = compose_layout(spec_render, payloads_by_id, labels_by_id)
     if markdown is None:
         return _as_mcp_text({
             "status": "error",
@@ -2734,12 +2747,6 @@ async def compose_results(args: dict[str, Any]) -> dict[str, Any]:
             f"{response['hint']}\n{gate_msg}".strip()
             if response["hint"] else gate_msg
         )
-    # ``collisions`` was previously surfaced as a post-render hint
-    # alongside ``status: ok``. The compose path now returns early
-    # with ``status: error`` on any cross-session rid collision (see
-    # the rejection block above ``compose_layout``), so by the time
-    # we reach this response builder ``collisions`` is empty by
-    # construction.
     return _as_mcp_text(response)
 
 

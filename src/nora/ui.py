@@ -5383,24 +5383,39 @@ def _materialize_cache_busted_index(web_dir: Path, index_path: Path) -> Path:
     Bundle-safety: in a packaged macOS .app, ``web_dir`` lives under
     ``Contents/Resources/nora/web/`` — sealed by codesign. Writing
     the bust file there at first launch modifies the bundle and
-    breaks ``spctl --assess`` ("sealed resource is missing or
-    invalid"), blocking Gatekeeper on clean installs. When ``web_dir``
-    isn't writable we route the bust file to a process-private temp
-    directory and inject a ``<base href>`` so the bust file (now
-    outside ``web_dir``) still resolves the HTML's relative
-    ``app.js`` / ``style.css`` / image refs back to the bundle's
-    web_dir.
+    breaks strict signature verification (``codesign --verify
+    --strict``: "sealed resource is missing or invalid"), which can
+    block Gatekeeper on clean installs and trips anything else that
+    checks bundle integrity (MDM, updaters). Filesystem writability
+    is NOT a usable discriminator here: a drag-installed .app is
+    owned by the installing user and therefore writable while still
+    being sealed, so a "writable → co-locate with assets" branch
+    writes into the bundle on exactly the installs it's meant to
+    protect. Instead the bust file ALWAYS goes to a process-private
+    temp directory, with a ``<base href>`` injected so the HTML's
+    relative ``app.js`` / ``style.css`` / image refs resolve back to
+    ``web_dir``. pywebview loads the page over ``file://``, where
+    ``<base>`` applies to scripts, stylesheets, and images alike —
+    this is the same mechanism the packaged app has always relied
+    on when web_dir was root-owned.
 
     Falls back to the original index_path on any error — cache busting
     is a polish feature, not a correctness one.
     """
     import hashlib
-    import os
     import re
     import tempfile
     try:
         stamps: list[str] = []
         for child in sorted(web_dir.iterdir()):
+            if child.name.startswith(".index.bust-"):
+                # Leftover bust files (written into web_dir by builds
+                # that predate the temp-dir routing below) must not
+                # feed the hash: a bust file's mtime changes every
+                # launch, so including it rolls the build id — and
+                # thus busts every cache — on each start even when no
+                # asset changed.
+                continue
             if child.suffix.lower() in {".js", ".css", ".html"}:
                 try:
                     stamps.append(f"{child.name}:{child.stat().st_mtime_ns}")
@@ -5410,38 +5425,31 @@ def _materialize_cache_busted_index(web_dir: Path, index_path: Path) -> Path:
             return index_path
         build_id = hashlib.sha256("\n".join(stamps).encode()).hexdigest()[:12]
 
-        # Pick the output directory based on whether ``web_dir`` is
-        # writable. Dev mode keeps the bust file co-located with
-        # assets so relative refs resolve as before; packaged-app /
-        # read-only-web_dir mode routes to a temp directory and adds
-        # a ``<base>`` tag so relative refs still resolve.
-        web_dir_writable = os.access(web_dir, os.W_OK)
-        if web_dir_writable:
-            out_dir = web_dir
-            base_tag = ""
-        else:
-            out_dir = Path(tempfile.gettempdir()) / "nora-cache-bust"
-            try:
-                out_dir.mkdir(parents=True, exist_ok=True)
-            except OSError:
-                return index_path
-            base_tag = (
-                f'<base href="{web_dir.resolve().as_uri()}/" />\n'
-            )
+        out_dir = Path(tempfile.gettempdir()) / "nora-cache-bust"
+        try:
+            out_dir.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            return index_path
+        base_tag = (
+            f'<base href="{web_dir.resolve().as_uri()}/" />\n'
+        )
 
-        # Wipe stale ``.index.bust-*.html`` siblings before generating
-        # a fresh one. Without this, every launch leaves a new sibling
-        # in ``out_dir`` and the directory accumulates indefinitely
-        # (each iteration on app.js / style.css produced one). Also
-        # avoids confusion when reading mtimes during debugging — only
-        # the live bust-file should be present after startup.
-        for stale in out_dir.glob(".index.bust-*.html"):
-            try:
-                stale.unlink()
-            except OSError:
-                # Best-effort cleanup — don't crash the launch if a
-                # sibling is locked / read-only / already gone.
-                continue
+        # Wipe stale ``.index.bust-*.html`` files before generating a
+        # fresh one — both in ``out_dir`` (every launch would otherwise
+        # leave a new sibling and the directory accumulates
+        # indefinitely) and in ``web_dir`` (leftovers from builds that
+        # co-located the bust file with the assets). For a signed
+        # bundle the web_dir sweep is remediation, not just tidiness:
+        # the added file is precisely what fails strict signature
+        # verification, so removing it restores the seal.
+        for stale_dir in (out_dir, web_dir):
+            for stale in stale_dir.glob(".index.bust-*.html"):
+                try:
+                    stale.unlink()
+                except OSError:
+                    # Best-effort cleanup — don't crash the launch if a
+                    # file is locked / read-only / already gone.
+                    continue
 
         html = index_path.read_text(encoding="utf-8")
 
@@ -5459,10 +5467,9 @@ def _materialize_cache_busted_index(web_dir: Path, index_path: Path) -> Path:
             r'(src|href)="([^"]+\.(?:js|css))"',
             _add_bust, html,
         )
-        if base_tag:
-            # Inject just after <head> so the base applies to every
-            # subsequent relative ref (scripts, stylesheets, images).
-            html = html.replace("<head>", f"<head>\n  {base_tag}", 1)
+        # Inject just after <head> so the base applies to every
+        # subsequent relative ref (scripts, stylesheets, images).
+        html = html.replace("<head>", f"<head>\n  {base_tag}", 1)
         out = out_dir / f".index.bust-{build_id}.html"
         out.write_text(html, encoding="utf-8")
         return out

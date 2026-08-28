@@ -4,6 +4,46 @@ Notable changes per release. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 versions follow semver, pre-1.0.
 
+## [Unreleased]
+
+Three fixes: two silent-context/collision correctness bugs and one
+packaging integrity bug.
+
+- **Cross-session comparison tables work for ordinary ids.** Every
+  session's store numbers results from `M1`, so composing "this
+  session's M1 next to that session's M1" — the whole point of
+  cross-session recall — collided on the bare id and hard-errored,
+  with remediation advice that couldn't work (`session_path` was a
+  lookup hint, not a render key, and ids aren't renameable). The
+  compose path now re-keys cross-session rows onto call-private
+  aliases before rendering: colliding ids compose cleanly, each row
+  shows its own session's numbers, and a denied or missing foreign
+  row can no longer borrow the local payload for the same id.
+- **A failed OpenAI tool turn no longer vanishes from the model's
+  context.** When a turn's tool round succeeded but a later request
+  in the same turn failed (a transport blip, a 5xx), the next
+  message chained onto the point *before* the failed turn — the
+  transcript showed a tool result the model never saw, and a
+  follow-up like "explain that result" produced a confident answer
+  about the wrong thing. The provider now stashes the failed turn's
+  server-side progress plus its undelivered tool outputs and hands
+  both to the model with the next message; if that recovery itself
+  fails, it falls back to rebuilding context from on-disk history
+  (the chain-expiry contract) rather than ever losing the turn
+  silently. The exhausted-tool-rounds path, which deliberately
+  abandoned its rounds, now preserves them the same way.
+- **Cache busting never writes inside the app bundle.** The
+  generated `.index.bust-*.html` was co-located with the web assets
+  whenever that directory was writable — but a drag-installed,
+  user-owned `Nora.app` is writable while still being code-signed,
+  so first launch modified the sealed resources and broke strict
+  signature verification. The bust file now always lands in a temp
+  directory (a `<base href>` resolves the asset refs, as the
+  packaged read-only path always did), leftovers inside a bundle
+  are cleaned up — restoring the seal on installs the old behavior
+  damaged — and the bust file no longer feeds its own mtime into
+  the build id, which had rolled the cache key on every launch.
+
 ## [0.11.2] - 2026-08-19
 
 Single-change patch on top of `0.11.1`, all presentation. Answers
