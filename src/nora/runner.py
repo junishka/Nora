@@ -1232,6 +1232,17 @@ class SessionRunner:
                 # ``context_reset`` field on ``TurnError`` in
                 # ``provider/base.py``.
                 turn_context_reset = False
+                # Set when a provider error reports the failed turn's
+                # content is preserved provider-side (the OpenAI
+                # mid-turn recovery stash) and will be delivered with
+                # the next message. Restoration must then be SKIPPED:
+                # the prefix / dataset diff / plots this turn carried
+                # reached the provider in the turn's first round and
+                # live on in its context, so re-carrying them would
+                # duplicate what the model sees. See
+                # ``context_preserved`` on ``TurnError`` in
+                # ``provider/base.py``.
+                turn_context_preserved = False
                 try:
                     async for evt in session.send(
                         prompt,
@@ -1243,6 +1254,11 @@ class SessionRunner:
                                 turn_failed_event = True
                             if isinstance(evt, TurnError) and evt.context_reset:
                                 turn_context_reset = True
+                            if (
+                                isinstance(evt, TurnError)
+                                and getattr(evt, "context_preserved", False)
+                            ):
+                                turn_context_preserved = True
                         # Capture any plots produced by submit_script
                         # so they're available on the NEXT user turn.
                         from nora.provider import ToolCallResult
@@ -1264,7 +1280,7 @@ class SessionRunner:
                                 "resend if the chat feels stuck."
                             ),
                         })
-                    if turn_failed_event:
+                    if turn_failed_event and not turn_context_preserved:
                         # Same restoration posture as the cancel /
                         # exception branches: a failed turn means the
                         # researcher's next attempt should see the
@@ -1274,7 +1290,11 @@ class SessionRunner:
                         # do NOT carry — the composer chip already
                         # cleared on send, so re-prepending would
                         # smuggle attachments the researcher no
-                        # longer sees.
+                        # longer sees. A context-preserved failure
+                        # skips ALL of this: the turn's content
+                        # reached the provider and rides its recovery
+                        # stash into the next turn, so restoring here
+                        # would double-deliver it.
                         if carried_prefix or turn_context_reset:
                             # ``carried_prefix``: standard retry path
                             # — re-arm so the prefix that THIS turn

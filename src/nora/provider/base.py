@@ -142,9 +142,22 @@ class TurnError:
     ``needs_context_prefix`` so the next turn doesn't silently
     start with no recoverable context. Defaults to False so existing
     error sites stay unchanged.
+
+    ``context_preserved``: True iff the turn failed but the provider
+    holds everything needed to deliver the turn's content with the
+    next message (the OpenAI provider's mid-turn recovery stash —
+    the failed turn's rounds live server-side and the unsent tool
+    outputs ride along on the next send). The runner reads this in
+    the failure-restoration branch and SKIPS the usual restoration
+    (prefix re-arm, dataset-diff rollback, plot re-queue): the
+    failed turn's prompt content reached the provider and is
+    preserved, so re-sending it would duplicate context. Mutually
+    exclusive with ``context_reset`` by construction. Defaults to
+    False so existing error sites stay unchanged.
     """
     message: str
     context_reset: bool = False
+    context_preserved: bool = False
 
 
 Event = Union[

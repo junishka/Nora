@@ -320,6 +320,22 @@ class OpenAISession:
         # we walk a local pointer through each round so a mid-turn
         # failure leaves the committed pointer at the last good turn.
         self._last_response_id: str | None = None
+        # Mid-turn failure recovery stash: ``(dangling_head_id,
+        # unsent_input_items)`` from a turn that made server-side
+        # progress (at least one round-trip succeeded) but never
+        # committed. The dangling response — carrying the turn's user
+        # message, any assistant items, and its function_calls — is
+        # still live server-side; the stash holds the
+        # ``function_call_output`` items that answer it but were
+        # never delivered. The next ``send()`` consumes the stash by
+        # chaining onto the dangling head with those outputs
+        # prepended to the new user message, so a transport blip
+        # mid-tool-loop no longer silently drops a turn the UI and
+        # chat history both show. Without this, "explain that result"
+        # after a failed turn reached the model with
+        # ``previous_response_id`` pointing BEFORE the tool ever ran
+        # — a confidently wrong answer waiting to happen.
+        self._pending_turn_recovery: tuple[str, list[dict[str, Any]]] | None = None
         # Cached tool list — same function tools for every call.
         # Built once at open() rather than per-send so the lockdown
         # check has a stable reference.
@@ -367,6 +383,7 @@ class OpenAISession:
         client = self._client
         self._client = None
         self._last_response_id = None
+        self._pending_turn_recovery = None
         self._tools = []
         if client is not None:
             try:
@@ -506,29 +523,63 @@ class OpenAISession:
         # reasoning items already live on the server, reachable via
         # the response-id chain.
         user_content = _build_user_content(prompt, images)
-        pending_input: list[dict[str, Any]] = [
-            {"role": "user", "content": user_content},
-        ]
+        new_user_msg: dict[str, Any] = {"role": "user", "content": user_content}
 
-        # First-turn-only: prepend the few-shot demonstration exchange
-        # (see _build_fewshot_items for rationale). The chain pointer is
-        # None here because no real turn has committed yet on this
-        # session. On every subsequent turn the few-shot rides for free
-        # via previous_response_id, so we never re-prepend it. A mid-
-        # session context-chain reset (chain expiry) drops
-        # _last_response_id back to None, which correctly re-injects
-        # the few-shot when the next turn rebuilds the chain from a
-        # fresh root.
-        if self._last_response_id is None and _fewshot_enabled():
-            pending_input = _build_fewshot_items() + pending_input
+        # Consume any mid-turn failure stash from the previous send
+        # (see ``_pending_turn_recovery`` in __init__). When present,
+        # round 1 chains onto the DANGLING head — the last response
+        # of the failed turn, which already carries that turn's user
+        # message and tool calls server-side — and the input leads
+        # with the ``function_call_output`` items that answer it,
+        # followed by the new user message. This is the same request
+        # the failed round would have made, plus the new prompt: the
+        # model sees the failed turn exactly as the UI showed it.
+        # ``recovery_carried`` gates the single-shot fallback below —
+        # if the recovery request ITSELF fails before making
+        # progress, we don't re-stash (the payload may be the
+        # problem); we reset the chain and let the warm-start prefix
+        # re-prime instead.
+        recovery = self._pending_turn_recovery
+        self._pending_turn_recovery = None
+        recovery_carried = recovery is not None
+        if recovery is not None:
+            recovery_head, recovery_outputs = recovery
+            pending_input: list[dict[str, Any]] = [
+                *recovery_outputs, new_user_msg,
+            ]
+            turn_response_id: str | None = recovery_head
+        else:
+            pending_input = [new_user_msg]
+            # Walk a local pointer through each round of the tool
+            # loop. Initialised from the last committed turn so the
+            # new turn threads onto the prior conversation. Only
+            # promoted to ``self._last_response_id`` after a clean
+            # turn end so a mid-turn failure doesn't strand the chain
+            # on a half-done response.
+            turn_response_id = self._last_response_id
 
-        # Walk a local pointer through each round of the tool loop.
-        # Initialised from the last committed turn so the new turn
-        # threads onto the prior conversation. Only promoted to
-        # ``self._last_response_id`` after a clean turn end so a
-        # mid-turn failure doesn't strand the chain on a half-done
-        # response.
-        turn_response_id: str | None = self._last_response_id
+            # First-turn-only: prepend the few-shot demonstration
+            # exchange (see _build_fewshot_items for rationale). The
+            # chain pointer is None here because no real turn has
+            # committed yet on this session. On every subsequent turn
+            # the few-shot rides for free via previous_response_id, so
+            # we never re-prepend it. A mid-session context-chain
+            # reset (chain expiry) drops _last_response_id back to
+            # None, which correctly re-injects the few-shot when the
+            # next turn rebuilds the chain from a fresh root. A
+            # recovery turn skips this branch entirely: its chain
+            # head descends from the original round 1, so the
+            # few-shot is already in the chain.
+            if turn_response_id is None and _fewshot_enabled():
+                pending_input = _build_fewshot_items() + pending_input
+
+        # Whether at least one ``responses.create`` succeeded THIS
+        # turn — i.e. ``turn_response_id`` points at a response that
+        # exists server-side but is not yet committed. Gates the
+        # failure paths below: with progress, the turn's content is
+        # recoverable via the stash; without, there is nothing on the
+        # server to recover.
+        progressed = False
 
         # Bound the tool-loop iterations so a runaway model can't pin
         # the loop forever. 16 is generous — most analyses use 1–4.
@@ -622,6 +673,21 @@ class OpenAISession:
                     msg = str(e)
                     lower = msg.lower()
                     if "auth" in lower or "api key" in lower or "401" in lower:
+                        # An auth rejection means the request was
+                        # never processed, so the turn's server-side
+                        # progress (if any) is intact — stash it so
+                        # the next send after the researcher fixes
+                        # the key resumes losslessly. On a recovery
+                        # turn that failed before progressing, put
+                        # the original stash back untouched: the
+                        # stashed outputs are still valid and the
+                        # rejected request never consumed them.
+                        if progressed and turn_response_id is not None:
+                            self._pending_turn_recovery = (
+                                turn_response_id, list(pending_input),
+                            )
+                        elif recovery_carried:
+                            self._pending_turn_recovery = recovery
                         yield AuthFailure(reason=f"OpenAI auth failure: {msg}")
                         return
                     # Context-window overrun: with ``truncation="disabled"``
@@ -640,6 +706,13 @@ class OpenAISession:
                         or ("input" in lower and "tokens" in lower
                             and ("limit" in lower or "exceed" in lower))
                     ):
+                        # Deliberately NO recovery stash here: the
+                        # failed request overran the window, and a
+                        # stash would re-send the same overrun (plus
+                        # the next prompt) on every subsequent turn.
+                        # The message below is the actionable path —
+                        # the turn's tool results stay reachable by
+                        # id via expand_result either way.
                         yield TurnError(message=(
                             "Conversation hit the model's context "
                             "window. To continue: start a new "
@@ -706,6 +779,60 @@ class OpenAISession:
                             context_reset=True,
                         )
                         return
+                    # Generic failure (transport blip, 5xx, SDK
+                    # hiccup). Three cases:
+                    #
+                    # 1. The turn made progress (a round succeeded,
+                    #    so the dangling head — user message, tool
+                    #    calls, tool results the UI already showed —
+                    #    exists server-side): stash the head plus the
+                    #    unsent outputs and tell the runner context
+                    #    is preserved. The next send delivers them,
+                    #    so the failed turn is NOT silently dropped
+                    #    from the model's context. Before this stash
+                    #    existed, the next turn chained onto the
+                    #    pre-failure head: history and UI showed a
+                    #    tool result the model never saw, and a
+                    #    follow-up like "explain that result" got a
+                    #    confident answer about the wrong thing.
+                    # 2. A recovery attempt failed before making any
+                    #    progress: don't re-stash (the stashed
+                    #    payload itself may be what the server keeps
+                    #    rejecting, and re-stashing would also
+                    #    double-deliver this turn's user message on
+                    #    the researcher's retry). Reset the chain and
+                    #    re-prime via the warm-start prefix — the
+                    #    same recovery contract as chain expiry.
+                    # 3. Round 1 of an ordinary turn failed: nothing
+                    #    reached the server, nothing to recover; the
+                    #    researcher retries the message.
+                    if progressed and turn_response_id is not None:
+                        self._pending_turn_recovery = (
+                            turn_response_id, list(pending_input),
+                        )
+                        yield TurnError(
+                            message=(
+                                f"OpenAI request failed: {msg}. The "
+                                f"turn's progress is preserved and "
+                                f"will reach the model with the next "
+                                f"message."
+                            ),
+                            context_preserved=True,
+                        )
+                        return
+                    if recovery_carried:
+                        self._last_response_id = None
+                        yield TurnError(
+                            message=(
+                                f"OpenAI request failed: {msg}. "
+                                f"Recovery of the previously failed "
+                                f"turn also failed, so the next turn "
+                                f"will rebuild context from the "
+                                f"session's on-disk history."
+                            ),
+                            context_reset=True,
+                        )
+                        return
                     yield TurnError(message=f"OpenAI request failed: {msg}")
                     return
 
@@ -715,6 +842,7 @@ class OpenAISession:
                 new_id = getattr(resp, "id", None)
                 if isinstance(new_id, str) and new_id:
                     turn_response_id = new_id
+                    progressed = True
 
                 # Track usage. ``=`` not ``+=`` (see the rationale
                 # above where last_input_tokens is initialized).
@@ -931,20 +1059,50 @@ class OpenAISession:
             # in this turn carries an unsatisfied ``function_call`` and
             # we built ``function_call_output`` items in ``pending_input``
             # that we never sent back. Chaining the next user message
-            # onto that response would either 400 server-side (open tool
-            # call) or silently continue with inconsistent context. Roll
-            # back to the prior committed turn instead — the next user
-            # message threads onto the last clean state, and the
-            # orphaned round-trips on the server are simply abandoned.
+            # onto that response directly would 400 server-side (open
+            # tool call) — but abandoning those round-trips (the prior
+            # behavior) silently dropped up to MAX_TOOL_ROUNDS of tool
+            # work the UI and history already showed. Stash the head +
+            # unsent outputs instead: the next user message delivers
+            # the outputs and threads cleanly onto the full turn, and
+            # the researcher's reply is what steers the model out of
+            # the loop.
+            if turn_response_id is not None:
+                self._pending_turn_recovery = (
+                    turn_response_id, list(pending_input),
+                )
             yield TurnError(
                 message=(
                     f"OpenAI tool loop did not converge within "
                     f"{MAX_TOOL_ROUNDS} rounds; last response still had "
-                    f"pending function calls."
+                    f"pending function calls. The rounds so far are "
+                    f"preserved and will reach the model with the next "
+                    f"message."
                 ),
+                context_preserved=True,
             )
         except Exception as e:  # noqa: BLE001 — last-line catch
-            yield TurnError(message=f"OpenAI session error: {e}")
+            # A raised exception can land here from anywhere in the
+            # round loop — including mid-dispatch, where
+            # ``pending_input`` may hold outputs for only SOME of the
+            # dangling head's function calls. An incomplete output
+            # set would 400 on delivery, so no stash: when the turn
+            # made server-side progress (or consumed a recovery
+            # stash), reset the chain and re-prime from on-disk
+            # history — silent context loss is the one outcome we
+            # never allow.
+            if progressed or recovery_carried:
+                self._last_response_id = None
+                yield TurnError(
+                    message=(
+                        f"OpenAI session error: {e}. The next turn "
+                        f"will rebuild context from the session's "
+                        f"on-disk history."
+                    ),
+                    context_reset=True,
+                )
+            else:
+                yield TurnError(message=f"OpenAI session error: {e}")
 
     # ---- async-context-manager sugar ------------------------------------
 
