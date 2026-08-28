@@ -1496,21 +1496,22 @@ def test_compose_results_tool_cross_session_lookup(
         reset_store_for_tests()
 
 
-def test_compose_results_tool_rejects_cross_session_rid_collision(
+def test_compose_results_tool_composes_cross_session_rid_collision(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """When two rows reference the same ``result_id`` in different
-    sessions, the layout's payload dict is keyed by rid alone — one
-    payload would silently overwrite the other and the rendered
-    table would show the wrong numbers under that row's label.
+    """Two rows referencing the same ``result_id`` in different
+    sessions must BOTH render, each with its own session's numbers.
 
-    Earlier behavior surfaced a ``rid_collisions_across_sessions``
-    hint alongside ``status: ok`` and a wrong-data render; the model
-    only learned about the collision after the bad markdown had
-    already crossed. The tool now hard-rejects with ``status:
-    error`` BEFORE rendering — the model has to disambiguate (use
-    ``session_path`` on one of the rows, or rename one of the
-    source results) before any wrong numbers cross.
+    Every store numbers results from M1, so this collision is the
+    normal cross-session shape, not an edge case. Earlier behaviors
+    got it wrong twice over: first last-write-wins rendered one
+    session's numbers under the other's label, then a hard
+    ``status: error`` reject made the case unusable outright — its
+    remediation advice was circular (``session_path`` was a lookup
+    hint, not a render key, so adding it re-produced the error) or
+    impossible (ids are store-assigned; there is no rename). The
+    tool now re-keys cross-session rows onto call-private aliases
+    before rendering, so colliding ids compose cleanly.
     """
     sessions_root = tmp_path / ".nora-sessions"
     sessions_root.mkdir()
@@ -1562,11 +1563,17 @@ def test_compose_results_tool_rejects_cross_session_rid_collision(
                 },
             }))
         body = _mcp_text(res)
-        assert body["status"] == "error"
-        assert m_a.id in body["rid_collisions_across_sessions"]
-        # No markdown was rendered — the model never sees confused
-        # cells under this id.
-        assert "markdown" not in body
+        assert body["status"] == "ok", body
+        assert "missing_result_ids" not in body
+        assert "denied_result_ids" not in body
+        md = body["markdown"]
+        # Each row rendered ITS session's coefficient: B's 0.7 under
+        # "in B", A's 0.5 under "in A" — no overwrite in either
+        # direction, and the internal re-keying alias never leaks.
+        assert "0.7" in md
+        assert "0.5" in md
+        assert "in A" in md and "in B" in md
+        assert "\x1f" not in md
     finally:
         reset_store_for_tests()
 
