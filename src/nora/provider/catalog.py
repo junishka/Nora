@@ -60,11 +60,16 @@ PROVIDER_API_KEY_URLS: dict[str, str] = {
 # There's no pricing tier on context length: a 900k-token request
 # costs the same per-token as a 9k-token one. Labels are clean —
 # context-window numbers live in the picker's right-side column.
-# Tiers (per Anthropic's pricing doc, Aug 2026): Sonnet 5 $3/$15 per
-# MTok, Opus 5 $5/$25, Fable 5 $10/$50. Opus 5 and Fable 5 are
-# listed in the picker but deliberately NOT the default (see
-# PROVIDER_DEFAULTS below); a researcher opts in per session and
-# per-session model memory keeps the choice.
+# Tiers (per Anthropic's pricing doc, Sep 2026): Sonnet 5 $2/$10 per
+# MTok (the launch price, since made permanent), Opus 5 $5/$25,
+# Fable 5.1 $10/$50. Fable 5.1 replaced Fable 5 in the picker: same
+# tier, same per-token price, so a researcher who opted into Fable
+# pays the same. The id spells out ``claude-fable-5-1`` rather than
+# the CLI's ``fable`` alias because an older installed CLI may still
+# resolve that alias to Fable 5. Opus 5 and Fable 5.1 are listed in
+# the picker but deliberately NOT the default (see PROVIDER_DEFAULTS
+# below); a researcher opts in per session and per-session model
+# memory keeps the choice.
 # Haiku is intentionally excluded for now: the Nora workload
 # (multi-turn analysis with tool use) calls for the heavier models.
 ANTHROPIC_MODELS: tuple[ModelInfo, ...] = (
@@ -81,25 +86,32 @@ ANTHROPIC_MODELS: tuple[ModelInfo, ...] = (
         provider="anthropic",
     ),
     ModelInfo(
-        id="claude-fable-5[1m]",
-        label="Fable 5",
+        id="claude-fable-5-1[1m]",
+        label="Fable 5.1",
         context_window=1_000_000,
         provider="anthropic",
     ),
 )
 
-# OpenAI — the GPT-5.6 family, cheapest tier first. ``gpt-5.6-terra``
-# is the balanced / cost-tier model (roughly the "mini" slot of
-# earlier GPT-5 families; $2/$12 per MTok); ``gpt-5.6-sol`` is the
-# flagship ($5/$30 — same price point as the gpt-5.5 it replaces;
-# the bare ``gpt-5.6`` alias routes to Sol). Both accept the full
-# none/low/medium/high/xhigh/max reasoning range, so the provider's
-# pinned ``effort="xhigh"`` is valid on either. Ids match the OpenAI
-# Models API exactly so a researcher can cross-reference pricing and
-# limits in OpenAI's own docs / billing dashboard.
-# Context window: 1.05M tokens for both per OpenAI's published spec
-# (the Models API itself doesn't expose this — it has to be hard-coded
-# from OpenAI's docs and updated when they publish new variants).
+# OpenAI — cheapest tier first: the GPT-5.6 pair, then GPT-6 Astra
+# on top. ``gpt-5.6-terra`` is the balanced / cost-tier model
+# (roughly the "mini" slot of earlier GPT-5 families; $2/$12 per
+# MTok); ``gpt-5.6-sol`` is the GPT-5.6 flagship ($5/$30 — same
+# price point as the gpt-5.5 it replaced; the bare ``gpt-5.6`` alias
+# routes to Sol). ``gpt-6-astra`` (Sep 2026) is OpenAI's top tier at
+# $10/$50 — the same price point as Fable 5.1 on the Anthropic side
+# — and the one entry in this catalog with a length tier: prompts
+# over 272k input tokens bill 2x on input and cache and 1.5x on
+# output. All three take low/medium/high/xhigh and pro mode, so
+# every rung of the OpenAI effort ladder below is valid on any of
+# them (Astra drops ``none``, which the ladder never offered). Ids
+# match the OpenAI Models API exactly so a researcher can
+# cross-reference pricing and limits in OpenAI's own docs / billing
+# dashboard.
+# Context window: 1.05M tokens for all three per OpenAI's published
+# spec (the Models API itself doesn't expose this — it has to be
+# hard-coded from OpenAI's docs and updated when they publish new
+# variants). Astra caps input at 922k of that and output at 128k.
 OPENAI_MODELS: tuple[ModelInfo, ...] = (
     ModelInfo(
         id="gpt-5.6-terra",
@@ -113,6 +125,12 @@ OPENAI_MODELS: tuple[ModelInfo, ...] = (
         context_window=1_050_000,
         provider="openai",
     ),
+    ModelInfo(
+        id="gpt-6-astra",
+        label="GPT-6 Astra",
+        context_window=1_050_000,
+        provider="openai",
+    ),
 )
 
 
@@ -123,10 +141,12 @@ ALL_MODELS: tuple[ModelInfo, ...] = ANTHROPIC_MODELS + OPENAI_MODELS
 # call uses when the researcher hasn't picked something explicitly.
 # Anthropic stays on Sonnet even though heavier tiers (Opus, Fable)
 # are in the picker: the default is what a researcher gets without
-# asking, and silently defaulting to a 2–3x-priced tier would change
-# their bill, not just their model. OpenAI defaults to Sol — it is
-# the direct successor to gpt-5.5 (the previous default) at the same
-# $5/$30 price point, so a researcher's bill doesn't move on upgrade;
+# asking, and silently defaulting to a 2.5–5x-priced tier would
+# change their bill, not just their model. OpenAI stays on Sol for
+# the same reason: GPT-6 Astra is the newer flagship, but at $10/$50
+# it costs double, so it is a per-session opt-in like Fable 5.1
+# rather than the default. Sol itself was the direct successor to
+# gpt-5.5 (the default before it) at the same $5/$30 price point;
 # Terra is the cheaper opt-in.
 PROVIDER_DEFAULTS: dict[str, str] = {
     "anthropic": "claude-sonnet-5[1m]",

@@ -334,8 +334,13 @@ Picker (top-right of composer, grouped by provider):
 
 | Provider | Models | Pricing link |
 |---|---|---|
-| Anthropic | Sonnet 5 (default), Opus 5, Fable 5 | platform.claude.com/docs/…/pricing |
-| OpenAI | GPT-5.6 Terra (cost tier), GPT-5.6 Sol (flagship, default) | openai.com/api/pricing |
+| Anthropic | Sonnet 5 (default), Opus 5, Fable 5.1 | platform.claude.com/docs/…/pricing |
+| OpenAI | GPT-5.6 Terra (cost tier), GPT-5.6 Sol (default), GPT-6 Astra (top tier) | openai.com/api/pricing |
+
+The default on each side is the mid-priced mainstream model. The two
+top tiers, Fable 5.1 and GPT-6 Astra, both bill $10/$50 per MTok and
+are per-session opt-ins; Astra additionally bills 2x input / 1.5x
+output on prompts over 272k input tokens.
 
 Each row carries a small `$` link that opens the provider's pricing
 page in the system browser. Models for un-authed providers stay

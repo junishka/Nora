@@ -378,7 +378,7 @@ class AnthropicSession:
             #   - effort: the researcher's per-session pick from the
             #     picker's Effort section (``catalog.EFFORT_LEVELS``;
             #     default ``xhigh``). Every catalog model (Sonnet 5 /
-            #     Opus 5 / Fable 5) accepts the full low..max ladder,
+            #     Opus 5 / Fable 5.1) accepts the full low..max ladder,
             #     so any level is safe across the catalog. The SDK
             #     hands it to the CLI as ``--effort`` at launch.
             #   - thinking adaptive + display="summarized": keep the model
@@ -386,7 +386,7 @@ class AnthropicSession:
             #     summarized traces so the thinking panel stays populated
             #     — the Claude 5 default is "omitted" (empty text).
             #     ``{"type": "adaptive"}`` is the one explicit thinking
-            #     config Fable 5 accepts (it rejects "disabled" and any
+            #     config Fable 5.1 accepts (it rejects "disabled" and any
             #     budget_tokens), so this shape is valid on all three.
             effort=self.effort,
             thinking={"type": "adaptive", "display": "summarized"},

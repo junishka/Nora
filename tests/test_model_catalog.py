@@ -8,8 +8,8 @@ edit that drops or renames a model trips loudly instead of silently
 breaking per-session model memory (which restores only catalog-known
 ids).
 
-Current lineup (Aug 2026): the Claude 5 family (Sonnet 5 / Opus 5 /
-Fable 5) alongside the GPT-5.6 family (Terra / Sol).
+Current lineup (Sep 2026): the Claude 5 family (Sonnet 5 / Opus 5 /
+Fable 5.1) alongside GPT-5.6 Terra / Sol and GPT-6 Astra.
 """
 
 from __future__ import annotations
@@ -33,7 +33,7 @@ from nora.ui import NoraBridge
 # ---------------------------------------------------------------------------
 
 def test_anthropic_catalog_is_the_claude_5_family() -> None:
-    """Sonnet 5 / Opus 5 / Fable 5, cheapest tier first. Every id
+    """Sonnet 5 / Opus 5 / Fable 5.1, cheapest tier first. Every id
     carries the ``[1m]`` suffix (the Claude CLI / Agent SDK 1M-context
     convention) so the ids pass through ``ClaudeAgentOptions(model=...)``
     unchanged and follow one convention across the provider."""
@@ -41,7 +41,7 @@ def test_anthropic_catalog_is_the_claude_5_family() -> None:
     assert ids == [
         "claude-sonnet-5[1m]",
         "claude-opus-5[1m]",
-        "claude-fable-5[1m]",
+        "claude-fable-5-1[1m]",
     ]
     for m in ANTHROPIC_MODELS:
         assert m.provider == "anthropic"
@@ -54,7 +54,7 @@ def test_anthropic_catalog_is_the_claude_5_family() -> None:
     [
         ("claude-sonnet-5[1m]", "Sonnet 5"),
         ("claude-opus-5[1m]", "Opus 5"),
-        ("claude-fable-5[1m]", "Fable 5"),
+        ("claude-fable-5-1[1m]", "Fable 5.1"),
     ],
 )
 def test_anthropic_entries_resolve(model_id: str, label: str) -> None:
@@ -65,10 +65,19 @@ def test_anthropic_entries_resolve(model_id: str, label: str) -> None:
 
 def test_anthropic_default_stays_on_sonnet() -> None:
     """The default is what a researcher gets without asking. Opus 5
-    bills $5/$25 per MTok and Fable 5 $10/$50 (vs Sonnet 5's $3/$15)
+    bills $5/$25 per MTok and Fable 5.1 $10/$50 (vs Sonnet 5's $2/$10)
     — the heavier tiers must be an explicit per-session opt-in, never
     the silent default."""
     assert PROVIDER_DEFAULTS["anthropic"] == "claude-sonnet-5[1m]"
+
+
+def test_fable_5_id_is_gone() -> None:
+    """Fable 5.1 replaced Fable 5 rather than sitting beside it (same
+    tier, same price, direct successor). A session saved on Fable 5
+    falls back to the default on restore, the same way the 4.x ids
+    did — the picker never offers two rungs at one price point."""
+    with pytest.raises(KeyError):
+        get_model("claude-fable-5[1m]")
 
 
 def test_pre_5_anthropic_ids_are_gone() -> None:
@@ -82,15 +91,16 @@ def test_pre_5_anthropic_ids_are_gone() -> None:
 
 
 # ---------------------------------------------------------------------------
-# OpenAI — GPT-5.6 family
+# OpenAI — GPT-5.6 Terra / Sol + GPT-6 Astra
 # ---------------------------------------------------------------------------
 
-def test_openai_catalog_is_the_gpt_5_6_family() -> None:
-    """Terra (cost tier) then Sol (flagship). Ids match the OpenAI
-    Models API exactly — no bare ``gpt-5.6`` alias, which routes to
-    Sol server-side and would make the picker's row ambiguous."""
+def test_openai_catalog_is_terra_sol_astra() -> None:
+    """Terra (cost tier), Sol (GPT-5.6 flagship), then Astra (GPT-6,
+    top tier) — cheapest first. Ids match the OpenAI Models API
+    exactly — no bare ``gpt-5.6`` alias, which routes to Sol
+    server-side and would make the picker's row ambiguous."""
     ids = [m.id for m in OPENAI_MODELS]
-    assert ids == ["gpt-5.6-terra", "gpt-5.6-sol"]
+    assert ids == ["gpt-5.6-terra", "gpt-5.6-sol", "gpt-6-astra"]
     for m in OPENAI_MODELS:
         assert m.provider == "openai"
         assert m.context_window == 1_050_000
@@ -101,6 +111,7 @@ def test_openai_catalog_is_the_gpt_5_6_family() -> None:
     [
         ("gpt-5.6-terra", "GPT-5.6 Terra"),
         ("gpt-5.6-sol", "GPT-5.6 Sol"),
+        ("gpt-6-astra", "GPT-6 Astra"),
     ],
 )
 def test_openai_entries_resolve(model_id: str, label: str) -> None:
@@ -112,7 +123,9 @@ def test_openai_entries_resolve(model_id: str, label: str) -> None:
 def test_openai_default_is_sol() -> None:
     """Sol is the direct successor to gpt-5.5 (the previous default)
     at the same $5/$30 price point, so a researcher's bill doesn't
-    move on upgrade. Terra is the cheaper opt-in, not the default."""
+    move on upgrade. Terra is the cheaper opt-in, not the default —
+    and GPT-6 Astra, the newer flagship, bills double ($10/$50), so
+    it is an opt-in too, the way Fable 5.1 is on Anthropic."""
     assert PROVIDER_DEFAULTS["openai"] == "gpt-5.6-sol"
 
 
@@ -173,8 +186,9 @@ def test_list_models_exposes_full_lineup(
     "model_id, provider",
     [
         ("claude-opus-5[1m]", "anthropic"),
-        ("claude-fable-5[1m]", "anthropic"),
+        ("claude-fable-5-1[1m]", "anthropic"),
         ("gpt-5.6-terra", "openai"),
+        ("gpt-6-astra", "openai"),
     ],
 )
 def test_set_model_accepts_new_entries(
