@@ -4,11 +4,30 @@ Notable changes per release. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 versions follow semver, pre-1.0.
 
-## [Unreleased]
+## [0.12.0] - 2026-09-06
 
-Three fixes — two silent-context/collision correctness bugs and one
-packaging integrity bug — plus a model picker refresh.
+Minor bump on top of `0.11.2`. Three threads. Work now stays with
+the session it started in, however quickly you switch between
+sessions. A set of silent wrong-answer paths are closed: a failed
+OpenAI tool turn, cross-session comparison tables, CSV header
+detection, and the app bundle's own signature. And the model picker
+moves to Fable 5.1 and GPT-6 Astra.
 
+- **Work stays with the session it started in.** pywebview runs
+  each UI call on its own thread, so a click in another session
+  could land in the middle of a slow operation. With two sessions
+  running, Stop could blacklist the other session's turn: its
+  output vanished and its sidebar dot stayed busy. A file dropped
+  or picked while a large read was in progress followed you into
+  the session you switched to. A rewind, a model or effort change,
+  or a mentioned script could act on one session and be recorded
+  against another. And rapid A→B→C switching could repaint the
+  screen to a session you had already left. Every session-scoped
+  action now binds its session the moment it starts and either
+  acts there or says that focus moved; live turns are tracked per
+  session, so Stop cancels only the session on screen; sends name
+  the session they were typed in; and a switch that fails no
+  longer discards the attachments you had staged.
 - **Cross-session comparison tables work for ordinary ids.** Every
   session's store numbers results from `M1`, so composing "this
   session's M1 next to that session's M1" — the whole point of
@@ -53,6 +72,43 @@ packaging integrity bug — plus a model picker refresh.
   new models cost more per token than the model a researcher gets
   without asking. The effort ladders are unchanged — every listed
   model takes every rung its provider offers.
+- **CSV headers are inferred from the body, not the first row
+  alone.** A file whose first row was all text was always read as
+  a header, and one whose first row was all numbers never was. A
+  headerless categorical file lost its first observation to the
+  column names, and numeric year headers over numeric data gained
+  a phantom row named `0, 1, …`. Detection now compares the first
+  row against a sample of the rows below it, column by column.
+  Genuinely undecidable files keep the old behaviour, and the
+  schema now carries a note saying which way the guess went so the
+  model can flag it when it looks wrong.
+- **The model popup fits small windows.** The window has no
+  minimum size, and at small sizes the popup's top or left edge
+  sat off screen with the clipped options unreachable. It is now
+  pinned to the viewport and scrolls when it cannot fit.
+- **Smaller fixes.** The mid-turn switch refusal reads as plain
+  sentences. The system prompt no longer tells the model that SSC
+  installs are impossible: `install_packages` does reach SSC, and
+  what is deferred is the Stata payload helper for DiD and RDD.
+
+Researcher-visible: Stop, drops, picks, rewinds, and model changes
+land in the session you meant even while another one is busy;
+CSV files with unusual first rows load with the right row count;
+the picker lists Sonnet 5 / Opus 5 / Fable 5.1 and GPT-5.6 Terra /
+Sol / GPT-6 Astra; and a drag-installed `Nora.app` keeps its
+signature intact after first launch.
+
+Sessions saved under `0.11.x` resolve unchanged, with one expected
+consequence of the catalog move: a session last used on Fable 5
+reopens on the Sonnet 5 default rather than a model no longer
+listed. Recorded effort is restored either way.
+
+**Updated in 0.12.0**: session-scoped actions bound to the session
+that started them, recovery of failed OpenAI tool turns, working
+cross-session comparison tables, body-aware CSV header detection,
+a cache file that no longer breaks the app bundle's signature, a
+model picker on Fable 5.1 and GPT-6 Astra with unchanged defaults,
+and a model popup that fits small windows.
 
 ## [0.11.2] - 2026-08-19
 

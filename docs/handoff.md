@@ -1,8 +1,21 @@
 # Nora — handoff
 
 Single-page entry point for picking this project up. Last
-substantive update **2026-08-20**, covering the 0.11.x releases
-(0.11.0 / 0.11.1 / 0.11.2, each signed and notarized).
+substantive update **2026-09-06**, covering the 0.12.0 release
+(signed and notarized) and the 0.11.x line before it.
+
+The 0.12.0 release in brief. Work stays with the session it
+started in: Stop, file drops and picks, rewinds, and model or
+effort changes bind their session up front and say so if focus
+moved, and live turns are tracked per session. A failed OpenAI
+tool turn is recovered instead of dropped from the model's
+context. Cross-session comparison tables work for ordinary result
+ids. CSV header detection looks at the body, not just the first
+row. The cache-bust file lives outside the app bundle, so a
+drag-installed app keeps its signature. The model picker moves to
+Fable 5.1 (replacing Fable 5) and adds GPT-6 Astra above GPT-5.6
+Terra and Sol; both defaults stay where they were. The 0.11.x
+paragraph below is kept as history.
 
 The 0.11.x batch in brief. The model picker moved to the current
 families: Sonnet 5 (default) / Opus 5 / Fable 5 on Anthropic, and

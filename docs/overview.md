@@ -1,7 +1,7 @@
 # Nora overview
 
 Plain-language description of what Nora is and how it works.
-Current version: **0.11.2** (August 2026).
+Current version: **0.12.0** (September 2026).
 
 ## What Nora is
 
@@ -69,7 +69,7 @@ The boundary is enforced by three independent layers:
 
 Download the signed and notarized `.dmg` from the
 [releases page](https://github.com/junishka/Nora/releases) (you
-want the latest `0.11.x`). Drag `Nora.app` to `/Applications` and
+want the latest `0.12.x`). Drag `Nora.app` to `/Applications` and
 launch. First launch asks for an Anthropic or OpenAI credential
 and stores it in the macOS Keychain.
 
