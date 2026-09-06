@@ -6,8 +6,8 @@ versions follow semver, pre-1.0.
 
 ## [Unreleased]
 
-Three fixes: two silent-context/collision correctness bugs and one
-packaging integrity bug.
+Three fixes — two silent-context/collision correctness bugs and one
+packaging integrity bug — plus a model picker refresh.
 
 - **Cross-session comparison tables work for ordinary ids.** Every
   session's store numbers results from `M1`, so composing "this
@@ -43,6 +43,16 @@ packaging integrity bug.
   are cleaned up — restoring the seal on installs the old behavior
   damaged — and the bust file no longer feeds its own mtime into
   the build id, which had rolled the cache key on every launch.
+- **Model picker: Fable 5.1 and GPT-6 Astra.** Anthropic now lists
+  Sonnet 5, Opus 5, and Fable 5.1; Fable 5.1 replaces Fable 5 at the
+  same \$10/\$50 per MTok, so a session saved on Fable 5 reopens on
+  the Sonnet 5 default and needs re-picking once. OpenAI gains GPT-6
+  Astra (\$10/\$50, 1.05M context) above GPT-5.6 Terra and Sol;
+  Astra bills 2x input and 1.5x output on prompts over 272k input
+  tokens. Neither default moves: Sonnet 5 and Sol stay, because both
+  new models cost more per token than the model a researcher gets
+  without asking. The effort ladders are unchanged — every listed
+  model takes every rung its provider offers.
 
 ## [0.11.2] - 2026-08-19
 

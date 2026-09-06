@@ -76,7 +76,7 @@ if (cwdEl) {
 // Context-window ceiling for the chip's ratio display. Updated
 // whenever the researcher picks a model (see updateModelChip) from
 // the catalog's per-model ``context_window`` — every current entry
-// is 1M (Claude 5 family) or 1.05M (GPT-5.6 family). The starting
+// is 1M (Claude 5 family) or 1.05M (OpenAI). The starting
 // 1M matches the default model (Sonnet 5).
 const DEFAULT_CONTEXT_WINDOW = 1_000_000;
 let contextWindow = DEFAULT_CONTEXT_WINDOW;
@@ -4528,10 +4528,11 @@ function renderModelPopup() {
   //   Anthropic
   //     Sonnet 5 (1M)
   //     Opus 5 (1M)
-  //     Fable 5 (1M)
+  //     Fable 5.1 (1M)
   //   OpenAI
   //     GPT-5.6 Terra (1.05M)
   //     GPT-5.6 Sol (1.05M)
+  //     GPT-6 Astra (1.05M)
   // Models for un-authed providers stay in the list but render
   // disabled with a "Configure auth" hint so the researcher can see
   // the option exists without being able to silently pick it.
